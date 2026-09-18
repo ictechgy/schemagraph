@@ -1,0 +1,20 @@
+# Rust
+target/
+*.rs.bk
+
+# Kotlin/JVM (probe-jdbc)
+.gradle/
+build/
+out/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+
+# 산출물
+*.graph.json
+*.catalog.json
