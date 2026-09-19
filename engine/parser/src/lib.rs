@@ -112,7 +112,7 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
             };
             match routine.language.as_deref() {
                 // SQL 언어 함수는 몸체가 그대로 SQL이라 파싱 가능 — 나머지
-                // 언어(plpgsql 등)는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
+                // 언어는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
                 Some("sql") | None => match parse_routine_body(dialect.as_deref(), body) {
                     Ok(parsed) => {
                         apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
@@ -120,6 +120,26 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                     }
                     Err(msg) => notes.push(format!("routine {owner} 몸체 파싱 실패: {msg}")),
                 },
+                // plpgsql·plsql은 문장 단위 추출기로 SQL 문장만 꺼내 파싱한다.
+                // 꺼내지 못한 문장(동적 SQL 등)은 수를 세어 limitation으로 남긴다.
+                Some("plpgsql" | "plsql" | "pl/sql") => {
+                    let (parsed, unextracted) = parse_procedural_body(dialect.as_deref(), body);
+                    apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                    if routine.kind == "package" {
+                        // PACKAGE BODY의 멤버 몸체는 패키지 정점에 귀속된다 —
+                        // 멤버별 정점 분리는 미지원이라 소비자가 알아야 한다.
+                        notes.push(format!(
+                            "routine {owner}: 패키지 멤버별 귀속 미지원 — 멤버 몸체 간선은 패키지 정점에 귀속"
+                        ));
+                    }
+                    if unextracted > 0 {
+                        notes.push(format!(
+                            "routine {owner}: 몸체 문장 {unextracted}건 미추출\
+                             (동적 SQL·비SQL 구문) — 몸체 간선 불완전"
+                        ));
+                    }
+                    enriched += 1;
+                }
                 Some(lang) => notes.push(format!(
                     "routine {owner}: 언어 {lang}의 몸체 파싱 미지원 — 몸체 간선 없음"
                 )),
@@ -588,6 +608,700 @@ fn word_boundary(s: &str, i: usize, len: usize) -> bool {
     let before_ok = i == 0 || !ident(s.as_bytes()[i - 1]);
     let after_ok = i + len >= s.len() || !ident(s.as_bytes()[i + len]);
     before_ok && after_ok
+}
+
+/// plpgsql/plsql 몸체 — 문장 추출기가 꺼낸 SQL을 문장별로 파싱한다.
+/// 한 문장이 이상해도 나머지가 살도록 개별 파싱하고, 실패는 미추출 수에
+/// 합산한다. 반환의 usize는 추출·파싱에 실패한 문장 수다.
+fn parse_procedural_body(dialect: Option<&dyn Dialect>, body: &str) -> (ParsedTrigger, usize) {
+    let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
+    let (stmts, mut unextracted) = extract_procedural_statements(&inner);
+    let default = GenericDialect {};
+    let dialect = dialect.unwrap_or(&default);
+    let mut parsed = ParsedTrigger {
+        writes: Vec::new(),
+        reads: Vec::new(),
+        fired_columns: Vec::new(),
+        calls: Vec::new(),
+    };
+    for stmt in &stmts {
+        match sqlparser::parser::Parser::parse_sql(dialect, stmt) {
+            Ok(list) => {
+                for s in &list {
+                    collect_trigger_stmt(s, &mut parsed);
+                }
+            }
+            // 추출기가 SQL이 아닌 조각을 문장으로 오인한 경우 — 하나의
+            // 실패가 전체를 쓰러뜨리지 않게 수만 센다.
+            Err(_) => unextracted += 1,
+        }
+    }
+    (parsed, unextracted)
+}
+
+/// 절차형 몸체(plpgsql·plsql)에서 SQL 문장을 문장 단위로 추출한다.
+///
+/// 전체 문법을 파싱하는 대신 `;`로 나눈 조각에서 제어 구조 키워드를 벗겨
+/// SQL 문장만 복원한다 — 조건식은 서브쿼리를 담을 수 있어 `(`가 있을 때
+/// `SELECT`로 싸고, `FOR .. IN <질의>`·`PERFORM`·`EXECUTE '리터럴'`·
+/// `:=` 대입·PL/SQL bare 호출은 그에 맞는 SQL로 재작성한다. 꺼내지 못한
+/// 문장(동적 SQL 식, 인식 못 한 구문)은 수를 돌려 limitation으로 남긴다 —
+/// 추측으로 채우지 않는다.
+fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
+    let mut stmts: Vec<String> = Vec::new();
+    let mut unextracted = 0usize;
+    // DECLARE/IS 섹션 안의 조각은 선언문 — 의존 대상이 아니라 미추출로 세지
+    // 않되, DEFAULT/:= 안의 서브쿼리는 추출한다.
+    let mut in_declare = false;
+    for chunk in split_top_level(body) {
+        let mut rest = chunk;
+        loop {
+            rest = rest.trim_start();
+            if rest.is_empty() {
+                break;
+            }
+            if rest.starts_with("<<") {
+                // <<label>> 형태의 레이블은 소비하고 계속.
+                match rest.find(">>") {
+                    Some(end) => rest = &rest[end + 2..],
+                    None => break,
+                }
+                continue;
+            }
+            let (word, wlen) = head_word(rest);
+            match word.to_ascii_uppercase().as_str() {
+                "BEGIN" => {
+                    in_declare = false;
+                    rest = &rest[wlen..];
+                }
+                "DECLARE" | "IS" | "AS" => {
+                    in_declare = true;
+                    rest = &rest[wlen..];
+                }
+                "END" => {
+                    rest = &rest[wlen..];
+                    // END IF/LOOP/CASE 또는 END <label> — 꼬리 한 단어를 소비.
+                    let (_tail_word, tail_len) = head_word(rest.trim_start());
+                    if tail_len > 0 {
+                        rest = &rest.trim_start()[tail_len..];
+                    }
+                }
+                "LOOP" | "ELSE" | "EXCEPTION" | "REPEAT" => {
+                    rest = &rest[wlen..];
+                }
+                "IF" | "ELSIF" | "ELSEIF" | "WHEN" => {
+                    rest = strip_condition(rest, wlen, "THEN", &mut stmts, &mut unextracted);
+                }
+                "WHILE" => {
+                    rest = strip_condition(rest, wlen, "LOOP", &mut stmts, &mut unextracted);
+                }
+                "UNTIL" => {
+                    rest = strip_condition(rest, wlen, "END", &mut stmts, &mut unextracted);
+                }
+                "FOR" => rest = strip_for(rest, wlen, &mut stmts, &mut unextracted),
+                "CASE" => rest = strip_case_operand(rest, wlen, &mut unextracted),
+                "RETURN" => rest = strip_return(rest, wlen, &mut stmts, &mut unextracted),
+                "PERFORM" => {
+                    // PERFORM은 결과를 버리는 SELECT — 몸체로는 SELECT와 같다.
+                    let target = rest[wlen..].trim();
+                    if !target.is_empty() {
+                        stmts.push(format!("SELECT {target}"));
+                    }
+                    break;
+                }
+                "OPEN" => {
+                    strip_open(rest, wlen, &mut stmts, &mut unextracted);
+                    break;
+                }
+                "EXECUTE" => {
+                    strip_execute(rest, wlen, &mut stmts, &mut unextracted);
+                    break;
+                }
+                "EXIT" | "CONTINUE" | "ASSERT" => {
+                    strip_tail_condition(rest, wlen, &mut stmts);
+                    break;
+                }
+                "DO" => rest = strip_do(rest, wlen, &mut stmts, &mut unextracted),
+                "PROCEDURE" | "FUNCTION" | "PACKAGE" => {
+                    rest = strip_routine_header(rest, wlen, &mut unextracted);
+                    in_declare = true;
+                }
+                "CREATE" => {
+                    if create_is_routine_header(rest) {
+                        rest = strip_routine_header(rest, wlen, &mut unextracted);
+                        in_declare = true;
+                    } else {
+                        stmts.push(rest.trim().to_owned());
+                        break;
+                    }
+                }
+                "GOTO" | "GET" | "RAISE" | "SIGNAL" | "RESIGNAL" | "NULL" | "PRAGMA" | "CLOSE"
+                | "FETCH" | "MOVE" | "LEAVE" | "ITERATE" => break,
+                _ => {
+                    if in_declare {
+                        extract_decl_default(rest, &mut stmts);
+                    } else if is_statement_head(&word) {
+                        // SELECT .. INTO <변수>·RETURNING .. INTO <변수>는
+                        // 변수 귀속 절 — 벗기지 않으면 변수가 테이블로 오인된다.
+                        let stmt = match word.to_ascii_uppercase().as_str() {
+                            "SELECT" | "WITH" => strip_select_into(rest),
+                            "INSERT" | "UPDATE" | "DELETE" => {
+                                match find_top_level(rest, "RETURNING", true) {
+                                    Some(r) => strip_returning_into(rest, r),
+                                    None => rest.trim().to_owned(),
+                                }
+                            }
+                            _ => rest.trim().to_owned(),
+                        };
+                        if !stmt.is_empty() {
+                            stmts.push(stmt);
+                        }
+                    } else if let Some(p) = find_top_level(rest, ":=", false) {
+                        // 대입문 — 우변의 서브쿼리·함수 호출만 SELECT로 살린다.
+                        let rhs = rest[p + 2..].trim();
+                        if rhs.contains('(') {
+                            stmts.push(format!("SELECT {rhs}"));
+                        }
+                    } else if !bare_call(rest, &mut stmts) {
+                        unextracted += 1;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    (stmts, unextracted)
+}
+
+/// `;`로 끝나는 최상위 조각으로 나눈다 — 문자열·식별자 인용·주석·
+/// dollar-quote·Oracle q-quote 안의 `;`는 문장 경계가 아니다.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        i = match b[i] {
+            b'\'' => skip_string(s, i),
+            b'"' | b'`' => skip_quoted_ident(s, i),
+            b'-' if b.get(i + 1) == Some(&b'-') => skip_line_comment(s, i),
+            b'/' if b.get(i + 1) == Some(&b'*') => skip_block_comment(s, i),
+            b'$' => dollar_quote_end(s, i).unwrap_or(i + 1),
+            b'q' | b'Q' if b.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(b[i - 1])) => {
+                q_quote_end(s, i).unwrap_or(i + 1)
+            }
+            b';' => {
+                parts.push(&s[start..i]);
+                i += 1;
+                start = i;
+                i
+            }
+            _ => i + 1,
+        };
+    }
+    if start < n {
+        parts.push(&s[start..]);
+    }
+    parts
+}
+
+/// 인용·주석·괄호 안이 아닌 최상위에서 needle의 첫 위치를 찾는다.
+/// word_boundary가 true면 식별자 문자와 붙은 위치는 건너뛴다.
+fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < n {
+        i = match b[i] {
+            b'\'' => skip_string(s, i),
+            b'"' | b'`' => skip_quoted_ident(s, i),
+            b'-' if b.get(i + 1) == Some(&b'-') => skip_line_comment(s, i),
+            b'/' if b.get(i + 1) == Some(&b'*') => skip_block_comment(s, i),
+            b'$' => dollar_quote_end(s, i).unwrap_or(i + 1),
+            b'q' | b'Q' if b.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(b[i - 1])) => {
+                q_quote_end(s, i).unwrap_or(i + 1)
+            }
+            b'(' => {
+                depth += 1;
+                i + 1
+            }
+            b')' => {
+                depth = (depth - 1).max(0);
+                i + 1
+            }
+            _ => {
+                if depth == 0
+                    && i + needle.len() <= n
+                    && b[i..i + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
+                    && (!word_boundary || self::word_boundary(s, i, needle.len()))
+                {
+                    return Some(i);
+                }
+                i + 1
+            }
+        };
+    }
+    None
+}
+
+/// i의 여는 ' 다음에 오는 닫는 ' 다음 위치 — ''는 이스케이프다.
+fn skip_string(s: &str, i: usize) -> usize {
+    let b = s.as_bytes();
+    let mut j = i + 1;
+    while j < b.len() {
+        if b[j] == b'\'' {
+            if b.get(j + 1) == Some(&b'\'') {
+                j += 2;
+            } else {
+                return j + 1;
+            }
+        } else {
+            j += 1;
+        }
+    }
+    b.len()
+}
+
+/// "ident"·`ident` 인용 식별자의 끝 다음 위치 — ""·``는 이스케이프다.
+fn skip_quoted_ident(s: &str, i: usize) -> usize {
+    let b = s.as_bytes();
+    let q = b[i];
+    let mut j = i + 1;
+    while j < b.len() {
+        if b[j] == q {
+            if b.get(j + 1) == Some(&q) {
+                j += 2;
+            } else {
+                return j + 1;
+            }
+        } else {
+            j += 1;
+        }
+    }
+    b.len()
+}
+
+/// `--` 줄 주석의 끝 위치.
+fn skip_line_comment(s: &str, i: usize) -> usize {
+    s[i..].find('\n').map(|k| i + k + 1).unwrap_or(s.len())
+}
+
+/// `/* */` 블록 주석의 끝 위치 — pg는 중첩을 허용해 깊이로 추적한다.
+fn skip_block_comment(s: &str, i: usize) -> usize {
+    let b = s.as_bytes();
+    let mut j = i + 2;
+    let mut depth = 1;
+    while j < b.len() && depth > 0 {
+        if b[j] == b'/' && b.get(j + 1) == Some(&b'*') {
+            depth += 1;
+            j += 2;
+        } else if b[j] == b'*' && b.get(j + 1) == Some(&b'/') {
+            depth -= 1;
+            j += 2;
+        } else {
+            j += 1;
+        }
+    }
+    j
+}
+
+/// i의 `$`가 `$tag$` 여는 인용이면 닫는 태그 다음 위치 — 태그는 식별자
+/// 규칙이라 `$1` 같은 위치 매개변수와 구분된다(숫자로 시작 못 함).
+fn dollar_quote_end(s: &str, i: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut j = i + 1;
+    if j < b.len() && (b[j].is_ascii_alphabetic() || b[j] == b'_') {
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+    }
+    if j >= b.len() || b[j] != b'$' {
+        return None;
+    }
+    let tag = &s[i..=j];
+    s[j + 1..].find(tag).map(|k| j + 1 + k + tag.len())
+}
+
+/// Oracle `q'구분자...구분자'`의 끝 다음 위치 — 괄호 구분자는 대칭,
+/// 나머지는 같은 문자가 닫는다.
+fn q_quote_end(s: &str, i: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let open = *b.get(i + 2)?;
+    let close = match open {
+        b'[' => b']',
+        b'(' => b')',
+        b'{' => b'}',
+        b'<' => b'>',
+        c if !c.is_ascii_whitespace() => c,
+        _ => return None,
+    };
+    let mut j = i + 3;
+    while j + 1 < b.len() {
+        if b[j] == close && b[j + 1] == b'\'' {
+            return Some(j + 2);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// 조각 선두의 식별자 단어 — (단어, 바이트 길이). 선두가 식별자 문자가
+/// 아니면 ("", 0)이다. Oracle은 `$`·`#`도 식별자 문자다.
+fn head_word(s: &str) -> (&str, usize) {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && is_ident_char(b[i]) {
+        i += 1;
+    }
+    (&s[..i], i)
+}
+
+/// 식별자 문자 — `$`는 pg 위치 매개변수·Oracle 식별자, `#`는 Oracle 식별자.
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'#')
+}
+
+/// `식별자[.식별자]*`의 바이트 길이.
+fn dotted_name_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && is_ident_char(b[i]) {
+        i += 1;
+    }
+    while b.get(i) == Some(&b'.') && b.get(i + 1).is_some_and(|c| is_ident_char(*c)) {
+        i += 1;
+        while i < b.len() && is_ident_char(b[i]) {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// `IF/ELSIF/WHEN <cond> THEN`·`WHILE <cond> LOOP`의 조건식을 추출한다.
+/// 조건 안의 EXISTS/IN 서브쿼리가 테이블을 읽을 수 있어 `(`가 있으면
+/// SELECT로 싼다 — 없으면 스칼라 조건이라 간선이 생기지 않는다.
+fn strip_condition<'a>(
+    rest: &'a str,
+    kwlen: usize,
+    term: &str,
+    stmts: &mut Vec<String>,
+    unextracted: &mut usize,
+) -> &'a str {
+    let tail = &rest[kwlen..];
+    match find_top_level(tail, term, true) {
+        Some(p) => {
+            let cond = tail[..p].trim();
+            if cond.contains('(') {
+                stmts.push(format!("SELECT {cond}"));
+            }
+            &tail[p + term.len()..]
+        }
+        None => {
+            *unextracted += 1;
+            ""
+        }
+    }
+}
+
+/// `FOR <var> IN <질의|범위|EXECUTE> LOOP` — IN 뒤가 질의면 문장으로 살리고,
+/// EXECUTE면 동적 SQL로 미추출, 숫자 범위는 의존이 없어 넘긴다.
+fn strip_for<'a>(
+    rest: &'a str,
+    kwlen: usize,
+    stmts: &mut Vec<String>,
+    unextracted: &mut usize,
+) -> &'a str {
+    let tail = &rest[kwlen..];
+    let Some(in_pos) = find_top_level(tail, "IN", true) else {
+        *unextracted += 1;
+        return "";
+    };
+    let after_in = &tail[in_pos + "IN".len()..];
+    let Some(loop_pos) = find_top_level(after_in, "LOOP", true) else {
+        *unextracted += 1;
+        return "";
+    };
+    let inner = after_in[..loop_pos].trim();
+    if starts_with_keyword(inner, "EXECUTE") {
+        *unextracted += 1;
+    } else if is_query_text(inner) {
+        stmts.push(inner.to_owned());
+    }
+    &after_in[loop_pos + "LOOP".len()..]
+}
+
+/// `CASE <피연산자> WHEN` — 피연산자를 건너뛰고 첫 WHEN부터 다시 처리한다.
+fn strip_case_operand<'a>(rest: &'a str, kwlen: usize, unextracted: &mut usize) -> &'a str {
+    let tail = &rest[kwlen..];
+    match find_top_level(tail, "WHEN", true) {
+        Some(p) => &tail[p..],
+        None => {
+            *unextracted += 1;
+            ""
+        }
+    }
+}
+
+/// `RETURN QUERY <q>`·`RETURN NEXT <e>`·`RETURN <e>` — QUERY 뒤 질의는
+/// 그대로 살리고, 스칼라 식은 호출·서브쿼리(`(`)가 있을 때만 SELECT로 싼다.
+fn strip_return<'a>(
+    rest: &'a str,
+    kwlen: usize,
+    stmts: &mut Vec<String>,
+    unextracted: &mut usize,
+) -> &'a str {
+    let mut tail = rest[kwlen..].trim_start();
+    if starts_with_keyword(tail, "QUERY") {
+        tail = tail["QUERY".len()..].trim_start();
+        if starts_with_keyword(tail, "EXECUTE") {
+            *unextracted += 1;
+        } else if !tail.is_empty() {
+            stmts.push(tail.to_owned());
+        }
+        return "";
+    }
+    if starts_with_keyword(tail, "NEXT") {
+        tail = tail["NEXT".len()..].trim_start();
+    }
+    if tail.contains('(') {
+        stmts.push(format!("SELECT {tail}"));
+    }
+    ""
+}
+
+/// `OPEN <cursor> FOR <질의>` — FOR 뒤의 질의를 살린다.
+fn strip_open<'a>(
+    rest: &'a str,
+    kwlen: usize,
+    stmts: &mut Vec<String>,
+    unextracted: &mut usize,
+) -> &'a str {
+    let tail = &rest[kwlen..];
+    if let Some(p) = find_top_level(tail, "FOR", true) {
+        let inner = tail[p + "FOR".len()..].trim();
+        if starts_with_keyword(inner, "EXECUTE") {
+            *unextracted += 1;
+        } else if is_query_text(inner) {
+            stmts.push(inner.to_owned());
+        }
+    }
+    ""
+}
+
+/// `EXECUTE '문자열'`은 리터럴 안의 SQL을 살리고, `EXECUTE <식>`(format 등
+/// 동적 SQL)은 미추출로 센다. `EXECUTE FUNCTION/PROCEDURE f()`는 CALL로
+/// 재작성한다 — 인자는 이름 해석에 필요 없어 버린다.
+fn strip_execute(rest: &str, kwlen: usize, stmts: &mut Vec<String>, unextracted: &mut usize) {
+    let mut tail = rest[kwlen..].trim_start();
+    if starts_with_keyword(tail, "IMMEDIATE") {
+        tail = tail["IMMEDIATE".len()..].trim_start();
+    }
+    if tail.starts_with('\'') {
+        if let Some(inner) = unquote_sql_string(tail) {
+            stmts.push(inner.into_owned());
+            return;
+        }
+    }
+    for kw in ["FUNCTION", "PROCEDURE"] {
+        if starts_with_keyword(tail, kw) {
+            let name = tail[kw.len()..].trim_start();
+            let len = dotted_name_len(name);
+            if len > 0 {
+                stmts.push(format!("CALL {}()", &name[..len]));
+                return;
+            }
+        }
+    }
+    *unextracted += 1;
+}
+
+/// `EXIT/CONTINUE WHEN <cond>`·`ASSERT <cond>`의 꼬리 조건 — `(`가
+/// 있으면 서브쿼리·호출이 있을 수 있어 SELECT로 싼다.
+fn strip_tail_condition(rest: &str, kwlen: usize, stmts: &mut Vec<String>) {
+    let tail = &rest[kwlen..];
+    let cond = match find_top_level(tail, "WHEN", true) {
+        Some(p) => tail[p + "WHEN".len()..].trim(),
+        None => tail.trim(),
+    };
+    if cond.contains('(') {
+        stmts.push(format!("SELECT {cond}"));
+    }
+}
+
+/// `DO $$..$$`·`DO '..'` 중첩 익명 블록 — 몸체를 꺼내 재귀 추출한다.
+fn strip_do<'a>(
+    rest: &'a str,
+    kwlen: usize,
+    stmts: &mut Vec<String>,
+    unextracted: &mut usize,
+) -> &'a str {
+    let tail = rest[kwlen..].trim_start();
+    let inner = if tail.starts_with('$') {
+        undollar_quote(tail).map(|c| c.into_owned())
+    } else if tail.starts_with('\'') {
+        unquote_sql_string(tail).map(|c| c.into_owned())
+    } else {
+        None
+    };
+    match inner {
+        Some(b) => {
+            let (mut s, u) = extract_procedural_statements(&b);
+            stmts.append(&mut s);
+            *unextracted += u;
+        }
+        None => *unextracted += 1,
+    }
+    ""
+}
+
+/// `PROCEDURE p(a int)`·`FUNCTION f RETURN t IS`·`PACKAGE BODY x IS` 같은
+/// 정의 헤더를 IS/AS까지 건너뛴다 — 인자 목록은 괄호 안이라 최상위
+/// 키워드 검색이 건너뛴다. 헤더 뒤는 선언부다.
+fn strip_routine_header<'a>(rest: &'a str, kwlen: usize, unextracted: &mut usize) -> &'a str {
+    let tail = &rest[kwlen..];
+    let pos = find_top_level(tail, "IS", true)
+        .into_iter()
+        .chain(find_top_level(tail, "AS", true))
+        .min();
+    match pos {
+        Some(p) => &tail[p + 2..],
+        None => {
+            *unextracted += 1;
+            ""
+        }
+    }
+}
+
+/// `CREATE [OR REPLACE] PROCEDURE/FUNCTION/PACKAGE` 꼴이면 routine 헤더다 —
+/// CREATE TABLE 같은 진짜 DDL과 구분해 헤더만 건너뛰게 한다.
+fn create_is_routine_header(rest: &str) -> bool {
+    let mut tail = rest["CREATE".len()..].trim_start();
+    for _ in 0..6 {
+        if let Some(t) = tail.strip_prefix('=') {
+            // DEFINER=user 같은 절의 값 부분을 건너뛴다.
+            let t = t.trim_start();
+            let (_, l) = head_word(t);
+            tail = t[l..].trim_start();
+        }
+        let (w, l) = head_word(tail);
+        match w.to_ascii_uppercase().as_str() {
+            "OR" | "REPLACE" | "NONEDITIONABLE" | "EDITIONABLE" | "GLOBAL" | "TEMPORARY"
+            | "DEFINER" | "ALGORITHM" | "SQL" | "SECURITY" | "INVOKER" => {
+                tail = tail[l..].trim_start();
+            }
+            "PROCEDURE" | "FUNCTION" | "PACKAGE" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// `SELECT .. [BULK COLLECT] INTO <변수> [FROM ..]` — plpgsql/plsql의 변수
+/// 귀속 절을 벗긴다. 벗기지 않으면 변수명이 FROM 없는 테이블로 오인된다.
+fn strip_select_into(stmt: &str) -> String {
+    let cut = find_top_level(stmt, "BULK", true).or_else(|| find_top_level(stmt, "INTO", true));
+    let Some(cut) = cut else {
+        return stmt.trim().to_owned();
+    };
+    match find_top_level(&stmt[cut..], "FROM", true).map(|p| cut + p) {
+        Some(f) => format!("{} {}", stmt[..cut].trim_end(), &stmt[f..]),
+        None => stmt[..cut].trim_end().to_owned(),
+    }
+}
+
+/// `INSERT/UPDATE/DELETE .. RETURNING <cols> INTO <변수>` — RETURNING의
+/// INTO 뒤는 변수 귀속이라 잘라낸다(변수는 항상 절의 마지막이다).
+fn strip_returning_into(stmt: &str, returning_pos: usize) -> String {
+    let after = &stmt[returning_pos + "RETURNING".len()..];
+    match find_top_level(after, "INTO", true) {
+        Some(p) => stmt[..returning_pos + "RETURNING".len() + p]
+            .trim_end()
+            .to_owned(),
+        None => stmt.trim().to_owned(),
+    }
+}
+
+/// 선언부 조각 — `x int DEFAULT f()`·`x := (SELECT..)`의 기본값만 살린다.
+fn extract_decl_default(chunk: &str, stmts: &mut Vec<String>) {
+    let rhs = find_top_level(chunk, ":=", false)
+        .map(|p| &chunk[p + 2..])
+        .or_else(|| find_top_level(chunk, "DEFAULT", true).map(|p| &chunk[p + "DEFAULT".len()..]));
+    if let Some(rhs) = rhs.map(str::trim).filter(|r| r.contains('(')) {
+        stmts.push(format!("SELECT {rhs}"));
+    }
+}
+
+/// `f(a)`·`pkg.f(a)` 꼴의 bare 호출을 `CALL f(a)`로 재작성한다 —
+/// PL/SQL은 CALL 없이 프로시저를 부른다. 대상이 routine이 아니면
+/// resolve 단계에서 내장 함수·미수집으로 걸러진다.
+fn bare_call(rest: &str, stmts: &mut Vec<String>) -> bool {
+    let n = dotted_name_len(rest);
+    if n > 0 && rest[n..].trim_start().starts_with('(') {
+        stmts.push(format!("CALL {}", rest.trim()));
+        true
+    } else {
+        false
+    }
+}
+
+/// 조각 선두가 이 단어면 그대로 SQL 문장으로 넘긴다 — CREATE·EXECUTE·DO는
+/// 별도 처리가 필요해 여기 두지 않는다.
+fn is_statement_head(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "SELECT"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "MERGE"
+            | "WITH"
+            | "VALUES"
+            | "TABLE"
+            | "CALL"
+            | "SET"
+            | "SHOW"
+            | "EXPLAIN"
+            | "TRUNCATE"
+            | "COMMENT"
+            | "ANALYZE"
+            | "VACUUM"
+            | "GRANT"
+            | "REVOKE"
+            | "DENY"
+            | "RENAME"
+            | "LOCK"
+            | "UNLOCK"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "SAVEPOINT"
+            | "RELEASE"
+            | "START"
+            | "DESCRIBE"
+            | "DESC"
+            | "USE"
+            | "DISCARD"
+            | "LISTEN"
+            | "NOTIFY"
+            | "COPY"
+            | "ALTER"
+            | "DROP"
+            | "REINDEX"
+            | "CHECKPOINT"
+            | "CLUSTER"
+            | "IMPORT"
+    )
+}
+
+/// 텍스트가 질의문인지 — FOR .. IN이나 OPEN .. FOR 뒤를 걸러내는 데 쓴다.
+fn is_query_text(s: &str) -> bool {
+    let (w, _) = head_word(s.trim_start());
+    w.eq_ignore_ascii_case("select")
+        || w.eq_ignore_ascii_case("with")
+        || w.eq_ignore_ascii_case("values")
+        || w.eq_ignore_ascii_case("table")
+        || s.trim_start().starts_with('(')
 }
 
 /// 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
@@ -1392,7 +2106,25 @@ mod tests {
     }
 
     #[test]
-    fn plpgsql_routine은_파싱대신_한계를_보고한다() {
+    fn 미지원_언어_routine은_파싱대신_한계를_보고한다() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "touch_customer",
+                Some("plpython3u"),
+                "UPDATE customers SET name = name WHERE id = 1",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.iter().any(|n| n.contains("plpython3u")));
+        assert!(!g
+            .edges()
+            .iter()
+            .any(|e| e.from.as_str() == "public.touch_customer"));
+    }
+
+    #[test]
+    fn plpgsql_몸체의_dml이_간선이_된다() {
         let doc = doc_with_routine(
             vec![routine(
                 "touch_customer",
@@ -1402,11 +2134,197 @@ mod tests {
             "",
         );
         let (g, notes) = build(&doc);
-        assert!(notes.iter().any(|n| n.contains("plpgsql")));
-        assert!(!g
-            .edges()
-            .iter()
-            .any(|e| e.from.as_str() == "public.touch_customer"));
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.touch_customer"
+            && e.to.as_str() == "public.customers"));
+    }
+
+    #[test]
+    fn plpgsql의_선언부_조건_루프가_전부_추출된다() {
+        // 선언 기본값의 서브쿼리, IF의 EXISTS, FOR .. IN 질의 — 어느 것도
+        // 몸체 밖 참조가 아니라 간선이어야 한다.
+        let doc = doc_with_routine(
+            vec![routine(
+                "sync_orders",
+                Some("plpgsql"),
+                "DECLARE max_id int := (SELECT max(id) FROM orders); \
+                 BEGIN \
+                 IF EXISTS (SELECT 1 FROM customers WHERE id = 1) THEN \
+                   UPDATE orders SET customer_id = 1 WHERE id = max_id; \
+                 END IF; \
+                 FOR r IN (SELECT id FROM customers) LOOP \
+                   UPDATE orders SET customer_id = r.id WHERE id = r.id; \
+                 END LOOP; \
+                 END",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.sync_orders"
+            && e.to.as_str() == "public.customers"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.sync_orders"
+            && e.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn plpgsql의_리터럴_동적sql은_파싱하고_식은_미추출로_남긴다() {
+        // EXECUTE '리터럴'은 안의 SQL이 보이지만 EXECUTE <식>은 못 본다 —
+        // 보이는 만큼만 간선으로, 못 본 건 수로 남는다.
+        let doc = doc_with_routine(
+            vec![routine(
+                "wipe",
+                Some("plpgsql"),
+                "BEGIN EXECUTE 'DELETE FROM customers'; \
+                 EXECUTE format('DELETE FROM %I', 'orders'); END",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.wipe"
+            && e.to.as_str() == "public.customers"));
+        assert!(
+            notes.iter().any(|n| n.contains("미추출")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn plsql의_bare_호출이_calls_간선이_된다() {
+        // PL/SQL은 CALL 없이 프로시저를 부른다 — f(...) 꼴을 CALL로 재작성.
+        let mut callee = routine(
+            "touch_customer",
+            Some("plsql"),
+            "BEGIN UPDATE customers SET name = name WHERE id = 1; END",
+        );
+        callee.kind = "procedure".into();
+        let doc = doc_with_routine(
+            vec![
+                callee,
+                routine("nightly", Some("plsql"), "BEGIN touch_customer(1); END"),
+            ],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+            && e.from.as_str() == "public.nightly"
+            && e.to.as_str() == "public.touch_customer"));
+    }
+
+    #[test]
+    fn plsql의_is_헤더와_선언부를_건너뛴다() {
+        // Oracle ALL_SOURCE 원문은 PROCEDURE p IS 헤더를 포함한다.
+        let doc = doc_with_routine(
+            vec![routine(
+                "touch_customer",
+                Some("plsql"),
+                "PROCEDURE touch_customer IS cnt NUMBER; \
+                 BEGIN UPDATE customers SET name = name WHERE id = 1; END;",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.touch_customer"
+            && e.to.as_str() == "public.customers"));
+    }
+
+    #[test]
+    fn plpgsql의_perform과_return_query가_reads가_된다() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "report",
+                Some("plpgsql"),
+                "BEGIN PERFORM id FROM customers; \
+                 RETURN QUERY SELECT id FROM orders; END",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.report"
+            && e.to.as_str() == "public.customers"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.report"
+            && e.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn plpgsql_몸체의_세미콜론_문자열은_문장을_나누지_않는다() {
+        // 'a;b' 안의 ;가 조각을 갈라 뒷 문장이 뭉개지면 UPDATE가 사라진다.
+        let doc = doc_with_routine(
+            vec![routine(
+                "mark",
+                Some("plpgsql"),
+                "BEGIN UPDATE customers SET name = 'a;b' WHERE id = 1; \
+                 UPDATE orders SET customer_id = 2 WHERE id = 1; END",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.mark"
+            && e.to.as_str() == "public.customers"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.mark"
+            && e.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn package_body의_멤버_문장이_패키지_정점에_귀속된다() {
+        // 멤버별 정점 분리는 미지원 — 대신 멤버 몸체의 간선이 패키지 정점에
+        // 붙고, 귀속이 부분적이라는 한계가 보고돼야 한다.
+        let mut pkg = routine(
+            "order_ops",
+            Some("plsql"),
+            "PACKAGE BODY order_ops IS \
+             PROCEDURE touch(cid IN NUMBER) IS \
+             BEGIN UPDATE customers SET name = name WHERE id = cid; END touch; \
+             FUNCTION count_all RETURN NUMBER IS n NUMBER; \
+             BEGIN SELECT count(*) INTO n FROM orders; RETURN n; END count_all; \
+             END order_ops;",
+        );
+        pkg.kind = "package".into();
+        let doc = doc_with_routine(vec![pkg], "");
+        let (g, notes) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.order_ops"
+            && e.to.as_str() == "public.customers"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.order_ops"
+            && e.to.as_str() == "public.orders"));
+        assert!(
+            notes.iter().any(|n| n.contains("멤버별 귀속")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn plpgsql의_select_into_변수는_테이블로_오인되지_않는다() {
+        // SELECT .. INTO n은 변수 귀속 — 벗기지 않으면 n이 테이블처럼
+        // 보여 "카탈로그에 없음" 노이즈가 된다.
+        let doc = doc_with_routine(
+            vec![routine(
+                "order_count",
+                Some("plpgsql"),
+                "DECLARE n int; BEGIN SELECT count(*) INTO n FROM orders; \
+                 RETURN n; END",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.order_count"
+            && e.to.as_str() == "public.orders"));
     }
 
     #[test]
