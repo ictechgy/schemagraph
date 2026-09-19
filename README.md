@@ -63,6 +63,7 @@ schemagraph query <object> [--depth N]
 schemagraph impact <object>
 schemagraph cycles [--level object|column] [--strict]
 schemagraph dead [--strict]
+schemagraph stats                          # collected usage evidence
 schemagraph rules [--config schemagraph.toml] [--strict]
 ```
 
@@ -91,6 +92,17 @@ kinds = ["calls"]
 Output lists every violating edge with its rule name; `checked: 0` means no
 rules were evaluated — not "pass".
 
+## Usage statistics
+
+PostgreSQL (`pg_stat_user_tables`/`_indexes`) and MySQL
+(`sys.schema_table_statistics`/`schema_unused_indexes`) readers attach observed
+usage to vertices. `stats` lists it; `dead` candidates carry it as evidence.
+
+The contract: a `usage` record is valid only since its `since` timestamp —
+missing usage means "not collected" (SQLite, unsupported views), `reads: 0`
+with usage present means "observed zero". Statistics are evidence to weigh,
+never proof an object is unused: application queries are not in the graph.
+
 ## Current state
 
 - Readers: SQLite, PostgreSQL, MySQL (native `sqlx`), plus every JDBC
@@ -108,7 +120,7 @@ rules were evaluated — not "pass".
 - **P0** — core graph model + native readers + `scan`/`graph`/`query`/`cycles` — done
 - **P1** — body parsing + `impact` + `dead` — done
 - **P2** — catalog document protocol + Kotlin JDBC probe + `rules` — done
-- **P3** — `stats` evidence, mermaid polish, `skill`
+- **P3** — `stats` usage evidence + `dead` evidence — done (mermaid polish, `skill` remain)
 - **P4** — MSSQL/Oracle rich probes, `diff`, inferred edges
 
 Details and trade-offs: [DESIGN.md](DESIGN.md).

@@ -28,7 +28,7 @@
   된다(내장 함수 필터로 노이즈 차단). `schemagraph rules --config
   schemagraph.toml`이 `from`/`to` 글롭 규칙을 간선 단위로 검사해 위반을
   보고하고 `--strict`로 CI 게이트가 된다.
-- 2026-09-19: **P2 완료 — Kotlin/JDBC 프로브** (커밋 예정). `probe/`가
+- 2026-09-19: **P2 완료 — Kotlin/JDBC 프로브** (`62010f2`, `b147f34`). `probe/`가
   `DatabaseMetaData`(스키마·테이블·컬럼·PK·FK·인덱스·routine) + best-effort
   몸체 쿼리(INFORMATION_SCHEMA, Oracle은 ALL_*)로 버전 달린 catalog
   document를 뱉고, `schemagraph scan --document`가 먹는다. 번들 드라이버는
@@ -36,6 +36,20 @@
   MySQL 실검증에서 네이티브 reader와 의존성 간선 22개 완전 일치. PG는
   trigger calls까지 패리티. H2 임베디드로 서버 없는 end-to-end 검증이
   verify-fixtures.sh에 들어갔다.
+- 2026-09-19: **P3 stats 증거 계층 완료** (커밋 예정). `Usage{since,reads,
+  writes}`가 `Graph.usage` 맵에 실리고(정점 식별자는 순수 유지),
+  `project()`가 멤버 관측치를 조상으로 합산한다(since는 가장 이른 것).
+  document 계약엔 `ObjectDoc.usage`·`IndexDoc.usage` 선택 필드로 —
+  additive라 버전은 v1 유지. 네이티브 PG(`pg_stat_user_tables`/`_indexes`,
+  since는 `pg_stat_database.stats_reset`, NULL이면 postmaster 기동 시각
+  폴백)와 MySQL(`sys.schema_table_statistics` + `sys.schema_unused_indexes`,
+  since는 Uptime 역산)이 수확하고, 프로브도 같은 방언이면 수확한다.
+  `dead` 후보는 usage를 증거로 싣고, `stats` 명령이 수집된 통계를 보고한다
+  (관측 정점만 목록 + totals로 미수집 비율 표시). 골든은 usage 값을
+  정규화해 저장 — 시각·카운트는 환경 의존이라 비교 불가.
+- 구현 중 발견: **멤버 id 충돌** — MySQL의 FK 자동 인덱스가 컬럼/제약과
+  이름을 공유해 index 정점이 first-wins로 드랍된다. 이제 limitation으로
+  신고한다("멤버 id 충돌: …"). 근본 해결(id 공간 분리)은 미결.
 
 ## 확정된 결정
 
@@ -107,7 +121,7 @@
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 46개 테스트
+cd engine && cargo build && cargo test        # 빌드 + 51개 테스트
 Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + JDBC probe 양방향 검증
 # PG는 initdb로, MySQL은 docker로 임시 인스턴스를 자동 프로비전한다. 직접 지정:
 #   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh      (폐기용 DB만!)
@@ -119,13 +133,15 @@ Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + JDBC probe
 
 ## 다음 할 일
 
-1. `stats` — pg_stat·information_schema.table_statistics 같은 사용 통계를
-   증거 계층으로 붙여 `dead` 후보의 근거를 강화한다 (P3).
+1. `skill` — 에이전트용 스킬 문서 출력 (P3 잔여). mermaid export 다듬기도.
 2. MariaDB 검증 — reader는 같은 information_schema지만 시퀀스·
    tx_read_only 등 차이가 있어 별도 fixture가 필요하다.
-3. `skill` — 에이전트용 스킬 문서 출력 (P3).
+3. 멤버 id 공간 충돌의 근본 해결 — kind를 id에 섞을지(`s.t.idx@index`),
+   별도 네임스페이스를 둘지 결정. 지금은 limitation으로 신고만 한다.
 4. 프로브 보강 — MSSQL `sys.*` 몸체 소스, Oracle ALL_* 실서버 검증,
    SQLite JDBC의 스키마 귀속 확인.
+5. routine 사용 통계 — `pg_stat_user_functions`(calls/total_time)는
+   Usage 모델(reads/writes)에 안 맞아 미수확. 확장할지 결정.
 
 ## 미결
 

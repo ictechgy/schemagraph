@@ -89,7 +89,7 @@ schemagraph impact <객체>                      # 바꾸면/지우면 뭐가 �
 schemagraph cycles [--level object|column]     # FK 순환 — 삭제 순서·데드락 분석
 schemagraph dead                               # 도달 불가/무사용 후보 — state는 그래프 사실
 schemagraph rules                              # 레이어·규칙 검사
-schemagraph stats <jdbc-url>                   # 사용 통계 스냅샷 수집 (dead의 증거 입력)
+schemagraph stats                              # 수집된 사용 통계 열람 (그래프 위의 질의)
 schemagraph diff <old.json> <new.json>         # 마이그레이션 전후 델타
 schemagraph skill                              # 에이전트 스킬 설치 (계열 전통)
 ```
@@ -100,7 +100,8 @@ DB에는 `main()`이 없다. 다른 객체가 참조하지 않는 테이블이 �
 가장 핫한 테이블일 수 있다. 그래서:
 
 - roots는 설정으로 선언한다. 앱이 만지는 진입 표면을 glob으로(`retain: ["app_*", ...]`).
-- 사용 통계 스냅샷을 증거로 첨부한다(`evidence: [{kind: "stats", scans: 0, since: "..."}]`).
+- 사용 통계 스냅샷을 증거로 첨부한다(후보의 `usage: {since, reads, writes}` —
+  통계는 `since` 이후만 유효하고, 없는 usage는 "미수집"이지 0이 아니다).
 - 출력은 `state: unreachable` 같은 **그래프 사실 + evidence 목록**이다.
   "지워도 됨" 판정은 영원히 없다. 확신이 없으면 살리는 쪽을 고르고 이유를 남긴다.
 
@@ -173,7 +174,12 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
   (Tier 0 Generic → "JDBC 전부" 성립) + `rules` — **완료**:
   `probe/`가 `DatabaseMetaData` + best-effort 몸체 쿼리로 document를 뱉고,
   `scan --document`가 먹는다. MySQL에서 네이티브와 간선 완전 일치를 확인.
-- **P3**: `stats`(pg_stat·sys) + `dead` + mermaid export + `skill`.
+- **P3**: `stats` + `dead` 증거 — **부분 완료**: `Usage{since,reads,writes}`가
+  그래프 정점의 별도 맵에 실리고, PG(`pg_stat_user_tables`/`_indexes` +
+  `pg_stat_database.stats_reset`, 미리셋 시 postmaster 기동 시각 폴백)와
+  MySQL(`sys.schema_table_statistics` + `sys.schema_unused_indexes`,
+  uptime 역산으로 since) 네이티브·프로브 양쪽이 수확한다. `dead` 후보는
+  usage를 증거로 싣는다. mermaid export와 `skill`은 잔여.
 - **P4**: MSSQL·Oracle Tier 1 프로브, `diff`, `inferred` 간선,
   Go 프로브("JVM 없는 배포" 수요가 생기면).
 
