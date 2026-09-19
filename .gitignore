@@ -7,6 +7,9 @@ target/
 build/
 out/
 
+# Go (probe-go 빌드 산출물 — 소스만 추적한다)
+probe-go/schemagraph-probe-go
+
 # IDE
 .idea/
 *.iml
