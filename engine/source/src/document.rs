@@ -11,7 +11,7 @@ pub const DOCUMENT_VERSION: u32 = 1;
 
 /// reader가 채우는 스키마 스냅샷. 결정적 출력을 위해 모든 컬렉션은
 /// reader가 이름 순으로 정렬해 넣는다.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogDocument {
     pub version: u32,
     /// "sqlite" | "postgres" | "mysql" | ...
@@ -23,14 +23,14 @@ pub struct CatalogDocument {
     pub limitations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaDoc {
     pub name: String,
     pub objects: Vec<ObjectDoc>,
     pub routines: Vec<RoutineDoc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObjectDoc {
     pub name: String,
     /// "table" | "view" | "materialized-view" | "sequence" | "type" | "synonym"
@@ -48,7 +48,7 @@ pub struct ObjectDoc {
     pub usage: Option<UsageDoc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDoc {
     pub name: String,
     /// 카탈로그가 보고한 원문 타입("INTEGER", "varchar(20)" 등).
@@ -62,7 +62,7 @@ pub struct ColumnDoc {
     pub pk_position: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConstraintDoc {
     /// 카탈로그가 이름을 주지 않는 DB(SQLite)에서는 reader가 만들어 쓴다
     /// ("orders_fk_0"). 이름이 없으면 그래프 정점을 못 만든다.
@@ -76,7 +76,7 @@ pub struct ConstraintDoc {
     pub referenced: Option<ReferencedDoc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReferencedDoc {
     /// 대상 스키마. 카탈로그가 알려주지 않으면 None — 같은 스키마로 추정하지
     /// 않고 엔진이 이름 해석하게 둔다.
@@ -87,7 +87,7 @@ pub struct ReferencedDoc {
     pub columns: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexDoc {
     pub name: String,
     pub unique: bool,
@@ -100,7 +100,7 @@ pub struct IndexDoc {
 /// 사용 통계 — DB가 리셋 이후 관측한 작업량. 통계는 "since 이후만 유효"라는
 /// 것이 계약의 핵심이라, since 없는 0은 "미사용"이 아니라 "모름"이다.
 /// additive 필드라 document 버전은 올리지 않는다(없는 reader는 None).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageDoc {
     /// 통계 유효 시작 시점(리셋·재시작 시각). 모르면 None.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,7 +119,7 @@ pub struct UsageDoc {
     pub self_ms: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TriggerDoc {
     pub name: String,
     /// 트리거 몸체 원문. 파싱은 엔진이 한다.
@@ -127,7 +127,7 @@ pub struct TriggerDoc {
     pub body: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutineDoc {
     pub name: String,
     /// "function" | "procedure" | "package"

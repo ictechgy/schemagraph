@@ -6,7 +6,8 @@
 //! (AGENTS.md "JSON 출력은 결정적이어야 합니다").
 
 use schemagraph_analysis::{
-    CyclesReport, DeadReason, DeadReport, ImpactReport, QueryReport, RulesReport,
+    CyclesReport, DeadReason, DeadReport, EdgeKey, GraphDiff, ImpactReport, QueryReport,
+    RulesReport,
 };
 use schemagraph_core::{Edge, EdgeKind, EvidenceLayer, Graph, Level, Vertex, VertexKind};
 use serde::{Deserialize, Serialize};
@@ -449,6 +450,50 @@ pub fn cycles_to_value(report: &CyclesReport) -> serde_json::Value {
             })
         }).collect::<Vec<_>>(),
         "level": level_str(report.level),
+        "limitations": report.limitations,
+    })
+}
+
+/// GraphDiff → JSON Value. usage는 델타가 아니라서 실리지 않는다 —
+/// summary 숫자와 목록이 항상 일치하는 게 계약이다.
+pub fn graph_diff_to_value(report: &GraphDiff) -> serde_json::Value {
+    fn vertex_json(v: &Vertex) -> serde_json::Value {
+        serde_json::json!({
+            "id": v.id.as_str(),
+            "kind": vertex_kind_str(v.kind),
+        })
+    }
+    fn edge_json(e: &EdgeKey) -> serde_json::Value {
+        serde_json::json!({
+            "kind": edge_kind_str(e.kind),
+            "from": e.from.as_str(),
+            "to": e.to.as_str(),
+        })
+    }
+    serde_json::json!({
+        "kind": "graph",
+        "summary": {
+            "added": report.vertices_added.len() + report.edges_added.len(),
+            "removed": report.vertices_removed.len() + report.edges_removed.len(),
+            "changed": report.vertices_changed.len(),
+        },
+        "vertices": {
+            "added": report.vertices_added.iter().map(vertex_json).collect::<Vec<_>>(),
+            "removed": report.vertices_removed.iter().map(vertex_json).collect::<Vec<_>>(),
+            "changed": report.vertices_changed.iter().map(|c| {
+                serde_json::json!({
+                    "id": c.id.as_str(),
+                    "kind": {
+                        "old": vertex_kind_str(c.old_kind),
+                        "new": vertex_kind_str(c.new_kind),
+                    },
+                })
+            }).collect::<Vec<_>>(),
+        },
+        "edges": {
+            "added": report.edges_added.iter().map(edge_json).collect::<Vec<_>>(),
+            "removed": report.edges_removed.iter().map(edge_json).collect::<Vec<_>>(),
+        },
         "limitations": report.limitations,
     })
 }

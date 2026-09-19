@@ -436,6 +436,94 @@ pub fn rules(graph: &Graph, rule_set: &[Rule]) -> RulesReport {
     }
 }
 
+/// `diff` 보고 — 두 그래프의 구조 델타.
+///
+/// usage는 비교하지 않는다 — 카운트·시각은 관측 부속물이라 항상 달라 모든
+/// 정점이 "changed"로 나온다. 스키마 델타는 정점·간선의 구조만이다.
+#[derive(Debug)]
+pub struct GraphDiff {
+    /// 새 그래프에만 있는 정점.
+    pub vertices_added: Vec<Vertex>,
+    /// 옛 그래프에만 있는 정점.
+    pub vertices_removed: Vec<Vertex>,
+    /// id는 같은데 kind가 바뀐 정점.
+    pub vertices_changed: Vec<VertexKindChange>,
+    /// 새 그래프에만 있는 간선. evidence는 비교하지 않는다 — 같은 관계를
+    /// 다른 경로로 관측한 것은 델타가 아니다.
+    pub edges_added: Vec<EdgeKey>,
+    /// 옛 그래프에만 있는 간선.
+    pub edges_removed: Vec<EdgeKey>,
+    /// 새 그래프의 분석 한계 — 지금 상태에서 못 보는 것.
+    pub limitations: Vec<String>,
+}
+
+/// id는 같은데 kind가 바뀐 정점(테이블이 뷰로 바뀐 경우 등).
+#[derive(Debug, Clone)]
+pub struct VertexKindChange {
+    pub id: VertexId,
+    pub old_kind: VertexKind,
+    pub new_kind: VertexKind,
+}
+
+/// 간선 비교 키 — (kind, from, to). evidence는 관측 경로라 제외한다.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EdgeKey {
+    pub kind: EdgeKind,
+    pub from: VertexId,
+    pub to: VertexId,
+}
+
+/// 두 그래프를 정점 id·간선 (kind,from,to) 기준으로 비교한다.
+/// 컬렉션은 id/from·to 순이라 출력도 그 순서를 따른다.
+pub fn diff_graph(old: &Graph, new: &Graph) -> GraphDiff {
+    let old_vertices: BTreeMap<&VertexId, &Vertex> = old.vertices().map(|v| (&v.id, v)).collect();
+    let new_vertices: BTreeMap<&VertexId, &Vertex> = new.vertices().map(|v| (&v.id, v)).collect();
+
+    let mut vertices_added = Vec::new();
+    let mut vertices_removed = Vec::new();
+    let mut vertices_changed = Vec::new();
+    for (id, nv) in &new_vertices {
+        match old_vertices.get(id) {
+            Some(ov) if ov.kind != nv.kind => vertices_changed.push(VertexKindChange {
+                id: (*id).clone(),
+                old_kind: ov.kind,
+                new_kind: nv.kind,
+            }),
+            Some(_) => {}
+            None => vertices_added.push((*nv).clone()),
+        }
+    }
+    for (id, ov) in &old_vertices {
+        if !new_vertices.contains_key(id) {
+            vertices_removed.push((*ov).clone());
+        }
+    }
+
+    fn keys(g: &Graph) -> BTreeSet<EdgeKey> {
+        g.edges()
+            .iter()
+            .map(|e| EdgeKey {
+                kind: e.kind,
+                from: e.from.clone(),
+                to: e.to.clone(),
+            })
+            .collect()
+    }
+    let old_edges = keys(old);
+    let new_edges = keys(new);
+    let edges_added: Vec<EdgeKey> = new_edges.difference(&old_edges).cloned().collect();
+    let edges_removed: Vec<EdgeKey> = old_edges.difference(&new_edges).cloned().collect();
+
+    GraphDiff {
+        vertices_added,
+        vertices_removed,
+        vertices_changed,
+        edges_added,
+        edges_removed,
+        limitations: new.limitations().to_vec(),
+    }
+}
+
 /// 글롭 매칭 — `*`는 임의 길이(점 포함), `?`는 정확히 한 글자.
 /// 정규식 없이 직접 매칭한다 — 정점 id가 `.`을 많이 쓰는데 `*`가 점을
 /// 포함해야 `reporting.*`가 `reporting.orders.id`까지 덮는다.
@@ -832,5 +920,62 @@ mod tests {
             kinds: None,
         };
         assert!(rules(&g, &[r]).violations.is_empty());
+    }
+
+    #[test]
+    fn diff는_정점과_간선의_구조_델타를_잡는다() {
+        let old = chain();
+        let mut new = Graph::new();
+        // b를 view로 바꾸고(kind change), d를 추가하고, a→b 간선을 뺀다.
+        for n in ["a", "c"] {
+            new.add_vertex(table("s", n));
+        }
+        let mut view_b = table("s", "b");
+        view_b.kind = VertexKind::View;
+        new.add_vertex(view_b);
+        new.add_vertex(table("s", "d"));
+        new.add_edge(dep(
+            &VertexId::object("s", "b"),
+            &VertexId::object("s", "c"),
+        ));
+
+        let report = diff_graph(&old, &new);
+        assert!(report.vertices_added.iter().any(|v| v.id.as_str() == "s.d"));
+        assert!(report
+            .vertices_changed
+            .iter()
+            .any(|c| c.id.as_str() == "s.b"
+                && c.old_kind == VertexKind::Table
+                && c.new_kind == VertexKind::View));
+        assert!(report.edges_removed.iter().any(|e| e.from.as_str() == "s.a"
+            && e.to.as_str() == "s.b"
+            && e.kind == EdgeKind::References));
+        assert!(report.edges_added.is_empty() && report.vertices_removed.is_empty());
+    }
+
+    #[test]
+    fn diff는_usage_차이를_델타로_세지_않는다() {
+        let mut old = Graph::new();
+        let mut new = Graph::new();
+        for g in [&mut old, &mut new] {
+            g.add_vertex(table("s", "t"));
+        }
+        old.set_usage(
+            VertexId::object("s", "t"),
+            Usage {
+                since: Some("2026-01-01".into()),
+                reads: 10,
+                writes: 1,
+                total_ms: None,
+                self_ms: None,
+            },
+        );
+        // new는 usage가 아예 없다 — 관측 부속물의 차이는 델타가 아니다.
+        let report = diff_graph(&old, &new);
+        assert!(
+            report.vertices_changed.is_empty()
+                && report.vertices_added.is_empty()
+                && report.vertices_removed.is_empty()
+        );
     }
 }

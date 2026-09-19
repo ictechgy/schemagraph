@@ -99,6 +99,16 @@ enum Command {
         #[arg(short, long, default_value = "graph.json")]
         graph: PathBuf,
     },
+    /// Compare two snapshots — graph.json↔graph.json or document↔document.
+    Diff {
+        /// Older snapshot (graph.json or catalog document).
+        old: PathBuf,
+        /// Newer snapshot (same artifact kind as old).
+        new: PathBuf,
+        /// Exit 1 when any difference is found (CI drift gate).
+        #[arg(long)]
+        strict: bool,
+    },
     /// Print the agent skill document for consuming this tool's output.
     Skill,
     /// Check declared dependency rules against the graph (CI gate).
@@ -187,6 +197,7 @@ async fn run(cli: Cli) -> Result<i32> {
             strict,
         } => cycles(&graph, level.level(), strict),
         Command::Stats { graph } => stats(&graph),
+        Command::Diff { old, new, strict } => diff(&old, &new, strict),
         Command::Skill => {
             // 스킬 원본은 저장소의 skills/schemagraph/SKILL.md — 에이전트가
             // 저장소에서 직접 읽을 수도 있고 이 명령으로 설치할 수도 있다.
@@ -357,6 +368,59 @@ fn stats(path: &std::path::Path) -> Result<i32> {
         serde_json::to_string_pretty(&export::stats_to_value(&graph))?
     );
     Ok(0)
+}
+
+/// 입력 파일이 graph.json인지 catalog document인지 꼴로 판별한다 —
+/// 두 산출물은 계약이 달라 같은 명령으로 비교할 수 없다.
+fn snapshot_kind(path: &std::path::Path) -> Result<SnapshotKind> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("스냅샷을 못 읽음: {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("스냅샷 JSON 파싱 실패: {}", path.display()))?;
+    if value.get("vertices").is_some() && value.get("edges").is_some() {
+        Ok(SnapshotKind::Graph)
+    } else if value.get("schemas").is_some() {
+        Ok(SnapshotKind::Document)
+    } else {
+        bail!(
+            "스냅샷 형태를 모르겠다: {} — graph.json(vertices/edges) 또는 catalog document(schemas)여야 한다",
+            path.display()
+        )
+    }
+}
+
+enum SnapshotKind {
+    Graph,
+    Document,
+}
+
+/// diff — 같은 종류의 산출물 둘을 비교한다. usage는 델타에서 뺀다 —
+/// 카운트·시각은 관측 부속물이라 항상 달라 스키마 델타를 묻는다.
+fn diff(old_path: &std::path::Path, new_path: &std::path::Path, strict: bool) -> Result<i32> {
+    let (old_kind, new_kind) = (snapshot_kind(old_path)?, snapshot_kind(new_path)?);
+    if std::mem::discriminant(&old_kind) != std::mem::discriminant(&new_kind) {
+        bail!("graph.json과 catalog document는 비교할 수 없다 — 같은 종류끼리 diff해라");
+    }
+    let (value, changed) = match old_kind {
+        SnapshotKind::Graph => {
+            let report = analysis::diff_graph(&load_graph(old_path)?, &load_graph(new_path)?);
+            let changed = !report.vertices_added.is_empty()
+                || !report.vertices_removed.is_empty()
+                || !report.vertices_changed.is_empty()
+                || !report.edges_added.is_empty()
+                || !report.edges_removed.is_empty();
+            (export::graph_diff_to_value(&report), changed)
+        }
+        SnapshotKind::Document => {
+            let report =
+                source::diff::diff_documents(&load_document(old_path)?, &load_document(new_path)?);
+            let changed =
+                report.summary.added + report.summary.removed + report.summary.changed > 0;
+            (serde_json::to_value(&report)?, changed)
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(if strict && changed { 1 } else { 0 })
 }
 
 fn cycles(path: &std::path::Path, level: Level, strict: bool) -> Result<i32> {
