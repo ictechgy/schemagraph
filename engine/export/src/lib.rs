@@ -133,6 +133,20 @@ pub struct VertexDoc {
     pub level: String,
     pub name: String,
     pub schema: String,
+    /// 사용 통계 — 없는 것(미수집)은 키가 빠진다. 0 관측은 usage가 있는 채로
+    /// reads=0/writes=0이다 — 둘을 구분하는 게 계약이다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageDoc>,
+}
+
+/// graph.json 안의 사용 통계. `since` 없이 수치만 있으면 소비자가
+/// "0 = 미사용"으로 오독할 수 있어 since를 같은 필드로 싣는다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageDoc {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    pub reads: u64,
+    pub writes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,6 +176,11 @@ pub fn graph_to_doc(g: &Graph) -> GraphDoc {
             level: level_str(v.kind.level()).to_owned(),
             name: v.name.clone(),
             schema: v.schema.clone(),
+            usage: g.usage(&v.id).map(|u| UsageDoc {
+                since: u.since.clone(),
+                reads: u.reads,
+                writes: u.writes,
+            }),
         })
         .collect();
     vertices.sort_by(|a, b| a.id.cmp(&b.id));
@@ -204,12 +223,25 @@ pub fn graph_from_doc(doc: &GraphDoc) -> Graph {
     let mut dropped_e = 0usize;
     for v in &doc.vertices {
         match vertex_kind_parse(&v.kind) {
-            Some(kind) => g.add_vertex(Vertex {
-                id: schemagraph_core::VertexId::from_raw(&v.id),
-                kind,
-                name: v.name.clone(),
-                schema: v.schema.clone(),
-            }),
+            Some(kind) => {
+                let id = schemagraph_core::VertexId::from_raw(&v.id);
+                g.add_vertex(Vertex {
+                    id: id.clone(),
+                    kind,
+                    name: v.name.clone(),
+                    schema: v.schema.clone(),
+                });
+                if let Some(u) = &v.usage {
+                    g.set_usage(
+                        id,
+                        schemagraph_core::Usage {
+                            since: u.since.clone(),
+                            reads: u.reads,
+                            writes: u.writes,
+                        },
+                    );
+                }
+            }
             None => dropped_v += 1,
         }
     }
@@ -328,21 +360,64 @@ pub fn impact_to_value(report: &ImpactReport) -> serde_json::Value {
     })
 }
 
-/// DeadReport → JSON Value.
+/// DeadReport → JSON Value. usage는 미수집(None)이면 키가 빠진다 —
+/// 0 관측은 usage가 있는 채로 reads=0/writes=0이다.
 pub fn dead_to_value(report: &DeadReport) -> serde_json::Value {
     serde_json::json!({
         "candidates": report.candidates.iter().map(|c| {
-            serde_json::json!({
+            let mut v = serde_json::json!({
                 "id": c.vertex.id.as_str(),
                 "kind": vertex_kind_str(c.vertex.kind),
                 "reason": match c.reason {
                     DeadReason::NoDependents => "noDependents",
                     DeadReason::AllDependentsDead => "allDependentsDead",
                 },
-            })
+            });
+            if let Some(u) = &c.usage {
+                // UsageDoc으로 직렬화해야 since 생략 계약(없으면 키 없음)이 유지된다.
+                v["usage"] = serde_json::to_value(UsageDoc {
+                    since: u.since.clone(),
+                    reads: u.reads,
+                    writes: u.writes,
+                })
+                .unwrap_or(serde_json::Value::Null);
+            }
+            v
         }).collect::<Vec<_>>(),
         "limitations": report.limitations,
         "truncated": report.truncated,
+    })
+}
+
+/// 그래프에 싣린 사용 통계를 그대로 보고한다 — 목록엔 관측된 정점만 나오고,
+/// 미수집 정점은 totals로 소비자가 짐작한다. 통계는 since 이후만 유효하므로
+/// "미사용" 판정이 아니라 증거 나열이다.
+pub fn stats_to_value(g: &Graph) -> serde_json::Value {
+    let stats: Vec<serde_json::Value> = g
+        .usages()
+        .map(|(id, u)| {
+            let mut v = serde_json::json!({
+                "id": id.as_str(),
+                "reads": u.reads,
+                "writes": u.writes,
+            });
+            if let Some(vertex) = g.vertex(id) {
+                v["kind"] = serde_json::json!(vertex_kind_str(vertex.kind));
+            }
+            if let Some(since) = &u.since {
+                v["since"] = serde_json::json!(since);
+            }
+            v
+        })
+        .collect();
+    let total = g.vertices().count();
+    serde_json::json!({
+        "limitations": g.limitations(),
+        "stats": stats,
+        "totals": {
+            "observed": g.usages().count(),
+            "vertices": total,
+        },
     })
 }
 
@@ -449,5 +524,70 @@ mod tests {
         let g2 = graph_from_doc(&doc2);
         assert_eq!(g.vertices().count(), g2.vertices().count());
         assert_eq!(g.edges().len(), g2.edges().len());
+    }
+
+    #[test]
+    fn usage는_graph_json을_왕복하고_미수집은_키가_없다() {
+        let mut g = sample();
+        g.set_usage(
+            VertexId::object("main", "a"),
+            schemagraph_core::Usage {
+                since: Some("2025-06-01".into()),
+                reads: 9,
+                writes: 2,
+            },
+        );
+        let doc = graph_to_doc(&g);
+        let json = to_pretty_json(&doc).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let a = v["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == "main.a")
+            .unwrap();
+        assert_eq!(a["usage"]["reads"], 9);
+        assert_eq!(a["usage"]["since"], "2025-06-01");
+        // 미수집 정점(main.b)은 usage 키가 아예 없다 — 0 관측과 구분된다.
+        let b = v["vertices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == "main.b")
+            .unwrap();
+        assert!(b.get("usage").is_none());
+
+        let g2 = graph_from_doc(&serde_json::from_str::<GraphDoc>(&json).unwrap());
+        let u = g2.usage(&VertexId::object("main", "a")).unwrap();
+        assert_eq!((u.reads, u.writes), (9, 2));
+        assert!(g2.usage(&VertexId::object("main", "b")).is_none());
+    }
+
+    #[test]
+    fn stats는_관측된_정점만_나열하고_총계를_싣는다() {
+        let mut g = sample();
+        g.set_usage(
+            VertexId::object("main", "a"),
+            schemagraph_core::Usage {
+                since: None,
+                reads: 0,
+                writes: 0,
+            },
+        );
+        let v = stats_to_value(&g);
+        let stats = v["stats"].as_array().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0]["id"], "main.a");
+        assert_eq!(stats[0]["reads"], 0);
+        // since 없음 → 키 생략 계약.
+        assert!(stats[0].get("since").is_none());
+        assert_eq!(v["totals"]["observed"], 1);
+        // 스키마+테이블2 = 정점 3개 중 1개만 관측됐다.
+        assert_eq!(v["totals"]["vertices"], 3);
+        // 출력이 결정적이어야 한다.
+        assert_eq!(
+            serde_json::to_string(&stats_to_value(&g)).unwrap(),
+            serde_json::to_string(&stats_to_value(&g)).unwrap()
+        );
     }
 }

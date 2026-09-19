@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use schemagraph_core::{EdgeKind, Graph, Level, Vertex, VertexId, VertexKind};
+use schemagraph_core::{EdgeKind, Graph, Level, Usage, Vertex, VertexId, VertexKind};
 
 /// 질의 대상을 못 찾았을 때. `notFound`에도 limitations를 싣는다 —
 /// 없는 것과 이 도구가 못 보는 것을 소비자가 구분해야 한다.
@@ -148,6 +148,9 @@ pub enum DeadReason {
 pub struct DeadCandidate {
     pub vertex: Vertex,
     pub reason: DeadReason,
+    /// 사용 통계 증거 — 있다고 후보가 확정되지는 않는다(통계는 since 이후만
+    /// 유효하고 애플리케이션 조회는 그래프에 없다). None = 미수집, 0 = 관측된 0.
+    pub usage: Option<Usage>,
 }
 
 /// `dead` 보고.
@@ -215,6 +218,7 @@ pub fn dead(graph: &Graph, max_candidates: usize) -> DeadReport {
             graph.vertex(id).map(|v| DeadCandidate {
                 vertex: v.clone(),
                 reason: reasons[id],
+                usage: graph.usage(id).cloned(),
             })
         })
         .collect();
@@ -698,6 +702,36 @@ mod tests {
             .find(|c| c.vertex.id.as_str() == "s.v_mid")
             .unwrap();
         assert_eq!(mid.reason, DeadReason::AllDependentsDead);
+    }
+
+    #[test]
+    fn dead_후보는_usage_증거를_같이_싣는다() {
+        let mut g = Graph::new();
+        g.add_vertex(view("s", "v_obs"));
+        g.add_vertex(view("s", "v_none"));
+        // v_obs는 관측된 0 — 미수집(v_none의 None)과 구분되어야 한다.
+        g.set_usage(
+            VertexId::object("s", "v_obs"),
+            Usage {
+                since: Some("2025-01-01".into()),
+                reads: 0,
+                writes: 0,
+            },
+        );
+        let report = dead(&g, 256);
+        assert_eq!(report.candidates.len(), 2);
+        let without = report
+            .candidates
+            .iter()
+            .find(|c| c.vertex.id.as_str() == "s.v_none")
+            .unwrap();
+        assert!(without.usage.is_none());
+        let with_usage = report
+            .candidates
+            .iter()
+            .find(|c| c.vertex.id.as_str() == "s.v_obs")
+            .unwrap();
+        assert_eq!(with_usage.usage.as_ref().map(|u| u.reads), Some(0));
     }
 
     #[test]

@@ -94,6 +94,11 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
+    /// Report collected usage statistics (evidence, not a deletion verdict).
+    Stats {
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+    },
     /// Check declared dependency rules against the graph (CI gate).
     Rules {
         #[arg(short, long, default_value = "graph.json")]
@@ -179,6 +184,7 @@ async fn run(cli: Cli) -> Result<i32> {
             level,
             strict,
         } => cycles(&graph, level.level(), strict),
+        Command::Stats { graph } => stats(&graph),
         Command::Rules {
             graph,
             config,
@@ -334,6 +340,15 @@ fn dead(path: &std::path::Path, max: usize, strict: bool) -> Result<i32> {
     } else {
         0
     })
+}
+
+fn stats(path: &std::path::Path) -> Result<i32> {
+    let graph = load_graph(path)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&export::stats_to_value(&graph))?
+    );
+    Ok(0)
 }
 
 fn cycles(path: &std::path::Path, level: Level, strict: bool) -> Result<i32> {
