@@ -272,12 +272,15 @@ class Extractor(
             bestEffort("routines",
                 "SELECT ROUTINE_SCHEMA, ROUTINE_NAME, SPECIFIC_NAME, ROUTINE_TYPE, " +
                     "ROUTINE_DEFINITION, EXTERNAL_LANGUAGE FROM INFORMATION_SCHEMA.ROUTINES") { rs ->
+                // PG의 집계 함수는 ROUTINE_TYPE이 NULL이다 — null-safe로 받지
+                // 않으면 NPE가 나서 이후 행 전부의 수확이 끊긴다.
+                val rtype = rs.getString(4) ?: return@bestEffort
                 routines += Triple(
                     rs.getString(1),
                     rs.getString(3),
                     RoutineDoc(
                         name = rs.getString(2),
-                        kind = when (rs.getString(4).uppercase()) {
+                        kind = when (rtype.uppercase()) {
                             "PROCEDURE" -> "procedure"
                             else -> "function"
                         },
