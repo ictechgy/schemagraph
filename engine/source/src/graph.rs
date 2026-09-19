@@ -315,6 +315,8 @@ fn to_usage(u: &UsageDoc) -> Usage {
         since: u.since.clone(),
         reads: u.reads,
         writes: u.writes,
+        total_ms: u.total_ms,
+        self_ms: u.self_ms,
     }
 }
 
@@ -416,6 +418,8 @@ mod tests {
             since: None,
             reads: 0,
             writes: 0,
+            total_ms: None,
+            self_ms: None,
         });
         // customers의 인덱스에도 usage를 둔다(인덱스는 멤버 레벨 정점).
         doc.schemas[0].objects[0].indexes.push(IndexDoc {
@@ -426,6 +430,8 @@ mod tests {
                 since: Some("2025-01-01".into()),
                 reads: 7,
                 writes: 0,
+                total_ms: None,
+                self_ms: None,
             }),
         });
 
@@ -452,6 +458,8 @@ mod tests {
                 since: Some("2025-01-01".into()),
                 reads: 4,
                 writes: 0,
+                total_ms: None,
+                self_ms: None,
             }),
         });
         // 제약과도 충돌하는 인덱스 — fk 제약과 같은 이름.
@@ -497,6 +505,8 @@ mod tests {
                     since: Some("2025-01-01".into()),
                     reads: 12,
                     writes: 0,
+                    total_ms: Some(120.5),
+                    self_ms: Some(80.0),
                 }),
             },
             RoutineDoc {
@@ -509,6 +519,8 @@ mod tests {
                     since: None,
                     reads: 3,
                     writes: 0,
+                    total_ms: None,
+                    self_ms: None,
                 }),
             },
         ];
@@ -522,8 +534,10 @@ mod tests {
         );
         let fn_id = VertexId::from_raw("main.orders@function");
         assert_eq!(g.vertex(&fn_id).map(|v| v.kind), Some(VertexKind::Function));
-        // usage는 분리된 정점에 붙는다.
-        assert_eq!(g.usage(&fn_id).map(|u| u.reads), Some(12));
+        // usage는 분리된 정점에 붙는다 — 시간 필드도 함께 간다.
+        let fu = g.usage(&fn_id).unwrap();
+        assert_eq!(fu.reads, 12);
+        assert_eq!((fu.total_ms, fu.self_ms), (Some(120.5), Some(80.0)));
         assert_eq!(
             g.usage(&VertexId::object("main", "helper"))
                 .map(|u| u.reads),

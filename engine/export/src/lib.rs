@@ -147,6 +147,12 @@ pub struct UsageDoc {
     pub since: Option<String>,
     pub reads: u64,
     pub writes: u64,
+    /// routine 누적 실행 시간 ms — routine 정점에만 온다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_ms: Option<f64>,
+    /// routine 자기 실행 시간 ms(중첩 호출 제외).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_ms: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -180,6 +186,8 @@ pub fn graph_to_doc(g: &Graph) -> GraphDoc {
                 since: u.since.clone(),
                 reads: u.reads,
                 writes: u.writes,
+                total_ms: u.total_ms,
+                self_ms: u.self_ms,
             }),
         })
         .collect();
@@ -238,6 +246,8 @@ pub fn graph_from_doc(doc: &GraphDoc) -> Graph {
                             since: u.since.clone(),
                             reads: u.reads,
                             writes: u.writes,
+                            total_ms: u.total_ms,
+                            self_ms: u.self_ms,
                         },
                     );
                 }
@@ -379,6 +389,8 @@ pub fn dead_to_value(report: &DeadReport) -> serde_json::Value {
                     since: u.since.clone(),
                     reads: u.reads,
                     writes: u.writes,
+                    total_ms: u.total_ms,
+                    self_ms: u.self_ms,
                 })
                 .unwrap_or(serde_json::Value::Null);
             }
@@ -406,6 +418,12 @@ pub fn stats_to_value(g: &Graph) -> serde_json::Value {
             }
             if let Some(since) = &u.since {
                 v["since"] = serde_json::json!(since);
+            }
+            if let Some(ms) = u.total_ms {
+                v["total_ms"] = serde_json::json!(ms);
+            }
+            if let Some(ms) = u.self_ms {
+                v["self_ms"] = serde_json::json!(ms);
             }
             v
         })
@@ -535,6 +553,8 @@ mod tests {
                 since: Some("2025-06-01".into()),
                 reads: 9,
                 writes: 2,
+                total_ms: Some(42.5),
+                self_ms: Some(10.0),
             },
         );
         let doc = graph_to_doc(&g);
@@ -560,6 +580,7 @@ mod tests {
         let g2 = graph_from_doc(&serde_json::from_str::<GraphDoc>(&json).unwrap());
         let u = g2.usage(&VertexId::object("main", "a")).unwrap();
         assert_eq!((u.reads, u.writes), (9, 2));
+        assert_eq!((u.total_ms, u.self_ms), (Some(42.5), Some(10.0)));
         assert!(g2.usage(&VertexId::object("main", "b")).is_none());
     }
 
@@ -572,6 +593,8 @@ mod tests {
                 since: None,
                 reads: 0,
                 writes: 0,
+                total_ms: None,
+                self_ms: None,
             },
         );
         let v = stats_to_value(&g);

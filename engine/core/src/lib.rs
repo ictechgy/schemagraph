@@ -143,7 +143,7 @@ impl EdgeKind {
 /// 미사용이 아니고, since가 없으면 소비자가 0을 오독할 수 있다(AGENTS.md
 /// "사용 통계를 단독 증거로 쓰지 마세요"). 그래서 판정 근거가 아니라
 /// 소비자가 스스로 무게를 재는 증거로 둔다.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Usage {
     /// 통계 유효 시작 시점(카탈로그가 보고한 리셋·재시작 시각). 모르면 None.
     pub since: Option<String>,
@@ -152,6 +152,10 @@ pub struct Usage {
     pub reads: u64,
     /// 관측된 쓰기 작업량(insert·update·delete 계열 합산).
     pub writes: u64,
+    /// routine 누적 실행 시간 ms(중첩 호출 포함). routine이 아니면 None.
+    pub total_ms: Option<f64>,
+    /// routine 자기 실행 시간 ms(중첩 호출 제외) — 비용 핫스팟 판별용.
+    pub self_ms: Option<f64>,
 }
 
 /// 간선이 어느 증거 계층에서 왔는지(DESIGN.md "세 개의 증거 계층").
@@ -359,6 +363,13 @@ impl Graph {
             let entry = projected.usage.entry(ancestor).or_default();
             entry.reads += usage.reads;
             entry.writes += usage.writes;
+            // 시간 필드도 합산한다 — 어느 한 멤버라도 관측됐으면 합계가 의미 있다.
+            if let Some(ms) = usage.total_ms {
+                *entry.total_ms.get_or_insert(0.0) += ms;
+            }
+            if let Some(ms) = usage.self_ms {
+                *entry.self_ms.get_or_insert(0.0) += ms;
+            }
             match (&entry.since, &usage.since) {
                 (Some(cur), Some(new)) if new < cur => entry.since = Some(new.clone()),
                 (None, Some(new)) => entry.since = Some(new.clone()),
@@ -617,6 +628,8 @@ mod tests {
                 since: Some("2025-01-01".into()),
                 reads: 3,
                 writes: 1,
+                total_ms: Some(30.0),
+                self_ms: Some(10.0),
             },
         );
         g.set_usage(
@@ -625,6 +638,8 @@ mod tests {
                 since: Some("2025-03-01".into()),
                 reads: 10,
                 writes: 5,
+                total_ms: None,
+                self_ms: None,
             },
         );
         // 미관측 정점은 투영 후에도 없어야 한다 — 없음과 0 관측은 다르다.
@@ -635,6 +650,9 @@ mod tests {
         // 멤버 관측치(3r/1w)가 조상에 합산된다.
         assert_eq!(usage.reads, 13);
         assert_eq!(usage.writes, 6);
+        // 시간 필드도 관측된 멤버분만 합산된다(미관측 멤버가 0을 끼얹지 않는다).
+        assert_eq!(usage.total_ms, Some(30.0));
+        assert_eq!(usage.self_ms, Some(10.0));
         // since는 가장 이른 것 — 보수적으로 유효 구간을 좁힌다.
         assert_eq!(usage.since.as_deref(), Some("2025-01-01"));
         assert!(obj.usage(&VertexId::object("s", "b")).is_none());

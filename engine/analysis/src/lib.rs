@@ -716,6 +716,8 @@ mod tests {
                 since: Some("2025-01-01".into()),
                 reads: 0,
                 writes: 0,
+                total_ms: None,
+                self_ms: None,
             },
         );
         let report = dead(&g, 256);

@@ -109,6 +109,14 @@ pub struct UsageDoc {
     pub reads: u64,
     /// 관측된 쓰기 작업량(insert·update·delete 합산).
     pub writes: u64,
+    /// routine 누적 실행 시간 ms(pg_stat_user_functions.total_time).
+    /// 중첩 호출 시간을 포함한다. routine이 아닌 정점·미지원 방언은 None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_ms: Option<f64>,
+    /// routine 자기 실행 시간 ms(pg_stat_user_functions.self_time).
+    /// 안에서 부른 다른 routine의 시간을 뺀 값 — 비용 핫스팟 판별용.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

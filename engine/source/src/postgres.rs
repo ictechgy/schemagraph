@@ -122,6 +122,8 @@ async fn attach_usage(
                         since: since.clone(),
                         reads: r.get::<i64, _>("reads").max(0) as u64,
                         writes: r.get::<i64, _>("writes").max(0) as u64,
+                        total_ms: None,
+                        self_ms: None,
                     });
                 }
             }
@@ -151,6 +153,8 @@ async fn attach_usage(
                         since: since.clone(),
                         reads: r.get::<i64, _>("reads").max(0) as u64,
                         writes: 0,
+                        total_ms: None,
+                        self_ms: None,
                     });
                 }
             }
@@ -174,11 +178,13 @@ async fn attach_usage(
             .push("track_functions=none — routine usage 미수집(함수 통계 비활성)".to_owned());
         return;
     }
-    let rows =
-        sqlx::query("SELECT funcname, calls FROM pg_stat_user_functions WHERE schemaname = $1")
-            .bind(schema)
-            .fetch_all(pool)
-            .await;
+    let rows = sqlx::query(
+        "SELECT funcname, calls, total_time, self_time \
+         FROM pg_stat_user_functions WHERE schemaname = $1",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await;
     match rows {
         Ok(rows) => {
             let mut ambiguous = 0usize;
@@ -187,10 +193,14 @@ async fn attach_usage(
                 let mut hits = routines.iter_mut().filter(|rt| rt.name == name);
                 match (hits.next(), hits.next()) {
                     (Some(rt), None) => {
+                        // track_calls는 track_functions와 별개 스위치다 — 꺼져
+                        // 있으면 시간 컬럼이 전부 NULL이라 Option으로 받는다.
                         rt.usage = Some(UsageDoc {
                             since: since.clone(),
                             reads: r.get::<i64, _>("calls").max(0) as u64,
                             writes: 0,
+                            total_ms: r.get::<Option<f64>, _>("total_time"),
+                            self_ms: r.get::<Option<f64>, _>("self_time"),
                         });
                     }
                     (Some(_), Some(_)) => ambiguous += 1,
