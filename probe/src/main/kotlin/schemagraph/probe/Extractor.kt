@@ -306,28 +306,41 @@ class Extractor(
                         TriggerDoc(rs.getString(3), rs.getString(4))
                 }
                 // routine — ALL_OBJECTS가 kind를, ALL_SOURCE가 LINE순 몸체를 준다.
-                // PACKAGE BODY의 멤버는 OBJECT_NAME이 패키지라 routine 귀속이
-                // 다르다 — 독립 routine만 수확한다(PROCEDURE/FUNCTION).
-                val oracleKinds = mutableMapOf<Pair<String, String>, String>()
-                val oracleBodies = mutableMapOf<Pair<String, String>, StringBuilder>()
+                // 멤버 단위 귀속은 미지원이라 PACKAGE BODY는 패키지 정점
+                // 하나로 수확한다 — 몸체 간선이 패키지에 귀속되는 것이
+                // 멤버 추측보다 정직하다(엔진이 limitation으로 남긴다).
+                val oracleBodies = mutableMapOf<Triple<String, String, String>, StringBuilder>()
                 bestEffort("routines",
                     "SELECT o.OWNER, o.OBJECT_NAME, o.OBJECT_TYPE, s.LINE, s.TEXT " +
                         "FROM ALL_OBJECTS o " +
                         "JOIN ALL_SOURCE s ON s.OWNER = o.OWNER " +
                         "  AND s.NAME = o.OBJECT_NAME AND s.TYPE = o.OBJECT_TYPE " +
-                        "WHERE o.OBJECT_TYPE IN ('PROCEDURE','FUNCTION') " +
+                        "WHERE o.OBJECT_TYPE IN ('PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY') " +
                         "ORDER BY o.OWNER, o.OBJECT_NAME, s.LINE") { rs ->
-                    val key = rs.getString(1) to rs.getString(2)
-                    oracleKinds[key] = rs.getString(3)
+                    val key = Triple(rs.getString(1), rs.getString(2), rs.getString(3))
                     oracleBodies.getOrPut(key) { StringBuilder() }.append(rs.getString(5))
                 }
+                // PACKAGE와 PACKAGE BODY는 같은 이름의 별개 OBJECT — 정점은
+                // 하나다. 몸체는 PACKAGE BODY를 우선하고 없으면 스펙이 대표다.
+                val grouped = mutableMapOf<Pair<String, String>, Pair<String, String>>()
                 for ((key, body) in oracleBodies) {
-                    routines += Triple(key.first, key.second, RoutineDoc(
-                        name = key.second,
-                        kind = if (oracleKinds[key] == "PROCEDURE") "procedure" else "function",
-                        // PL/SQL — plpgsql과 같은 계약이라 엔진이 미지원 한계로 보고한다.
+                    val name = key.first to key.second
+                    val cur = grouped[name]
+                    if (cur == null || (key.third == "PACKAGE BODY" && cur.first == "PACKAGE")) {
+                        grouped[name] = key.third to body.toString()
+                    }
+                }
+                for ((name, src) in grouped) {
+                    routines += Triple(name.first, name.second, RoutineDoc(
+                        name = name.second,
+                        kind = when (src.first) {
+                            "PROCEDURE" -> "procedure"
+                            "FUNCTION" -> "function"
+                            else -> "package"
+                        },
+                        // PL/SQL — plpgsql과 같은 계약이라 엔진이 문장 추출로 파싱한다.
                         language = "plsql",
-                        body = body.toString(),
+                        body = src.second,
                     ))
                 }
                 // 파라미터 — POSITION=0은 반환값이라 제외(MySQL ordinal=0 함정과 같다).
