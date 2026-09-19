@@ -880,6 +880,7 @@ mod tests {
             indexes: vec![],
             triggers: vec![],
             body: None,
+            usage: None,
         }
     }
 
@@ -903,6 +904,7 @@ mod tests {
                         indexes: vec![],
                         triggers: vec![],
                         body: Some(body.to_owned()),
+                        usage: None,
                     },
                 ],
             }],

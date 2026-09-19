@@ -5,7 +5,7 @@
 //! 추측으로 간선을 만들지 않는다.
 
 use schemagraph_core::{
-    Edge, EdgeKind, Evidence, EvidenceLayer, Graph, Vertex, VertexId, VertexKind,
+    Edge, EdgeKind, Evidence, EvidenceLayer, Graph, Usage, Vertex, VertexId, VertexKind,
 };
 
 use crate::document::*;
@@ -54,6 +54,9 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
             schema: schema.name.clone(),
         });
         g.add_edge(contains(&schema_id, &obj_id));
+        if let Some(u) = &obj.usage {
+            g.set_usage(obj_id.clone(), to_usage(u));
+        }
 
         for col in &obj.columns {
             let col_id = VertexId::member(&schema.name, &obj.name, &col.name);
@@ -82,6 +85,19 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
 
         for idx in &obj.indexes {
             let idx_id = VertexId::member(&schema.name, &obj.name, &idx.name);
+            // 컬럼과 인덱스가 이름을 공유할 수 있다(MySQL의 FK 자동 인덱스는
+            // 컬럼 이름을 쓴다) — add_vertex는 first-wins라 인덱스 정점이
+            // 조용히 드랍된다. 사라지는 걸 limitation으로 신고한다.
+            if let Some(existing) = g.vertex(&idx_id) {
+                if existing.kind != VertexKind::Index {
+                    g.add_limitation(format!(
+                        "멤버 id 충돌: {}는 {:?}와 index 양쪽 이름이다 — \
+                         index 정점이 생략되고 usage가 공유 정점에 붙는다",
+                        idx_id.as_str(),
+                        existing.kind,
+                    ));
+                }
+            }
             g.add_vertex(Vertex {
                 id: idx_id.clone(),
                 kind: VertexKind::Index,
@@ -89,6 +105,9 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
                 schema: schema.name.clone(),
             });
             g.add_edge(contains(&obj_id, &idx_id));
+            if let Some(u) = &idx.usage {
+                g.set_usage(idx_id, to_usage(u));
+            }
         }
 
         for trg in &obj.triggers {
@@ -203,6 +222,15 @@ fn contains(from: &VertexId, to: &VertexId) -> Edge {
     }
 }
 
+/// UsageDoc → core Usage — 와이어 타입과 도메인 타입을 분리해 둔 변환.
+fn to_usage(u: &UsageDoc) -> Usage {
+    Usage {
+        since: u.since.clone(),
+        reads: u.reads,
+        writes: u.writes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +260,7 @@ mod tests {
                         indexes: vec![],
                         triggers: vec![],
                         body: None,
+                        usage: None,
                     },
                     ObjectDoc {
                         name: "orders".into(),
@@ -257,6 +286,7 @@ mod tests {
                         indexes: vec![],
                         triggers: vec![],
                         body: None,
+                        usage: None,
                     },
                 ],
             }],
@@ -289,5 +319,37 @@ mod tests {
         // orders의 의존 간선은 customers를 향한 references 하나뿐.
         assert_eq!(dep.len(), 1);
         assert_eq!(dep[0].to.as_str(), "main.customers");
+    }
+
+    #[test]
+    fn document의_usage는_정점에_매핑되고_없음과_0은_다르다() {
+        let mut doc = doc_with_fk();
+        // orders: 0 관측(usage가 있는 채로 0) — 미수집과 구분해야 한다.
+        doc.schemas[0].objects[1].usage = Some(UsageDoc {
+            since: None,
+            reads: 0,
+            writes: 0,
+        });
+        // customers의 인덱스에도 usage를 둔다(인덱스는 멤버 레벨 정점).
+        doc.schemas[0].objects[0].indexes.push(IndexDoc {
+            name: "idx_id".into(),
+            columns: vec!["id".into()],
+            unique: true,
+            usage: Some(UsageDoc {
+                since: Some("2025-01-01".into()),
+                reads: 7,
+                writes: 0,
+            }),
+        });
+
+        let g = document_to_graph(&doc);
+        let orders = VertexId::object("main", "orders");
+        let usage = g.usage(&orders).expect("orders usage");
+        assert_eq!(usage.reads, 0);
+        assert_eq!(usage.since, None);
+        let idx = VertexId::member("main", "customers", "idx_id");
+        assert_eq!(g.usage(&idx).map(|u| u.reads), Some(7));
+        // customers 객체 자체는 미수집 — None이어야 0 관측과 구분된다.
+        assert!(g.usage(&VertexId::object("main", "customers")).is_none());
     }
 }

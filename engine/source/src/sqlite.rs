@@ -112,6 +112,8 @@ async fn read_schema(
                     indexes: read_indexes(pool, schema, &name).await?,
                     triggers: Vec::new(),
                     body: sql,
+                    // SQLite는 사용 통계 카탈로그가 없다 — 미수집과 0 관측을 구분해 None.
+                    usage: None,
                 });
             }
             "trigger" => {
@@ -284,6 +286,7 @@ async fn read_indexes(
             name: idx_name,
             unique: r.get::<i64, _>("unique") == 1,
             columns,
+            usage: None,
         });
     }
     Ok(indexes)

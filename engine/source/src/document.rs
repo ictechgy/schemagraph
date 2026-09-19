@@ -43,6 +43,9 @@ pub struct ObjectDoc {
     /// view 정의·객체 DDL 원문. 파싱은 엔진의 일 — reader는 옮기기만 한다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// 사용 통계(pg_stat·sys 스키마 등). 통계가 없는 DB는 None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageDoc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +92,23 @@ pub struct IndexDoc {
     pub name: String,
     pub unique: bool,
     pub columns: Vec<String>,
+    /// 인덱스 사용 통계(pg_stat_user_indexes, sys.schema_unused_indexes 등).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageDoc>,
+}
+
+/// 사용 통계 — DB가 리셋 이후 관측한 작업량. 통계는 "since 이후만 유효"라는
+/// 것이 계약의 핵심이라, since 없는 0은 "미사용"이 아니라 "모름"이다.
+/// additive 필드라 document 버전은 올리지 않는다(없는 reader는 None).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageDoc {
+    /// 통계 유효 시작 시점(리셋·재시작 시각). 모르면 None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// 관측된 읽기 작업량(방언별 스캔·fetch 합산).
+    pub reads: u64,
+    /// 관측된 쓰기 작업량(insert·update·delete 합산).
+    pub writes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

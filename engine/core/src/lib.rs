@@ -137,6 +137,23 @@ impl EdgeKind {
     }
 }
 
+/// 정점의 사용 통계 — DB가 리셋 이후 관측한 작업량.
+///
+/// 통계는 "since 이후만 유효하다"는 게 계약의 핵심이다: 리셋 직후면 0도
+/// 미사용이 아니고, since가 없으면 소비자가 0을 오독할 수 있다(AGENTS.md
+/// "사용 통계를 단독 증거로 쓰지 마세요"). 그래서 판정 근거가 아니라
+/// 소비자가 스스로 무게를 재는 증거로 둔다.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Usage {
+    /// 통계 유효 시작 시점(카탈로그가 보고한 리셋·재시작 시각). 모르면 None.
+    pub since: Option<String>,
+    /// 관측된 읽기 작업량(스캔·fetch 계열의 방언별 합산 — 단위는 정점 kind에
+    /// 따라 다르므로 서로 다른 kind끼리 비교하지 않는다).
+    pub reads: u64,
+    /// 관측된 쓰기 작업량(insert·update·delete 계열 합산).
+    pub writes: u64,
+}
+
 /// 간선이 어느 증거 계층에서 왔는지(DESIGN.md "세 개의 증거 계층").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EvidenceLayer {
@@ -189,6 +206,10 @@ pub struct Graph {
     out_edges: BTreeMap<VertexId, Vec<Edge>>,
     in_edges: BTreeMap<VertexId, Vec<Edge>>,
     limitations: Vec<String>,
+    /// 정점별 사용 통계 — 정점에 안 박고 따로 두는 이유: usage는 정점의
+    /// 정체성이 아니라 관측 부속물이라, 없는 것(미수집)과 0(미사용 관측)을
+    /// Option으로 구분해야 한다.
+    usage: BTreeMap<VertexId, Usage>,
 }
 
 impl Graph {
@@ -204,6 +225,22 @@ impl Graph {
 
     pub fn add_limitation(&mut self, limitation: impl Into<String>) {
         self.limitations.push(limitation.into());
+    }
+
+    /// 정점의 사용 통계를 싣는다. 같은 정점에 다시 오면 최신 것으로 — reader
+    /// 경로가 둘 이상이면 나중 관측이 이기게 한다.
+    pub fn set_usage(&mut self, id: VertexId, usage: Usage) {
+        self.usage.insert(id, usage);
+    }
+
+    /// 정점의 사용 통계. None은 "관측 안 함"이지 "0 관측"이 아니다.
+    pub fn usage(&self, id: &VertexId) -> Option<&Usage> {
+        self.usage.get(id)
+    }
+
+    /// id 순으로 정렬된 (정점 id, usage) 쌍.
+    pub fn usages(&self) -> impl Iterator<Item = (&VertexId, &Usage)> {
+        self.usage.iter()
     }
 
     /// 정점 추가. 같은 id가 다시 오면 처음 것을 유지한다 — reader가 같은
@@ -311,6 +348,22 @@ impl Graph {
                 kind: edge.kind,
                 evidence: edge.evidence.clone(),
             });
+        }
+        // usage도 조상으로 합산해 올린다 — 멤버 관측치가 투영에서 사라지면
+        // "member 레벨에선 쓰였는데 object에선 미사용"이라는 모순이 나온다.
+        // 합쳐질 때 since는 가장 이른 것(보수적으로)을 남긴다.
+        for (id, usage) in &self.usage {
+            let Some(ancestor) = self.ancestor_at(id, level) else {
+                continue;
+            };
+            let entry = projected.usage.entry(ancestor).or_default();
+            entry.reads += usage.reads;
+            entry.writes += usage.writes;
+            match (&entry.since, &usage.since) {
+                (Some(cur), Some(new)) if new < cur => entry.since = Some(new.clone()),
+                (None, Some(new)) => entry.since = Some(new.clone()),
+                _ => {}
+            }
         }
         projected.limitations = self.limitations.clone();
         projected
@@ -544,6 +597,47 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn project는_usage를_조상으로_합산한다() {
+        let mut g = Graph::new();
+        g.add_vertex(table("s", "a"));
+        let col = VertexId::member("s", "a", "x");
+        g.add_vertex(Vertex {
+            id: col.clone(),
+            kind: VertexKind::Column,
+            name: "x".into(),
+            schema: "s".into(),
+        });
+        // 인덱스는 멤버 레벨 정점이라 usage도 멤버에 붙는다.
+        g.set_usage(
+            col.clone(),
+            Usage {
+                since: Some("2025-01-01".into()),
+                reads: 3,
+                writes: 1,
+            },
+        );
+        g.set_usage(
+            VertexId::object("s", "a"),
+            Usage {
+                since: Some("2025-03-01".into()),
+                reads: 10,
+                writes: 5,
+            },
+        );
+        // 미관측 정점은 투영 후에도 없어야 한다 — 없음과 0 관측은 다르다.
+        g.add_vertex(table("s", "b"));
+
+        let obj = g.project(Level::Object);
+        let usage = obj.usage(&VertexId::object("s", "a")).unwrap();
+        // 멤버 관측치(3r/1w)가 조상에 합산된다.
+        assert_eq!(usage.reads, 13);
+        assert_eq!(usage.writes, 6);
+        // since는 가장 이른 것 — 보수적으로 유효 구간을 좁힌다.
+        assert_eq!(usage.since.as_deref(), Some("2025-01-01"));
+        assert!(obj.usage(&VertexId::object("s", "b")).is_none());
     }
 
     #[test]
