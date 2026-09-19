@@ -103,6 +103,32 @@
     트랩까지 살려뒀는데, 4GiB급 docker VM에서 mysql+maria+mssql+oracle
     동시 기동으로 Oracle이 OOMKilled로 죽었다 — 각 섹션이 끝날 때
     컨테이너를 정리하게 바꿨다.
+- 2026-09-19: **P5 완료 — 판정 도구 + 프로브 확장**.
+  - `diff`(`fedb998`) — graph↔graph·document↔document 구조 델타
+    (added/removed vertices·edges + bodyChanged 등), `--strict` 델타 시 1.
+  - `plpgsql`/`plsql` 문장 추출(커밋 예정) — 절차형 스캐폴딩을 걷어내고
+    보이는 SQL만 문장 단위 파싱. 한 문장 실패가 전체를 죽이지 않고
+    미추출은 limitation 카운트. `SELECT/RETURNING … INTO`의 변수는
+    참조로 오인하지 않게 INTO를 벗긴다. `plpython3u` 등 나머지는
+    여전히 limitation. 검증 스크립트의 "plpgsql 미지원" 기대는 실제
+    간선 assertion으로 갱신됐다 — 바이너리와 스크립트의 기대가 어긋나
+    실행 중 재빌드로 오탐이 난 적 있다(검증 실행 중 `cargo build`로
+    바이너리 교체 금지).
+  - Oracle PACKAGE 수확 — PACKAGE+BODY를 `package` 정점으로 병합,
+    멤버별 귀속 미지원은 limitation 신고.
+  - `inferred` 간선(`scan --inferred`) — 미선언 `*_id`의 이름 규칙 추정.
+    선언 FK 우선·모호 후보는 limitation, `EvidenceLayer::inferred`라
+    `is_dependency()`가 거짓 — impact·cycles·dead에 섞이지 않는다.
+    sqlite fixture에 `shipments.customer_id`를 넣어 검증.
+  - NDJSON 전송 — 프로브 `--format ndjson`, 엔진 `scan --document`가
+    `type:"document"` 첫 행으로 자동 감지. 알 수 없는 레코드 타입은
+    건너뛰지 않고 거부. source::ndjson이 읽기/쓰기 양방향.
+  - document v2 정책 — 같은 버전의 미지 필드는 받되 무시된 경로를
+    limitations에 신고(`unknown_field_paths`, additive 계약의 정직한 끝).
+  - **Go 프로브**(`probe-go/`) — go-ora pure-Go 드라이버로 Oracle 전용
+    단일 정적 바이너리. ojdbc(OTN)도 JVM도 없이 JVM 프로브와
+    85/85 간선 완전 패리티(실검증). verify-fixtures가 go가 있으면
+    Oracle 섹션에서 패리티를 검증한다.
 
 ## 확정된 결정
 
@@ -202,16 +228,16 @@ Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + 
 
 ## 다음 할 일
 
-1. 멤버 id 공간 v2 — 모든 멤버 id에 kind를 박는 안은 **보류 결정**됐다
-   (기존 id와 호환 깨짐). 되살릴 때는 골든·문서·파서 해석이 함께 간다.
-2. routine 파싱 커버리지 — plpgsql·plsql·T-SQL 몸체의 방언 파서.
-   지금은 언어 한계를 limitation으로 정직하게 보고한다.
-3. 배포 준비 — crates.io `schemagraph`·Maven `schemagraph` 모두 비어
+1. 배포 준비 — crates.io `schemagraph`·Maven `schemagraph` 모두 비어
    있음(2026-09-19 확인). 선점·퍼블리시는 아직 하지 않았다.
-4. `diff` 명령, `inferred` 휴리스틱 간선, JVM 없는 Go 프로브(배포용).
+2. routine 파싱 잔여 — T-SQL 전용 구문(TRY/CATCH·CURSOR), Oracle 패키지
+   멤버별 귀속(ALL_ARGUMENTS의 PACKAGE_NAME으로 시그니처 복원).
+3. 프로브 측 진짜 스트리밍 — NDJSON은 직렬화만 행 단위다. Extractor를
+   행 방출로 고치면 대형 카탈로그도 상수 메모리로 수확된다.
+4. Go 프로브 확장 — Oracle만 커버. pure-Go 드라이버가 있는 방언
+   (pgwire·mysql·sqlserver·sqlite)으로 수요별 확장.
 
 ## 미결
 
-DESIGN.md "미결 사항" 절 참조: document 스키마 세부(v2), 프로브 전송
-방식, inferred 휴리스틱, package routine(Oracle PACKAGE BODY 멤버)의
-정점 귀속.
+DESIGN.md "미결 사항" 절 참조: document 스키마 v2(additive 너머의 협상),
+프로브 Tier 1 방언 확장, 멤버 id v2(보류 결정 유지).

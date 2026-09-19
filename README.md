@@ -66,8 +66,9 @@ Dialect notes:
   schemas are suppressed (they would exhaust cursors, ORA-01000). Unquoted
   identifiers fold to uppercase, so lowercase body references resolve to
   UPPERCASE vertices case-insensitively; genuinely ambiguous case
-  collisions are reported, never guessed. `plsql` bodies are reported as
-  limitations, not parsed (same contract as `plpgsql`).
+  collisions are reported, never guessed. `PACKAGE BODY` bodies attach to a
+  single `package` vertex — per-member attribution is reported as a
+  limitation.
 - **SQLite** — JDBC `TABLE_SCHEM`/`TABLE_CAT` come back null, so objects map
   to `main`; bodies come from `sqlite_master` (same source as the native
   reader → vertex and edge parity, verified).
@@ -78,11 +79,32 @@ Dialect notes:
 On SQLite, MySQL and MariaDB the probe's dependency edges match the native
 reader's exactly.
 
+`--format ndjson` emits the document as newline-delimited JSON (one record
+per line: a `document` header, then `schema`/`object`/`routine` rows) —
+`scan --document` detects the format automatically, so large catalogs can
+be streamed rather than held as one JSON value.
+
+### Go probe (no JVM — Oracle)
+
+`probe-go/` builds a single static binary covering Oracle via the pure-Go
+`go-ora` driver — the path where the JVM probe still needs an external
+OTN-licensed `ojdbc` jar:
+
+```
+cd probe-go && go build -o schemagraph-probe-go .
+./schemagraph-probe-go --url oracle://u:p@host:1521/FREEPDB1 -o catalog.json
+```
+
+Harvest semantics mirror the Kotlin probe's Oracle branch (`ALL_*` +
+`ALL_SOURCE`); on the same database it produces a graph identical to the
+JVM probe (verified live — 85/85 edges, 63/63 vertices).
+
 ## Commands
 
 ```
 schemagraph scan <url> [-o graph.json]   # sqlite:PATH, postgres://…, mysql://…
-schemagraph scan --document catalog.json # probe output → graph
+schemagraph scan --document catalog.json # probe output (json|ndjson) → graph
+schemagraph scan <url> --inferred        # add naming-heuristic `inferred` edges
 schemagraph graph --format mermaid|json|dot [--level schema|object|column]
 schemagraph query <object> [--depth N]
 schemagraph impact <object>
@@ -90,10 +112,18 @@ schemagraph cycles [--level object|column] [--strict]
 schemagraph dead [--strict]
 schemagraph stats                          # collected usage evidence
 schemagraph rules [--config schemagraph.toml] [--strict]
+schemagraph diff <old> <new> [--strict]  # graph↔graph or document↔document delta
 schemagraph skill                          # agent skill document (stdout)
 ```
 
 `--strict` exits 1 when findings are reported, for CI gates.
+
+`--inferred` adds opt-in `inferred` edges: undeclared `*_id` columns whose
+name matches a same-schema table (`products`, `product`→`products`, `ies`
+plurals) with an `id` column. Declared FKs always win, ambiguous candidates
+are skipped and counted in `limitations`, and inferred edges carry
+`EvidenceLayer::inferred` — they never feed `impact`, `cycles`, `dead`, or
+any dependency query.
 
 ## Rules file
 
@@ -144,10 +174,15 @@ the graph.
 - Body parsing: views (`reads`, object + member level), triggers
   (`writes`/`reads`/`NEW.`/`OLD.`, `EXECUTE FUNCTION` → `calls`), SQL-language
   routines (`reads`/`writes`/`calls`, including in-body `CALL`/function
-  invocations). `plpgsql` and other procedural languages are reported in
-  `limitations`, not parsed.
+  invocations). `plpgsql`/`plsql` bodies go through a statement extractor —
+  visible SQL (`IF/FOR/LOOP` conditions, `PERFORM`, `EXECUTE 'literal'`,
+  `SELECT … INTO`, `RETURNING … INTO`, bare PL/SQL calls) produces real
+  edges; unextractable dynamic constructs are counted in `limitations`.
+  Other languages (`plpython3u`, …) are reported, not guessed.
 - Deterministic JSON everywhere; unknown targets never become ghost vertices —
-  they land in `limitations`.
+  they land in `limitations`. Documents carrying fields the engine does not
+  know are accepted (same-version additive contract) but the ignored field
+  paths are reported in `limitations`.
 
 ## Roadmap
 
@@ -155,6 +190,10 @@ the graph.
 - **P1** — body parsing + `impact` + `dead` — done
 - **P2** — catalog document protocol + Kotlin JDBC probe + `rules` — done
 - **P3** — `stats` usage evidence (tables·indexes·routines) + `dead` evidence + `skill` + mermaid — done
-- **P4** — MSSQL/Oracle rich probes — done (live-verified); next: `diff`, inferred edges, routine parsing coverage
+- **P4** — MSSQL/Oracle rich probes — done (live-verified)
+- **P5** — `diff`, `plpgsql`/`plsql` statement extraction, opt-in `inferred`
+  edges, Oracle package harvest, NDJSON transport, Go probe (Oracle) — done
+  (live-verified); next: document v2 negotiation beyond additive fields,
+  wider procedural coverage, publishing
 
 Details and trade-offs: [DESIGN.md](DESIGN.md).

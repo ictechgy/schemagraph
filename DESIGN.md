@@ -201,7 +201,22 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
   (Azure SQL Edge, gvenzl/oracle-free — 둘 다 arm64 지원). MSSQL의 JDBC
   메타 오분류·`;N` 접미사, Oracle의 PUBLIC 커서 고갈·대소문자 접힘
   해석(ci, oracle 한정) 등이 실검증에서 드러나 고쳤다.
-  다음: `diff`, `inferred` 간선, Go 프로브("JVM 없는 배포" 수요가 생기면).
+- **P5**: 판정 도구 + 프로브 확장 — **완료**:
+  - `diff`: document↔document·graph↔graph 구조 델타(추가/제거 정점·간선,
+    몸체 변경), `--strict`는 델타 시 1.
+  - `plpgsql`/`plsql` 문장 추출: 절차형 스캐폴딩(BEGIN/IF/FOR/LOOP/DECLARE)을
+    걷어내고 보이는 SQL만 문장 단위로 파싱 — 한 문장의 실패가 전체를 죽이지
+    않고, 못 건진 구문(동적 SQL 식 등)은 limitation으로 센다.
+    `SELECT … INTO`/`RETURNING … INTO`의 변수는 참조로 오인하지 않는다.
+  - `inferred` 간선(opt-in `--inferred`): 미선언 `*_id` 컬럼의 이름 규칙으로
+    같은 스키마 `id` 보유 테이블을 추정 — 선언 FK 우선, 모호 후보는 limitation.
+    `EvidenceLayer::inferred`라 의존성 질의(`is_dependency()`가 거짓)에 섞이지 않는다.
+  - Oracle PACKAGE 수확: PACKAGE+PACKAGE BODY를 `package` 정점 하나로 병합
+    (BODY 우선), 멤버별 귀속 미지원은 limitation으로 신고.
+  - NDJSON 전송: 프로브 `--format ndjson` + 엔진 `scan --document` 자동 감지.
+    레이아웃은 `document` 헤더 → `schema` 행 → `object`/`routine` 행.
+  - Go 프로브(`probe-go/`): go-ora로 Oracle만 커버하는 단일 정적 바이너리 —
+    JVM도 외부 ojdbc도 없이 JVM 프로브와 그래프 완전 패리티(실검증).
 
 각 단계의 완료 조건은 실제 DB fixture로 양방향 검증하는 스크립트다
 (계열의 verify-fixtures 전통 — 도구가 실제로 발견한 결함이 단위 테스트를 통과한 뒤
@@ -219,16 +234,23 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
 ## 미결 사항
 
 - **catalog document 스키마** — version 1로 고정됨(`document.rs`의
-  `DOCUMENT_VERSION`). 필드 추가는 하위호환으로, 이름 변경·의미 변경은 버전을 올린다.
-- **routine 몸체 파싱 커버리지** — `language=sql`은 파싱됨. plpgsql·pl/sql 등은
-  limitation으로 보고 중. 파서 개선 기여 vs 프로브 측 "파싱된 참조" 증거로 결정.
-- **프로브 전송 방식** — 현재 파일(`-o`) 또는 stdout(`-o -`). 큰 스키마의
-  스트리밍 NDJSON은 수요가 생기면.
+  `DOCUMENT_VERSION`). 정책: 필드 추가는 하위호환(additive), 이름·의미 변경은
+  버전을 올린다. 버전 불일치는 거부하고, 같은 버전 안의 미지 필드는 받되
+  무시된 경로를 `limitations`에 신고한다(`unknown_field_paths`).
+- **routine 몸체 파싱 커버리지** — `sql`·`plpgsql`·`plsql`은 문장 추출로
+  파싱됨(P5). 남은 것: T-SQL 전용 구문(TRY/CATCH, CURSOR 루프 등)과
+  Oracle 패키지 멤버별 귀속, 기타 언어는 limitation 유지.
+- **프로브 전송 방식** — 파일·stdout에 NDJSON 형식이 더해짐(P5). 프로브 측
+  진짜 스트리밍(수확과 동시에 행 출력)은 아직 — 현재는 문서를 만든 뒤
+  직렬화만 행 단위다. 수요가 생기면 Extractor를 행 방출로 고친다.
 - **crates.io / Maven Central 이름** — `schemagraph`는 둘 다 비어 있음
   (2026-09-19 확인). 선점·퍼블리시는 아직이다.
-- **`inferred` 간선 휴리스틱 세부** — Azimutt 방식 벤치마크 후 결정.
 - **멤버 id 공간 v2** — 모든 멤버 id에 kind를 박는 안은 보류(호환 깨짐).
   현행: 충돌 시에만 `@kind` 접미사.
-- **Oracle package routine 귀속** — PACKAGE BODY의 멤버는 OBJECT_NAME이
-  패키지라 독립 routine과 귀속이 다르다. 독립 PROCEDURE/FUNCTION만 수확 중.
+- **Oracle package 멤버별 귀속** — 패키지 정점 하나에 몸체 간선이 모인다.
+  멤버 id로 쪼개려면 ALL_ARGUMENTS의 PACKAGE_NAME 경로로 시그니처를
+  복원해 정점을 나누는 설계가 필요하다.
 - **프로브 Tier 1 추가 확장** — DB2, Informix 등의 몸체 소스는 수요별로.
+- **Go 프로브 확장** — Oracle만 커버(ojdbc 마찰이 큰 곳부터). 다른 방언은
+  JVM 프로브가 번들 드라이버로 충분 — 수요가 생기면 pure-Go 드라이버가
+  있는 방언(pgwire, mysql, sqlserver, sqlite)으로 넓힌다.
