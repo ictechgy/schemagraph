@@ -112,6 +112,21 @@ async fn attach_usage(
     objects: &mut [ObjectDoc],
     limitations: &mut Vec<String>,
 ) {
+    // MariaDB는 performance_schema=OFF가 기본값이다 — sys 통계 뷰는 쿼리는
+    // 되지만 0행이라, 꺼져 있으면 그 이유를 limitation으로 남기고 수확을
+    // 건너뛴다(0행을 "관측된 0"으로 오독하지 않기 위해).
+    let pfs: Option<String> =
+        sqlx::query_scalar("SELECT CAST(@@performance_schema AS CHAR)")
+            .fetch_one(pool)
+            .await
+            .ok();
+    if matches!(pfs.as_deref(), Some("0") | Some("OFF")) {
+        limitations.push(
+            "performance_schema=OFF — usage 미수집(통계 비활성, MariaDB 기본값)".to_owned(),
+        );
+        return;
+    }
+
     // 통계의 유효 시작점 — performance_schema는 재시작에 리셋된다.
     let since: Option<String> = sqlx::query_scalar::<_, String>(
         "SELECT CAST(NOW() - INTERVAL VARIABLE_VALUE SECOND AS CHAR) \
@@ -242,7 +257,7 @@ async fn read_columns(
 ) -> Result<Vec<ColumnDoc>, SourceError> {
     let rows = sqlx::query(
         "SELECT CAST(column_name AS CHAR) AS name, CAST(data_type AS CHAR) AS data_type, CAST(is_nullable AS CHAR) AS nullable, \
-                CAST(column_default AS CHAR) AS default_value, ordinal_position AS ordinal \
+                CAST(column_default AS CHAR) AS default_value, CAST(ordinal_position AS SIGNED) AS ordinal \
          FROM information_schema.columns \
          WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
     )
@@ -253,8 +268,10 @@ async fn read_columns(
     .map_err(SourceError::Query)?;
 
     // PK 안에서의 위치는 columns에는 없고 key_column_usage에 있다.
+    // ordinal_position은 MySQL에선 UNSIGNED, MariaDB에선 SIGNED로 온다 —
+    // SIGNED로 캐스트해 둘을 같은 디코딩으로 맞춘다.
     let pk_rows = sqlx::query(
-        "SELECT CAST(column_name AS CHAR) AS name, ordinal_position AS pos FROM information_schema.key_column_usage \
+        "SELECT CAST(column_name AS CHAR) AS name, CAST(ordinal_position AS SIGNED) AS pos FROM information_schema.key_column_usage \
          WHERE table_schema = ? AND table_name = ? AND constraint_name = 'PRIMARY'",
     )
     .bind(schema)
@@ -264,7 +281,7 @@ async fn read_columns(
     .map_err(SourceError::Query)?;
     let pk_pos: BTreeMap<String, u32> = pk_rows
         .iter()
-        .map(|r| (r.get("name"), r.get::<u64, _>("pos") as u32))
+        .map(|r| (r.get("name"), r.get::<i64, _>("pos") as u32))
         .collect();
 
     Ok(rows
@@ -277,7 +294,7 @@ async fn read_columns(
                 data_type: r.get("data_type"),
                 nullable: r.get::<String, _>("nullable") == "YES",
                 default: r.get::<Option<String>, _>("default_value"),
-                ordinal: r.get::<u64, _>("ordinal") as u32,
+                ordinal: r.get::<i64, _>("ordinal") as u32,
             }
         })
         .collect())
