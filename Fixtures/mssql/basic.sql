@@ -74,9 +74,41 @@ BEGIN
 END;
 GO
 
+CREATE PROCEDURE audit_orders @n INT AS
+BEGIN
+    INSERT INTO tickets (note) VALUES ('audit');
+END;
+GO
+
+-- T-SQL 절차형 구문 커버: SET @v=, IF..BEGIN, TRY/CATCH, EXEC 호출.
 CREATE PROCEDURE touch_customer @id INT AS
 BEGIN
-    UPDATE customers SET name = name WHERE id = @id;
+    SET NOCOUNT ON;
+    DECLARE @n INT;
+    SET @n = (SELECT COUNT(*) FROM customers);
+    IF @n > 0
+    BEGIN
+        UPDATE customers SET name = name WHERE id = @id;
+    END
+    BEGIN TRY
+        EXEC audit_orders @n;
+    END TRY
+    BEGIN CATCH
+        INSERT INTO tickets (note) VALUES ('err');
+    END CATCH
+END;
+GO
+
+-- WHILE..BEGIN과 CURSOR FOR SELECT — 블록 안의 DML이 writes로 귀속돼야 한다.
+CREATE PROCEDURE drain_orders AS
+BEGIN
+    DECLARE c CURSOR FOR SELECT id FROM customers;
+    DECLARE @i INT = 0;
+    WHILE @i < 1
+    BEGIN
+        UPDATE orders SET customer_id = @i WHERE id = @i;
+        SET @i = @i + 1;
+    END
 END;
 GO
 

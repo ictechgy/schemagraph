@@ -726,6 +726,13 @@ want = {
     ("fires", "dbo.orders.trg_orders_touch", "dbo.orders"),
     ("writes", "dbo.orders.trg_orders_touch", "dbo.customers"),
     ("writes", "dbo.touch_customer(int)", "dbo.customers"),
+    # T-SQL 절차형 구문 — IF/TRY/CATCH/SET @v=/EXEC/WHILE/CURSOR 안의 문장.
+    ("reads", "dbo.touch_customer(int)", "dbo.customers"),
+    ("writes", "dbo.touch_customer(int)", "dbo.tickets"),
+    ("calls", "dbo.touch_customer(int)", "dbo.audit_orders(int)"),
+    ("writes", "dbo.audit_orders(int)", "dbo.tickets"),
+    ("reads", "dbo.drain_orders", "dbo.customers"),
+    ("writes", "dbo.drain_orders", "dbo.orders"),
     ("reads", "dbo.order_totals", "dbo.orders"),
     ("reads", "dbo.order_count", "dbo.orders"),
 }
