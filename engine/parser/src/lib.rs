@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
-use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId};
+use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId, VertexKind};
 use schemagraph_source::document::CatalogDocument;
 use sqlparser::ast::{
     visit_expressions, visit_relations, Expr, JoinConstraint, JoinOperator, ObjectName, Query,
@@ -49,7 +49,23 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
             }
             for trg in &obj.triggers {
                 let Some(body) = &trg.body else { continue };
-                let trigger_id = VertexId::member(&schema.name, &obj.name, &trg.name);
+                // document_to_graph가 멤버 이름 충돌을 `name@kind`로 분리한다 —
+                // 같은 규칙으로 실제 정점 id를 찾고, 못 찾으면 유령 간선 대신
+                // notes로 남긴다.
+                let Some(trigger_id) = resolve_member(
+                    g,
+                    &schema.name,
+                    &obj.name,
+                    &trg.name,
+                    VertexKind::Trigger,
+                    "trigger",
+                ) else {
+                    notes.push(format!(
+                        "trigger {}.{}.{}: 정점을 못 찾음(이름 충돌?) — 몸체 간선 생략",
+                        schema.name, obj.name, trg.name
+                    ));
+                    continue;
+                };
                 match parse_trigger_body(dialect.as_deref(), body) {
                     Ok(parsed) => {
                         apply_trigger(g, &schema.name, &obj.name, &trigger_id, &parsed, &mut notes);
@@ -63,12 +79,24 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
             let Some(body) = routine.body.as_ref().filter(|b| !b.trim().is_empty()) else {
                 continue;
             };
-            // routine 정점 id는 graph.rs와 같은 규칙 — 시그니처가 있으면 괄호로 붙는다.
+            // routine 정점 id는 graph.rs와 같은 규칙 — 시그니처가 있으면 괄호로
+            // 붙고, 같은 이름의 테이블/프로시저가 있으면 `id_name@kind`로 분리된다.
             let id_name = match &routine.signature {
                 Some(sig) if !sig.is_empty() => format!("{}({})", routine.name, sig),
                 _ => routine.name.clone(),
             };
-            let owner = VertexId::object(&schema.name, &id_name);
+            let (kind, suffix) = match routine.kind.as_str() {
+                "procedure" => (VertexKind::Procedure, "procedure"),
+                "package" => (VertexKind::Package, "package"),
+                _ => (VertexKind::Function, "function"),
+            };
+            let Some(owner) = resolve_object(g, &schema.name, &id_name, kind, suffix) else {
+                notes.push(format!(
+                    "routine {}.{id_name}: 정점을 못 찾음 — 몸체 간선 생략",
+                    schema.name
+                ));
+                continue;
+            };
             match routine.language.as_deref() {
                 // SQL 언어 함수는 몸체가 그대로 SQL이라 파싱 가능 — 나머지
                 // 언어(plpgsql 등)는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
@@ -703,12 +731,65 @@ enum RoutineHit {
     Ambiguous(usize),
 }
 
+/// 멤버 정점 id를 찾는다 — document_to_graph가 이름 충돌을 `name@kind`로
+/// 분리하므로, 평범한 id에 우리 kind가 없으면 접미사 id를 시도한다.
+/// 못 찾으면 None — 유령 id로 간선을 만들지 않는다.
+fn resolve_member(
+    g: &Graph,
+    schema: &str,
+    obj: &str,
+    name: &str,
+    kind: VertexKind,
+    suffix: &str,
+) -> Option<VertexId> {
+    resolve_renamed(g, VertexId::member(schema, obj, name), kind, suffix)
+}
+
+/// 객체 레벨 정점(routine 등)을 같은 규칙으로 찾는다.
+fn resolve_object(
+    g: &Graph,
+    schema: &str,
+    name: &str,
+    kind: VertexKind,
+    suffix: &str,
+) -> Option<VertexId> {
+    resolve_renamed(g, VertexId::object(schema, name), kind, suffix)
+}
+
+/// base id가 다른 kind에게 점유됐으면 `base@suffix`를 시도한다 —
+/// graph.rs의 resolve_collision과 같은 명명 규칙을 공유해야 한다.
+fn resolve_renamed(
+    g: &Graph,
+    base: VertexId,
+    kind: VertexKind,
+    suffix: &str,
+) -> Option<VertexId> {
+    let renamed = VertexId::from_raw(&format!("{}@{suffix}", base.as_str()));
+    [base, renamed]
+        .into_iter()
+        .find(|id| g.vertex(id).map(|v| v.kind == kind).unwrap_or(false))
+}
+
 /// 스키마 안에서 routine 정점을 이름으로 찾는다. 정확한 id(name 그대로)가
 /// 먼저이고, 없으면 routine kind 정점의 표시 이름과 비교한다 — 호출자는
 /// 시그니처를 모르므로 이름이 유일할 때만 받아들인다(resolve()와 같은 철학).
 fn resolve_routine(g: &Graph, schema: &str, name: &str) -> RoutineHit {
     let exact = VertexId::object(schema, name);
-    if g.vertex(&exact).is_some() {
+    // 정확한 id가 routine kind일 때만 바로 받는다 — 같은 이름의 테이블이
+    // base id를 차지한 채 routine이 `name@function`으로 분리됐을 수 있어
+    // kind를 확인하지 않으면 calls 간선이 테이블을 가리킨다.
+    if g
+        .vertex(&exact)
+        .map(|v| {
+            matches!(
+                v.kind,
+                schemagraph_core::VertexKind::Function
+                    | schemagraph_core::VertexKind::Procedure
+                    | schemagraph_core::VertexKind::Package
+            )
+        })
+        .unwrap_or(false)
+    {
         return RoutineHit::One(exact);
     }
     let hits: Vec<VertexId> = g
@@ -749,11 +830,21 @@ fn apply_trigger(
     }
     apply_dml_edges(g, schema, trigger_id, parsed, notes);
     apply_call_edges(g, schema, trigger_id, &parsed.calls, notes);
-    // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다.
+    // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다. 컬럼이 id 충돌로
+    // `@column`으로 분리됐을 수 있어 kind-aware 해석자를 쓴다.
     let mut made = std::collections::BTreeSet::new();
     for column in &parsed.fired_columns {
-        let target = VertexId::member(schema, owner_table, column);
-        if g.vertex(&target).is_none() || !made.insert(target.clone()) {
+        let Some(target) = resolve_member(
+            g,
+            schema,
+            owner_table,
+            column,
+            VertexKind::Column,
+            "column",
+        ) else {
+            continue;
+        };
+        if !made.insert(target.clone()) {
             continue;
         }
         g.add_edge(Edge {
@@ -1089,6 +1180,7 @@ mod tests {
             language: language.map(|l| l.to_owned()),
             body: Some(body.to_owned()),
             signature: None,
+            usage: None,
         }
     }
 
@@ -1123,6 +1215,46 @@ mod tests {
         assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
             && e.from.as_str() == "public.touch_customer"
             && e.to.as_str() == "public.customers"));
+    }
+
+    #[test]
+    fn 이름_충돌한_routine의_몸체_간선이_분리된_정점에_붙는다() {
+        // 테이블 orders와 같은 이름의 함수 — document_to_graph가
+        // public.orders@function으로 분리한다. 파서가 옛 id로 유령 간선을
+        // 만들면 이 테스트가 잡는다.
+        let doc = doc_with_routine(
+            vec![routine("orders", Some("sql"), "SELECT count(*) FROM customers")],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.orders@function"
+            && e.to.as_str() == "public.customers"),
+            "notes: {notes:?}");
+        // 테이블 정점을 소스로 하는 몸체 간선은 없어야 한다.
+        assert!(!g.edges().iter().any(|e| e.from.as_str() == "public.orders"
+            && e.kind == EdgeKind::Reads));
+    }
+
+    #[test]
+    fn 호출_해석은_정확한_id가_routine일_때만_받는다() {
+        // 함수 orders는 테이블과 충돌해 @function으로 분리됐다. 호출자가
+        // orders()를 부르면 정확한 id(public.orders)는 테이블이라 건너뛰고
+        // 이름 스캔으로 분리된 함수 정점을 찾아야 한다.
+        let doc = doc_with_routine(
+            vec![
+                routine("orders", Some("sql"), "SELECT 1"),
+                routine("caller", Some("sql"), "SELECT orders()"),
+            ],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+            && e.from.as_str() == "public.caller"
+            && e.to.as_str() == "public.orders@function"),
+            "notes: {notes:?}");
+        assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+            && e.to.as_str() == "public.orders"));
     }
 
     #[test]

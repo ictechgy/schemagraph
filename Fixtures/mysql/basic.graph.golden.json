@@ -73,6 +73,11 @@
     {
       "from": "sgfix.a",
       "kind": "contains",
+      "to": "sgfix.a.a_b_fk@index"
+    },
+    {
+      "from": "sgfix.a",
+      "kind": "contains",
       "to": "sgfix.a.b_id"
     },
     {
@@ -127,6 +132,11 @@
       "from": "sgfix.b",
       "kind": "contains",
       "to": "sgfix.b.b_a_fk"
+    },
+    {
+      "from": "sgfix.b",
+      "kind": "contains",
+      "to": "sgfix.b.b_a_fk@index"
     },
     {
       "from": "sgfix.b",
@@ -191,6 +201,11 @@
       "to": "sgfix.loop_self.parent_id"
     },
     {
+      "from": "sgfix.loop_self",
+      "kind": "contains",
+      "to": "sgfix.loop_self.parent_id@index"
+    },
+    {
       "evidence": [
         {
           "detail": "fk loop_self_ibfk_1: parent_id -> id",
@@ -230,6 +245,11 @@
     {
       "from": "sgfix.order_items",
       "kind": "contains",
+      "to": "sgfix.order_items.order_id@index"
+    },
+    {
+      "from": "sgfix.order_items",
+      "kind": "contains",
       "to": "sgfix.order_items.order_items_ibfk_1"
     },
     {
@@ -241,6 +261,11 @@
       "from": "sgfix.order_items",
       "kind": "contains",
       "to": "sgfix.order_items.product_id"
+    },
+    {
+      "from": "sgfix.order_items",
+      "kind": "contains",
+      "to": "sgfix.order_items.product_id@index"
     },
     {
       "evidence": [
@@ -462,6 +487,16 @@
       "to": "sgfix.products.sku"
     },
     {
+      "from": "sgfix.products",
+      "kind": "contains",
+      "to": "sgfix.products.sku@constraint"
+    },
+    {
+      "from": "sgfix.products",
+      "kind": "contains",
+      "to": "sgfix.products.sku@index"
+    },
+    {
       "from": "sgfix.standalone",
       "kind": "contains",
       "to": "sgfix.standalone.PRIMARY"
@@ -504,12 +539,13 @@
     }
   ],
   "limitations": [
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.a.a_b_fk\ub294 Constraint\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.b.b_a_fk\ub294 Constraint\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.loop_self.parent_id\ub294 Column\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.order_items.order_id\ub294 Column\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.order_items.product_id\ub294 Column\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.products.sku\ub294 Column\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4"
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.a.a_b_fk\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.a.a_b_fk@index\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.b.b_a_fk\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.b.b_a_fk@index\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.loop_self.parent_id\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.loop_self.parent_id@index\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.order_items.order_id\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.order_items.order_id@index\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.order_items.product_id\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.order_items.product_id@index\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.products.sku\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 constraint \uc815\uc810\uc740 sgfix.products.sku@constraint\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.products.sku\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.products.sku@index\ub85c \ubd84\ub9ac"
   ],
   "version": 1,
   "vertices": [
@@ -542,6 +578,13 @@
     {
       "id": "sgfix.a.a_b_fk",
       "kind": "constraint",
+      "level": "member",
+      "name": "a_b_fk",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.a.a_b_fk@index",
+      "kind": "index",
       "level": "member",
       "name": "a_b_fk",
       "schema": "sgfix",
@@ -594,6 +637,13 @@
     {
       "id": "sgfix.b.b_a_fk",
       "kind": "constraint",
+      "level": "member",
+      "name": "b_a_fk",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.b.b_a_fk@index",
+      "kind": "index",
       "level": "member",
       "name": "b_a_fk",
       "schema": "sgfix",
@@ -681,6 +731,13 @@
       "kind": "column",
       "level": "member",
       "name": "parent_id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.loop_self.parent_id@index",
+      "kind": "index",
+      "level": "member",
+      "name": "parent_id",
       "schema": "sgfix",
       "usage": {
         "reads": "<value>",
@@ -726,6 +783,13 @@
       "kind": "column",
       "level": "member",
       "name": "order_id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_items.order_id@index",
+      "kind": "index",
+      "level": "member",
+      "name": "order_id",
       "schema": "sgfix",
       "usage": {
         "reads": "<value>",
@@ -750,6 +814,13 @@
     {
       "id": "sgfix.order_items.product_id",
       "kind": "column",
+      "level": "member",
+      "name": "product_id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_items.product_id@index",
+      "kind": "index",
       "level": "member",
       "name": "product_id",
       "schema": "sgfix",
@@ -882,6 +953,20 @@
     {
       "id": "sgfix.products.sku",
       "kind": "column",
+      "level": "member",
+      "name": "sku",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.products.sku@constraint",
+      "kind": "constraint",
+      "level": "member",
+      "name": "sku",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.products.sku@index",
+      "kind": "index",
       "level": "member",
       "name": "sku",
       "schema": "sgfix"

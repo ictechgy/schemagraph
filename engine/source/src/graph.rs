@@ -59,66 +59,37 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
         }
 
         for col in &obj.columns {
-            let col_id = VertexId::member(&schema.name, &obj.name, &col.name);
-            g.add_vertex(Vertex {
-                id: col_id.clone(),
-                kind: VertexKind::Column,
-                name: col.name.clone(),
-                schema: schema.name.clone(),
-            });
-            g.add_edge(contains(&obj_id, &col_id));
+            add_member(g, &obj_id, &schema.name, &obj.name, &col.name, VertexKind::Column);
         }
 
         for con in &obj.constraints {
-            let con_id = VertexId::member(&schema.name, &obj.name, &con.name);
-            g.add_vertex(Vertex {
-                id: con_id.clone(),
-                kind: VertexKind::Constraint,
-                name: con.name.clone(),
-                schema: schema.name.clone(),
-            });
-            g.add_edge(contains(&obj_id, &con_id));
+            add_member(g, &obj_id, &schema.name, &obj.name, &con.name, VertexKind::Constraint);
             if con.kind == "fk" {
                 build_fk_edges(g, schema, obj, con, &obj_id);
             }
         }
 
         for idx in &obj.indexes {
-            let idx_id = VertexId::member(&schema.name, &obj.name, &idx.name);
-            // 컬럼과 인덱스가 이름을 공유할 수 있다(MySQL의 FK 자동 인덱스는
-            // 컬럼 이름을 쓴다) — add_vertex는 first-wins라 인덱스 정점이
-            // 조용히 드랍된다. 사라지는 걸 limitation으로 신고한다.
-            if let Some(existing) = g.vertex(&idx_id) {
-                if existing.kind != VertexKind::Index {
-                    g.add_limitation(format!(
-                        "멤버 id 충돌: {}는 {:?}와 index 양쪽 이름이다 — \
-                         index 정점이 생략되고 usage가 공유 정점에 붙는다",
-                        idx_id.as_str(),
-                        existing.kind,
-                    ));
+            if let Some(idx_id) =
+                add_member(g, &obj_id, &schema.name, &obj.name, &idx.name, VertexKind::Index)
+            {
+                if let Some(u) = &idx.usage {
+                    g.set_usage(idx_id, to_usage(u));
                 }
-            }
-            g.add_vertex(Vertex {
-                id: idx_id.clone(),
-                kind: VertexKind::Index,
-                name: idx.name.clone(),
-                schema: schema.name.clone(),
-            });
-            g.add_edge(contains(&obj_id, &idx_id));
-            if let Some(u) = &idx.usage {
-                g.set_usage(idx_id, to_usage(u));
             }
         }
 
         for trg in &obj.triggers {
-            let trg_id = VertexId::member(&schema.name, &obj.name, &trg.name);
-            g.add_vertex(Vertex {
-                id: trg_id.clone(),
-                kind: VertexKind::Trigger,
-                name: trg.name.clone(),
-                schema: schema.name.clone(),
-            });
-            g.add_edge(contains(&obj_id, &trg_id));
+            let Some(trg_id) = add_member(
+                g,
+                &obj_id,
+                &schema.name,
+                &obj.name,
+                &trg.name,
+                VertexKind::Trigger,
+            ) else {
+                continue;
+            };
             // 발화 대상은 카탈로그가 알려준 사실 — 몸체 파싱 없이도 fires를 둘 수 있다.
             g.add_edge(Edge {
                 from: trg_id,
@@ -144,13 +115,32 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
             Some(sig) if !sig.is_empty() => format!("{}({})", routine.name, sig),
             _ => routine.name.clone(),
         };
-        let rt_id = VertexId::object(&schema.name, &id_name);
+        // 함수와 프로시저는 같은 이름을 공유할 수 있다(MySQL) — member와
+        // 같은 규칙으로 충돌을 분리해 나중 정점이 조용히 드랍되지 않게 한다.
+        let suffix = match kind {
+            VertexKind::Procedure => "procedure",
+            VertexKind::Package => "package",
+            _ => "function",
+        };
+        let Some(rt_id) = resolve_collision(
+            g,
+            VertexId::object(&schema.name, &id_name),
+            &routine.name,
+            kind,
+            suffix,
+            "routine",
+        ) else {
+            continue;
+        };
         g.add_vertex(Vertex {
             id: rt_id.clone(),
             kind,
             name: routine.name.clone(),
             schema: schema.name.clone(),
         });
+        if let Some(u) = &routine.usage {
+            g.set_usage(rt_id.clone(), to_usage(u));
+        }
         g.add_edge(contains(&schema_id, &rt_id));
     }
 }
@@ -219,6 +209,84 @@ fn contains(from: &VertexId, to: &VertexId) -> Edge {
         to: to.clone(),
         kind: EdgeKind::Contains,
         evidence: vec![],
+    }
+}
+
+/// 멤버 정점을 추가한다 — 충돌 시 `@kind` 접미사로 분리한다.
+///
+/// 컬럼·제약·인덱스·트리거는 `schema.object.name` 공간을 공유하는데,
+/// MySQL의 FK 자동 인덱스처럼 다른 kind가 같은 이름을 쓸 수 있다.
+/// add_vertex는 first-wins라 나중 정점이 조용히 드랍되므로, 다른 kind가
+/// 이미 차지한 이름은 `name@kind`로 분리해 정점을 살린다 — `@`는 SQL
+/// 식별자에 못 쓰는 문자라 추가 충돌이 거의 없다. 실제로 쓰인 id를
+/// 돌려주고, 분리조차 실패하면 None(정점 생략 + limitation 신고).
+fn add_member(
+    g: &mut Graph,
+    obj_id: &VertexId,
+    schema: &str,
+    obj: &str,
+    name: &str,
+    kind: VertexKind,
+) -> Option<VertexId> {
+    let base = VertexId::member(schema, obj, name);
+    let suffix = match kind {
+        VertexKind::Column => "column",
+        VertexKind::Constraint => "constraint",
+        VertexKind::Index => "index",
+        VertexKind::Trigger => "trigger",
+        _ => "member",
+    };
+    let id = resolve_collision(g, base, name, kind, suffix, "멤버")?;
+    g.add_vertex(Vertex {
+        id: id.clone(),
+        kind,
+        name: name.to_owned(),
+        schema: schema.to_owned(),
+    });
+    g.add_edge(contains(obj_id, &id));
+    Some(id)
+}
+
+/// id가 이미 점유됐을 때의 분리 규칙 — member·routine 정점이 공유한다.
+/// 같은 kind면 진짜 중복이라 합치고, 다른 kind면 `name@kind`로 옮긴다.
+/// 반환 id가 실제 정점 id — 호출자는 이 id로 정점·간선·usage를 달아야 한다.
+fn resolve_collision(
+    g: &mut Graph,
+    base: VertexId,
+    name: &str,
+    kind: VertexKind,
+    suffix: &str,
+    label: &str,
+) -> Option<VertexId> {
+    match g.vertex(&base) {
+        None => Some(base),
+        Some(v) if v.kind == kind => {
+            // 같은 kind의 같은 이름은 진짜 중복 — 정점은 합쳐지지만 신고한다.
+            g.add_limitation(format!(
+                "{label} 이름 중복: {}는 {suffix}가 이미 있다 — 정점이 합쳐진다",
+                base.as_str(),
+            ));
+            Some(base)
+        }
+        Some(_) => {
+            // `@`는 SQL 식별자에 못 쓰는 문자라 base 뒤에 붙여도 안전하다 —
+            // member/schema.object 어느 깊이든 같은 규칙으로 분리한다.
+            let renamed = VertexId::from_raw(&format!("{}@{suffix}", base.as_str()));
+            if g.vertex(&renamed).is_some() {
+                g.add_limitation(format!(
+                    "{label} id 충돌 미해소: {}와 {} 모두 점유 — {name} {suffix} 정점 생략",
+                    base.as_str(),
+                    renamed.as_str(),
+                ));
+                return None;
+            }
+            g.add_limitation(format!(
+                "{label} id 충돌: {}는 다른 kind가 먼저 차지 — {suffix} 정점은 {}로 분리",
+                base.as_str(),
+                renamed.as_str(),
+            ));
+            Some(renamed)
+        }
     }
 }
 
@@ -351,5 +419,104 @@ mod tests {
         assert_eq!(g.usage(&idx).map(|u| u.reads), Some(7));
         // customers 객체 자체는 미수집 — None이어야 0 관측과 구분된다.
         assert!(g.usage(&VertexId::object("main", "customers")).is_none());
+    }
+
+    #[test]
+    fn 멤버_id_충돌은_kind_접미사로_분리된다() {
+        let mut doc = doc_with_fk();
+        // MySQL의 FK 자동 인덱스는 컬럼 이름을 그대로 쓴다 — 컬럼과 충돌.
+        doc.schemas[0].objects[1].indexes.push(IndexDoc {
+            name: "customer_id".into(),
+            columns: vec!["customer_id".into()],
+            unique: false,
+            usage: Some(UsageDoc {
+                since: Some("2025-01-01".into()),
+                reads: 4,
+                writes: 0,
+            }),
+        });
+        // 제약과도 충돌하는 인덱스 — fk 제약과 같은 이름.
+        doc.schemas[0].objects[1].indexes.push(IndexDoc {
+            name: "orders_fk_0".into(),
+            columns: vec!["customer_id".into()],
+            unique: false,
+            usage: None,
+        });
+
+        let g = document_to_graph(&doc);
+        // 컬럼은 원래 id를 지키고, 인덱스는 @index로 분리된다.
+        assert!(g
+            .vertex(&VertexId::member("main", "orders", "customer_id"))
+            .is_some());
+        let idx_id = VertexId::member("main", "orders", "customer_id@index");
+        let idx = g.vertex(&idx_id).expect("분리된 index 정점");
+        assert_eq!(idx.kind, VertexKind::Index);
+        // usage도 분리된 정점에 붙는다.
+        assert_eq!(g.usage(&idx_id).map(|u| u.reads), Some(4));
+        // 제약 이름과 충돌한 인덱스도 분리된다.
+        assert_eq!(
+            g.vertex(&VertexId::member("main", "orders", "orders_fk_0@index"))
+                .map(|v| v.kind),
+            Some(VertexKind::Index)
+        );
+        // 충돌은 limitation으로 신고된다.
+        assert!(g
+            .limitations()
+            .iter()
+            .any(|l| l.contains("멤버 id 충돌")));
+    }
+
+    #[test]
+    fn routine_이름_충돌과_usage가_분리된_정점에_붙는다() {
+        let mut doc = doc_with_fk();
+        // 테이블과 같은 이름의 함수 — MySQL에선 함수/프로시저가 이름을 공유할 수 있다.
+        doc.schemas[0].routines = vec![
+            RoutineDoc {
+                name: "orders".into(), // 테이블 orders와 충돌
+                kind: "function".into(),
+                language: Some("sql".into()),
+                body: None,
+                signature: None,
+                usage: Some(UsageDoc {
+                    since: Some("2025-01-01".into()),
+                    reads: 12,
+                    writes: 0,
+                }),
+            },
+            RoutineDoc {
+                name: "helper".into(),
+                kind: "procedure".into(),
+                language: Some("sql".into()),
+                body: None,
+                signature: None,
+                usage: Some(UsageDoc {
+                    since: None,
+                    reads: 3,
+                    writes: 0,
+                }),
+            },
+        ];
+
+        let g = document_to_graph(&doc);
+        // 테이블이 base id를 지키고 함수는 @function으로 분리된다.
+        assert_eq!(
+            g.vertex(&VertexId::object("main", "orders")).map(|v| v.kind),
+            Some(VertexKind::Table)
+        );
+        let fn_id = VertexId::from_raw("main.orders@function");
+        assert_eq!(
+            g.vertex(&fn_id).map(|v| v.kind),
+            Some(VertexKind::Function)
+        );
+        // usage는 분리된 정점에 붙는다.
+        assert_eq!(g.usage(&fn_id).map(|u| u.reads), Some(12));
+        assert_eq!(
+            g.usage(&VertexId::object("main", "helper")).map(|u| u.reads),
+            Some(3)
+        );
+        assert!(g
+            .limitations()
+            .iter()
+            .any(|l| l.contains("routine id 충돌")));
     }
 }

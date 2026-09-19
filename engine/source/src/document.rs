@@ -133,4 +133,8 @@ pub struct RoutineDoc {
     /// 같은 이름의 오버로드 구분자(Postgres 인자 시그니처 등). 없으면 생략.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// 사용 통계(pg_stat_user_functions의 calls 등). reads의 단위는
+    /// kind에 따라 다르다 — routine에선 호출 횟수다. 없는 reader는 None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageDoc>,
 }

@@ -486,6 +486,7 @@ async fn read_routines(
             language: Some("sql".to_owned()),
             body,
             signature,
+            usage: None,
         });
     }
     if null_bodies > 0 {
