@@ -207,8 +207,14 @@ elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
         -p "$my_port":3306 mysql:8.4 >/dev/null
     my_own=1
     trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
+    # ping이 떠도 entrypoint가 MYSQL_DATABASE를 만드는 중일 수 있다 —
+    # ping 대기 후 sgfix가 실제로 열릴 때까지 한 번 더 기다린다.
     for _ in $(seq 1 60); do
         docker exec "$my_container" mysqladmin ping -uroot --silent 2>/dev/null && break
+        sleep 2
+    done
+    for _ in $(seq 1 30); do
+        docker exec "$my_container" mysql -uroot sgfix -e "SELECT 1" >/dev/null 2>&1 && break
         sleep 2
     done
     docker exec -i "$my_container" mysql -uroot sgfix < "$MYFIX/basic.sql"

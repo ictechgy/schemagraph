@@ -561,16 +561,94 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger) {
         ControlFlow::<()>::Continue(())
     });
     let _ = visit_expressions(stmt, |e| {
-        if let Expr::CompoundIdentifier(parts) = e {
-            if parts.len() == 2 {
-                let q = parts[0].value.to_ascii_lowercase();
-                if q == "new" || q == "old" {
-                    parsed.fired_columns.push(parts[1].value.clone());
+        match e {
+            Expr::CompoundIdentifier(parts) => {
+                if parts.len() == 2 {
+                    let q = parts[0].value.to_ascii_lowercase();
+                    if q == "new" || q == "old" {
+                        parsed.fired_columns.push(parts[1].value.clone());
+                    }
                 }
             }
+            // 몸체 안의 함수 호출 — 내장 함수는 routine이 아니라 걸러야
+            // count() 같은 호출이 "카탈로그에 없음" 노이즈를 만들지 않는다.
+            Expr::Function(f) => {
+                let t = object_name_parts(&f.name);
+                if !t.1.is_empty() && !is_builtin_function(&t.1) && !parsed.calls.contains(&t) {
+                    parsed.calls.push(t);
+                }
+            }
+            _ => {}
         }
         ControlFlow::<()>::Continue(())
     });
+    // CALL proc(...) 문장 — sqlparser가 파싱하는 방언이면 여기 잡힌다.
+    if let Statement::Call(call) = stmt {
+        let t = object_name_parts(&call.name);
+        if !t.1.is_empty() && !parsed.calls.contains(&t) {
+            parsed.calls.push(t);
+        }
+    }
+}
+
+/// 내장 함수 이름 — 이 목록에 있으면 routine 해석·한계 보고 모두 건너뛴다.
+/// 빠진 내장 함수는 "카탈로그에 없음" notes로 가는데 그것이 정직하다:
+/// 실제로 그래프에 없는 호출이므로, 소비자가 내장 함수로 판별할 수 있다.
+fn is_builtin_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        // 집계·수학
+        "count" | "sum" | "avg" | "min" | "max" | "abs" | "ceil" | "ceiling" | "floor"
+            | "round" | "truncate" | "mod" | "power" | "pow" | "sqrt" | "exp" | "ln" | "log"
+            | "log2" | "log10" | "sign" | "pi" | "rand" | "random" | "greatest" | "least"
+            | "stddev" | "stddev_pop" | "stddev_samp" | "var_pop" | "var_samp" | "variance"
+            // 문자열
+            | "concat" | "concat_ws" | "substring" | "substr" | "position" | "length"
+            | "char_length" | "character_length" | "octet_length" | "upper" | "lower" | "ucase"
+            | "lcase" | "trim" | "ltrim" | "rtrim" | "btrim" | "replace" | "reverse" | "repeat"
+            | "left" | "right" | "lpad" | "rpad" | "instr" | "locate" | "ascii" | "chr" | "char"
+            | "ord" | "soundex" | "format" | "quote_ident" | "quote_literal" | "translate"
+            | "initcap" | "split_part" | "strpos" | "to_hex" | "md5" | "string_agg"
+            | "group_concat" | "array_agg" | "listagg"
+            // 널·조건
+            | "coalesce" | "nullif" | "ifnull" | "isnull" | "nvl" | "nvl2" | "if" | "iif"
+            | "decode" | "greatest" | "case" | "exists"
+            // 날짜·시각
+            | "now" | "curdate" | "curtime" | "current_date" | "current_time"
+            | "current_timestamp" | "localtime" | "localtimestamp" | "date_add" | "date_sub"
+            | "datediff" | "timestampdiff" | "timestampadd" | "date_format" | "str_to_date"
+            | "extract" | "year" | "month" | "day" | "hour" | "minute" | "second" | "week"
+            | "quarter" | "dayofyear" | "dayofmonth" | "dayofweek" | "weekday" | "last_day"
+            | "adddate" | "subdate" | "makedate" | "maketime" | "unix_timestamp"
+            | "from_unixtime" | "sec_to_time" | "time_to_sec" | "timediff" | "date_trunc"
+            | "age" | "make_date" | "make_time" | "make_timestamp" | "to_date"
+            | "to_timestamp" | "to_char" | "to_number" | "to_interval"
+            // 형변환·정체성·컨텍스트
+            | "cast" | "convert" | "current_user" | "session_user" | "system_user" | "user"
+            | "database" | "schema" | "version" | "uuid" | "typeof" | "pg_typeof"
+            | "current_schema" | "current_schemas" | "current_catalog" | "current_setting"
+            | "set_config" | "inet_client_addr" | "inet_server_addr" | "pg_backend_pid"
+            | "pg_postmaster_start_time" | "pg_conf_load_time" | "pg_is_in_recovery"
+            // JSON
+            | "json_extract" | "json_set" | "json_insert" | "json_replace" | "json_remove"
+            | "json_contains" | "json_valid" | "json_length" | "json_keys" | "json_array"
+            | "json_object" | "json_quote" | "json_unquote" | "json_search" | "json_value"
+            | "json_query" | "jsonb_build_object" | "jsonb_build_array" | "to_json"
+            | "to_jsonb" | "row_to_json" | "json_agg" | "jsonb_agg" | "json_extract_path"
+            | "json_extract_path_text" | "jsonb_extract_path" | "jsonb_extract_path_text"
+            // 윈도우·순위
+            | "row_number" | "rank" | "dense_rank" | "ntile" | "lag" | "lead" | "first_value"
+            | "last_value" | "nth_value" | "cume_dist" | "percent_rank"
+            // 기타 흔한 것
+            | "count_big" | "checksum_agg" | "grouping" | "grouping_id" | "sha1" | "sha2"
+            | "compress" | "uncompress" | "crc32" | "inet_aton" | "inet_ntoa" | "is_ipv4"
+            | "is_ipv6" | "name_const" | "sleep" | "get_lock" | "release_lock" | "pg_sleep"
+            | "generate_series" | "unnest" | "array_length" | "cardinality" | "string_to_array"
+            | "array_to_string" | "regexp_replace" | "regexp_matches" | "pg_get_userbyid"
+            | "pg_table_is_visible" | "pg_function_is_visible" | "has_table_privilege"
+            | "has_schema_privilege" | "pg_get_expr" | "format_type" | "obj_description"
+            | "col_description" | "shobj_description" | "txid_current" | "pg_current_xact_id"
+    )
 }
 
 /// DML 문장의 쓰기 대상. SELECT-only 문장은 빈 벡터다.
@@ -767,7 +845,8 @@ fn apply_call_edges(
                 });
             }
             RoutineHit::None => notes.push(format!(
-                "{from}이(가) 부르는 {target_schema}.{name}이 카탈로그에 없음"
+                "{from}이(가) 부르는 {target_schema}.{name}이 카탈로그에 없음 \
+                 (내장 함수이거나 미수집)"
             )),
             RoutineHit::Ambiguous(n) => notes.push(format!(
                 "{from}이(가) 부르는 {target_schema}.{name}에 {n}개 오버로드가 있어 간선 생략"
@@ -1083,6 +1162,66 @@ mod tests {
         let (g, notes) = build(&doc);
         assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Calls));
         assert!(notes.iter().any(|n| n.contains("ghost_fn")));
+    }
+
+    #[test]
+    fn routine_몸체의_함수_호출이_calls_간선이_된다() {
+        let doc = doc_with_routine(
+            vec![
+                routine("order_count", Some("sql"), "SELECT count(*) FROM orders"),
+                routine(
+                    "daily_report",
+                    Some("sql"),
+                    "SELECT order_count() FROM orders LIMIT 1",
+                ),
+            ],
+            "",
+        );
+        let (g, _) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+            && e.from.as_str() == "public.daily_report"
+            && e.to.as_str() == "public.order_count"));
+    }
+
+    #[test]
+    fn 내장_함수는_calls도_notes도_만들지_않는다() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "order_count",
+                Some("sql"),
+                "SELECT count(*), coalesce(max(total), 0) FROM orders",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Calls));
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.contains("count") || n.contains("coalesce")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn call_문장의_프로시저가_calls_간선이_된다() {
+        let mut proc = routine(
+            "touch_customer",
+            Some("sql"),
+            "UPDATE customers SET name = name WHERE id = 1",
+        );
+        proc.kind = "procedure".into();
+        let doc = doc_with_routine(
+            vec![
+                proc,
+                routine("nightly", Some("sql"), "CALL touch_customer(1)"),
+            ],
+            "",
+        );
+        let (g, _) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+            && e.from.as_str() == "public.nightly"
+            && e.to.as_str() == "public.touch_customer"));
     }
 
     #[test]
