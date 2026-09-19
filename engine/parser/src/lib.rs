@@ -612,7 +612,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "group_concat" | "array_agg" | "listagg"
             // 널·조건
             | "coalesce" | "nullif" | "ifnull" | "isnull" | "nvl" | "nvl2" | "if" | "iif"
-            | "decode" | "greatest" | "case" | "exists"
+            | "decode" | "case" | "exists"
             // 날짜·시각
             | "now" | "curdate" | "curtime" | "current_date" | "current_time"
             | "current_timestamp" | "localtime" | "localtimestamp" | "date_add" | "date_sub"
