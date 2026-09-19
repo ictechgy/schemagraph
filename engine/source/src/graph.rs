@@ -150,7 +150,10 @@ fn build_fk_edges(
     // 스키마가 하나뿐인 DB에서 사실상 항상 맞고, 틀릴 경우는 limitations에
     // 남길 수 있는 게 아니라 조용히 다른 정점을 가리키게 되므로 이름이
     // 존재하는지 검사해 없으면 limitation을 남긴다.
-    let target_schema = referenced.schema.clone().unwrap_or_else(|| schema.name.clone());
+    let target_schema = referenced
+        .schema
+        .clone()
+        .unwrap_or_else(|| schema.name.clone());
     let target_id = VertexId::object(&target_schema, &referenced.table);
 
     g.add_edge(Edge {

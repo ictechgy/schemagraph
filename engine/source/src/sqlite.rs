@@ -32,7 +32,8 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
 
     let schema_names = database_list(&pool).await?;
     for schema in schema_names {
-        doc.schemas.push(read_schema(&pool, &schema, &mut doc.limitations).await?);
+        doc.schemas
+            .push(read_schema(&pool, &schema, &mut doc.limitations).await?);
     }
     doc.schemas.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(doc)
@@ -84,7 +85,6 @@ async fn read_schema(
 
     let mut objects: Vec<ObjectDoc> = Vec::new();
     let mut pending_triggers: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut unparsed_views = 0usize;
     let mut inline_constraints = false;
 
     for row in &rows {
@@ -96,11 +96,8 @@ async fn read_schema(
         );
         match kind.as_str() {
             "table" | "view" => {
-                if kind == "view" {
-                    unparsed_views += 1;
-                }
                 // UNIQUE/CHECK는 DDL 안에 박혀 있어 PRAGMA로 못 읽는다.
-                // 몸체 파싱(P1)이 와야 보인다는 사실을 limitations로 남긴다.
+                // 엔진의 몸체 파서가 보강할 때까지 한계로 남긴다.
                 if let Some(ddl) = &sql {
                     let lower = ddl.to_lowercase();
                     if lower.contains("unique") || lower.contains("check") {
@@ -129,10 +126,7 @@ async fn read_schema(
 
     for (tbl, name, sql) in pending_triggers {
         if let Some(obj) = objects.iter_mut().find(|o| o.name == tbl) {
-            obj.triggers.push(TriggerDoc {
-                name,
-                body: sql,
-            });
+            obj.triggers.push(TriggerDoc { name, body: sql });
         } else {
             limitations.push(format!(
                 "trigger {schema}.{name}의 대상 {tbl}을 스캔에서 찾지 못함"
@@ -140,14 +134,9 @@ async fn read_schema(
         }
     }
 
-    if unparsed_views > 0 {
-        limitations.push(format!(
-            "{unparsed_views}개 view 본문을 수집했으나 몸체 파서는 P1이라 reads/writes 간선이 없음"
-        ));
-    }
     if inline_constraints {
         limitations.push(
-            "DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (몸체 파싱 P1 필요)"
+            "DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (인라인 제약 파싱 미지원)"
                 .to_owned(),
         );
     }
@@ -213,8 +202,7 @@ async fn read_constraints(
 
     let mut fk_groups: std::collections::BTreeMap<i64, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
-    let mut fk_targets: std::collections::BTreeMap<i64, String> =
-        std::collections::BTreeMap::new();
+    let mut fk_targets: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
     for r in &fk_rows {
         let id = r.get::<i64, _>("id");
         fk_targets.insert(id, r.get::<String, _>("table"));
@@ -332,11 +320,7 @@ mod tests {
         let main = &doc.schemas[0];
         assert_eq!(main.name, "main");
         let orders = main.objects.iter().find(|o| o.name == "orders").unwrap();
-        let fk = orders
-            .constraints
-            .iter()
-            .find(|c| c.kind == "fk")
-            .unwrap();
+        let fk = orders.constraints.iter().find(|c| c.kind == "fk").unwrap();
         assert_eq!(fk.columns, ["customer_id"]);
         let referenced = fk.referenced.as_ref().unwrap();
         assert_eq!(referenced.table, "customers");
@@ -345,7 +329,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn view_본문을_수집하고_limitation을_남긴다() {
+    async fn view_본문을_수집한다() {
         let doc = fixture_doc(
             "CREATE TABLE a(id INTEGER PRIMARY KEY);
              CREATE VIEW v AS SELECT id FROM a",
@@ -358,7 +342,6 @@ mod tests {
             .unwrap();
         assert_eq!(view.kind, "view");
         assert!(view.body.as_ref().unwrap().contains("SELECT"));
-        assert!(doc.limitations.iter().any(|l| l.contains("view 본문")));
     }
 
     #[tokio::test]

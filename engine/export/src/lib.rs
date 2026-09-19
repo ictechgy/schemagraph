@@ -5,10 +5,8 @@
 //! 같은 입력이 같은 바이트여야 리포트 diff와 캐시가 성립한다
 //! (AGENTS.md "JSON 출력은 결정적이어야 합니다").
 
-use schemagraph_analysis::{CyclesReport, QueryReport};
-use schemagraph_core::{
-    Edge, EdgeKind, EvidenceLayer, Graph, Level, Vertex, VertexKind,
-};
+use schemagraph_analysis::{CyclesReport, ImpactReport, QueryReport};
+use schemagraph_core::{Edge, EdgeKind, EvidenceLayer, Graph, Level, Vertex, VertexKind};
 use serde::{Deserialize, Serialize};
 
 pub mod mermaid;
@@ -253,53 +251,76 @@ pub fn to_pretty_json<T: Serialize>(value: &T) -> serde_json::Result<String> {
 
 // ---------- query/cycles 보고의 와이어 표현 ----------
 
+/// 이웃 목록의 공통 직렬화 — query의 dependents/dependencies와 impact의
+/// impacted가 같은 형태다.
+fn neighbors_value(ns: &[schemagraph_analysis::Neighbor]) -> serde_json::Value {
+    serde_json::Value::Array(
+        ns.iter()
+            .map(|n| {
+                serde_json::json!({
+                    "distance": n.distance,
+                    "edges": n.edges.iter().map(|k| edge_kind_str(*k)).collect::<Vec<_>>(),
+                    "id": n.vertex.id.as_str(),
+                    "kind": vertex_kind_str(n.vertex.kind),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn subject_value(v: &schemagraph_core::Vertex) -> serde_json::Value {
+    serde_json::json!({
+        "id": v.id.as_str(),
+        "kind": vertex_kind_str(v.kind),
+        "level": level_str(v.kind.level()),
+        "name": v.name,
+        "schema": v.schema,
+    })
+}
+
 /// QueryReport → JSON Value. 키 순서는 BTreeMap 정렬에 맡긴다.
 pub fn query_to_value(report: &QueryReport) -> serde_json::Value {
-    let neighbors = |ns: &[schemagraph_analysis::Neighbor]| -> serde_json::Value {
-        serde_json::Value::Array(
-            ns.iter()
-                .map(|n| {
-                    serde_json::json!({
-                        "distance": n.distance,
-                        "edges": n.edges.iter().map(|k| edge_kind_str(*k)).collect::<Vec<_>>(),
-                        "id": n.vertex.id.as_str(),
-                        "kind": vertex_kind_str(n.vertex.kind),
-                    })
-                })
-                .collect(),
-        )
-    };
     let mut value = serde_json::json!({
-        "dependencies": neighbors(&report.dependencies),
-        "dependents": neighbors(&report.dependents),
+        "dependencies": neighbors_value(&report.dependencies),
+        "dependents": neighbors_value(&report.dependents),
         "depth": report.depth,
         "limitations": report.limitations,
-        "subject": {
-            "id": report.subject.id.as_str(),
-            "kind": vertex_kind_str(report.subject.kind),
-            "level": level_str(report.subject.kind.level()),
-            "name": report.subject.name,
-            "schema": report.subject.schema,
-        },
+        "subject": subject_value(&report.subject),
         "truncated": report.truncated,
     });
     // 자기 참조 간선이 있을 때만 selfEdges를 싣는다 — 빈 선택 필드는 키를
     // 빼는 것이 계약이다.
     if !report.self_edges.is_empty() {
-        value["selfEdges"] = serde_json::json!(
-            report.self_edges.iter().map(|k| edge_kind_str(*k)).collect::<Vec<_>>()
-        );
+        value["selfEdges"] = serde_json::json!(report
+            .self_edges
+            .iter()
+            .map(|k| edge_kind_str(*k))
+            .collect::<Vec<_>>());
     }
     value
 }
 
 /// 대상을 못 찾은 경우의 notFound 응답 — limitations도 싣는다.
-pub fn not_found_value(name: &str, candidates: &[schemagraph_core::VertexId], limitations: &[String]) -> serde_json::Value {
+pub fn not_found_value(
+    name: &str,
+    candidates: &[schemagraph_core::VertexId],
+    limitations: &[String],
+) -> serde_json::Value {
     serde_json::json!({
         "candidates": candidates.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
         "found": false,
         "limitations": limitations,
         "name": name,
+    })
+}
+
+/// ImpactReport → JSON Value.
+pub fn impact_to_value(report: &ImpactReport) -> serde_json::Value {
+    serde_json::json!({
+        "impacted": neighbors_value(&report.impacted),
+        "limitations": report.limitations,
+        "subject": subject_value(&report.subject),
+        "truncated": report.truncated,
     })
 }
 

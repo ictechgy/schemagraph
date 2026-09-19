@@ -60,6 +60,16 @@ enum Command {
         #[arg(long, default_value_t = 256)]
         max: usize,
     },
+    /// What breaks if this object is changed or dropped (reverse transitive closure).
+    Impact {
+        /// Object name or qualified id (schema.object[.member]).
+        name: String,
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        /// Max impacted objects before `truncated` is reported.
+        #[arg(long, default_value_t = 1024)]
+        max: usize,
+    },
     /// Report dependency cycles (delete ordering / deadlock analysis).
     Cycles {
         #[arg(short, long, default_value = "graph.json")]
@@ -128,6 +138,7 @@ async fn run(cli: Cli) -> Result<i32> {
             depth,
             max,
         } => query(&name, &graph, depth, max),
+        Command::Impact { name, graph, max } => impact(&name, &graph, max),
         Command::Cycles {
             graph,
             level,
@@ -145,7 +156,12 @@ async fn scan(url: &str, output: &str, emit_document: Option<&std::path::Path>) 
         std::fs::write(path, format!("{json}\n"))
             .with_context(|| format!("catalog document 쓰기 실패: {}", path.display()))?;
     }
-    let graph = source::graph::document_to_graph(&doc);
+    let mut graph = source::graph::document_to_graph(&doc);
+    // 몸체 파싱은 엔진의 일 — reader는 원문만 옮기고 의미는 여기서 해석한다.
+    let (_enriched, notes) = schemagraph_parser::enrich_from_document(&mut graph, &doc);
+    for note in notes {
+        graph.add_limitation(note);
+    }
     let graph_doc = export::graph_to_doc(&graph);
     let json = export::to_pretty_json(&graph_doc)?;
     write_output(output, &json)?;
@@ -155,8 +171,10 @@ async fn scan(url: &str, output: &str, emit_document: Option<&std::path::Path>) 
 /// 지원 안 하는 방언에 걸렸을 때 힌트를 단다.
 fn unsupported_dialect_hint(url: &str) -> String {
     if url.starts_with("postgres") || url.starts_with("mysql") {
-        format!("{url}: 이 방언의 네이티브 reader는 아직 없다 (P0은 sqlite만). \
-                 다른 DB는 P2의 JDBC 프로브를 기다려라")
+        format!(
+            "{url}: 이 방언의 네이티브 reader는 아직 없다 (P0은 sqlite만). \
+                 다른 DB는 P2의 JDBC 프로브를 기다려라"
+        )
     } else {
         format!("스캔 실패: {url}")
     }
@@ -230,7 +248,30 @@ fn query(name: &str, path: &std::path::Path, depth: u32, max: usize) -> Result<i
     match analysis::resolve(&graph, name) {
         Resolve::Found(id) => {
             let report = analysis::query(&graph, &id, depth, max);
-            println!("{}", serde_json::to_string_pretty(&export::query_to_value(&report))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&export::query_to_value(&report))?
+            );
+            Ok(0)
+        }
+        Resolve::NotFound { candidates } => {
+            let value = export::not_found_value(name, &candidates, graph.limitations());
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(1)
+        }
+    }
+}
+
+/// impact — query와 같은 resolve 경로를 타고, 결과만 역방향 클로저로 다르다.
+fn impact(name: &str, path: &std::path::Path, max: usize) -> Result<i32> {
+    let graph = load_graph(path)?;
+    match analysis::resolve(&graph, name) {
+        Resolve::Found(id) => {
+            let report = analysis::impact(&graph, &id, max);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&export::impact_to_value(&report))?
+            );
             Ok(0)
         }
         Resolve::NotFound { candidates } => {
@@ -244,8 +285,15 @@ fn query(name: &str, path: &std::path::Path, depth: u32, max: usize) -> Result<i
 fn cycles(path: &std::path::Path, level: Level, strict: bool) -> Result<i32> {
     let graph = load_graph(path)?;
     let report = analysis::cycles(&graph, level);
-    println!("{}", serde_json::to_string_pretty(&export::cycles_to_value(&report))?);
-    Ok(if strict && !report.cycles.is_empty() { 1 } else { 0 })
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&export::cycles_to_value(&report))?
+    );
+    Ok(if strict && !report.cycles.is_empty() {
+        1
+    } else {
+        0
+    })
 }
 
 fn write_output(output: &str, json: &str) -> Result<()> {

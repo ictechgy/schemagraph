@@ -13,7 +13,9 @@ use schemagraph_core::{EdgeKind, Graph, Level, Vertex, VertexId};
 pub enum Resolve {
     Found(VertexId),
     /// 유일 후보가 없다. 가까운 후보들을 실어준다.
-    NotFound { candidates: Vec<VertexId> },
+    NotFound {
+        candidates: Vec<VertexId>,
+    },
 }
 
 /// 이름 또는 정규 id를 정점으로 해석한다.
@@ -100,6 +102,34 @@ pub fn query(graph: &Graph, subject: &VertexId, depth: u32, max_neighbors: usize
         self_edges,
         depth,
         truncated: dep_trunc || out_trunc,
+        limitations: graph.limitations().to_vec(),
+    }
+}
+
+/// `impact` 보고 — 이 대상을 바꾸거나 지우면 깨지는 것들의 목록.
+///
+/// `query`의 dependents를 무제한 깊이로 펼친 것이다. 그래프 사실
+/// ("이 정점들이 대상에 도달한다")을 보고할 뿐, 깨짐의 심각도 판정은
+/// 소비자가 한다.
+#[derive(Debug)]
+pub struct ImpactReport {
+    pub subject: Vertex,
+    /// 대상에 의존 도달하는 정점들. distance가 곧 전파 거리다.
+    pub impacted: Vec<Neighbor>,
+    pub truncated: bool,
+    pub limitations: Vec<String>,
+}
+
+/// 대상의 역방향 전이 클로저. "이 컬럼/테이블을 바꾸면 뭐가 깨지나"의 답.
+pub fn impact(graph: &Graph, subject: &VertexId, max_neighbors: usize) -> ImpactReport {
+    let vertex = graph
+        .vertex(subject)
+        .expect("impact는 resolve로 확인된 id만 받는다");
+    let (impacted, truncated) = bfs(graph, subject, u32::MAX, max_neighbors, Direction::In);
+    ImpactReport {
+        subject: vertex.clone(),
+        impacted,
+        truncated,
         limitations: graph.limitations().to_vec(),
     }
 }
@@ -253,8 +283,14 @@ mod tests {
         for n in ["a", "b", "c"] {
             g.add_vertex(table("s", n));
         }
-        g.add_edge(dep(&VertexId::object("s", "a"), &VertexId::object("s", "b")));
-        g.add_edge(dep(&VertexId::object("s", "b"), &VertexId::object("s", "c")));
+        g.add_edge(dep(
+            &VertexId::object("s", "a"),
+            &VertexId::object("s", "b"),
+        ));
+        g.add_edge(dep(
+            &VertexId::object("s", "b"),
+            &VertexId::object("s", "c"),
+        ));
         g
     }
 
@@ -316,10 +352,16 @@ mod tests {
     fn cycles는_순환과_자기루프를_보고한다() {
         let mut g = chain();
         // c -> a 추가로 a->b->c->a 순환 완성.
-        g.add_edge(dep(&VertexId::object("s", "c"), &VertexId::object("s", "a")));
+        g.add_edge(dep(
+            &VertexId::object("s", "c"),
+            &VertexId::object("s", "a"),
+        ));
         // 자기 참조 d.
         g.add_vertex(table("s", "d"));
-        g.add_edge(dep(&VertexId::object("s", "d"), &VertexId::object("s", "d")));
+        g.add_edge(dep(
+            &VertexId::object("s", "d"),
+            &VertexId::object("s", "d"),
+        ));
         // 순환에 안 끼는 e.
         g.add_vertex(table("s", "e"));
 
@@ -331,6 +373,30 @@ mod tests {
         let solo = &report.cycles[1];
         assert_eq!(solo.members.len(), 1);
         assert!(solo.self_loop);
+    }
+
+    #[test]
+    fn impact는_전이_의존자를_전부_모은다() {
+        // a -> b -> c: c를 바꾸면 b와 a 둘 다 깨진다.
+        let g = chain();
+        let report = impact(&g, &VertexId::object("s", "c"), 256);
+        assert_eq!(report.impacted.len(), 2);
+        // distance 1이 b, distance 2가 a.
+        let b = report
+            .impacted
+            .iter()
+            .find(|n| n.vertex.id.as_str() == "s.b")
+            .unwrap();
+        let a = report
+            .impacted
+            .iter()
+            .find(|n| n.vertex.id.as_str() == "s.a")
+            .unwrap();
+        assert_eq!(b.distance, 1);
+        assert_eq!(a.distance, 2);
+        // a를 바꾸면 아무것도 안 깨진다.
+        let report_a = impact(&g, &VertexId::object("s", "a"), 256);
+        assert!(report_a.impacted.is_empty());
     }
 
     #[test]

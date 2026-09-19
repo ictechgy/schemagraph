@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 schemagraph-core = { path = "../core" }
 schemagraph-source = { path = "../source" }
+schemagraph-parser = { path = "../parser" }
 schemagraph-analysis = { path = "../analysis" }
 schemagraph-export = { path = "../export" }
 anyhow = "1"

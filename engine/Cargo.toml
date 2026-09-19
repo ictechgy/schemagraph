@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "source", "analysis", "export", "cli"]
+members = ["core", "source", "parser", "analysis", "export", "cli"]
 
 [workspace.package]
 version = "0.1.0"

@@ -4,10 +4,13 @@
 
 ## 지금 상태
 
-- 2026-09-19: **P0 완료.** `engine/` Rust 워크스페이스에 core·source·analysis·
-  export·cli 크레이트. SQLite 네이티브 reader가 카탈로그를 읽어 그래프를 만들고,
-  `scan`/`graph`/`query`/`cycles`가 동작한다. 18개 단위 테스트 통과,
-  `Scripts/verify-fixtures.sh`가 fixture+골든으로 양방향 검증한다.
+- 2026-09-19: **P0 완료** (`651fb12`). `engine/` Rust 워크스페이스에 core·source·
+  analysis·export·cli 크레이트. SQLite 네이티브 reader가 카탈로그를 읽어
+  그래프를 만들고, `scan`/`graph`/`query`/`cycles`가 동작한다.
+- 2026-09-19: **P1 완료** (미커밋 시점에 이 파일 갱신). `parser` 크레이트가
+  sqlparser-rs로 view 본문을 파싱해 `reads` 간선을 만든다(객체·멤버 둘 다).
+  `impact` 명령이 역방향 전이 클로저를 보고한다. 24개 단위 테스트 통과,
+  `Scripts/verify-fixtures.sh`가 reads·impact까지 fixture로 양방향 검증한다.
 
 ## 확정된 결정
 
@@ -27,20 +30,32 @@
 - SQLite는 `mode=ro`로 읽기 전용 접속. attached db도 `database_list`로 다 읽는다.
 - `cargo test`는 CLI 바이너리를 갱신하지 않을 수 있다 — verify 전 `cargo build` 필수
   (verify-fixtures.sh 주석에도 명시).
+- **몸체 파싱은 reader 밖, 엔진의 일** — sqlite.rs는 원문 SQL만 옮기고,
+  cli의 scan 경로가 `parser::enrich_from_document`를 불러 간선을 보강한다.
+  파서 노트는 그래프 limitations에 합류한다.
+- 파서는 sqlparser-rs `visitor` feature의 `visit_relations`/`visit_expressions`를
+  쓴다. 테이블 참조는 전 쿼리에서 수집하지만, **컬럼 참조는 최상위 select의
+  별칭 맵으로만** 해석한다 — 서브쿼리·CTE가 있으면 `has_nested_scope`를 세우고
+  "컬럼 참조 미해석"을 limitations로 남긴다(추측하지 않는 원칙).
+- 파싱 실패·없는 대상 참조는 유령 정점을 만들지 않고 notes로 보고한다.
+- `impact`는 `query`의 dependents를 무제한 깊이로 펼친 것 — distance가 전파 거리.
+  `--max`(기본 1024)로 잘림을 `truncated`로 보고한다.
 
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 18개 테스트
+cd engine && cargo build && cargo test        # 빌드 + 24개 테스트
 Scripts/verify-fixtures.sh                    # fixture 양방향 검증 (골든 diff 포함)
 ```
 
-## 다음 할 일 (P1)
+## 다음 할 일
 
-1. `parser` 크레이트 — sqlparser-rs로 view 본문을 파싱해 `reads` 간선 생성.
-   limitations의 "view 본문 미파싱" 보고가 실제로 줄어드는지 fixture로 확인.
-2. `impact` 명령 — query의 역방향 전이 클로저 + 간선 종류별 분해.
-3. PG·MySQL 네이티브 reader — docker로 로컬 DB 띄워 fixture 검증.
+1. PG·MySQL 네이티브 reader — docker로 로컬 DB 띄워 fixture 검증.
+2. routine/trigger 몸체 파싱 → `writes`/`calls`/`fires` 간선 보강
+   (현재 trigger는 카탈로그 기반 `fires`만 있다).
+3. `dead` — roots 선언 설정 + 도달성 + (통계는 P3 증거).
+4. `rules` — 레이어/순환 규칙 선언.
+5. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).
 
 ## 미결
 

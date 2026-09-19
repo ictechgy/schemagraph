@@ -261,6 +261,28 @@
       "to": "main.products.id"
     },
     {
+      "evidence": [
+        {
+          "detail": "view main.order_totals reads main.customers",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.order_totals",
+      "kind": "reads",
+      "to": "main.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "view main.order_totals reads main.customers.name",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.order_totals",
+      "kind": "reads",
+      "to": "main.customers.name"
+    },
+    {
       "from": "main.order_totals",
       "kind": "contains",
       "to": "main.order_totals.customer_name"
@@ -274,6 +296,39 @@
       "from": "main.order_totals",
       "kind": "contains",
       "to": "main.order_totals.total"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "view main.order_totals reads main.orders",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.order_totals",
+      "kind": "reads",
+      "to": "main.orders"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "view main.order_totals reads main.orders.id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.order_totals",
+      "kind": "reads",
+      "to": "main.orders.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "view main.order_totals reads main.orders.total",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.order_totals",
+      "kind": "reads",
+      "to": "main.orders.total"
     },
     {
       "evidence": [
@@ -380,8 +435,7 @@
     }
   ],
   "limitations": [
-    "1개 view 본문을 수집했으나 몸체 파서는 P1이라 reads/writes 간선이 없음",
-    "DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (몸체 파싱 P1 필요)"
+    "DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (인라인 제약 파싱 미지원)"
   ],
   "version": 1,
   "vertices": [

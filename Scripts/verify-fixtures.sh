@@ -52,7 +52,24 @@ set -e
 [ "$code" -eq 1 ] || { echo "notFound 종료 코드가 1이 아니다: $code" >&2; exit 1; }
 grep -q '"found": false' "$tmp/notfound.json" || { echo "notFound 보고 형식 이상" >&2; exit 1; }
 
-# limitations에 view 미파싱이 실려 있어야 한다(fixture에 view가 있으므로).
-grep -q 'view 본문' "$tmp/graph.json" || { echo "limitations: view 미파싱 미보고" >&2; exit 1; }
+# P1: view 몸체 파싱으로 reads 간선이 만들어져야 한다.
+python3 - "$tmp/graph.json" <<'EOF'
+import json, sys
+edges = {(e["from"], e["to"]) for e in json.load(open(sys.argv[1]))["edges"] if e["kind"] == "reads"}
+want = {
+    ("main.order_totals", "main.orders"),
+    ("main.order_totals", "main.customers"),
+    ("main.order_totals", "main.customers.name"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"reads 간선 미검출: {sorted(missing)}")
+EOF
+
+# P1: impact — customers를 바꾸면 view와 trigger가 전이로 깨진다.
+"$BIN" impact main.customers --graph "$tmp/graph.json" > "$tmp/impact.json"
+grep -q '"main.order_totals"' "$tmp/impact.json" || { echo "impact: order_totals 미검출" >&2; exit 1; }
+grep -q '"main.order_items"' "$tmp/impact.json" || { echo "impact: order_items 전이 미검출" >&2; exit 1; }
+grep -q '"reads"' "$tmp/impact.json" || { echo "impact: reads 간선 종류 미보고" >&2; exit 1; }
 
 echo "verify-fixtures: OK"

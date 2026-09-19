@@ -484,7 +484,7 @@ mod tests {
         g.add_edge(fk(&a, &b));
         g.add_edge(fk(&b, &a));
         g.add_edge(fk(&c, &c)); // 자기 참조 FK
-        // contains 간선은 순환 판정에서 무시된다.
+                                // contains 간선은 순환 판정에서 무시된다.
         g.add_edge(Edge {
             from: VertexId::schema("s"),
             to: a.clone(),
@@ -494,12 +494,19 @@ mod tests {
 
         let sccs = g.strongly_connected();
         // a↔b 순환.
-        assert!(sccs.iter().any(|c| c.len() == 2 && c.contains(&a) && c.contains(&b)));
+        assert!(sccs
+            .iter()
+            .any(|c| c.len() == 2 && c.contains(&a) && c.contains(&b)));
         // c는 자기 참조 — 크기 1 SCC이고 자기 의존 간선을 가진다.
         assert!(sccs.iter().any(|comp| comp.len() == 1 && comp[0] == c));
-        assert!(g.outgoing(&c).iter().any(|e| e.to == c && e.kind.is_dependency()));
+        assert!(g
+            .outgoing(&c)
+            .iter()
+            .any(|e| e.to == c && e.kind.is_dependency()));
         // contains 간선으로는 어떤 SCC도 커지지 않는다.
-        assert!(!sccs.iter().any(|c| c.len() > 1 && c.contains(&VertexId::schema("s"))));
+        assert!(!sccs
+            .iter()
+            .any(|c| c.len() > 1 && c.contains(&VertexId::schema("s"))));
     }
 
     #[test]
@@ -508,7 +515,7 @@ mod tests {
         let a = VertexId::object("s", "a");
         g.add_vertex(table("s", "a"));
         g.add_edge(fk(&a, &a)); // 자기 참조 FK — 진짜 자기 루프
-        // 멤버→멤버 간선은 object로 투영하면 자기처럼 보이지만 붕괴품이다.
+                                // 멤버→멤버 간선은 object로 투영하면 자기처럼 보이지만 붕괴품이다.
         let col = VertexId::member("s", "a", "x");
         g.add_vertex(Vertex {
             id: col.clone(),
@@ -544,7 +551,10 @@ mod tests {
         let col = VertexId::member("main", "orders", "customer_id");
         assert_eq!(col.parent().unwrap().as_str(), "main.orders");
         assert_eq!(
-            VertexId::object("main", "orders").parent().unwrap().as_str(),
+            VertexId::object("main", "orders")
+                .parent()
+                .unwrap()
+                .as_str(),
             "main"
         );
         assert!(VertexId::schema("main").parent().is_none());

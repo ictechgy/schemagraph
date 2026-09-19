@@ -1,0 +1,11 @@
+[package]
+name = "schemagraph-parser"
+description = "SQL body parsing into dependency edges for schemagraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+schemagraph-core = { path = "../core" }
+schemagraph-source = { path = "../source" }
+sqlparser = { version = "0.58", features = ["visitor"] }
