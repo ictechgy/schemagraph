@@ -744,6 +744,35 @@ ghosts = [v["id"] for v in g["vertices"] if ";" in v["id"]]
 if ghosts:
     sys.exit(f"probe(MSSQL): ;N 유령 정점: {ghosts}")
 EOF
+
+        # Go 프로브(probe-go) — JVM 없는 경로가 JVM 프로브와 같은 그래프를
+        # 내는지 패리티로 검증한다(Oracle 섹션과 같은 선택 검증).
+        if command -v go >/dev/null 2>&1 && \
+            [[ "$mssql_jdbc" =~ jdbc:sqlserver://([^;:]+):([0-9]+)\;databaseName=([^;]+) ]]; then
+            ms_go_url="sqlserver://${ms_user}:${ms_pass}@${BASH_REMATCH[1]}:${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+            # Azure SQL Edge 계열은 Go TLS가 서버 인증서를 못 읽는다(negative
+            # serial) — JDBC의 encrypt=false와 같은 의도로 평문 접속한다.
+            [[ "$mssql_jdbc" =~ encrypt=false ]] && ms_go_url+="?encrypt=disable"
+            [ -x "$tmp/schemagraph-probe-go" ] || \
+                (cd "$PWD/probe-go" && go build -o "$tmp/schemagraph-probe-go" .) || \
+                { echo "probe-go 빌드 실패" >&2; exit 1; }
+            "$tmp/schemagraph-probe-go" --url "$ms_go_url" -o "$tmp/probe-go-ms-doc.json"
+            "$BIN" scan --document "$tmp/probe-go-ms-doc.json" -o "$tmp/probe-go-ms-graph.json"
+            python3 - "$tmp/probe-ms-graph.json" "$tmp/probe-go-ms-graph.json" <<'EOF'
+import json, sys
+def load(p):
+    g = json.load(open(p))
+    return ({v["id"] for v in g["vertices"]},
+            {(e["kind"], e["from"], e["to"]) for e in g["edges"]})
+jv, je = load(sys.argv[1])
+gv, ge = load(sys.argv[2])
+if jv != gv or je != ge:
+    sys.exit(f"probe-go(MSSQL) 패리티 불일치 — verts diff: {sorted(jv^gv)} "
+             f"edges diff: {sorted(je^ge)}")
+EOF
+        else
+            echo "주의: go가 없거나 MSSQL URL을 변환 못 해 probe-go(MSSQL) 검증 건너뜀" >&2
+        fi
     else
         echo "주의: MSSQL을 찾지 못해 probe-MSSQL 검증 건너뜀 (SG_MSSQL_URL 또는 docker)" >&2
     fi
