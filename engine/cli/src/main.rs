@@ -162,7 +162,7 @@ async fn run(cli: Cli) -> Result<i32> {
 async fn scan(url: &str, output: &str, emit_document: Option<&std::path::Path>) -> Result<i32> {
     let doc = source::read(url)
         .await
-        .with_context(|| unsupported_dialect_hint(url))?;
+        .with_context(|| format!("스캔 실패: {url}"))?;
     if let Some(path) = emit_document {
         let json = export::to_pretty_json(&doc)?;
         std::fs::write(path, format!("{json}\n"))
@@ -178,15 +178,6 @@ async fn scan(url: &str, output: &str, emit_document: Option<&std::path::Path>) 
     let json = export::to_pretty_json(&graph_doc)?;
     write_output(output, &json)?;
     Ok(0)
-}
-
-/// 지원 안 하는 방언에 걸렸을 때 힌트를 단다.
-fn unsupported_dialect_hint(url: &str) -> String {
-    if url.starts_with("mysql") {
-        format!("{url}: mysql 네이티브 reader는 아직 없다 — P2의 JDBC 프로브를 기다려라")
-    } else {
-        format!("스캔 실패: {url}")
-    }
 }
 
 fn load_graph(path: &std::path::Path) -> Result<Graph> {

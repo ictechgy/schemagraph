@@ -181,4 +181,89 @@ else
     echo "주의: PostgreSQL을 찾지 못해 PG 검증 건너뜀 (SG_PG_URL로 지정 가능)" >&2
 fi
 
+# ── MySQL ───────────────────────────────────────────────────────────────
+# SG_MYSQL_URL이 있으면 그 서버를 쓴다 — fixture를 새로 적용하니 폐기용
+# DB만 지정해라. 적용은 SG_MYSQL_CONTAINER가 있으면 docker exec로,
+# 없으면 로컬 mysql 클라이언트로 한다. URL이 없으면 docker로 임시
+# 인스턴스를 띄운다. 둘 다 없으면 건너뛰고 안내한다.
+MYFIX="Fixtures/mysql"
+my_url=""
+my_container=""
+my_own=""
+
+if [ -n "${SG_MYSQL_URL:-}" ]; then
+    my_url="$SG_MYSQL_URL"
+    my_container="${SG_MYSQL_CONTAINER:-}"
+    if [ -z "$my_container" ] && ! command -v mysql >/dev/null; then
+        echo "주의: SG_MYSQL_URL이 있는데 mysql 클라이언트가 없어 MySQL 검증 건너뜀" >&2
+        echo "  (SG_MYSQL_CONTAINER로 서버 컨테이너를 지정하면 docker exec로 적용한다)" >&2
+        my_url=""
+    fi
+elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+    my_container="sg-verify-mysql-$$"
+    my_port=$((33400 + RANDOM % 90))
+    docker run -d --name "$my_container" \
+        -e MYSQL_ALLOW_EMPTY_PASSWORD=1 -e MYSQL_DATABASE=sgfix \
+        -p "$my_port":3306 mysql:8.4 >/dev/null
+    my_own=1
+    trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
+    for _ in $(seq 1 60); do
+        docker exec "$my_container" mysqladmin ping -uroot --silent 2>/dev/null && break
+        sleep 2
+    done
+    docker exec -i "$my_container" mysql -uroot sgfix < "$MYFIX/basic.sql"
+    my_url="mysql://root@localhost:$my_port/sgfix"
+fi
+
+if [ -n "$my_url" ]; then
+    if [ -z "$my_own" ]; then
+        # 외부 서버 — fixture를 새로 적용한다(폐기용 DB 계약).
+        if [ -n "$my_container" ]; then
+            docker exec -i "$my_container" mysql -uroot sgfix < "$MYFIX/basic.sql"
+        else
+            # mysql://user[:pass]@host[:port]/db 를 클라이언트 인자로 푼다.
+            if [[ "$my_url" =~ mysql://([^:/@]+)(:([^@]*))?@([^:/]+)(:([0-9]+))?/([^?]+) ]]; then
+                MYSQL_PWD="${BASH_REMATCH[3]}" mysql -h "${BASH_REMATCH[4]}" \
+                    -P "${BASH_REMATCH[6]:-3306}" -u "${BASH_REMATCH[1]}" \
+                    "${BASH_REMATCH[7]}" < "$MYFIX/basic.sql"
+            else
+                echo "주의: SG_MYSQL_URL 형식을 못 풀어 fixture 적용 건너뜀" >&2
+            fi
+        fi
+    fi
+
+    "$BIN" scan "$my_url" -o "$tmp/graph-my.json"
+
+    if [ -f "$MYFIX/basic.graph.golden.json" ]; then
+        diff -u "$MYFIX/basic.graph.golden.json" "$tmp/graph-my.json"
+    else
+        echo "주의: MySQL 골든이 없다. 첫 출력을 검토하고 골든으로 고정해라:" >&2
+        echo "  cp $tmp/graph-my.json $MYFIX/basic.graph.golden.json" >&2
+    fi
+
+    # MySQL 스모크: a↔b 순환, view member reads, trigger writes+fires,
+    # procedure의 writes.
+    "$BIN" cycles --graph "$tmp/graph-my.json" --level object > "$tmp/cycles-my.json"
+    grep -q '"sgfix.a"' "$tmp/cycles-my.json" || { echo "MySQL cycles: sgfix.a 미검출" >&2; exit 1; }
+    grep -q '"selfLoop": true' "$tmp/cycles-my.json" || { echo "MySQL cycles: 자기루프 미검출" >&2; exit 1; }
+
+    python3 - "$tmp/graph-my.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+edges = {(e["kind"], e["from"], e["to"]) for e in g["edges"]}
+want = {
+    ("writes", "sgfix.orders.trg_orders_touch", "sgfix.customers"),
+    ("reads", "sgfix.orders.trg_orders_touch", "sgfix.orders.customer_id"),
+    ("fires", "sgfix.orders.trg_orders_touch", "sgfix.orders"),
+    ("writes", "sgfix.touch_customer(int)", "sgfix.customers"),
+    ("reads", "sgfix.order_totals", "sgfix.orders.id"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"MySQL 간선 미검출: {sorted(missing)}")
+EOF
+else
+    echo "주의: MySQL을 찾지 못해 MySQL 검증 건너뜀 (SG_MYSQL_URL 또는 docker)" >&2
+fi
+
 echo "verify-fixtures: OK"

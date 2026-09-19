@@ -11,15 +11,18 @@
   sqlparser-rs로 view 본문을 파싱해 `reads` 간선을 만들고(객체·멤버 둘 다),
   trigger 본문을 파싱해 `writes`·`reads`·`NEW./OLD.` member 간선을 만든다.
   `impact` 명령이 역방향 전이 클로저를, `dead`가 DB 내부 도달성 후보를 보고한다.
-- 2026-09-19: **PG 네이티브 reader + routine 파싱 완료** (커밋 예정).
-  `source::read`가 URL 스킴으로 디스패치한다 — postgres(계열)는 sqlx로 읽고,
-  mysql은 명시적 미지원 오류, 나머지는 SQLite. PG 리더는 read-only 세션으로
+- 2026-09-19: **PG 네이티브 reader + routine 파싱 완료** (`2dc4123`).
+  `source::read`가 URL 스킴으로 디스패치한다. PG 리더는 read-only 세션으로
   스키마·테이블·컬럼·제약·인덱스·trigger·시퀀스·routine을 수집한다.
   파서는 PG trigger의 `EXECUTE FUNCTION`을 껍질에서 직접 채취해 첫 `calls`
   간선을 만들고, `language=sql` routine 몸체의 `AS $$…$$` 껍질을 벗겨
   reads/writes를 파싱한다. plpgsql 등 미지원 언어는 limitation으로 보고한다.
-  38개 테스트 통과, verify-fixtures.sh가 임시 PG 인스턴스를 자동으로 띄워
-  골든까지 검증한다(없으면 건너뛰고 안내).
+- 2026-09-19: **MySQL 네이티브 reader 완료** (커밋 예정). information_schema로
+  스키마·테이블·컬럼·제약·인덱스·trigger·routine을 읽는다 — PG와 달리
+  카탈로그가 information_schema 하나로 모인다. URL에 DB가 있으면 그것만,
+  없으면 시스템 스키마를 뺀 전부를 읽는다. `mysqlx://`(X Protocol)는
+  명시적 미지원 오류다. 40개 테스트 통과, verify-fixtures.sh가 docker로
+  임시 MySQL을 띄워 골든까지 검증한다(없으면 건너뛰고 안내).
 
 ## 확정된 결정
 
@@ -74,24 +77,38 @@
 - routine 몸체는 `language=sql`/무표기만 파싱한다. `pg_get_functiondef`의
   `AS $$…$$`·`AS '…'` 껍질은 `extract_as_body`가 벗긴다. plpgsql 등은
   파싱하지 않고 limitation — 몸체 간선이 없다는 사실을 숨기지 않는다.
+- **MySQL information_schema는 문자열 컬럼이 binary collation으로 온다** —
+  모든 문자열 컬럼에 `CAST(x AS CHAR)`가 필요하고, ENUM 컬럼
+  (table_type·constraint_type·routine_type·is_nullable)도 마찬가지다.
+  `non_unique`는 INT라 i64로 받는다.
+- MySQL `parameters`는 함수 **반환값도 행으로** 준다(ordinal_position=0) —
+  시그니처에서 빼야 `fn()` 같은 가짜 인자가 안 생긴다. 같은 이름의
+  function/procedure는 시그니처까지 같으면 정점 id가 충돌 — limitation으로
+  보고하고 합쳐진다는 사실을 숨기지 않는다.
+- MySQL routine 몸체는 `language=sql`로 채운다(카탈로그에 언어 열이 없고
+  MySQL 저장 루틴은 SQL뿐이라는 제품 지식). FUNCTION의 RETURN도
+  sqlparser가 파싱한다 — 실제로 reads 간선이 나오는지 fixture로 확인했다.
+- 읽기 전용: MySQL 8은 `SET SESSION transaction_read_only=1`, MariaDB는
+  `tx_read_only` — 둘 다 시도하고 실패해도 스캔은 계속한다.
 
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 38개 테스트
-Scripts/verify-fixtures.sh                    # SQLite + PG fixture 양방향 검증
-# PG 검증은 임시 인스턴스를 자동 프로비전한다. 직접 지정하려면:
-#   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh  (폐기용 DB만!)
+cd engine && cargo build && cargo test        # 빌드 + 40개 테스트
+Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL fixture 양방향 검증
+# PG는 initdb로, MySQL은 docker로 임시 인스턴스를 자동 프로비전한다. 직접 지정:
+#   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh      (폐기용 DB만!)
+#   SG_MYSQL_URL=mysql://user@host/db SG_MYSQL_CONTAINER=<이름> ...   (컨테이너면 docker exec로 적용)
 ```
 
 ## 다음 할 일
 
-1. MySQL 네이티브 reader — 지금은 mysql:// URL이 명시적 미지원 오류.
-   information_schema.ROUTINES·TRIGGERS 수집 + docker/로컬 fixture.
-2. `rules` — 레이어/순환 규칙 선언 (config 파일이 P2와 같이 온다).
-3. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).
-4. routine `calls`의 몸체 내부 호출 — 지금은 trigger의 EXECUTE FUNCTION만
+1. `rules` — 레이어/순환 규칙 선언 (config 파일이 P2와 같이 온다).
+2. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).
+3. routine `calls`의 몸체 내부 호출 — 지금은 trigger의 EXECUTE FUNCTION만
    잡는다. routine 몸체의 CALL/함수 호출 식 추출은 파서 커버리지와 같이.
+4. MariaDB 검증 — reader는 같은 information_schema지만 시퀀스·
+   tx_read_only 등 차이가 있어 별도 fixture가 필요하다.
 
 ## 미결
 
