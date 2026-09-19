@@ -99,6 +99,8 @@ enum Command {
         #[arg(short, long, default_value = "graph.json")]
         graph: PathBuf,
     },
+    /// Print the agent skill document for consuming this tool's output.
+    Skill,
     /// Check declared dependency rules against the graph (CI gate).
     Rules {
         #[arg(short, long, default_value = "graph.json")]
@@ -185,6 +187,12 @@ async fn run(cli: Cli) -> Result<i32> {
             strict,
         } => cycles(&graph, level.level(), strict),
         Command::Stats { graph } => stats(&graph),
+        Command::Skill => {
+            // 스킬 원본은 저장소의 skills/schemagraph/SKILL.md — 에이전트가
+            // 저장소에서 직접 읽을 수도 있고 이 명령으로 설치할 수도 있다.
+            print!("{}", include_str!("../../../skills/schemagraph/SKILL.md"));
+            Ok(0)
+        }
         Command::Rules {
             graph,
             config,
