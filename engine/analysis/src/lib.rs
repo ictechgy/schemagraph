@@ -351,6 +351,118 @@ pub fn cycles(graph: &Graph, level: Level) -> CyclesReport {
     }
 }
 
+// ── rules ────────────────────────────────────────────────────────────────
+// 설정 파일이 선언한 금지 규칙을 그래프에 대조한다. cartograph의 레이어
+// 규칙에 대응한다 — "reporting 스키마는 core를 쓰면 안 된다" 같은 선언을
+// 간선 단위로 검사한다.
+
+/// 금지 규칙 하나: `from` 글롭이 `to` 글롭을 참조하는 의존성 간선이 있으면
+/// 위반이다.
+#[derive(Debug, Clone)]
+pub struct Rule {
+    /// 규칙 이름 — 보고와 CI 로그에서 사람이 읽는 이름이다.
+    pub name: String,
+    /// 출발 정점 id 글롭 (`*`는 임의 문자열, `?`는 한 글자).
+    pub from: String,
+    /// 도착 정점 id 글롭.
+    pub to: String,
+    /// 검사할 간선 종류. None이면 의존성 간선 전부(Contains·Inferred 제외
+    /// — 담는 관계는 쓰는 관계가 아니고, 추정은 판정 근거가 아니다).
+    pub kinds: Option<BTreeSet<EdgeKind>>,
+}
+
+/// 규칙 위반 한 건 — 위반한 간선을 그대로 보고한다.
+#[derive(Debug)]
+pub struct RuleViolation {
+    /// 위반한 규칙 이름.
+    pub rule: String,
+    /// 위반 간선의 출발 정점.
+    pub from: VertexId,
+    /// 위반 간선의 도착 정점.
+    pub to: VertexId,
+    /// 위반 간선의 종류.
+    pub kind: EdgeKind,
+}
+
+/// `rules` 결과 보고.
+#[derive(Debug)]
+pub struct RulesReport {
+    /// 검사한 규칙 수 — 규칙이 0이면 "통과"가 아니라 "검사한 게 없다"다.
+    pub checked: usize,
+    /// 규칙 이름 순으로 정렬된 위반 목록.
+    pub violations: Vec<RuleViolation>,
+    /// 그래프가 실은 분석 한계(파서 노트 등)를 그대로 전달한다.
+    pub limitations: Vec<String>,
+}
+
+/// 모든 규칙을 그래프의 모든 간선에 대조한다.
+pub fn rules(graph: &Graph, rule_set: &[Rule]) -> RulesReport {
+    let mut violations = Vec::new();
+    for rule in rule_set {
+        for edge in graph.edges() {
+            if !edge.kind.is_dependency() {
+                continue;
+            }
+            if let Some(kinds) = &rule.kinds {
+                if !kinds.contains(&edge.kind) {
+                    continue;
+                }
+            }
+            if glob_match(&rule.from, edge.from.as_str()) && glob_match(&rule.to, edge.to.as_str())
+            {
+                violations.push(RuleViolation {
+                    rule: rule.name.clone(),
+                    from: edge.from.clone(),
+                    to: edge.to.clone(),
+                    kind: edge.kind,
+                });
+            }
+        }
+    }
+    violations.sort_by(|a, b| {
+        a.rule
+            .cmp(&b.rule)
+            .then(a.from.cmp(&b.from))
+            .then(a.to.cmp(&b.to))
+    });
+    RulesReport {
+        checked: rule_set.len(),
+        violations,
+        limitations: graph.limitations().to_vec(),
+    }
+}
+
+/// 글롭 매칭 — `*`는 임의 길이(점 포함), `?`는 정확히 한 글자.
+/// 정규식 없이 직접 매칭한다 — 정점 id가 `.`을 많이 쓰는데 `*`가 점을
+/// 포함해야 `reporting.*`가 `reporting.orders.id`까지 덮는다.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    // 재귀 DP 대신 두 포인터 백트래킹 — 글롭 표준 알고리즘.
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_p, mut star_t) = (usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_p = pi;
+            star_t = ti;
+            pi += 1;
+        } else if star_p != usize::MAX {
+            pi = star_p + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,5 +718,83 @@ mod tests {
         ));
         let report = dead(&g, 256);
         assert!(report.candidates.is_empty());
+    }
+
+    #[test]
+    fn glob은_별이_점까지_덮고_물음표는_한글자다() {
+        assert!(glob_match("reporting.*", "reporting.orders"));
+        // `*`는 점도 덮는다 — member id까지 매치돼야 스키마 규칙이 컬럼에도 적용된다.
+        assert!(glob_match("reporting.*", "reporting.orders.id"));
+        assert!(glob_match("*", "anything.at.all"));
+        assert!(!glob_match("core.*", "corex.orders"));
+        assert!(glob_match("s.t?", "s.t1"));
+        assert!(!glob_match("s.t?", "s.t12"));
+        assert!(glob_match("a*b*c", "aXbYc"));
+        assert!(!glob_match("a*b", "ab_")); // 패턴은 'b'로 끝나야 한다
+        assert!(glob_match("a*b", "axb"));
+        assert!(!glob_match("", "x"));
+        assert!(glob_match("", ""));
+    }
+
+    #[test]
+    fn rules는_금지_간선을_규칙별로_보고한다() {
+        let mut g = Graph::new();
+        g.add_vertex(table("reporting", "rpt"));
+        g.add_vertex(table("core", "cust"));
+        g.add_vertex(table("core", "ord"));
+        // reporting.rpt -> core.cust (reads) — 금지 대상.
+        g.add_edge(reads(
+            &VertexId::object("reporting", "rpt"),
+            &VertexId::object("core", "cust"),
+        ));
+        // reporting.rpt -> core.ord (contains 아닌 writes) — kinds 필터 밖이면 통과.
+        let mut w = dep(
+            &VertexId::object("reporting", "rpt"),
+            &VertexId::object("core", "ord"),
+        );
+        w.kind = EdgeKind::Writes;
+        g.add_edge(w);
+
+        // 규칙 1: reporting.* -> core.* 모든 의존성 — 2건 위반.
+        let r_all = Rule {
+            name: "reporting→core 금지".into(),
+            from: "reporting.*".into(),
+            to: "core.*".into(),
+            kinds: None,
+        };
+        let report = rules(&g, &[r_all]);
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.violations.len(), 2);
+
+        // 규칙 2: kinds=[writes] — writes 간선만 위반.
+        let r_writes = Rule {
+            name: "reporting→core 쓰기 금지".into(),
+            from: "reporting.*".into(),
+            to: "core.*".into(),
+            kinds: Some(BTreeSet::from([EdgeKind::Writes])),
+        };
+        let report2 = rules(&g, &[r_writes]);
+        assert_eq!(report2.violations.len(), 1);
+        assert_eq!(report2.violations[0].kind, EdgeKind::Writes);
+    }
+
+    #[test]
+    fn rules는_contains와_inferred는_간선으로_세지_않는다() {
+        let mut g = Graph::new();
+        g.add_vertex(table("reporting", "rpt"));
+        g.add_vertex(table("core", "cust"));
+        let mut contains = dep(
+            &VertexId::object("reporting", "rpt"),
+            &VertexId::object("core", "cust"),
+        );
+        contains.kind = EdgeKind::Contains;
+        g.add_edge(contains);
+        let r = Rule {
+            name: "r".into(),
+            from: "*".into(),
+            to: "*".into(),
+            kinds: None,
+        };
+        assert!(rules(&g, &[r]).violations.is_empty());
     }
 }

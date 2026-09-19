@@ -1,0 +1,23 @@
+# schemagraph fixture 규칙 — verify-fixtures.sh가 이 파일로 `rules` 질의를
+# 검증한다. 스키마 접두는 * 글롭이라 sqlite(main)·PG(public)·MySQL(sgfix)
+# 세 fixture에 공용으로 쓴다.
+
+[[rule]]
+# 의도적 위반 — order_items -> orders FK는 세 fixture 모두에 있어서
+# 위반 보고·strict 종료 코드 1을 검증한다.
+name = "order_items는 orders를 참조하지 않는다"
+from = "*.order_items"
+to = "*.orders"
+
+[[rule]]
+# 통과 규칙 — view는 어디에도 쓰지 않아야 한다.
+name = "view는 테이블을 쓰지 않는다"
+from = "*.order_totals"
+to = "*"
+kinds = ["writes"]
+
+[[rule]]
+# 통과 규칙 — trigger는 products를 건드리지 않는다.
+name = "trigger는 products를 건드리지 않는다"
+from = "*.orders.trg_orders_touch"
+to = "*.products"

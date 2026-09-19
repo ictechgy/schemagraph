@@ -17,12 +17,17 @@
   파서는 PG trigger의 `EXECUTE FUNCTION`을 껍질에서 직접 채취해 첫 `calls`
   간선을 만들고, `language=sql` routine 몸체의 `AS $$…$$` 껍질을 벗겨
   reads/writes를 파싱한다. plpgsql 등 미지원 언어는 limitation으로 보고한다.
-- 2026-09-19: **MySQL 네이티브 reader 완료** (커밋 예정). information_schema로
+- 2026-09-19: **MySQL 네이티브 reader 완료** (`c36b6f8`). information_schema로
   스키마·테이블·컬럼·제약·인덱스·trigger·routine을 읽는다 — PG와 달리
   카탈로그가 information_schema 하나로 모인다. URL에 DB가 있으면 그것만,
   없으면 시스템 스키마를 뺀 전부를 읽는다. `mysqlx://`(X Protocol)는
-  명시적 미지원 오류다. 40개 테스트 통과, verify-fixtures.sh가 docker로
-  임시 MySQL을 띄워 골든까지 검증한다(없으면 건너뛰고 안내).
+  명시적 미지원 오류다. verify-fixtures.sh가 docker로 임시 MySQL을 띄워
+  골든까지 검증한다(없으면 건너뛰고 안내).
+- 2026-09-19: **몸체 내부 호출 + rules 명령 완료** (커밋 예정).
+  routine/trigger 몸체의 `Expr::Function`·`Statement::Call`이 calls 간선이
+  된다(내장 함수 필터로 노이즈 차단). `schemagraph rules --config
+  schemagraph.toml`이 `from`/`to` 글롭 규칙을 간선 단위로 검사해 위반을
+  보고하고 `--strict`로 CI 게이트가 된다. 46개 테스트 통과.
 
 ## 확정된 결정
 
@@ -103,12 +108,13 @@ Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL fixture 양�
 
 ## 다음 할 일
 
-1. `rules` — 레이어/순환 규칙 선언 (config 파일이 P2와 같이 온다).
-2. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).
-3. routine `calls`의 몸체 내부 호출 — 지금은 trigger의 EXECUTE FUNCTION만
-   잡는다. routine 몸체의 CALL/함수 호출 식 추출은 파서 커버리지와 같이.
-4. MariaDB 검증 — reader는 같은 information_schema지만 시퀀스·
+1. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).
+2. MariaDB 검증 — reader는 같은 information_schema지만 시퀀스·
    tx_read_only 등 차이가 있어 별도 fixture가 필요하다.
+3. `stats` — pg_stat·information_schema.table_statistics 같은 사용 통계를
+   증거 계층으로 붙여 `dead` 후보의 근거를 강화한다.
+4. rules 확장 — 지금은 "금지 간선"만. 허용 목록·필수 간선·스키마 계층
+   규칙 같은 방향은 수요가 생기면.
 
 ## 미결
 

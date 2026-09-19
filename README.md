@@ -1,14 +1,11 @@
 # schemagraph
 
-> **Status: design phase.** The authoritative design lives in [DESIGN.md](DESIGN.md)
-> (Korean). No code yet.
-
 schemagraph builds a dependency graph of a database schema — tables, columns,
 views, routines, triggers, foreign keys — and answers **judgment queries** on it:
 
 - `impact` — what breaks if this column or table is changed or dropped
 - `cycles` — circular dependencies (delete ordering, batch deadlock analysis)
-- `dead` — objects nothing reaches, with usage-statistics evidence attached
+- `dead` — objects nothing reaches inside the database (candidates, never verdicts)
 - `rules` — team architecture rules evaluated over the schema graph
 - `query` — who uses this / what does it use (deterministic JSON, agent-first)
 
@@ -35,27 +32,60 @@ The engine never touches a database directly; the probe is a dumb extractor
 that moves catalog rows and body text. Parse failures are measured and
 reported in `limitations`, not hidden.
 
-## Commands (planned)
+## Commands
 
 ```
-schemagraph scan <url> [-o graph.json]
+schemagraph scan <url> [-o graph.json]   # sqlite:PATH, postgres://…, mysql://…
 schemagraph graph --format mermaid|json|dot [--level schema|object|column]
 schemagraph query <object> [--depth N]
 schemagraph impact <object>
-schemagraph cycles [--level object|column]
-schemagraph dead
-schemagraph rules
-schemagraph stats <url>
-schemagraph diff <old.json> <new.json>
-schemagraph skill
+schemagraph cycles [--level object|column] [--strict]
+schemagraph dead [--strict]
+schemagraph rules [--config schemagraph.toml] [--strict]
 ```
+
+`--strict` exits 1 when findings are reported, for CI gates.
+
+## Rules file
+
+`schemagraph rules` reads a TOML file (default `schemagraph.toml`). Each rule
+forbids dependency edges matching a `from` glob → `to` glob; `*` covers any
+characters including dots, `?` covers exactly one.
+
+```toml
+[[rule]]
+name = "reporting must not write to core"
+from = "reporting.*"
+to = "core.*"
+kinds = ["writes"]           # optional; default = all dependency kinds
+
+[[rule]]
+name = "views must not call routines"
+from = "*.order_totals"
+to = "*"
+kinds = ["calls"]
+```
+
+Output lists every violating edge with its rule name; `checked: 0` means no
+rules were evaluated — not "pass".
+
+## Current state
+
+- Readers: SQLite, PostgreSQL, MySQL (native `sqlx`). `mysqlx://` is explicitly
+  unsupported.
+- Body parsing: views (`reads`, object + member level), triggers
+  (`writes`/`reads`/`NEW.`/`OLD.`, `EXECUTE FUNCTION` → `calls`), SQL-language
+  routines (`reads`/`writes`/`calls`). `plpgsql` and other procedural
+  languages are reported in `limitations`, not parsed.
+- Deterministic JSON everywhere; unknown targets never become ghost vertices —
+  they land in `limitations`.
 
 ## Roadmap
 
-- **P0** — core graph model + native readers (PG/MySQL/SQLite) + `scan`/`graph`/`query`/`cycles`
-- **P1** — view/routine/trigger bodies via sqlparser-rs + `impact`
-- **P2** — catalog document protocol + Kotlin JDBC probe ("any JDBC database") + `rules` + config
-- **P3** — `stats` + `dead` + mermaid export + `skill`
-- **P4** — MSSQL/Oracle rich probes, `diff`, inferred edges, Go probe if native-only distribution is demanded
+- **P0** — core graph model + native readers + `scan`/`graph`/`query`/`cycles` — done
+- **P1** — body parsing + `impact` + `dead` — done
+- **P2** — catalog document protocol + Kotlin JDBC probe ("any JDBC database")
+- **P3** — `stats` evidence, mermaid polish, `skill`
+- **P4** — MSSQL/Oracle rich probes, `diff`, inferred edges
 
 Details and trade-offs: [DESIGN.md](DESIGN.md).

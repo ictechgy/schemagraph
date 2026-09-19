@@ -95,6 +95,22 @@ grep -q 'not safe to delete' "$tmp/dead.json" || { echo "dead: 삭제 금지 계
 ! grep -q '"main.standalone"' "$tmp/dead.json" || { echo "dead: 테이블 오탐" >&2; exit 1; }
 ! grep -q '"main.orders.trg_orders_touch"' "$tmp/dead.json" || { echo "dead: trigger 오탐" >&2; exit 1; }
 
+# rules — 의도적 위반 1건이 보고되고 strict가 종료 코드 1을 낸다.
+"$BIN" rules --graph "$tmp/graph.json" --config Fixtures/rules.toml > "$tmp/rules.json"
+python3 - "$tmp/rules.json" <<'EOF'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r["checked"] == 3, f"checked: {r['checked']}"
+assert len(r["violations"]) == 1, f"violations: {r['violations']}"
+v = r["violations"][0]
+assert v["edge"]["from"] == "main.order_items" and v["edge"]["to"] == "main.orders", v
+EOF
+set +e
+"$BIN" rules --graph "$tmp/graph.json" --config Fixtures/rules.toml --strict >/dev/null
+code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "rules --strict 종료 코드가 1이 아니다: $code" >&2; exit 1; }
+
 # ── PostgreSQL ──────────────────────────────────────────────────────────
 # 네이티브 리더 검증은 실제 서버가 필요하다. SG_PG_URL이 있으면 그 서버를 쓰고
 # (fixture를 새로 적용한다 — 검증 DB를 공유하지 마라), 없으면 로컬 postgres
@@ -177,6 +193,11 @@ lims = g.get("limitations", [])
 if not any("plpgsql" in l for l in lims):
     sys.exit(f"plpgsql 미지원 limitation 미보고: {lims}")
 EOF
+
+    # rules — 같은 규칙 파일이 PG 그래프에서도 의도적 위반을 잡아야 한다.
+    "$BIN" rules --graph "$tmp/graph-pg.json" --config Fixtures/rules.toml \
+        | grep -q '"public.order_items"' \
+        || { echo "PG rules: 의도적 위반 미검출" >&2; exit 1; }
 else
     echo "주의: PostgreSQL을 찾지 못해 PG 검증 건너뜀 (SG_PG_URL로 지정 가능)" >&2
 fi
@@ -268,6 +289,11 @@ missing = want - edges
 if missing:
     sys.exit(f"MySQL 간선 미검출: {sorted(missing)}")
 EOF
+
+    # rules — 같은 규칙 파일이 MySQL 그래프에서도 의도적 위반을 잡아야 한다.
+    "$BIN" rules --graph "$tmp/graph-my.json" --config Fixtures/rules.toml \
+        | grep -q '"sgfix.order_items"' \
+        || { echo "MySQL rules: 의도적 위반 미검출" >&2; exit 1; }
 else
     echo "주의: MySQL을 찾지 못해 MySQL 검증 건너뜀 (SG_MYSQL_URL 또는 docker)" >&2
 fi

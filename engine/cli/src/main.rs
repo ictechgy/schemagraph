@@ -91,6 +91,17 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
+    /// Check declared dependency rules against the graph (CI gate).
+    Rules {
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        /// Rules file (TOML). Each [[rule]] declares name/from/to(/kinds).
+        #[arg(short, long, default_value = "schemagraph.toml")]
+        config: PathBuf,
+        /// Exit 1 when any rule is violated.
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -156,6 +167,11 @@ async fn run(cli: Cli) -> Result<i32> {
             level,
             strict,
         } => cycles(&graph, level.level(), strict),
+        Command::Rules {
+            graph,
+            config,
+            strict,
+        } => rules(&graph, &config, strict),
     }
 }
 
@@ -221,26 +237,11 @@ fn to_dot(g: &Graph) -> String {
             "    \"{}\" -> \"{}\" [label=\"{}\"];\n",
             edge.from.as_str(),
             edge.to.as_str(),
-            export_kind(edge.kind),
+            export::edge_kind_str(edge.kind),
         ));
     }
     out.push_str("}\n");
     out
-}
-
-fn export_kind(kind: schemagraph_core::EdgeKind) -> &'static str {
-    use schemagraph_core::EdgeKind::*;
-    match kind {
-        References => "references",
-        Reads => "reads",
-        Writes => "writes",
-        Calls => "calls",
-        Fires => "fires",
-        UsesSequence => "uses-sequence",
-        UsesType => "uses-type",
-        Contains => "contains",
-        Inferred => "inferred",
-    }
 }
 
 fn query(name: &str, path: &std::path::Path, depth: u32, max: usize) -> Result<i32> {
@@ -304,6 +305,75 @@ fn cycles(path: &std::path::Path, level: Level, strict: bool) -> Result<i32> {
         serde_json::to_string_pretty(&export::cycles_to_value(&report))?
     );
     Ok(if strict && !report.cycles.is_empty() {
+        1
+    } else {
+        0
+    })
+}
+
+/// TOML 규칙 파일의 형태 — [[rule]] 테이블 목록. kinds를 빼면 모든
+/// 의존성 간선을 대상으로 한다(Contains·Inferred는 어차피 판정 밖).
+#[derive(serde::Deserialize)]
+struct RulesFile {
+    #[serde(default)]
+    rule: Vec<RuleToml>,
+}
+
+/// 규칙 하나의 파일 표현 — name/from/to는 필수, kinds는 선택.
+#[derive(serde::Deserialize)]
+struct RuleToml {
+    name: String,
+    from: String,
+    to: String,
+    kinds: Option<Vec<String>>,
+}
+
+/// 규칙 파일을 analysis::Rule로 변환한다. 모르는 간선 종류는 명확한
+/// 오류로 — 조용히 무시하면 규칙이 느슨해지는데 사용자는 엄격해졌다고 믿는다.
+fn load_rules(path: &std::path::Path) -> Result<Vec<analysis::Rule>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("규칙 파일을 못 읽음: {}", path.display()))?;
+    let file: RulesFile = toml::from_str(&text)
+        .with_context(|| format!("규칙 파일 TOML 파싱 실패: {}", path.display()))?;
+    file.rule
+        .iter()
+        .map(|r| {
+            let kinds = r
+                .kinds
+                .as_ref()
+                .map(|ks| {
+                    ks.iter()
+                        .map(|k| {
+                            export::edge_kind_parse(k).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "규칙 '{}': 알 수 없는 간선 종류 '{k}' — \
+                                     references|reads|writes|calls|fires|uses-sequence|uses-type",
+                                    r.name
+                                )
+                            })
+                        })
+                        .collect::<Result<std::collections::BTreeSet<_>>>()
+                })
+                .transpose()?;
+            Ok(analysis::Rule {
+                name: r.name.clone(),
+                from: r.from.clone(),
+                to: r.to.clone(),
+                kinds,
+            })
+        })
+        .collect()
+}
+
+fn rules(path: &std::path::Path, config: &std::path::Path, strict: bool) -> Result<i32> {
+    let graph = load_graph(path)?;
+    let rule_set = load_rules(config)?;
+    let report = analysis::rules(&graph, &rule_set);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&export::rules_to_value(&report))?
+    );
+    Ok(if strict && !report.violations.is_empty() {
         1
     } else {
         0

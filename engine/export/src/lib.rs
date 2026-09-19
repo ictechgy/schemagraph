@@ -5,7 +5,9 @@
 //! 같은 입력이 같은 바이트여야 리포트 diff와 캐시가 성립한다
 //! (AGENTS.md "JSON 출력은 결정적이어야 합니다").
 
-use schemagraph_analysis::{CyclesReport, DeadReason, DeadReport, ImpactReport, QueryReport};
+use schemagraph_analysis::{
+    CyclesReport, DeadReason, DeadReport, ImpactReport, QueryReport, RulesReport,
+};
 use schemagraph_core::{Edge, EdgeKind, EvidenceLayer, Graph, Level, Vertex, VertexKind};
 use serde::{Deserialize, Serialize};
 
@@ -63,7 +65,8 @@ fn level_str(level: Level) -> &'static str {
     }
 }
 
-fn edge_kind_str(kind: EdgeKind) -> &'static str {
+/// 간선 종류의 JSON 라벨 — 그래프 문서와 규칙 파일이 같은 문자열을 쓴다.
+pub fn edge_kind_str(kind: EdgeKind) -> &'static str {
     match kind {
         EdgeKind::References => "references",
         EdgeKind::Reads => "reads",
@@ -77,7 +80,8 @@ fn edge_kind_str(kind: EdgeKind) -> &'static str {
     }
 }
 
-fn edge_kind_parse(s: &str) -> Option<EdgeKind> {
+/// JSON 라벨 → 간선 종류. 규칙 파일의 kinds 필드도 이 변환을 쓴다.
+pub fn edge_kind_parse(s: &str) -> Option<EdgeKind> {
     Some(match s {
         "references" => EdgeKind::References,
         "reads" => EdgeKind::Reads,
@@ -353,6 +357,25 @@ pub fn cycles_to_value(report: &CyclesReport) -> serde_json::Value {
         }).collect::<Vec<_>>(),
         "level": level_str(report.level),
         "limitations": report.limitations,
+    })
+}
+
+/// RulesReport → JSON Value. `checked`가 0이면 "검사한 규칙이 없다"이지
+/// 통과가 아니라는 것을 숫자로 보여준다.
+pub fn rules_to_value(report: &RulesReport) -> serde_json::Value {
+    serde_json::json!({
+        "checked": report.checked,
+        "limitations": report.limitations,
+        "violations": report.violations.iter().map(|v| {
+            serde_json::json!({
+                "edge": {
+                    "from": v.from.as_str(),
+                    "kind": edge_kind_str(v.kind),
+                    "to": v.to.as_str(),
+                },
+                "rule": v.rule,
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 
