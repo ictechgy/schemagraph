@@ -26,6 +26,7 @@ usage: schemagraph-probe --url <jdbc-url> [options]
   --driver-class <fqc> driver class name when ServiceLoader can't find it
   --schema <names>     comma-separated schema allowlist (default: non-system all)
   -o, --output <path>  catalog document path (default: catalog.json, '-' stdout)
+  --format <json|ndjson>  output format (default: json — ndjson은 행 단위 스트리밍)
   -h, --help           this help
 """
 
@@ -61,7 +62,11 @@ fun main(args: Array<String>) {
         }
     }.getOrElse { fatal("추출 실패: ${it.message}") }
 
-    val json = mapper.writeValueAsString(doc)
+    val json = when (opts.format) {
+        "json" -> mapper.writeValueAsString(doc)
+        "ndjson" -> toNdjson(doc)
+        else -> fatal("--format은 json|ndjson 중 하나다: ${opts.format}")
+    }
     if (opts.output == "-") println(json)
     else File(opts.output).writeText("$json\n")
 }
@@ -79,6 +84,7 @@ private data class Opts(
     var driverClass: String? = null,
     var schemas: List<String> = emptyList(),
     var output: String = "catalog.json",
+    var format: String = "json",
     var help: Boolean = false,
 )
 
@@ -96,6 +102,7 @@ private fun parseArgs(args: Array<String>): Opts {
             "--driver-class" -> o.driverClass = next(a)
             "--schema" -> o.schemas = next(a).split(',').filter { it.isNotBlank() }
             "-o", "--output" -> o.output = next(a)
+            "--format" -> o.format = next(a)
             "-h", "--help" -> o.help = true
             else -> fatal("error: 알 수 없는 인자 '$a'\n$USAGE")
         }

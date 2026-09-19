@@ -1,6 +1,7 @@
 package schemagraph.probe
 
 import com.fasterxml.jackson.annotation.JsonInclude
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.PropertyNamingStrategies
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
@@ -97,4 +98,38 @@ val mapper = jacksonObjectMapper().apply {
     propertyNamingStrategy = PropertyNamingStrategies.SNAKE_CASE
     setSerializationInclusion(JsonInclude.Include.NON_NULL)
     enable(SerializationFeature.INDENT_OUTPUT)
+}
+
+// NDJSON 행은 반드시 한 줄 — 들여쓰기 없는 별도 매퍼를 쓴다.
+val lineMapper = jacksonObjectMapper().apply {
+    propertyNamingStrategy = PropertyNamingStrategies.SNAKE_CASE
+    setSerializationInclusion(JsonInclude.Include.NON_NULL)
+}
+
+/**
+ * CatalogDocument를 NDJSON(행 단위 JSON)으로 직렬화한다. 엔진 쪽
+ * engine/source/src/ndjson.rs와 레이아웃이 같아야 한다:
+ * 헤더 document 행 → 스키마마다 schema 행 + object·routine 행.
+ */
+fun toNdjson(doc: CatalogDocument): String {
+    val out = StringBuilder()
+    fun record(type: String, vararg fields: Pair<String, Any?>) {
+        val node = lineMapper.createObjectNode()
+        node.put("type", type)
+        for ((k, v) in fields) node.set<JsonNode>(k, lineMapper.valueToTree(v))
+        out.append(lineMapper.writeValueAsString(node)).append('\n')
+    }
+    record(
+        "document",
+        "version" to doc.version,
+        "dialect" to doc.dialect,
+        "reader" to doc.reader,
+        "limitations" to doc.limitations,
+    )
+    for (schema in doc.schemas) {
+        record("schema", "name" to schema.name)
+        for (obj in schema.objects) record("object", "schema" to schema.name, "data" to obj)
+        for (routine in schema.routines) record("routine", "schema" to schema.name, "data" to routine)
+    }
+    return out.toString()
 }

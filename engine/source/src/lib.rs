@@ -7,6 +7,7 @@ pub mod diff;
 pub mod document;
 pub mod graph;
 pub mod mysql;
+pub mod ndjson;
 pub mod postgres;
 pub mod sqlite;
 

@@ -5,7 +5,7 @@
 //! - 1: 질의가 발견을 보고함(--strict 시) 또는 대상을 못 찾음(notFound)
 //! - 2: 사용법·엔진 오류 (잘못된 URL, 파일 없음, 파싱 불가)
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use schemagraph_analysis::{self as analysis, Resolve};
 use schemagraph_core::{Graph, Level};
@@ -257,11 +257,16 @@ async fn scan(
     Ok(0)
 }
 
-/// 프로브가 만든 catalog document를 읽는다. 버전이 다르면 명확히 거절한다 —
-/// 조용히 읽으면 스키마가 어긋난 채 그래프가 나와 소비자가 모른다.
+/// 프로브가 만든 catalog document를 읽는다. 단일 JSON과 NDJSON(행 단위)을
+/// 자동으로 구분하고, 버전이 다르면 명확히 거절한다 — 조용히 읽으면 스키마가
+/// 어긋난 채 그래프가 나와 소비자가 모른다.
 fn load_document(path: &std::path::Path) -> Result<source::CatalogDocument> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("catalog document를 못 읽음: {}", path.display()))?;
+    if source::ndjson::is_ndjson_document(&text) {
+        return source::ndjson::document_from_ndjson(&text)
+            .map_err(|e| anyhow!("NDJSON document 파싱 실패: {} — {e}", path.display()));
+    }
     let doc: source::CatalogDocument = serde_json::from_str(&text)
         .with_context(|| format!("catalog document 파싱 실패: {}", path.display()))?;
     if doc.version != source::document::DOCUMENT_VERSION {
