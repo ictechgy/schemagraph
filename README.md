@@ -44,13 +44,38 @@ java -jar probe/build/libs/schemagraph-probe-all.jar \
 schemagraph scan --document catalog.json -o graph.json
 ```
 
-Bundled drivers: PostgreSQL, H2, SQLite (permissive licenses only). Any other
-database — Oracle, MSSQL, MySQL, DB2 — works via `--driver /path/to.jar`
-(and `--driver-class` when ServiceLoader can't find the implementation).
+Bundled drivers: PostgreSQL, H2, SQLite, MSSQL (permissive licenses only —
+MIT/BSD/Apache). Oracle (`ojdbc`, OTN) and MySQL (GPL) drivers are supplied
+externally via `--driver /path/to.jar` (and `--driver-class` when
+ServiceLoader can't find the implementation).
+
 `DatabaseMetaData` provides the portable baseline (schemas, tables, columns,
 PK/FK, indexes); view/trigger/routine bodies are harvested best-effort from
-`INFORMATION_SCHEMA` (`ALL_*` on Oracle), with failures reported in
-`limitations`. On MySQL the probe's dependency edges match the native
+dialect-specific catalogs — `INFORMATION_SCHEMA` where it exists,
+`sys.sql_modules` on MSSQL (its INFORMATION_SCHEMA truncates bodies at 4000
+chars), `ALL_*`/`ALL_SOURCE` on Oracle, `sqlite_master` on SQLite — with
+failures reported in `limitations`.
+
+Dialect notes:
+
+- **MSSQL** — routines come from `sys.objects` + `sys.parameters` (JDBC
+  metadata mislabels them and appends `;N` numbered-procedure suffixes,
+  which the probe normalizes away). T-SQL bodies parse through the generic
+  SQL path; `inserted`/`deleted` pseudo-tables land in `limitations`.
+- **Oracle** — `ALL_*` + `ALL_SOURCE`; `PUBLIC` synonyms and Database Vault
+  schemas are suppressed (they would exhaust cursors, ORA-01000). Unquoted
+  identifiers fold to uppercase, so lowercase body references resolve to
+  UPPERCASE vertices case-insensitively; genuinely ambiguous case
+  collisions are reported, never guessed. `plsql` bodies are reported as
+  limitations, not parsed (same contract as `plpgsql`).
+- **SQLite** — JDBC `TABLE_SCHEM`/`TABLE_CAT` come back null, so objects map
+  to `main`; bodies come from `sqlite_master` (same source as the native
+  reader → vertex and edge parity, verified).
+- **MariaDB** — reachable via `jdbc:mysql://` with an external MySQL
+  driver; `performance_schema=OFF` (the default) is reported as a
+  limitation, not silently read as zero usage.
+
+On SQLite, MySQL and MariaDB the probe's dependency edges match the native
 reader's exactly.
 
 ## Commands
@@ -110,8 +135,9 @@ the graph.
 ## Current state
 
 - Readers: SQLite, PostgreSQL, MySQL (native `sqlx`), plus every JDBC
-  database via the probe. `mysql://` also covers MariaDB (validated on
-  11.4). `mysqlx://` is explicitly unsupported.
+  database via the probe — verified live on MSSQL (Azure SQL Edge),
+  Oracle 23ai/26ai Free, MariaDB 11.4, H2. `mysql://` also covers MariaDB
+  natively. `mysqlx://` is explicitly unsupported.
 - Vertex ids use `schema.object[.member]`; on a cross-kind name collision
   the later vertex is renamed `name@kind` (`orders.sku@index`) and the
   rename is reported in `limitations`.
@@ -129,6 +155,6 @@ the graph.
 - **P1** — body parsing + `impact` + `dead` — done
 - **P2** — catalog document protocol + Kotlin JDBC probe + `rules` — done
 - **P3** — `stats` usage evidence (tables·indexes·routines) + `dead` evidence + `skill` + mermaid — done
-- **P4** — MSSQL/Oracle rich probes, `diff`, inferred edges
+- **P4** — MSSQL/Oracle rich probes — done (live-verified); next: `diff`, inferred edges, routine parsing coverage
 
 Details and trade-offs: [DESIGN.md](DESIGN.md).

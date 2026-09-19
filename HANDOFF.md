@@ -62,7 +62,47 @@
   MySQL의 FK 자동 인덱스가 컬럼과 이름을 공유해 드랍되던 것이 이제
   `order_items.order_id@index`로 산다. usage도 분리된 정점에 붙는다.
   파서는 `resolve_renamed`로 분리된 정점을 찾는다 — 유령 id로 간선을
-  만들지 않는다. 모든 멤버 id에 kind를 박을지는 미결(호환 깨짐).
+  만들지 않는다. 모든 멤버 id에 kind를 박는 v2는 **보류 결정**(호환 깨짐).
+- 2026-09-19: **P4 프로브 보강 완료** (커밋 예정). MSSQL·Oracle·SQLite
+  프로브를 실서버로 검증하고 MariaDB fixture를 자동화했다.
+  - **MSSQL** — 몸체는 `sys.sql_modules.definition`(INFORMATION_SCHEMA는
+    4000자 절단), routine은 `sys.objects`+`sys.parameters`. JDBC 메타는
+    프로시저를 함수로 오분류하고 `;N`(numbered procedure) 접미사를 붙여
+    meta 호출을 건너뛰고 정규화했다. mssql-jdbc(MIT)를 번들. 검증 이미지는
+    Azure SQL Edge — 공식 2022 이미지는 ARM QEMU에서 죽고 Edge는
+    arm64/amd64 모두 돈다.
+  - **Oracle** — `ALL_*`+`ALL_SOURCE` 수확, `ALL_ARGUMENTS` 시그니처.
+    PUBLIC 시노님 슈도스키마는 ORA-01000 커서 고갈을 일으켜 방언 한정
+    억제(isSystem)로 막고, Database Vault(DVF/DVSYS)도 억제. view의
+    getIndexInfo는 ORA-20000이라 인덱스는 table/matview만 수확. routine은
+    plpgsql과 같은 계약으로 `plsql` limitation. **대소문자 해석(ci)**이
+    새로 생겼다 — Oracle 미인용 식별자는 대문자 접힘이라 몸체의 소문자
+    참조를 대문자 정점으로 연결한다(대소문자 구분 방언에 켜면 다른
+    객체를 가리키므로 oracle에만). 모호한 대소문자 충돌은 추측하지
+    않고 miss+note. ojdbc는 OTN이라 `--driver` 외부 공급. 검증은
+    gvenzl/oracle-free(arm64 지원 — XE엔 ARM 빌드 없음).
+  - **SQLite JDBC** — TABLE_SCHEM/CAT이 null이라 `main` 귀속 + `conn.
+    isReadOnly` 거부 드라이버 건너뜀 + `sqlite_master` 몸체 → 네이티브와
+    정점·간선 완전 패리티(67/67).
+  - **routine 통계 확장** — `Usage`에 `total_ms`/`self_ms`(선택 f64)
+    additive 추가. PG는 `pg_stat_user_functions.total_time`/`self_time`을
+    수확, MySQL은 per-routine 통계 소스가 없어 미수확 유지.
+  - **MariaDB 자동 fixture** — verify-fixtures.sh가 mariadb:11.4를 PFS
+    OFF(기본값, limitation 검증)→ON(수확 검증) 두 단계로 띄우고 전용
+    골든을 비교한다(int(11) 표기·sys 뷰 범위가 MySQL과 달라 공유 골든
+    불가). 프로브 경로도 mysql 드라이버로 검증.
+  - fixture 적용 도구 `Scripts/ApplySql.java` — sqlcmd 없는 이미지를 위해
+    GO·`/` 구분자로 나눠 JDBC로 실행한다(단일 파일 소스 실행, JDK 11+).
+    ServiceLoader로 드라이버를 찾으므로 `-cp`로 드라이버 jar을 받는다 —
+    번들 드라이버는 fat jar을, Oracle은 ojdbc를 넘긴다.
+  - **검증 인프라 결함 두 개 수정** — shadow `mergeServiceFiles()`가
+    `META-INF/services/java.sql.Driver`를 첫 항목(postgresql)만 남기고
+    합치지 못해 `java -cp fat.jar` 경로의 ServiceLoader가 드라이버를
+    못 찾았다. probe/src/main/resources에 번들 드라이버 4개를 직접
+    선언해 해결. verify-fixtures.sh는 소유 docker 컨테이너를 EXIT
+    트랩까지 살려뒀는데, 4GiB급 docker VM에서 mysql+maria+mssql+oracle
+    동시 기동으로 Oracle이 OOMKilled로 죽었다 — 각 섹션이 끝날 때
+    컨테이너를 정리하게 바꿨다.
 
 ## 확정된 결정
 
@@ -147,28 +187,31 @@
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 56개 테스트
-Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + JDBC probe 양방향 검증
-# PG는 initdb로, MySQL은 docker로 임시 인스턴스를 자동 프로비전한다. 직접 지정:
+cd engine && cargo build && cargo test        # 빌드 + 58개 테스트
+Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + JDBC probe 양방향 검증
+# PG는 initdb로, MySQL·MariaDB·MSSQL·Oracle은 docker로 자동 프로비전한다.
 #   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh      (폐기용 DB만!)
-#   SG_MYSQL_URL=mysql://user@host/db SG_MYSQL_CONTAINER=<이름> ...   (컨테이너면 docker exec로 적용)
-# probe는 java를 자동 탐색하고 jar이 없으면 gradle로 빌드한다. H2 임베디드가
-# 기본이고, PG가 떠 있으면 pgjdbc로 네이티브 패리티를 확인한다. MySQL까지:
-#   SG_MYSQL_JAR=/path/mysql-connector-j.jar ...
+#   SG_MYSQL_URL=mysql://user@host/db SG_MYSQL_CONTAINER=<이름> ...
+#   SG_MARIADB_URL=mysql://user@host/db ...
+#   SG_MSSQL_URL='jdbc:sqlserver://host:port;databaseName=db' ...
+# probe는 java를 자동 탐색하고 jar이 없으면 gradle로 빌드한다. MySQL·Oracle
+# 드라이버는 라이선스상 외부 공급:
+#   SG_MYSQL_JAR=/path/mysql-connector-j.jar SG_ORACLE_JAR=/path/ojdbc11.jar ...
+# MSSQL·Oracle fixture 적용은 Scripts/ApplySql.java가 GO·`/` 구분자로 한다.
 ```
 
 ## 다음 할 일
 
-1. 프로브 보강 — MSSQL `sys.*` 몸체 소스, Oracle ALL_* 실서버 검증,
-   SQLite JDBC의 스키마 귀속 확인.
-2. 멤버 id 공간 — 현재는 충돌 시에만 `@kind` 접미사. 모든 멤버 id에
-   kind를 박는 v2로 갈지(결정적이지만 기존 id와 호환 깨짐)는 미결.
-3. routine 통계 확장 — `total_time`/`self_time`·MySQL 쪽 routine 통계는
-   Usage 모델(reads/writes)에 안 맞아 미수확.
-4. MariaDB fixture — 네이티브+프로브 수동 검증은 됐고(ordinal_position
-   부호·PFS OFF), 자동 fixture 섹션은 아직 없다.
+1. 멤버 id 공간 v2 — 모든 멤버 id에 kind를 박는 안은 **보류 결정**됐다
+   (기존 id와 호환 깨짐). 되살릴 때는 골든·문서·파서 해석이 함께 간다.
+2. routine 파싱 커버리지 — plpgsql·plsql·T-SQL 몸체의 방언 파서.
+   지금은 언어 한계를 limitation으로 정직하게 보고한다.
+3. 배포 준비 — crates.io `schemagraph`·Maven `schemagraph` 모두 비어
+   있음(2026-09-19 확인). 선점·퍼블리시는 아직 하지 않았다.
+4. `diff` 명령, `inferred` 휴리스틱 간선, JVM 없는 Go 프로브(배포용).
 
 ## 미결
 
-DESIGN.md "미결 사항" 절 참조: document 스키마 세부, routine 파싱 커버리지,
-프로브 전송 방식, crates.io/Maven 이름 선점 확인, inferred 휴리스틱.
+DESIGN.md "미결 사항" 절 참조: document 스키마 세부(v2), 프로브 전송
+방식, inferred 휴리스틱, package routine(Oracle PACKAGE BODY 멤버)의
+정점 귀속.

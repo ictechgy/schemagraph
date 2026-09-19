@@ -79,6 +79,8 @@ id가 다른 kind에 점유됐으면 나중 정점은 `name@kind`로 분리된�
   JDBC 드라이버만 있으면 어떤 DB든 동작한다. 이것이 breadth의 바닥.
 - **Tier 1 Rich 프로브**: DB별 카탈로그 SQL(`pg_catalog`, `information_schema`+`sys`,
   `sqlite_master`)로 view·routine·trigger·sequence와 **몸체 원문**까지 읽는다.
+  실서버 검증이 끝난 Tier 1 방언: PG·MySQL·SQLite·**MSSQL**(`sys.objects`+
+  `sys.sql_modules`)·**Oracle**(`ALL_*`+`ALL_SOURCE`).
 - **Tier 2 Stats**: 사용 통계(`pg_stat_*`, `sys`·`performance_schema`) 수집.
   네이티브 경로와 프로브가 같은 document 필드에 싣는다.
 
@@ -181,17 +183,25 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
   (Tier 0 Generic → "JDBC 전부" 성립) + `rules` — **완료**:
   `probe/`가 `DatabaseMetaData` + best-effort 몸체 쿼리로 document를 뱉고,
   `scan --document`가 먹는다. MySQL에서 네이티브와 간선 완전 일치를 확인.
-- **P3**: `stats` + `dead` 증거 — **완료**: `Usage{since,reads,writes}`가
-  그래프 정점의 별도 맵에 실리고, PG(`pg_stat_user_tables`/`_indexes` +
+- **P3**: `stats` + `dead` 증거 — **완료**: `Usage{since,reads,writes,
+  total_ms,self_ms}`가 그래프 정점의 별도 맵에 실리고(시간 필드는 additive
+  확장이라 document 버전 유지), PG(`pg_stat_user_tables`/`_indexes` +
   `pg_stat_database.stats_reset`, 미리셋 시 postmaster 기동 시각 폴백)와
   MySQL(`sys.schema_table_statistics` + `sys.schema_unused_indexes`,
   uptime 역산으로 since) 네이티브·프로브 양쪽이 수확한다. routine은
-  `pg_stat_user_functions.calls`를 reads에 싣는다(오버로드는 귀속 불가 —
-  이름 유일할 때만). `track_functions=none`·`performance_schema=OFF`처럼
-  통계 자체가 꺼진 환경은 0행이 아니라 미수집으로 limitation 신고.
-  `dead` 후보는 usage를 증거로 싣는다. `skill`·mermaid 다듬기까지 완료.
-- **P4**: MSSQL·Oracle Tier 1 프로브, `diff`, `inferred` 간선,
-  Go 프로브("JVM 없는 배포" 수요가 생기면).
+  `pg_stat_user_functions`의 `calls`→reads, `total_time`/`self_time`→
+  total_ms/self_ms로 싣는다(오버로드는 귀속 불가 — 이름 유일할 때만;
+  MySQL엔 per-routine 통계 소스가 없어 미수확). `track_functions=none`·
+  `performance_schema=OFF`처럼 통계 자체가 꺼진 환경은 0행이 아니라
+  미수집으로 limitation 신고. `dead` 후보는 usage를 증거로 싣는다.
+  `skill`·mermaid 다듬기까지 완료.
+- **P4**: MSSQL·Oracle Tier 1 프로브 — **완료**: `sys.objects`+
+  `sys.sql_modules`(MSSQL, INFORMATION_SCHEMA의 4000자 절단 회피),
+  `ALL_*`+`ALL_SOURCE`(Oracle)로 몸체까지 수확하고 실서버로 검증했다
+  (Azure SQL Edge, gvenzl/oracle-free — 둘 다 arm64 지원). MSSQL의 JDBC
+  메타 오분류·`;N` 접미사, Oracle의 PUBLIC 커서 고갈·대소문자 접힘
+  해석(ci, oracle 한정) 등이 실검증에서 드러나 고쳤다.
+  다음: `diff`, `inferred` 간선, Go 프로브("JVM 없는 배포" 수요가 생기면).
 
 각 단계의 완료 조건은 실제 DB fixture로 양방향 검증하는 스크립트다
 (계열의 verify-fixtures 전통 — 도구가 실제로 발견한 결함이 단위 테스트를 통과한 뒤
@@ -214,7 +224,11 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
   limitation으로 보고 중. 파서 개선 기여 vs 프로브 측 "파싱된 참조" 증거로 결정.
 - **프로브 전송 방식** — 현재 파일(`-o`) 또는 stdout(`-o -`). 큰 스키마의
   스트리밍 NDJSON은 수요가 생기면.
-- **crates.io / Maven Central 이름 충돌** — `schemagraph` 선점 여부 릴리스 전 확인.
-- **`inferred` 간선 휴리스틱 세부** — P4에서 Azimutt 방식 벤치마크 후 결정.
-- **프로브 Tier 1 확장** — Oracle용 `ALL_*` 딕셔너리 경로는 있으나 실서버
-  미검증. MSSQL(`sys.*`), DB2, Informix 등의 몸체 소스는 수요별로 추가.
+- **crates.io / Maven Central 이름** — `schemagraph`는 둘 다 비어 있음
+  (2026-09-19 확인). 선점·퍼블리시는 아직이다.
+- **`inferred` 간선 휴리스틱 세부** — Azimutt 방식 벤치마크 후 결정.
+- **멤버 id 공간 v2** — 모든 멤버 id에 kind를 박는 안은 보류(호환 깨짐).
+  현행: 충돌 시에만 `@kind` 접미사.
+- **Oracle package routine 귀속** — PACKAGE BODY의 멤버는 OBJECT_NAME이
+  패키지라 독립 routine과 귀속이 다르다. 독립 PROCEDURE/FUNCTION만 수확 중.
+- **프로브 Tier 1 추가 확장** — DB2, Informix 등의 몸체 소스는 수요별로.
