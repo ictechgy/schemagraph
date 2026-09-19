@@ -73,12 +73,91 @@ async fn read_schema(
         obj.triggers = read_triggers(pool, schema, &obj.name).await?;
     }
     let mut routines = read_routines(pool, schema, limitations).await?;
+    attach_usage(pool, schema, &mut objects, limitations).await;
     sort_all(&mut objects, &mut routines);
     Ok(SchemaDoc {
         name: schema.to_owned(),
         objects,
         routines,
     })
+}
+
+/// 사용 통계 — pg_stat은 stats_reset 이후만 유효하다. 카탈로그 읽기와 달리
+/// 실패해도 스캔을 죽이지 않는다(증거가 빠질 뿐) — 대신 limitation으로 신고.
+async fn attach_usage(
+    pool: &PgPool,
+    schema: &str,
+    objects: &mut [ObjectDoc],
+    limitations: &mut Vec<String>,
+) {
+    // 통계의 유효 시작점 — 테이블별 리셋 시각은 없어 데이터베이스 리셋을 쓴다.
+    // pg_stat_reset()은 DB 통계 전부를 리셋하므로 이 시각이 모든 카운터의
+    // 공통 하한이다(단일 테이블 리셋은 추적 불가 — 보수적 하한).
+    // 리셋된 적 없는 클러스터에선 NULL이므로 서버 기동 시각으로 폴백한다 —
+    // 카운터가 기동 이전을 관측했을 리 없으니 유효한 보수적 하한이다.
+    let since: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT COALESCE(stats_reset::text, pg_postmaster_start_time()::text) \
+         FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    let rows = sqlx::query(
+        "SELECT relname, seq_tup_read + COALESCE(idx_tup_fetch, 0) AS reads, \
+         n_tup_ins + n_tup_upd + n_tup_del AS writes \
+         FROM pg_stat_user_tables WHERE schemaname = $1",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            for r in &rows {
+                let name: String = r.get("relname");
+                if let Some(obj) = objects.iter_mut().find(|o| o.name == name) {
+                    obj.usage = Some(UsageDoc {
+                        since: since.clone(),
+                        reads: r.get::<i64, _>("reads").max(0) as u64,
+                        writes: r.get::<i64, _>("writes").max(0) as u64,
+                    });
+                }
+            }
+        }
+        Err(e) => limitations.push(format!("pg_stat_user_tables 미수확 — usage 증거 없음: {e}")),
+    }
+
+    let rows = sqlx::query(
+        "SELECT relname, indexrelname, idx_scan AS reads \
+         FROM pg_stat_user_indexes WHERE schemaname = $1",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            for r in &rows {
+                let (table, index): (String, String) = (r.get("relname"), r.get("indexrelname"));
+                if let Some(idx) = objects
+                    .iter_mut()
+                    .find(|o| o.name == table)
+                    .and_then(|o| o.indexes.iter_mut().find(|i| i.name == index))
+                {
+                    // 인덱스는 idx_scan이 "쓰였다"의 단위 — 테이블의 행 단위와
+                    // 혼동하지 않게 kind별로만 비교해야 한다.
+                    idx.usage = Some(UsageDoc {
+                        since: since.clone(),
+                        reads: r.get::<i64, _>("reads").max(0) as u64,
+                        writes: 0,
+                    });
+                }
+            }
+        }
+        Err(e) => limitations.push(format!(
+            "pg_stat_user_indexes 미수확 — index usage 증거 없음: {e}"
+        )),
+    }
 }
 
 /// table·view·materialized-view·sequence 목록.
@@ -108,6 +187,7 @@ async fn read_objects(pool: &PgPool, schema: &str) -> Result<Vec<ObjectDoc>, Sou
             indexes: vec![],
             triggers: vec![],
             body: None,
+            usage: None,
         });
     }
 
@@ -139,6 +219,7 @@ async fn read_objects(pool: &PgPool, schema: &str) -> Result<Vec<ObjectDoc>, Sou
             indexes: vec![],
             triggers: vec![],
             body: r.get::<Option<String>, _>("definition"),
+            usage: None,
         });
     }
 
@@ -156,6 +237,7 @@ async fn read_objects(pool: &PgPool, schema: &str) -> Result<Vec<ObjectDoc>, Sou
             indexes: vec![],
             triggers: vec![],
             body: None,
+            usage: None,
         });
     }
     Ok(objects)
@@ -305,6 +387,7 @@ async fn read_indexes(
             unique: r.get("indisunique"),
             // indkey=0(식 인덱스)은 attname이 NULL이라 array_remove로 뺐다.
             columns: r.get::<Option<Vec<String>>, _>("cols").unwrap_or_default(),
+            usage: None,
         })
         .collect())
 }

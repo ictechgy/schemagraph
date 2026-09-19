@@ -95,12 +95,91 @@ async fn read_schema(
         ));
     }
     let mut routines = read_routines(pool, schema, limitations).await?;
+    attach_usage(pool, schema, &mut objects, limitations).await;
     sort_all(&mut objects, &mut routines);
     Ok(SchemaDoc {
         name: schema.to_owned(),
         objects,
         routines,
     })
+}
+
+/// 사용 통계 — performance_schema·sys는 서버 재시작에 리셋된다. sys 스키마가
+/// 없는 설치도 있어 실패해도 스캔을 죽이지 않고 limitation으로 신고한다.
+async fn attach_usage(
+    pool: &MySqlPool,
+    schema: &str,
+    objects: &mut [ObjectDoc],
+    limitations: &mut Vec<String>,
+) {
+    // 통계의 유효 시작점 — performance_schema는 재시작에 리셋된다.
+    let since: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT CAST(NOW() - INTERVAL VARIABLE_VALUE SECOND AS CHAR) \
+         FROM performance_schema.global_status WHERE VARIABLE_NAME='Uptime'",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    // `reads`는 MySQL 예약어라 별칭을 백틱으로 감싼다.
+    let rows = sqlx::query(
+        "SELECT CAST(table_name AS CHAR) AS name, \
+         CAST(rows_fetched AS SIGNED) AS `reads`, \
+         CAST(rows_inserted + rows_updated + rows_deleted AS SIGNED) AS `writes` \
+         FROM sys.schema_table_statistics WHERE table_schema = ?",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            for r in &rows {
+                let name: String = r.get("name");
+                if let Some(obj) = objects.iter_mut().find(|o| o.name == name) {
+                    obj.usage = Some(UsageDoc {
+                        since: since.clone(),
+                        reads: r.get::<i64, _>("reads").max(0) as u64,
+                        writes: r.get::<i64, _>("writes").max(0) as u64,
+                    });
+                }
+            }
+        }
+        Err(e) => limitations.push(format!(
+            "{schema}: sys.schema_table_statistics 미수확 — usage 증거 없음: {e}"
+        )),
+    }
+
+    // 재시작 이후 한 번도 안 쓰인 인덱스 — 올라 있지 않은 인덱스의 사용량은
+    // 모르는 것이지 0이 아니라서, 명단에 있는 것만 0 관측으로 싣는다.
+    let rows = sqlx::query(
+        "SELECT CAST(object_name AS CHAR) AS obj, CAST(index_name AS CHAR) AS idx \
+         FROM sys.schema_unused_indexes WHERE object_schema = ?",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            for r in &rows {
+                let (table, index): (String, String) = (r.get("obj"), r.get("idx"));
+                if let Some(idx) = objects
+                    .iter_mut()
+                    .find(|o| o.name == table)
+                    .and_then(|o| o.indexes.iter_mut().find(|i| i.name == index))
+                {
+                    idx.usage = Some(UsageDoc {
+                        since: since.clone(),
+                        reads: 0,
+                        writes: 0,
+                    });
+                }
+            }
+        }
+        Err(e) => limitations.push(format!(
+            "{schema}: sys.schema_unused_indexes 미수확 — index usage 증거 없음: {e}"
+        )),
+    }
 }
 
 /// table·view·sequence 목록 — TABLE_TYPE은 'BASE TABLE'|'VIEW'이고,
@@ -133,6 +212,7 @@ async fn read_objects(pool: &MySqlPool, schema: &str) -> Result<Vec<ObjectDoc>, 
                 indexes: vec![],
                 triggers: vec![],
                 body: None,
+                usage: None,
             }
         })
         .collect();
@@ -320,6 +400,7 @@ async fn read_indexes(
                 name,
                 unique,
                 columns,
+                usage: None,
             })
             .collect(),
         expr_cols,
