@@ -1,0 +1,20 @@
+[package]
+name = "schemagraph-cli"
+description = "schemagraph command line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "schemagraph"
+path = "src/main.rs"
+
+[dependencies]
+schemagraph-core = { path = "../core" }
+schemagraph-source = { path = "../source" }
+schemagraph-analysis = { path = "../analysis" }
+schemagraph-export = { path = "../export" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros"] }

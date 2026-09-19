@@ -1,0 +1,725 @@
+{
+  "edges": [
+    {
+      "from": "main",
+      "kind": "contains",
+      "to": "main.a"
+    },
+    {
+      "from": "main",
+      "kind": "contains",
+      "to": "main.b"
+    },
+    {
+      "from": "main",
+      "kind": "contains",
+      "to": "main.customers"
+    },
+    {
+      "from": "main",
+      "kind": "contains",
+      "to": "main.loop_self"
+    },
+    {
+      "from": "main",
+      "kind": "contains",
+      "to": "main.order_items"
+    },
+    {
+      "from": "main",
+      "kind": "contains",
+      "to": "main.order_totals"
+    },
+    {
+      "from": "main",
+      "kind": "contains",
+      "to": "main.orders"
+    },
+    {
+      "from": "main",
+      "kind": "contains",
+      "to": "main.products"
+    },
+    {
+      "from": "main",
+      "kind": "contains",
+      "to": "main.standalone"
+    },
+    {
+      "from": "main.a",
+      "kind": "contains",
+      "to": "main.a.a_fk_0"
+    },
+    {
+      "from": "main.a",
+      "kind": "contains",
+      "to": "main.a.a_pk"
+    },
+    {
+      "from": "main.a",
+      "kind": "contains",
+      "to": "main.a.b_id"
+    },
+    {
+      "from": "main.a",
+      "kind": "contains",
+      "to": "main.a.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk a_fk_0: main.a(b_id) -> main.b(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.a",
+      "kind": "references",
+      "to": "main.b"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk a_fk_0: b_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.a.b_id",
+      "kind": "references",
+      "to": "main.b.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk b_fk_0: main.b(a_id) -> main.a(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.b",
+      "kind": "references",
+      "to": "main.a"
+    },
+    {
+      "from": "main.b",
+      "kind": "contains",
+      "to": "main.b.a_id"
+    },
+    {
+      "from": "main.b",
+      "kind": "contains",
+      "to": "main.b.b_fk_0"
+    },
+    {
+      "from": "main.b",
+      "kind": "contains",
+      "to": "main.b.b_pk"
+    },
+    {
+      "from": "main.b",
+      "kind": "contains",
+      "to": "main.b.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk b_fk_0: a_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.b.a_id",
+      "kind": "references",
+      "to": "main.a.id"
+    },
+    {
+      "from": "main.customers",
+      "kind": "contains",
+      "to": "main.customers.customers_pk"
+    },
+    {
+      "from": "main.customers",
+      "kind": "contains",
+      "to": "main.customers.id"
+    },
+    {
+      "from": "main.customers",
+      "kind": "contains",
+      "to": "main.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk loop_self_fk_0: main.loop_self(parent_id) -> main.loop_self(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.loop_self",
+      "kind": "references",
+      "to": "main.loop_self"
+    },
+    {
+      "from": "main.loop_self",
+      "kind": "contains",
+      "to": "main.loop_self.id"
+    },
+    {
+      "from": "main.loop_self",
+      "kind": "contains",
+      "to": "main.loop_self.loop_self_fk_0"
+    },
+    {
+      "from": "main.loop_self",
+      "kind": "contains",
+      "to": "main.loop_self.loop_self_pk"
+    },
+    {
+      "from": "main.loop_self",
+      "kind": "contains",
+      "to": "main.loop_self.parent_id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk loop_self_fk_0: parent_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.loop_self.parent_id",
+      "kind": "references",
+      "to": "main.loop_self.id"
+    },
+    {
+      "from": "main.order_items",
+      "kind": "contains",
+      "to": "main.order_items.id"
+    },
+    {
+      "from": "main.order_items",
+      "kind": "contains",
+      "to": "main.order_items.order_id"
+    },
+    {
+      "from": "main.order_items",
+      "kind": "contains",
+      "to": "main.order_items.order_items_fk_0"
+    },
+    {
+      "from": "main.order_items",
+      "kind": "contains",
+      "to": "main.order_items.order_items_fk_1"
+    },
+    {
+      "from": "main.order_items",
+      "kind": "contains",
+      "to": "main.order_items.order_items_pk"
+    },
+    {
+      "from": "main.order_items",
+      "kind": "contains",
+      "to": "main.order_items.product_id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk order_items_fk_1: main.order_items(order_id) -> main.orders(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.order_items",
+      "kind": "references",
+      "to": "main.orders"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk order_items_fk_0: main.order_items(product_id) -> main.products(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.order_items",
+      "kind": "references",
+      "to": "main.products"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk order_items_fk_1: order_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.order_items.order_id",
+      "kind": "references",
+      "to": "main.orders.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk order_items_fk_0: product_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.order_items.product_id",
+      "kind": "references",
+      "to": "main.products.id"
+    },
+    {
+      "from": "main.order_totals",
+      "kind": "contains",
+      "to": "main.order_totals.customer_name"
+    },
+    {
+      "from": "main.order_totals",
+      "kind": "contains",
+      "to": "main.order_totals.order_id"
+    },
+    {
+      "from": "main.order_totals",
+      "kind": "contains",
+      "to": "main.order_totals.total"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk orders_fk_0: main.orders(customer_id) -> main.customers(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.orders",
+      "kind": "references",
+      "to": "main.customers"
+    },
+    {
+      "from": "main.orders",
+      "kind": "contains",
+      "to": "main.orders.customer_id"
+    },
+    {
+      "from": "main.orders",
+      "kind": "contains",
+      "to": "main.orders.id"
+    },
+    {
+      "from": "main.orders",
+      "kind": "contains",
+      "to": "main.orders.idx_orders_customer"
+    },
+    {
+      "from": "main.orders",
+      "kind": "contains",
+      "to": "main.orders.orders_fk_0"
+    },
+    {
+      "from": "main.orders",
+      "kind": "contains",
+      "to": "main.orders.orders_pk"
+    },
+    {
+      "from": "main.orders",
+      "kind": "contains",
+      "to": "main.orders.total"
+    },
+    {
+      "from": "main.orders",
+      "kind": "contains",
+      "to": "main.orders.trg_orders_touch"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk orders_fk_0: customer_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.orders.customer_id",
+      "kind": "references",
+      "to": "main.customers.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "trigger trg_orders_touch on orders",
+          "layer": "catalog"
+        }
+      ],
+      "from": "main.orders.trg_orders_touch",
+      "kind": "fires",
+      "to": "main.orders"
+    },
+    {
+      "from": "main.products",
+      "kind": "contains",
+      "to": "main.products.id"
+    },
+    {
+      "from": "main.products",
+      "kind": "contains",
+      "to": "main.products.products_pk"
+    },
+    {
+      "from": "main.products",
+      "kind": "contains",
+      "to": "main.products.sku"
+    },
+    {
+      "from": "main.products",
+      "kind": "contains",
+      "to": "main.products.sqlite_autoindex_products_1"
+    },
+    {
+      "from": "main.standalone",
+      "kind": "contains",
+      "to": "main.standalone.id"
+    },
+    {
+      "from": "main.standalone",
+      "kind": "contains",
+      "to": "main.standalone.note"
+    },
+    {
+      "from": "main.standalone",
+      "kind": "contains",
+      "to": "main.standalone.standalone_pk"
+    }
+  ],
+  "limitations": [
+    "1개 view 본문을 수집했으나 몸체 파서는 P1이라 reads/writes 간선이 없음",
+    "DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (몸체 파싱 P1 필요)"
+  ],
+  "version": 1,
+  "vertices": [
+    {
+      "id": "main",
+      "kind": "schema",
+      "level": "schema",
+      "name": "main",
+      "schema": "main"
+    },
+    {
+      "id": "main.a",
+      "kind": "table",
+      "level": "object",
+      "name": "a",
+      "schema": "main"
+    },
+    {
+      "id": "main.a.a_fk_0",
+      "kind": "constraint",
+      "level": "member",
+      "name": "a_fk_0",
+      "schema": "main"
+    },
+    {
+      "id": "main.a.a_pk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "a_pk",
+      "schema": "main"
+    },
+    {
+      "id": "main.a.b_id",
+      "kind": "column",
+      "level": "member",
+      "name": "b_id",
+      "schema": "main"
+    },
+    {
+      "id": "main.a.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "main"
+    },
+    {
+      "id": "main.b",
+      "kind": "table",
+      "level": "object",
+      "name": "b",
+      "schema": "main"
+    },
+    {
+      "id": "main.b.a_id",
+      "kind": "column",
+      "level": "member",
+      "name": "a_id",
+      "schema": "main"
+    },
+    {
+      "id": "main.b.b_fk_0",
+      "kind": "constraint",
+      "level": "member",
+      "name": "b_fk_0",
+      "schema": "main"
+    },
+    {
+      "id": "main.b.b_pk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "b_pk",
+      "schema": "main"
+    },
+    {
+      "id": "main.b.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "main"
+    },
+    {
+      "id": "main.customers",
+      "kind": "table",
+      "level": "object",
+      "name": "customers",
+      "schema": "main"
+    },
+    {
+      "id": "main.customers.customers_pk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "customers_pk",
+      "schema": "main"
+    },
+    {
+      "id": "main.customers.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "main"
+    },
+    {
+      "id": "main.customers.name",
+      "kind": "column",
+      "level": "member",
+      "name": "name",
+      "schema": "main"
+    },
+    {
+      "id": "main.loop_self",
+      "kind": "table",
+      "level": "object",
+      "name": "loop_self",
+      "schema": "main"
+    },
+    {
+      "id": "main.loop_self.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "main"
+    },
+    {
+      "id": "main.loop_self.loop_self_fk_0",
+      "kind": "constraint",
+      "level": "member",
+      "name": "loop_self_fk_0",
+      "schema": "main"
+    },
+    {
+      "id": "main.loop_self.loop_self_pk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "loop_self_pk",
+      "schema": "main"
+    },
+    {
+      "id": "main.loop_self.parent_id",
+      "kind": "column",
+      "level": "member",
+      "name": "parent_id",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_items",
+      "kind": "table",
+      "level": "object",
+      "name": "order_items",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_items.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_items.order_id",
+      "kind": "column",
+      "level": "member",
+      "name": "order_id",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_items.order_items_fk_0",
+      "kind": "constraint",
+      "level": "member",
+      "name": "order_items_fk_0",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_items.order_items_fk_1",
+      "kind": "constraint",
+      "level": "member",
+      "name": "order_items_fk_1",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_items.order_items_pk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "order_items_pk",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_items.product_id",
+      "kind": "column",
+      "level": "member",
+      "name": "product_id",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_totals",
+      "kind": "view",
+      "level": "object",
+      "name": "order_totals",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_totals.customer_name",
+      "kind": "column",
+      "level": "member",
+      "name": "customer_name",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_totals.order_id",
+      "kind": "column",
+      "level": "member",
+      "name": "order_id",
+      "schema": "main"
+    },
+    {
+      "id": "main.order_totals.total",
+      "kind": "column",
+      "level": "member",
+      "name": "total",
+      "schema": "main"
+    },
+    {
+      "id": "main.orders",
+      "kind": "table",
+      "level": "object",
+      "name": "orders",
+      "schema": "main"
+    },
+    {
+      "id": "main.orders.customer_id",
+      "kind": "column",
+      "level": "member",
+      "name": "customer_id",
+      "schema": "main"
+    },
+    {
+      "id": "main.orders.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "main"
+    },
+    {
+      "id": "main.orders.idx_orders_customer",
+      "kind": "index",
+      "level": "member",
+      "name": "idx_orders_customer",
+      "schema": "main"
+    },
+    {
+      "id": "main.orders.orders_fk_0",
+      "kind": "constraint",
+      "level": "member",
+      "name": "orders_fk_0",
+      "schema": "main"
+    },
+    {
+      "id": "main.orders.orders_pk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "orders_pk",
+      "schema": "main"
+    },
+    {
+      "id": "main.orders.total",
+      "kind": "column",
+      "level": "member",
+      "name": "total",
+      "schema": "main"
+    },
+    {
+      "id": "main.orders.trg_orders_touch",
+      "kind": "trigger",
+      "level": "member",
+      "name": "trg_orders_touch",
+      "schema": "main"
+    },
+    {
+      "id": "main.products",
+      "kind": "table",
+      "level": "object",
+      "name": "products",
+      "schema": "main"
+    },
+    {
+      "id": "main.products.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "main"
+    },
+    {
+      "id": "main.products.products_pk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "products_pk",
+      "schema": "main"
+    },
+    {
+      "id": "main.products.sku",
+      "kind": "column",
+      "level": "member",
+      "name": "sku",
+      "schema": "main"
+    },
+    {
+      "id": "main.products.sqlite_autoindex_products_1",
+      "kind": "index",
+      "level": "member",
+      "name": "sqlite_autoindex_products_1",
+      "schema": "main"
+    },
+    {
+      "id": "main.standalone",
+      "kind": "table",
+      "level": "object",
+      "name": "standalone",
+      "schema": "main"
+    },
+    {
+      "id": "main.standalone.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "main"
+    },
+    {
+      "id": "main.standalone.note",
+      "kind": "column",
+      "level": "member",
+      "name": "note",
+      "schema": "main"
+    },
+    {
+      "id": "main.standalone.standalone_pk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "standalone_pk",
+      "schema": "main"
+    }
+  ]
+}

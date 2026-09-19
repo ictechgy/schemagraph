@@ -1,0 +1,17 @@
+[package]
+name = "schemagraph-source"
+description = "Catalog document types and database readers for schemagraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+schemagraph-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
