@@ -46,6 +46,13 @@
 - **member**: `column`(1급 정점 — impact 질의의 핵심), `index`, `constraint`, `trigger`
 - **executable**: `function`, `procedure`, `package`(Oracle 계열)
 
+정점 id는 `schema`, `schema.object`, `schema.object.member` 형식이다.
+이름이 kind를 넘나들며 충돌할 수 있다(MySQL의 FK 자동 인덱스는 컬럼
+이름을 그대로 쓰고, 함수와 프로시저는 이름을 공유할 수 있다) — base
+id가 다른 kind에 점유됐으면 나중 정점은 `name@kind`로 분리된다
+(`orders.sku@index`). `@`는 SQL 식별자에 못 쓰는 문자라 추가 충돌이
+거의 없고, 분리는 항상 limitation으로 신고된다.
+
 ### 간선 종류
 
 - `references` — 선언된 FK. object 레벨과 column 레벨 둘 다 만든다.
@@ -174,12 +181,15 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
   (Tier 0 Generic → "JDBC 전부" 성립) + `rules` — **완료**:
   `probe/`가 `DatabaseMetaData` + best-effort 몸체 쿼리로 document를 뱉고,
   `scan --document`가 먹는다. MySQL에서 네이티브와 간선 완전 일치를 확인.
-- **P3**: `stats` + `dead` 증거 — **부분 완료**: `Usage{since,reads,writes}`가
+- **P3**: `stats` + `dead` 증거 — **완료**: `Usage{since,reads,writes}`가
   그래프 정점의 별도 맵에 실리고, PG(`pg_stat_user_tables`/`_indexes` +
   `pg_stat_database.stats_reset`, 미리셋 시 postmaster 기동 시각 폴백)와
   MySQL(`sys.schema_table_statistics` + `sys.schema_unused_indexes`,
-  uptime 역산으로 since) 네이티브·프로브 양쪽이 수확한다. `dead` 후보는
-  usage를 증거로 싣는다. mermaid export와 `skill`은 잔여.
+  uptime 역산으로 since) 네이티브·프로브 양쪽이 수확한다. routine은
+  `pg_stat_user_functions.calls`를 reads에 싣는다(오버로드는 귀속 불가 —
+  이름 유일할 때만). `track_functions=none`·`performance_schema=OFF`처럼
+  통계 자체가 꺼진 환경은 0행이 아니라 미수집으로 limitation 신고.
+  `dead` 후보는 usage를 증거로 싣는다. `skill`·mermaid 다듬기까지 완료.
 - **P4**: MSSQL·Oracle Tier 1 프로브, `diff`, `inferred` 간선,
   Go 프로브("JVM 없는 배포" 수요가 생기면).
 

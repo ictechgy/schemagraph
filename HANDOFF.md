@@ -47,9 +47,22 @@
   `dead` 후보는 usage를 증거로 싣고, `stats` 명령이 수집된 통계를 보고한다
   (관측 정점만 목록 + totals로 미수집 비율 표시). 골든은 usage 값을
   정규화해 저장 — 시각·카운트는 환경 의존이라 비교 불가.
-- 구현 중 발견: **멤버 id 충돌** — MySQL의 FK 자동 인덱스가 컬럼/제약과
-  이름을 공유해 index 정점이 first-wins로 드랍된다. 이제 limitation으로
-  신고한다("멤버 id 충돌: …"). 근본 해결(id 공간 분리)은 미결.
+- 2026-09-19: **P3 잔여 + 견고성 라운드** (`40d932f`..`e6db7d7`). 멤버·
+  routine id 충돌을 `@kind` 접미사로 근본 해결하고 파서 해석을 맞췄다.
+  `pg_stat_user_functions`로 routine 호출 수를 usage에 실었다(이름이
+  유일할 때만 — 오버로드는 funcname으로 귀속 불가). `track_functions=
+  none`·`performance_schema=OFF` 같이 통계 자체가 꺼진 환경은 0행이
+  아니라 미수집으로 limitation 신고. 프로브의 `ROUTINE_TYPE` NULL NPE
+  (집계 함수 행이 수확을 중단) 수정. MariaDB 11.4로 네이티브+프로브
+  실검증(ordinal_position 부호 차이 수정). mermaid는 kind 도형·스키마
+  subgraph·결정적 n0.. 노드 id로 다듬고, `skill` 명령이 에이전트 계약
+  문서를 출력한다.
+- **멤버·routine id 충돌은 `@kind` 접미사로 분리한다** (`40d932f`) — base
+  id가 다른 kind에 점유됐으면 `name@kind`로 옮기고 limitation으로 신고.
+  MySQL의 FK 자동 인덱스가 컬럼과 이름을 공유해 드랍되던 것이 이제
+  `order_items.order_id@index`로 산다. usage도 분리된 정점에 붙는다.
+  파서는 `resolve_renamed`로 분리된 정점을 찾는다 — 유령 id로 간선을
+  만들지 않는다. 모든 멤버 id에 kind를 박을지는 미결(호환 깨짐).
 
 ## 확정된 결정
 
@@ -117,11 +130,24 @@
   sqlparser가 파싱한다 — 실제로 reads 간선이 나오는지 fixture로 확인했다.
 - 읽기 전용: MySQL 8은 `SET SESSION transaction_read_only=1`, MariaDB는
   `tx_read_only` — 둘 다 시도하고 실패해도 스캔은 계속한다.
+- **통계가 꺼진 환경은 0행이 아니라 미수집이다** — PG `track_functions=
+  none`이면 pg_stat_user_functions가 0행, MariaDB는 `performance_schema=
+  OFF`가 기본값이라 sys 뷰가 0행. 둘 다 "관측된 0"이 아니라 미수집이라
+  비활성을 감지해 limitation으로 남긴다 — 비어 있는 이유를 숨기지 않는다.
+- routine usage는 `pg_stat_user_functions.calls`를 reads에 싣는다 —
+  funcname엔 시그니처가 없어 오버로드면 귀속 못 한다(이중 집계 방지로
+  이름 유일할 때만). 모호하면 limitation. MySQL엔 routine 통계 뷰가 없어
+  미수확.
+- **MariaDB는 MySQL과 information_schema 부호가 다르다** —
+  `ordinal_position`이 MySQL은 UNSIGNED, MariaDB는 SIGNED로 온다.
+  쿼리에서 `CAST(... AS SIGNED)`로 통일해 같은 i64 디코딩을 쓴다.
+- 프로브의 `ROUTINE_TYPE` NULL 행(PG 집계 함수)은 건너뛴다 — null-safe로
+  받지 않으면 NPE가 수확 루프를 중단시켜 행 순서에 따라 몸체가 빠진다.
 
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 51개 테스트
+cd engine && cargo build && cargo test        # 빌드 + 56개 테스트
 Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + JDBC probe 양방향 검증
 # PG는 initdb로, MySQL은 docker로 임시 인스턴스를 자동 프로비전한다. 직접 지정:
 #   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh      (폐기용 DB만!)
@@ -133,15 +159,14 @@ Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + JDBC probe
 
 ## 다음 할 일
 
-1. `skill` — 에이전트용 스킬 문서 출력 (P3 잔여). mermaid export 다듬기도.
-2. MariaDB 검증 — reader는 같은 information_schema지만 시퀀스·
-   tx_read_only 등 차이가 있어 별도 fixture가 필요하다.
-3. 멤버 id 공간 충돌의 근본 해결 — kind를 id에 섞을지(`s.t.idx@index`),
-   별도 네임스페이스를 둘지 결정. 지금은 limitation으로 신고만 한다.
-4. 프로브 보강 — MSSQL `sys.*` 몸체 소스, Oracle ALL_* 실서버 검증,
+1. 프로브 보강 — MSSQL `sys.*` 몸체 소스, Oracle ALL_* 실서버 검증,
    SQLite JDBC의 스키마 귀속 확인.
-5. routine 사용 통계 — `pg_stat_user_functions`(calls/total_time)는
-   Usage 모델(reads/writes)에 안 맞아 미수확. 확장할지 결정.
+2. 멤버 id 공간 — 현재는 충돌 시에만 `@kind` 접미사. 모든 멤버 id에
+   kind를 박는 v2로 갈지(결정적이지만 기존 id와 호환 깨짐)는 미결.
+3. routine 통계 확장 — `total_time`/`self_time`·MySQL 쪽 routine 통계는
+   Usage 모델(reads/writes)에 안 맞아 미수확.
+4. MariaDB fixture — 네이티브+프로브 수동 검증은 됐고(ordinal_position
+   부호·PFS OFF), 자동 fixture 섹션은 아직 없다.
 
 ## 미결
 

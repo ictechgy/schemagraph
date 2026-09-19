@@ -65,6 +65,7 @@ schemagraph cycles [--level object|column] [--strict]
 schemagraph dead [--strict]
 schemagraph stats                          # collected usage evidence
 schemagraph rules [--config schemagraph.toml] [--strict]
+schemagraph skill                          # agent skill document (stdout)
 ```
 
 `--strict` exits 1 when findings are reported, for CI gates.
@@ -94,19 +95,26 @@ rules were evaluated — not "pass".
 
 ## Usage statistics
 
-PostgreSQL (`pg_stat_user_tables`/`_indexes`) and MySQL
-(`sys.schema_table_statistics`/`schema_unused_indexes`) readers attach observed
-usage to vertices. `stats` lists it; `dead` candidates carry it as evidence.
+PostgreSQL (`pg_stat_user_tables`/`_indexes`, `pg_stat_user_functions`) and
+MySQL (`sys.schema_table_statistics`/`schema_unused_indexes`) readers attach
+observed usage to vertices. `stats` lists it; `dead` candidates carry it as
+evidence. Routine call counts land on `reads` (the unit differs by kind).
 
 The contract: a `usage` record is valid only since its `since` timestamp —
-missing usage means "not collected" (SQLite, unsupported views), `reads: 0`
-with usage present means "observed zero". Statistics are evidence to weigh,
-never proof an object is unused: application queries are not in the graph.
+missing usage means "not collected" (SQLite, unsupported views, disabled
+statistics such as `track_functions=none` or `performance_schema=OFF`),
+`reads: 0` with usage present means "observed zero". Statistics are evidence
+to weigh, never proof an object is unused: application queries are not in
+the graph.
 
 ## Current state
 
 - Readers: SQLite, PostgreSQL, MySQL (native `sqlx`), plus every JDBC
-  database via the probe. `mysqlx://` is explicitly unsupported.
+  database via the probe. `mysql://` also covers MariaDB (validated on
+  11.4). `mysqlx://` is explicitly unsupported.
+- Vertex ids use `schema.object[.member]`; on a cross-kind name collision
+  the later vertex is renamed `name@kind` (`orders.sku@index`) and the
+  rename is reported in `limitations`.
 - Body parsing: views (`reads`, object + member level), triggers
   (`writes`/`reads`/`NEW.`/`OLD.`, `EXECUTE FUNCTION` → `calls`), SQL-language
   routines (`reads`/`writes`/`calls`, including in-body `CALL`/function
@@ -120,7 +128,7 @@ never proof an object is unused: application queries are not in the graph.
 - **P0** — core graph model + native readers + `scan`/`graph`/`query`/`cycles` — done
 - **P1** — body parsing + `impact` + `dead` — done
 - **P2** — catalog document protocol + Kotlin JDBC probe + `rules` — done
-- **P3** — `stats` usage evidence + `dead` evidence — done (mermaid polish, `skill` remain)
+- **P3** — `stats` usage evidence (tables·indexes·routines) + `dead` evidence + `skill` + mermaid — done
 - **P4** — MSSQL/Oracle rich probes, `diff`, inferred edges
 
 Details and trade-offs: [DESIGN.md](DESIGN.md).
