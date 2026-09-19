@@ -4,6 +4,8 @@ description = "Judgment queries over the schemagraph dependency graph"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-schemagraph-core = { path = "../core" }
+schemagraph-core = { path = "../core", version = "0.1.0" }

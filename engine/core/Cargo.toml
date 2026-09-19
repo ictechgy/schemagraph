@@ -4,6 +4,8 @@ description = "Pure schema-dependency graph domain for schemagraph"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # 외부 의존성 0 — 그래프 도메인이 순수해야 분석 계층 전체를 DB 없이 테스트할 수 있다.

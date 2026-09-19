@@ -4,17 +4,19 @@ description = "schemagraph command line interface"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "schemagraph"
 path = "src/main.rs"
 
 [dependencies]
-schemagraph-core = { path = "../core" }
-schemagraph-source = { path = "../source" }
-schemagraph-parser = { path = "../parser" }
-schemagraph-analysis = { path = "../analysis" }
-schemagraph-export = { path = "../export" }
+schemagraph-core = { path = "../core", version = "0.1.0" }
+schemagraph-source = { path = "../source", version = "0.1.0" }
+schemagraph-parser = { path = "../parser", version = "0.1.0" }
+schemagraph-analysis = { path = "../analysis", version = "0.1.0" }
+schemagraph-export = { path = "../export", version = "0.1.0" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
