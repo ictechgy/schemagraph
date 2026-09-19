@@ -165,23 +165,20 @@ async fn attach_usage(
     // 알 수 없다 — 둘 다에 달면 이중 집계라, 이름이 유일할 때만 귀속한다.
     // track_functions 기본값은 none — 그러면 뷰가 0행(0 호출이 아니라 미수집)이라
     // 비어 있는 이유를 limitation으로 남겨 "호출 0"으로 오독되지 않게 한다.
-    let tracking: Option<String> =
-        sqlx::query_scalar("SELECT current_setting('track_functions')")
-            .fetch_one(pool)
-            .await
-            .ok();
+    let tracking: Option<String> = sqlx::query_scalar("SELECT current_setting('track_functions')")
+        .fetch_one(pool)
+        .await
+        .ok();
     if tracking.as_deref() == Some("none") {
-        limitations.push(
-            "track_functions=none — routine usage 미수집(함수 통계 비활성)".to_owned(),
-        );
+        limitations
+            .push("track_functions=none — routine usage 미수집(함수 통계 비활성)".to_owned());
         return;
     }
-    let rows = sqlx::query(
-        "SELECT funcname, calls FROM pg_stat_user_functions WHERE schemaname = $1",
-    )
-    .bind(schema)
-    .fetch_all(pool)
-    .await;
+    let rows =
+        sqlx::query("SELECT funcname, calls FROM pg_stat_user_functions WHERE schemaname = $1")
+            .bind(schema)
+            .fetch_all(pool)
+            .await;
     match rows {
         Ok(rows) => {
             let mut ambiguous = 0usize;

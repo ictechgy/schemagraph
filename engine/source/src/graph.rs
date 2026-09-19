@@ -59,20 +59,39 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
         }
 
         for col in &obj.columns {
-            add_member(g, &obj_id, &schema.name, &obj.name, &col.name, VertexKind::Column);
+            add_member(
+                g,
+                &obj_id,
+                &schema.name,
+                &obj.name,
+                &col.name,
+                VertexKind::Column,
+            );
         }
 
         for con in &obj.constraints {
-            add_member(g, &obj_id, &schema.name, &obj.name, &con.name, VertexKind::Constraint);
+            add_member(
+                g,
+                &obj_id,
+                &schema.name,
+                &obj.name,
+                &con.name,
+                VertexKind::Constraint,
+            );
             if con.kind == "fk" {
                 build_fk_edges(g, schema, obj, con, &obj_id);
             }
         }
 
         for idx in &obj.indexes {
-            if let Some(idx_id) =
-                add_member(g, &obj_id, &schema.name, &obj.name, &idx.name, VertexKind::Index)
-            {
+            if let Some(idx_id) = add_member(
+                g,
+                &obj_id,
+                &schema.name,
+                &obj.name,
+                &idx.name,
+                VertexKind::Index,
+            ) {
                 if let Some(u) = &idx.usage {
                     g.set_usage(idx_id, to_usage(u));
                 }
@@ -460,10 +479,7 @@ mod tests {
             Some(VertexKind::Index)
         );
         // 충돌은 limitation으로 신고된다.
-        assert!(g
-            .limitations()
-            .iter()
-            .any(|l| l.contains("멤버 id 충돌")));
+        assert!(g.limitations().iter().any(|l| l.contains("멤버 id 충돌")));
     }
 
     #[test]
@@ -500,18 +516,17 @@ mod tests {
         let g = document_to_graph(&doc);
         // 테이블이 base id를 지키고 함수는 @function으로 분리된다.
         assert_eq!(
-            g.vertex(&VertexId::object("main", "orders")).map(|v| v.kind),
+            g.vertex(&VertexId::object("main", "orders"))
+                .map(|v| v.kind),
             Some(VertexKind::Table)
         );
         let fn_id = VertexId::from_raw("main.orders@function");
-        assert_eq!(
-            g.vertex(&fn_id).map(|v| v.kind),
-            Some(VertexKind::Function)
-        );
+        assert_eq!(g.vertex(&fn_id).map(|v| v.kind), Some(VertexKind::Function));
         // usage는 분리된 정점에 붙는다.
         assert_eq!(g.usage(&fn_id).map(|u| u.reads), Some(12));
         assert_eq!(
-            g.usage(&VertexId::object("main", "helper")).map(|u| u.reads),
+            g.usage(&VertexId::object("main", "helper"))
+                .map(|u| u.reads),
             Some(3)
         );
         assert!(g

@@ -115,15 +115,13 @@ async fn attach_usage(
     // MariaDB는 performance_schema=OFF가 기본값이다 — sys 통계 뷰는 쿼리는
     // 되지만 0행이라, 꺼져 있으면 그 이유를 limitation으로 남기고 수확을
     // 건너뛴다(0행을 "관측된 0"으로 오독하지 않기 위해).
-    let pfs: Option<String> =
-        sqlx::query_scalar("SELECT CAST(@@performance_schema AS CHAR)")
-            .fetch_one(pool)
-            .await
-            .ok();
+    let pfs: Option<String> = sqlx::query_scalar("SELECT CAST(@@performance_schema AS CHAR)")
+        .fetch_one(pool)
+        .await
+        .ok();
     if matches!(pfs.as_deref(), Some("0") | Some("OFF")) {
-        limitations.push(
-            "performance_schema=OFF — usage 미수집(통계 비활성, MariaDB 기본값)".to_owned(),
-        );
+        limitations
+            .push("performance_schema=OFF — usage 미수집(통계 비활성, MariaDB 기본값)".to_owned());
         return;
     }
 

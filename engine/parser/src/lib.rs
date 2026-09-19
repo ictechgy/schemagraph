@@ -758,12 +758,7 @@ fn resolve_object(
 
 /// base id가 다른 kind에게 점유됐으면 `base@suffix`를 시도한다 —
 /// graph.rs의 resolve_collision과 같은 명명 규칙을 공유해야 한다.
-fn resolve_renamed(
-    g: &Graph,
-    base: VertexId,
-    kind: VertexKind,
-    suffix: &str,
-) -> Option<VertexId> {
+fn resolve_renamed(g: &Graph, base: VertexId, kind: VertexKind, suffix: &str) -> Option<VertexId> {
     let renamed = VertexId::from_raw(&format!("{}@{suffix}", base.as_str()));
     [base, renamed]
         .into_iter()
@@ -778,8 +773,7 @@ fn resolve_routine(g: &Graph, schema: &str, name: &str) -> RoutineHit {
     // 정확한 id가 routine kind일 때만 바로 받는다 — 같은 이름의 테이블이
     // base id를 차지한 채 routine이 `name@function`으로 분리됐을 수 있어
     // kind를 확인하지 않으면 calls 간선이 테이블을 가리킨다.
-    if g
-        .vertex(&exact)
+    if g.vertex(&exact)
         .map(|v| {
             matches!(
                 v.kind,
@@ -834,14 +828,9 @@ fn apply_trigger(
     // `@column`으로 분리됐을 수 있어 kind-aware 해석자를 쓴다.
     let mut made = std::collections::BTreeSet::new();
     for column in &parsed.fired_columns {
-        let Some(target) = resolve_member(
-            g,
-            schema,
-            owner_table,
-            column,
-            VertexKind::Column,
-            "column",
-        ) else {
+        let Some(target) =
+            resolve_member(g, schema, owner_table, column, VertexKind::Column, "column")
+        else {
             continue;
         };
         if !made.insert(target.clone()) {
@@ -1223,17 +1212,25 @@ mod tests {
         // public.orders@function으로 분리한다. 파서가 옛 id로 유령 간선을
         // 만들면 이 테스트가 잡는다.
         let doc = doc_with_routine(
-            vec![routine("orders", Some("sql"), "SELECT count(*) FROM customers")],
+            vec![routine(
+                "orders",
+                Some("sql"),
+                "SELECT count(*) FROM customers",
+            )],
             "",
         );
         let (g, notes) = build(&doc);
-        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
-            && e.from.as_str() == "public.orders@function"
-            && e.to.as_str() == "public.customers"),
-            "notes: {notes:?}");
+        assert!(
+            g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+                && e.from.as_str() == "public.orders@function"
+                && e.to.as_str() == "public.customers"),
+            "notes: {notes:?}"
+        );
         // 테이블 정점을 소스로 하는 몸체 간선은 없어야 한다.
-        assert!(!g.edges().iter().any(|e| e.from.as_str() == "public.orders"
-            && e.kind == EdgeKind::Reads));
+        assert!(!g
+            .edges()
+            .iter()
+            .any(|e| e.from.as_str() == "public.orders" && e.kind == EdgeKind::Reads));
     }
 
     #[test]
@@ -1249,12 +1246,16 @@ mod tests {
             "",
         );
         let (g, notes) = build(&doc);
-        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Calls
-            && e.from.as_str() == "public.caller"
-            && e.to.as_str() == "public.orders@function"),
-            "notes: {notes:?}");
-        assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Calls
-            && e.to.as_str() == "public.orders"));
+        assert!(
+            g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+                && e.from.as_str() == "public.caller"
+                && e.to.as_str() == "public.orders@function"),
+            "notes: {notes:?}"
+        );
+        assert!(!g
+            .edges()
+            .iter()
+            .any(|e| e.kind == EdgeKind::Calls && e.to.as_str() == "public.orders"));
     }
 
     #[test]
