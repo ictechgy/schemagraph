@@ -52,7 +52,11 @@ pub fn to_mermaid(g: &Graph) -> String {
             }
             continue;
         }
-        out.push_str(&format!("    subgraph {}[\"{}\"]\n", node_id(schema), esc(schema)));
+        out.push_str(&format!(
+            "    subgraph {}[\"{}\"]\n",
+            node_id(schema),
+            esc(schema)
+        ));
         for id in ids {
             out.push_str(&node_decl(g, id, &node_ids));
         }
@@ -82,8 +86,9 @@ fn node_decl(g: &Graph, id: &str, node_ids: &BTreeMap<String, String>) -> String
         Some(VertexKind::View) | Some(VertexKind::MaterializedView) => {
             format!("{nid}[/\"{label}\"/]")
         }
-        Some(VertexKind::Function) | Some(VertexKind::Procedure)
-        | Some(VertexKind::Package) => format!("{nid}{{{{\"{label}\"}}}}"),
+        Some(VertexKind::Function) | Some(VertexKind::Procedure) | Some(VertexKind::Package) => {
+            format!("{nid}{{{{\"{label}\"}}}}")
+        }
         Some(VertexKind::Trigger) => format!("{nid}>\"{label}\"]"),
         Some(VertexKind::Sequence) => format!("{nid}((\"{label}\"))"),
         _ => format!("{nid}[\"{label}\"]"),
