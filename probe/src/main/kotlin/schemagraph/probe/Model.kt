@@ -32,6 +32,7 @@ data class ObjectDoc(
     val indexes: List<IndexDoc>,
     val triggers: List<TriggerDoc>,
     val body: String? = null,
+    val usage: UsageDoc? = null,
 )
 
 data class ColumnDoc(
@@ -60,6 +61,17 @@ data class IndexDoc(
     val name: String,
     val unique: Boolean,
     val columns: List<String>,
+    val usage: UsageDoc? = null,
+)
+
+/**
+ * 사용 통계 — since 이후만 유효한 관측량. document.rs의 UsageDoc과
+ * 필드명이 같아야 한다(additive 계약이라 버전은 안 올린다).
+ */
+data class UsageDoc(
+    val since: String? = null,
+    val reads: Long,
+    val writes: Long,
 )
 
 data class TriggerDoc(

@@ -35,6 +35,7 @@ class Extractor(
         val objects = collectObjects()
         val bodies = collectBodies()
         val routines = collectRoutines(bodies)
+        val usage = collectUsage()
         // 스키마 목록은 객체와 routine의 합집합 — routine만 있는 스키마도 있다.
         val schemaNames = (objects.keys + routines.keys).sorted()
         val schemas = schemaNames.map { schema ->
@@ -44,6 +45,10 @@ class Extractor(
                     obj.copy(
                         body = bodies.views[schema to obj.name],
                         triggers = bodies.triggers[schema to obj.name].orEmpty().sortedBy { it.name },
+                        usage = usage.tables[schema to obj.name],
+                        indexes = obj.indexes.map { idx ->
+                            idx.copy(usage = usage.indexes[Triple(schema, obj.name, idx.name)])
+                        },
                     )
                 }.sortedBy { it.name },
                 routines = routines[schema].orEmpty().sortedWith(
@@ -353,6 +358,81 @@ class Extractor(
         }
 
         return byKey.entries.groupBy({ it.key.first }, { it.value })
+    }
+
+    // ---- 사용 통계: 방언별 통계 뷰, 없는 방언은 빈 수확(0이 아니라 미수집) ----
+
+    private data class UsageHarvest(
+        val tables: Map<Pair<String, String>, UsageDoc>,
+        val indexes: Map<Triple<String, String, String>, UsageDoc>,
+    )
+
+    /** 통계는 since 이후만 유효하다는 게 계약의 핵심 — 쿼리가 지원되는 방언만
+     *  수확하고, 실패는 limitation으로 신고해 0으로 오독되지 않게 한다. */
+    private fun collectUsage(): UsageHarvest {
+        val tables = mutableMapOf<Pair<String, String>, UsageDoc>()
+        val indexes = mutableMapOf<Triple<String, String, String>, UsageDoc>()
+        when (dialect) {
+            "postgres" -> {
+                // 테이블별 리셋 시각은 없다 — pg_stat_database.stats_reset이
+                // 모든 카운터의 공통 하한(pg_stat_reset은 DB 전체를 리셋).
+                // 리셋된 적 없는 클러스터에선 NULL이라 서버 기동 시각으로 폴백.
+                val since = runCatching {
+                    conn.createStatement().use { st ->
+                        st.executeQuery(
+                            "SELECT COALESCE(stats_reset::text, pg_postmaster_start_time()::text) " +
+                                "FROM pg_stat_database WHERE datname = current_database()"
+                        ).use { rs -> if (rs.next()) rs.getString(1) else null }
+                    }
+                }.getOrNull()
+                bestEffort("table stats",
+                    "SELECT schemaname, relname, " +
+                        "seq_tup_read + COALESCE(idx_tup_fetch,0), " +
+                        "n_tup_ins + n_tup_upd + n_tup_del " +
+                        "FROM pg_stat_user_tables") { rs ->
+                    tables[rs.getString(1) to rs.getString(2)] =
+                        UsageDoc(since, rs.getLong(3), rs.getLong(4))
+                }
+                bestEffort("index stats",
+                    "SELECT schemaname, relname, indexrelname, idx_scan " +
+                        "FROM pg_stat_user_indexes") { rs ->
+                    indexes[Triple(rs.getString(1), rs.getString(2), rs.getString(3))] =
+                        UsageDoc(since, rs.getLong(4), 0)
+                }
+            }
+            "mysql" -> {
+                // performance_schema·sys는 재시작에 리셋된다 — uptime 역산이 since.
+                val since = runCatching {
+                    conn.createStatement().use { st ->
+                        st.executeQuery(
+                            "SELECT NOW() - INTERVAL VARIABLE_VALUE SECOND " +
+                                "FROM performance_schema.global_status " +
+                                "WHERE VARIABLE_NAME='Uptime'"
+                        ).use { rs -> if (rs.next()) rs.getString(1) else null }
+                    }
+                }.getOrNull()
+                bestEffort("table stats",
+                    "SELECT table_schema, table_name, rows_fetched, " +
+                        "rows_inserted + rows_updated + rows_deleted " +
+                        "FROM sys.schema_table_statistics") { rs ->
+                    tables[rs.getString(1) to rs.getString(2)] =
+                        UsageDoc(since, rs.getLong(3), rs.getLong(4))
+                }
+                // 재시작 이후 한 번도 안 쓰인 인덱스 명단 — 명단에 없는 것은
+                // 사용량이 모르는 것이지 0이 아니라서, 명단의 것만 0으로 싣는다.
+                bestEffort("unused indexes",
+                    "SELECT object_schema, object_name, index_name " +
+                        "FROM sys.schema_unused_indexes") { rs ->
+                    indexes[Triple(rs.getString(1), rs.getString(2), rs.getString(3))] =
+                        UsageDoc(since, 0, 0)
+                }
+            }
+        }
+        fun keep(schema: String) =
+            schema.lowercase() !in SYSTEM_SCHEMAS && (schemaFilter.isEmpty() || schema in schemaFilter)
+        tables.keys.removeIf { !keep(it.first) }
+        indexes.keys.removeIf { !keep(it.first) }
+        return UsageHarvest(tables, indexes)
     }
 
     /** best-effort 쿼리 — 실패를 limitation으로 변환해 숨기지 않는다. */
