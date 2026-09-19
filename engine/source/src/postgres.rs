@@ -73,7 +73,7 @@ async fn read_schema(
         obj.triggers = read_triggers(pool, schema, &obj.name).await?;
     }
     let mut routines = read_routines(pool, schema, limitations).await?;
-    attach_usage(pool, schema, &mut objects, limitations).await;
+    attach_usage(pool, schema, &mut objects, &mut routines, limitations).await;
     sort_all(&mut objects, &mut routines);
     Ok(SchemaDoc {
         name: schema.to_owned(),
@@ -88,6 +88,7 @@ async fn attach_usage(
     pool: &PgPool,
     schema: &str,
     objects: &mut [ObjectDoc],
+    routines: &mut [RoutineDoc],
     limitations: &mut Vec<String>,
 ) {
     // 통계의 유효 시작점 — 테이블별 리셋 시각은 없어 데이터베이스 리셋을 쓴다.
@@ -156,6 +157,58 @@ async fn attach_usage(
         }
         Err(e) => limitations.push(format!(
             "pg_stat_user_indexes 미수확 — index usage 증거 없음: {e}"
+        )),
+    }
+
+    // routine 호출 통계 — calls는 routine의 "reads"다(단위는 kind별로 다르다는
+    // 계약). funcname은 시그니처가 없어 오버로드면 어느 것의 calls인지
+    // 알 수 없다 — 둘 다에 달면 이중 집계라, 이름이 유일할 때만 귀속한다.
+    // track_functions 기본값은 none — 그러면 뷰가 0행(0 호출이 아니라 미수집)이라
+    // 비어 있는 이유를 limitation으로 남겨 "호출 0"으로 오독되지 않게 한다.
+    let tracking: Option<String> =
+        sqlx::query_scalar("SELECT current_setting('track_functions')")
+            .fetch_one(pool)
+            .await
+            .ok();
+    if tracking.as_deref() == Some("none") {
+        limitations.push(
+            "track_functions=none — routine usage 미수집(함수 통계 비활성)".to_owned(),
+        );
+        return;
+    }
+    let rows = sqlx::query(
+        "SELECT funcname, calls FROM pg_stat_user_functions WHERE schemaname = $1",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let mut ambiguous = 0usize;
+            for r in &rows {
+                let name: String = r.get("funcname");
+                let mut hits = routines.iter_mut().filter(|rt| rt.name == name);
+                match (hits.next(), hits.next()) {
+                    (Some(rt), None) => {
+                        rt.usage = Some(UsageDoc {
+                            since: since.clone(),
+                            reads: r.get::<i64, _>("calls").max(0) as u64,
+                            writes: 0,
+                        });
+                    }
+                    (Some(_), Some(_)) => ambiguous += 1,
+                    _ => {}
+                }
+            }
+            if ambiguous > 0 {
+                limitations.push(format!(
+                    "{schema}: 오버로드된 routine {ambiguous}개는 funcname만으로 \
+                     귀속 못 해 usage 미수집"
+                ));
+            }
+        }
+        Err(e) => limitations.push(format!(
+            "pg_stat_user_functions 미수확 — routine usage 증거 없음: {e}"
         )),
     }
 }

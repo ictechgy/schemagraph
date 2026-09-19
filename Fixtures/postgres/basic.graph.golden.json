@@ -442,6 +442,11 @@
     {
       "from": "public.products",
       "kind": "contains",
+      "to": "public.products.products_sku_key@index"
+    },
+    {
+      "from": "public.products",
+      "kind": "contains",
       "to": "public.products.sku"
     },
     {
@@ -476,7 +481,8 @@
     }
   ],
   "limitations": [
-    "\uba64\ubc84 id \ucda9\ub3cc: public.products.products_sku_key\ub294 Constraint\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
+    "track_functions=none \u2014 routine usage \ubbf8\uc218\uc9d1(\ud568\uc218 \ud1b5\uacc4 \ube44\ud65c\uc131)",
+    "\uba64\ubc84 id \ucda9\ub3cc: public.products.products_sku_key\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 public.products.products_sku_key@index\ub85c \ubd84\ub9ac",
     "routine public.trg_orders_touch_fn: \uc5b8\uc5b4 plpgsql\uc758 \ubab8\uccb4 \ud30c\uc2f1 \ubbf8\uc9c0\uc6d0 \u2014 \ubab8\uccb4 \uac04\uc120 \uc5c6\uc74c"
   ],
   "version": 1,
@@ -818,6 +824,13 @@
     {
       "id": "public.products.products_sku_key",
       "kind": "constraint",
+      "level": "member",
+      "name": "products_sku_key",
+      "schema": "public"
+    },
+    {
+      "id": "public.products.products_sku_key@index",
+      "kind": "index",
       "level": "member",
       "name": "products_sku_key",
       "schema": "public",

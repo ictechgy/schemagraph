@@ -51,9 +51,26 @@ class Extractor(
                         },
                     )
                 }.sortedBy { it.name },
-                routines = routines[schema].orEmpty().sortedWith(
-                    compareBy({ it.name }, { it.signature ?: "" })
-                ),
+                routines = run {
+                    val rts = routines[schema].orEmpty()
+                    val nameCounts = rts.groupingBy { it.name }.eachCount()
+                    // funcname엔 시그니처가 없다 — 같은 이름의 오버로드가 있으면
+                    // 어느 것의 calls인지 모르므로 미귀속(네이티브와 같은 규칙).
+                    val ambiguous = rts.count {
+                        nameCounts[it.name] != 1 &&
+                            usage.functions.containsKey(schema to it.name)
+                    }
+                    if (ambiguous > 0) {
+                        limitations += "$schema: 오버로드된 routine ${ambiguous}개는 " +
+                            "funcname만으로 귀속 못 해 usage 미수집"
+                    }
+                    rts.map { rt ->
+                        rt.copy(
+                            usage = usage.functions[schema to rt.name]
+                                .takeIf { nameCounts[rt.name] == 1 }
+                        )
+                    }.sortedWith(compareBy({ it.name }, { it.signature ?: "" }))
+                },
             )
         }
         return CatalogDocument(
@@ -368,6 +385,7 @@ class Extractor(
     private data class UsageHarvest(
         val tables: Map<Pair<String, String>, UsageDoc>,
         val indexes: Map<Triple<String, String, String>, UsageDoc>,
+        val functions: Map<Pair<String, String>, UsageDoc>,
     )
 
     /** 통계는 since 이후만 유효하다는 게 계약의 핵심 — 쿼리가 지원되는 방언만
@@ -375,6 +393,7 @@ class Extractor(
     private fun collectUsage(): UsageHarvest {
         val tables = mutableMapOf<Pair<String, String>, UsageDoc>()
         val indexes = mutableMapOf<Triple<String, String, String>, UsageDoc>()
+        val functions = mutableMapOf<Pair<String, String>, UsageDoc>()
         when (dialect) {
             "postgres" -> {
                 // 테이블별 리셋 시각은 없다 — pg_stat_database.stats_reset이
@@ -402,32 +421,66 @@ class Extractor(
                     indexes[Triple(rs.getString(1), rs.getString(2), rs.getString(3))] =
                         UsageDoc(since, rs.getLong(4), 0)
                 }
-            }
-            "mysql" -> {
-                // performance_schema·sys는 재시작에 리셋된다 — uptime 역산이 since.
-                val since = runCatching {
+                // routine 호출 수 — calls를 reads에 싣는다(단위는 kind별로 다르다는
+                // 계약). funcname엔 시그니처가 없어 오버로드 귀속은 extract()에서
+                // 이름 유일성으로 판별한다(네이티브 reader와 같은 규칙).
+                // track_functions=none이면 뷰가 0행(0 호출이 아니라 미수집)이라
+                // 비어 있는 이유를 limitation으로 남긴다.
+                val tracking = runCatching {
                     conn.createStatement().use { st ->
-                        st.executeQuery(
-                            "SELECT NOW() - INTERVAL VARIABLE_VALUE SECOND " +
-                                "FROM performance_schema.global_status " +
-                                "WHERE VARIABLE_NAME='Uptime'"
-                        ).use { rs -> if (rs.next()) rs.getString(1) else null }
+                        st.executeQuery("SELECT current_setting('track_functions')")
+                            .use { rs -> if (rs.next()) rs.getString(1) else null }
                     }
                 }.getOrNull()
-                bestEffort("table stats",
-                    "SELECT table_schema, table_name, rows_fetched, " +
-                        "rows_inserted + rows_updated + rows_deleted " +
-                        "FROM sys.schema_table_statistics") { rs ->
-                    tables[rs.getString(1) to rs.getString(2)] =
-                        UsageDoc(since, rs.getLong(3), rs.getLong(4))
+                if (tracking == "none") {
+                    limitations += "track_functions=none — routine usage 미수집(함수 통계 비활성)"
+                } else {
+                    bestEffort("function stats",
+                        "SELECT schemaname, funcname, calls " +
+                            "FROM pg_stat_user_functions") { rs ->
+                        functions[rs.getString(1) to rs.getString(2)] =
+                            UsageDoc(since, rs.getLong(3), 0)
+                    }
                 }
-                // 재시작 이후 한 번도 안 쓰인 인덱스 명단 — 명단에 없는 것은
-                // 사용량이 모르는 것이지 0이 아니라서, 명단의 것만 0으로 싣는다.
-                bestEffort("unused indexes",
-                    "SELECT object_schema, object_name, index_name " +
-                        "FROM sys.schema_unused_indexes") { rs ->
-                    indexes[Triple(rs.getString(1), rs.getString(2), rs.getString(3))] =
-                        UsageDoc(since, 0, 0)
+            }
+            "mysql" -> {
+                // MariaDB는 performance_schema=OFF가 기본값 — sys 통계 뷰는
+                // 쿼리는 되지만 0행이라, 꺼져 있으면 그 이유를 limitation으로
+                // 남기고 수확을 건너뛴다(0행을 "관측된 0"으로 오독하지 않기 위해).
+                val pfs = runCatching {
+                    conn.createStatement().use { st ->
+                        st.executeQuery("SELECT CAST(@@performance_schema AS CHAR)")
+                            .use { rs -> if (rs.next()) rs.getString(1) else null }
+                    }
+                }.getOrNull()
+                if (pfs == "0" || pfs == "OFF") {
+                    limitations += "performance_schema=OFF — usage 미수집(통계 비활성, MariaDB 기본값)"
+                } else {
+                    // performance_schema·sys는 재시작에 리셋된다 — uptime 역산이 since.
+                    val since = runCatching {
+                        conn.createStatement().use { st ->
+                            st.executeQuery(
+                                "SELECT NOW() - INTERVAL VARIABLE_VALUE SECOND " +
+                                    "FROM performance_schema.global_status " +
+                                    "WHERE VARIABLE_NAME='Uptime'"
+                            ).use { rs -> if (rs.next()) rs.getString(1) else null }
+                        }
+                    }.getOrNull()
+                    bestEffort("table stats",
+                        "SELECT table_schema, table_name, rows_fetched, " +
+                            "rows_inserted + rows_updated + rows_deleted " +
+                            "FROM sys.schema_table_statistics") { rs ->
+                        tables[rs.getString(1) to rs.getString(2)] =
+                            UsageDoc(since, rs.getLong(3), rs.getLong(4))
+                    }
+                    // 재시작 이후 한 번도 안 쓰인 인덱스 명단 — 명단에 없는 것은
+                    // 사용량이 모르는 것이지 0이 아니라서, 명단의 것만 0으로 싣는다.
+                    bestEffort("unused indexes",
+                        "SELECT object_schema, object_name, index_name " +
+                            "FROM sys.schema_unused_indexes") { rs ->
+                        indexes[Triple(rs.getString(1), rs.getString(2), rs.getString(3))] =
+                            UsageDoc(since, 0, 0)
+                    }
                 }
             }
         }
@@ -435,7 +488,8 @@ class Extractor(
             schema.lowercase() !in SYSTEM_SCHEMAS && (schemaFilter.isEmpty() || schema in schemaFilter)
         tables.keys.removeIf { !keep(it.first) }
         indexes.keys.removeIf { !keep(it.first) }
-        return UsageHarvest(tables, indexes)
+        functions.keys.removeIf { !keep(it.first) }
+        return UsageHarvest(tables, indexes, functions)
     }
 
     /** best-effort 쿼리 — 실패를 limitation으로 변환해 숨기지 않는다. */
