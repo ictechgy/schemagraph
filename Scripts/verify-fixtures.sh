@@ -837,16 +837,26 @@ if not any(k == "writes" and f.startswith(f"{schema}.TOUCH_CUSTOMER(")
     sys.exit("probe(Oracle): TOUCH_CUSTOMER의 plsql 몸체 writes 미검출")
 if ("reads", f"{schema}.ORDER_COUNT", f"{schema}.ORDERS") not in edges:
     sys.exit("probe(Oracle): ORDER_COUNT의 SELECT .. INTO reads 미검출")
-# PACKAGE BODY — 멤버별 귀속은 미지원, 몸체 간선은 패키지 정점에 귀속.
+# PACKAGE BODY — 멤버는 schema.pkg.member 정점이 되고 몸체 간선은
+# 멤버에 귀속된다. 시그니처가 붙을 수 있어 정점 id는 접두로 본다.
 if f"{schema}.ORDER_OPS" not in verts:
     sys.exit("probe(Oracle): ORDER_OPS 패키지 정점 없음")
-if ("writes", f"{schema}.ORDER_OPS", f"{schema}.CUSTOMERS") not in edges:
-    sys.exit("probe(Oracle): 패키지 멤버 UPDATE의 패키지 귀속 미검출")
-if ("reads", f"{schema}.ORDER_OPS", f"{schema}.ORDERS") not in edges:
-    sys.exit("probe(Oracle): 패키지 멤버 SELECT의 패키지 귀속 미검출")
-lims = g.get("limitations", [])
-if not any("멤버별 귀속" in l for l in lims):
-    sys.exit(f"probe(Oracle): 패키지 귀속 한계 미보고: {lims}")
+if not any(k == "contains" and f == f"{schema}.ORDER_OPS"
+           and t.startswith(f"{schema}.ORDER_OPS.TOUCH") for k, f, t in edges):
+    sys.exit("probe(Oracle): 패키지→멤버 contains 미검출")
+if not any(k == "writes" and f.startswith(f"{schema}.ORDER_OPS.TOUCH")
+           and t == f"{schema}.CUSTOMERS" for k, f, t in edges):
+    sys.exit("probe(Oracle): TOUCH 멤버 UPDATE 귀속 미검출")
+if not any(k == "reads" and f.startswith(f"{schema}.ORDER_OPS.COUNT_ALL")
+           and t == f"{schema}.ORDERS" for k, f, t in edges):
+    sys.exit("probe(Oracle): COUNT_ALL 멤버 SELECT 귀속 미검출")
+# pkg.member 꼴 호출 — refresh가 order_ops.count_all()을 부른다.
+if not any(k == "calls" and f.startswith(f"{schema}.ORDER_OPS.REFRESH")
+           and t.startswith(f"{schema}.ORDER_OPS.COUNT_ALL") for k, f, t in edges):
+    sys.exit("probe(Oracle): pkg.member 호출 해석 미검출")
+if not any(k == "writes" and f.startswith(f"{schema}.ORDER_OPS.REFRESH")
+           and t == f"{schema}.TICKETS" for k, f, t in edges):
+    sys.exit("probe(Oracle): REFRESH 멤버 UPDATE 귀속 미검출")
 EOF
 
         # Go 프로브(probe-go) — JVM 없는 경로가 JVM 프로브와 같은 그래프를

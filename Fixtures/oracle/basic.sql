@@ -79,11 +79,12 @@ BEGIN
 END;
 /
 
--- 패키지: 멤버별 귀속은 미지원 — 멤버 몸체의 간선이 패키지 정점에
--- 귀속되고, 부분 귀속이라는 한계가 보고돼야 한다.
+-- 패키지: 멤버는 member_of로 내보내져 schema.pkg.member 정점이 되고,
+-- 패키지→멤버 contains 간선이 생긴다. 몸체 간선은 멤버에 귀속된다.
 CREATE OR REPLACE PACKAGE order_ops AS
     PROCEDURE touch(cid IN NUMBER);
     FUNCTION count_all RETURN NUMBER;
+    PROCEDURE refresh;
 END order_ops;
 /
 CREATE OR REPLACE PACKAGE BODY order_ops AS
@@ -97,5 +98,12 @@ CREATE OR REPLACE PACKAGE BODY order_ops AS
         SELECT COUNT(*) INTO n FROM orders;
         RETURN n;
     END count_all;
+    -- 멤버가 패키지 한정 호출(order_ops.count_all)을 하면 멤버 정점으로 해석돼야 한다.
+    PROCEDURE refresh IS
+        n NUMBER;
+    BEGIN
+        n := order_ops.count_all();
+        UPDATE tickets SET note = 'refreshed' WHERE id = n;
+    END refresh;
 END order_ops;
 /
