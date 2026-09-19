@@ -35,6 +35,7 @@ private val BUNDLED_DRIVERS = listOf(
     "org.postgresql.Driver",
     "org.h2.Driver",
     "org.sqlite.JDBC",
+    "com.microsoft.sqlserver.jdbc.SQLServerDriver",
 )
 
 fun main(args: Array<String>) {

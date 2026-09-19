@@ -72,6 +72,9 @@ data class UsageDoc(
     val since: String? = null,
     val reads: Long,
     val writes: Long,
+    // routine 누적/자기 실행 시간 ms — routine 정점에만 온다(미지원 방언은 null).
+    val totalMs: Double? = null,
+    val selfMs: Double? = null,
 )
 
 data class TriggerDoc(
