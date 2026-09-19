@@ -26,6 +26,10 @@ use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialec
 /// reader가 이미 싣은 한계와 순서를 섞지 않기 위해서다.
 pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<String>) {
     let dialect = dialect_for(&doc.dialect);
+    // Oracle의 미인용 식별자는 대문자로 접힌다 — 카탈로그는 ORDERS인데 몸체는
+    // orders라 정확 일치가 없다. 대소문자 구분 방언(PG 등)에 켜면 다른
+    // 객체를 잘못 가리키므로 접힘 의미론이 확실한 방언에만 켠다.
+    let ci = doc.dialect == "oracle";
     let mut enriched = 0usize;
     let mut notes: Vec<String> = Vec::new();
 
@@ -36,7 +40,7 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 match obj.kind.as_str() {
                     "view" => match parse_view(dialect.as_deref(), body) {
                         Ok(parsed) => {
-                            apply_view(g, &schema.name, &owner, &parsed, &mut notes);
+                            apply_view(g, &schema.name, &owner, &parsed, &mut notes, ci);
                             enriched += 1;
                         }
                         Err(msg) => notes.push(format!(
@@ -59,6 +63,7 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                     &trg.name,
                     VertexKind::Trigger,
                     "trigger",
+                    ci,
                 ) else {
                     notes.push(format!(
                         "trigger {}.{}.{}: 정점을 못 찾음(이름 충돌?) — 몸체 간선 생략",
@@ -68,7 +73,15 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 };
                 match parse_trigger_body(dialect.as_deref(), body) {
                     Ok(parsed) => {
-                        apply_trigger(g, &schema.name, &obj.name, &trigger_id, &parsed, &mut notes);
+                        apply_trigger(
+                            g,
+                            &schema.name,
+                            &obj.name,
+                            &trigger_id,
+                            &parsed,
+                            &mut notes,
+                            ci,
+                        );
                         enriched += 1;
                     }
                     Err(msg) => notes.push(format!("trigger {trigger_id} 몸체 파싱 실패: {msg}")),
@@ -90,7 +103,7 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 "package" => (VertexKind::Package, "package"),
                 _ => (VertexKind::Function, "function"),
             };
-            let Some(owner) = resolve_object(g, &schema.name, &id_name, kind, suffix) else {
+            let Some(owner) = resolve_object(g, &schema.name, &id_name, kind, suffix, ci) else {
                 notes.push(format!(
                     "routine {}.{id_name}: 정점을 못 찾음 — 몸체 간선 생략",
                     schema.name
@@ -102,7 +115,7 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 // 언어(plpgsql 등)는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
                 Some("sql") | None => match parse_routine_body(dialect.as_deref(), body) {
                     Ok(parsed) => {
-                        apply_routine(g, &schema.name, &owner, &parsed, &mut notes);
+                        apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
                         enriched += 1;
                     }
                     Err(msg) => notes.push(format!("routine {owner} 몸체 파싱 실패: {msg}")),
@@ -338,6 +351,7 @@ fn apply_view(
     owner: &VertexId,
     parsed: &ParsedView,
     notes: &mut Vec<String>,
+    ci: bool,
 ) {
     if parsed.has_nested_scope {
         notes.push(format!(
@@ -348,34 +362,33 @@ fn apply_view(
     let mut made = std::collections::BTreeSet::new();
     for (ref_schema, table) in &parsed.tables {
         let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-        let target = VertexId::object(&target_schema, table);
-        if g.vertex(&target).is_none() {
+        let Some(target) = vertex_hit(g, &VertexId::object(&target_schema, table), ci) else {
             notes.push(format!(
                 "view {owner}가 참조하는 {target_schema}.{table}이 카탈로그에 없음 \
                  (다른 스키마이거나 미수집)"
             ));
             continue;
-        }
+        };
         if made.insert(target.clone()) {
             g.add_edge(Edge {
                 from: owner.clone(),
-                to: target,
+                to: target.clone(),
                 kind: EdgeKind::Reads,
                 evidence: vec![Evidence {
                     layer: EvidenceLayer::BodyParse,
-                    detail: format!("view {owner} reads {target_schema}.{table}"),
+                    detail: format!("view {owner} reads {target}"),
                 }],
             });
         }
     }
     for (ref_schema, table, column) in &parsed.columns {
         let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-        let target = VertexId::member(&target_schema, table, column);
-        if g.vertex(&target).is_none() {
+        let Some(target) = vertex_hit(g, &VertexId::member(&target_schema, table, column), ci)
+        else {
             // 컬럼 정점이 없으면(함수 반환값·계산 컬럼 등) 조용히 넘긴다 —
             // object 레벨 간선이 이미 있고, 없는 컬럼을 추측으로 만들지 않는다.
             continue;
-        }
+        };
         g.add_edge(Edge {
             from: owner.clone(),
             to: target,
@@ -741,8 +754,9 @@ fn resolve_member(
     name: &str,
     kind: VertexKind,
     suffix: &str,
+    ci: bool,
 ) -> Option<VertexId> {
-    resolve_renamed(g, VertexId::member(schema, obj, name), kind, suffix)
+    resolve_renamed(g, VertexId::member(schema, obj, name), kind, suffix, ci)
 }
 
 /// 객체 레벨 정점(routine 등)을 같은 규칙으로 찾는다.
@@ -752,23 +766,54 @@ fn resolve_object(
     name: &str,
     kind: VertexKind,
     suffix: &str,
+    ci: bool,
 ) -> Option<VertexId> {
-    resolve_renamed(g, VertexId::object(schema, name), kind, suffix)
+    resolve_renamed(g, VertexId::object(schema, name), kind, suffix, ci)
 }
 
 /// base id가 다른 kind에게 점유됐으면 `base@suffix`를 시도한다 —
 /// graph.rs의 resolve_collision과 같은 명명 규칙을 공유해야 한다.
-fn resolve_renamed(g: &Graph, base: VertexId, kind: VertexKind, suffix: &str) -> Option<VertexId> {
+fn resolve_renamed(
+    g: &Graph,
+    base: VertexId,
+    kind: VertexKind,
+    suffix: &str,
+    ci: bool,
+) -> Option<VertexId> {
     let renamed = VertexId::from_raw(&format!("{}@{suffix}", base.as_str()));
     [base, renamed]
         .into_iter()
+        .filter_map(|id| vertex_hit(g, &id, ci))
         .find(|id| g.vertex(id).map(|v| v.kind == kind).unwrap_or(false))
+}
+
+/// 정점 조회 — 정확 일치가 없을 때 ci가 켜져 있으면 대소문자 무시 단일 후보를
+/// 찾는다. Oracle의 미인용 식별자는 대문자로 접혀 몸체의 `orders`와 카탈로그의
+/// `ORDERS`가 같은 대상이지만, 대소문자만 다른 두 객체가 있으면 어느 쪽인지
+/// 추측할 수 없어 None을 돌려 유령 간선을 막는다.
+fn vertex_hit(g: &Graph, id: &VertexId, ci: bool) -> Option<VertexId> {
+    if g.vertex(id).is_some() {
+        return Some(id.clone());
+    }
+    if !ci {
+        return None;
+    }
+    let mut hits = g
+        .vertices()
+        .map(|v| &v.id)
+        .filter(|v| v.as_str().eq_ignore_ascii_case(id.as_str()));
+    let first = hits.next()?;
+    if hits.next().is_none() {
+        Some(first.clone())
+    } else {
+        None
+    }
 }
 
 /// 스키마 안에서 routine 정점을 이름으로 찾는다. 정확한 id(name 그대로)가
 /// 먼저이고, 없으면 routine kind 정점의 표시 이름과 비교한다 — 호출자는
 /// 시그니처를 모르므로 이름이 유일할 때만 받아들인다(resolve()와 같은 철학).
-fn resolve_routine(g: &Graph, schema: &str, name: &str) -> RoutineHit {
+fn resolve_routine(g: &Graph, schema: &str, name: &str, ci: bool) -> RoutineHit {
     let exact = VertexId::object(schema, name);
     // 정확한 id가 routine kind일 때만 바로 받는다 — 같은 이름의 테이블이
     // base id를 차지한 채 routine이 `name@function`으로 분리됐을 수 있어
@@ -786,11 +831,12 @@ fn resolve_routine(g: &Graph, schema: &str, name: &str) -> RoutineHit {
     {
         return RoutineHit::One(exact);
     }
+    let name_eq = |a: &str, b: &str| a == b || (ci && a.eq_ignore_ascii_case(b));
     let hits: Vec<VertexId> = g
         .vertices()
         .filter(|v| {
-            v.schema == schema
-                && v.name == name
+            name_eq(&v.schema, schema)
+                && name_eq(&v.name, name)
                 && matches!(
                     v.kind,
                     schemagraph_core::VertexKind::Function
@@ -815,6 +861,7 @@ fn apply_trigger(
     trigger_id: &VertexId,
     parsed: &ParsedTrigger,
     notes: &mut Vec<String>,
+    ci: bool,
 ) {
     if g.vertex(trigger_id).is_none() {
         notes.push(format!(
@@ -822,15 +869,21 @@ fn apply_trigger(
         ));
         return;
     }
-    apply_dml_edges(g, schema, trigger_id, parsed, notes);
-    apply_call_edges(g, schema, trigger_id, &parsed.calls, notes);
+    apply_dml_edges(g, schema, trigger_id, parsed, notes, ci);
+    apply_call_edges(g, schema, trigger_id, &parsed.calls, notes, ci);
     // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다. 컬럼이 id 충돌로
     // `@column`으로 분리됐을 수 있어 kind-aware 해석자를 쓴다.
     let mut made = std::collections::BTreeSet::new();
     for column in &parsed.fired_columns {
-        let Some(target) =
-            resolve_member(g, schema, owner_table, column, VertexKind::Column, "column")
-        else {
+        let Some(target) = resolve_member(
+            g,
+            schema,
+            owner_table,
+            column,
+            VertexKind::Column,
+            "column",
+            ci,
+        ) else {
             continue;
         };
         if !made.insert(target.clone()) {
@@ -856,6 +909,7 @@ fn apply_routine(
     owner: &VertexId,
     parsed: &ParsedTrigger,
     notes: &mut Vec<String>,
+    ci: bool,
 ) {
     if g.vertex(owner).is_none() {
         notes.push(format!(
@@ -863,8 +917,8 @@ fn apply_routine(
         ));
         return;
     }
-    apply_dml_edges(g, schema, owner, parsed, notes);
-    apply_call_edges(g, schema, owner, &parsed.calls, notes);
+    apply_dml_edges(g, schema, owner, parsed, notes, ci);
+    apply_call_edges(g, schema, owner, &parsed.calls, notes, ci);
 }
 
 /// 몸체 문장의 writes/reads 대상을 간선으로 만든다 — trigger와 routine이 공유.
@@ -874,6 +928,7 @@ fn apply_dml_edges(
     from: &VertexId,
     parsed: &ParsedTrigger,
     notes: &mut Vec<String>,
+    ci: bool,
 ) {
     for (kind, targets) in [
         (EdgeKind::Writes, &parsed.writes),
@@ -881,13 +936,12 @@ fn apply_dml_edges(
     ] {
         for (ref_schema, table) in targets {
             let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-            let target = VertexId::object(&target_schema, table);
-            if g.vertex(&target).is_none() {
+            let Some(target) = vertex_hit(g, &VertexId::object(&target_schema, table), ci) else {
                 notes.push(format!(
                     "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
                 ));
                 continue;
-            }
+            };
             g.add_edge(Edge {
                 from: from.clone(),
                 to: target.clone(),
@@ -909,10 +963,11 @@ fn apply_call_edges(
     from: &VertexId,
     calls: &[(Option<String>, String)],
     notes: &mut Vec<String>,
+    ci: bool,
 ) {
     for (ref_schema, name) in calls {
         let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-        match resolve_routine(g, &target_schema, name) {
+        match resolve_routine(g, &target_schema, name, ci) {
             RoutineHit::One(target) => {
                 g.add_edge(Edge {
                     from: from.clone(),
@@ -1073,6 +1128,84 @@ mod tests {
         );
         let (_g, notes) = build(&doc);
         assert!(notes.iter().any(|n| n.contains("미해석")));
+    }
+
+    /// Oracle은 카탈로그가 대문자(미인용 식별자 접힘)인데 몸체는 소문자로
+    /// 쓰이는 게 보통 — ci 해석이 소문자 참조를 대문자 정점으로 연결해야 한다.
+    #[test]
+    fn oracle의_소문자_몸체가_대문자_정점으로_해석된다() {
+        let doc = CatalogDocument {
+            version: 1,
+            dialect: "oracle".into(),
+            reader: "test".into(),
+            limitations: vec![],
+            schemas: vec![SchemaDoc {
+                name: "SGFIX".into(),
+                routines: vec![],
+                objects: vec![
+                    table("ORDERS", vec![col("ID", 1), col("CUSTOMER_ID", 2)]),
+                    table("CUSTOMERS", vec![col("ID", 1), col("NAME", 2)]),
+                    ObjectDoc {
+                        name: "ORDER_TOTALS".into(),
+                        kind: "view".into(),
+                        columns: vec![],
+                        constraints: vec![],
+                        indexes: vec![],
+                        triggers: vec![],
+                        body: Some(
+                            "CREATE VIEW order_totals AS SELECT o.id, c.name \
+                             FROM orders o JOIN customers c ON c.id = o.customer_id"
+                                .to_owned(),
+                        ),
+                        usage: None,
+                    },
+                ],
+            }],
+        };
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "SGFIX.ORDER_TOTALS"
+            && e.to.as_str() == "SGFIX.ORDERS"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "SGFIX.ORDER_TOTALS"
+            && e.to.as_str() == "SGFIX.CUSTOMERS.NAME"));
+    }
+
+    /// 대소문자만 다른 두 객체가 공존하고 몸체가 둘 중 어느 철자도 정확히
+    /// 쓰지 않으면 ci는 어느 쪽인지 모른다 — 추측 간선 대신 miss를 남긴다.
+    #[test]
+    fn oracle의_대소문자_충돌은_추측하지_않는다() {
+        let doc = CatalogDocument {
+            version: 1,
+            dialect: "oracle".into(),
+            reader: "test".into(),
+            limitations: vec![],
+            schemas: vec![SchemaDoc {
+                name: "SGFIX".into(),
+                routines: vec![],
+                objects: vec![
+                    table("ORDERS", vec![col("ID", 1)]),
+                    table("orders", vec![col("id", 1)]),
+                    ObjectDoc {
+                        name: "V".into(),
+                        kind: "view".into(),
+                        columns: vec![],
+                        constraints: vec![],
+                        indexes: vec![],
+                        triggers: vec![],
+                        body: Some("CREATE VIEW v AS SELECT id FROM Orders".to_owned()),
+                        usage: None,
+                    },
+                ],
+            }],
+        };
+        let (g, notes) = build(&doc);
+        assert!(!g
+            .edges()
+            .iter()
+            .any(|e| e.kind == EdgeKind::Reads && e.from.as_str() == "SGFIX.V"));
+        assert!(notes.iter().any(|n| n.contains("Orders")));
     }
 
     #[test]
