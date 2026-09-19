@@ -56,17 +56,30 @@ fun main(args: Array<String>) {
     (opts.password ?: System.getenv("SG_DB_PASSWORD"))?.let { props["password"] = it }
 
     val dialect = dialectOf(url)
+    if (opts.format == "ndjson") {
+        // 진짜 스트리밍 — 문서를 전부 들지 않고 스키마 단위로 수확→방출한다.
+        runCatching {
+            DriverManager.getConnection(url, props).use { conn ->
+                val writer = if (opts.output == "-") System.out.bufferedWriter()
+                    else File(opts.output).bufferedWriter()
+                Extractor(conn, dialect, opts.schemas).extractStreaming { line ->
+                    writer.write(line)
+                    writer.newLine()
+                }
+                writer.flush()
+                if (opts.output != "-") writer.close()
+            }
+        }.getOrElse { fatal("추출 실패: ${it.message}") }
+        return
+    }
+    if (opts.format != "json") fatal("--format은 json|ndjson 중 하나다: ${opts.format}")
     val doc = runCatching {
         DriverManager.getConnection(url, props).use { conn ->
             Extractor(conn, dialect, opts.schemas).extract()
         }
     }.getOrElse { fatal("추출 실패: ${it.message}") }
 
-    val json = when (opts.format) {
-        "json" -> mapper.writeValueAsString(doc)
-        "ndjson" -> toNdjson(doc)
-        else -> fatal("--format은 json|ndjson 중 하나다: ${opts.format}")
-    }
+    val json = mapper.writeValueAsString(doc)
     if (opts.output == "-") println(json)
     else File(opts.output).writeText("$json\n")
 }
