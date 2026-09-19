@@ -1,0 +1,1053 @@
+{
+  "edges": [
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.a"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.b"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.customers"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.loop_self"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.order_count"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.order_items"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.order_totals"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.orders"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.products"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.standalone"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.tickets"
+    },
+    {
+      "from": "sgfix",
+      "kind": "contains",
+      "to": "sgfix.touch_customer(int(11))"
+    },
+    {
+      "from": "sgfix.a",
+      "kind": "contains",
+      "to": "sgfix.a.PRIMARY"
+    },
+    {
+      "from": "sgfix.a",
+      "kind": "contains",
+      "to": "sgfix.a.a_b_fk"
+    },
+    {
+      "from": "sgfix.a",
+      "kind": "contains",
+      "to": "sgfix.a.a_b_fk@index"
+    },
+    {
+      "from": "sgfix.a",
+      "kind": "contains",
+      "to": "sgfix.a.b_id"
+    },
+    {
+      "from": "sgfix.a",
+      "kind": "contains",
+      "to": "sgfix.a.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk a_b_fk: sgfix.a(b_id) -> sgfix.b(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.a",
+      "kind": "references",
+      "to": "sgfix.b"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk a_b_fk: b_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.a.b_id",
+      "kind": "references",
+      "to": "sgfix.b.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk b_a_fk: sgfix.b(a_id) -> sgfix.a(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.b",
+      "kind": "references",
+      "to": "sgfix.a"
+    },
+    {
+      "from": "sgfix.b",
+      "kind": "contains",
+      "to": "sgfix.b.PRIMARY"
+    },
+    {
+      "from": "sgfix.b",
+      "kind": "contains",
+      "to": "sgfix.b.a_id"
+    },
+    {
+      "from": "sgfix.b",
+      "kind": "contains",
+      "to": "sgfix.b.b_a_fk"
+    },
+    {
+      "from": "sgfix.b",
+      "kind": "contains",
+      "to": "sgfix.b.b_a_fk@index"
+    },
+    {
+      "from": "sgfix.b",
+      "kind": "contains",
+      "to": "sgfix.b.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk b_a_fk: a_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.b.a_id",
+      "kind": "references",
+      "to": "sgfix.a.id"
+    },
+    {
+      "from": "sgfix.customers",
+      "kind": "contains",
+      "to": "sgfix.customers.PRIMARY"
+    },
+    {
+      "from": "sgfix.customers",
+      "kind": "contains",
+      "to": "sgfix.customers.id"
+    },
+    {
+      "from": "sgfix.customers",
+      "kind": "contains",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk loop_self_ibfk_1: sgfix.loop_self(parent_id) -> sgfix.loop_self(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.loop_self",
+      "kind": "references",
+      "to": "sgfix.loop_self"
+    },
+    {
+      "from": "sgfix.loop_self",
+      "kind": "contains",
+      "to": "sgfix.loop_self.PRIMARY"
+    },
+    {
+      "from": "sgfix.loop_self",
+      "kind": "contains",
+      "to": "sgfix.loop_self.id"
+    },
+    {
+      "from": "sgfix.loop_self",
+      "kind": "contains",
+      "to": "sgfix.loop_self.loop_self_ibfk_1"
+    },
+    {
+      "from": "sgfix.loop_self",
+      "kind": "contains",
+      "to": "sgfix.loop_self.parent_id"
+    },
+    {
+      "from": "sgfix.loop_self",
+      "kind": "contains",
+      "to": "sgfix.loop_self.parent_id@index"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk loop_self_ibfk_1: parent_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.loop_self.parent_id",
+      "kind": "references",
+      "to": "sgfix.loop_self.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.order_count Reads sgfix.orders",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_count",
+      "kind": "reads",
+      "to": "sgfix.orders"
+    },
+    {
+      "from": "sgfix.order_items",
+      "kind": "contains",
+      "to": "sgfix.order_items.PRIMARY"
+    },
+    {
+      "from": "sgfix.order_items",
+      "kind": "contains",
+      "to": "sgfix.order_items.id"
+    },
+    {
+      "from": "sgfix.order_items",
+      "kind": "contains",
+      "to": "sgfix.order_items.order_id"
+    },
+    {
+      "from": "sgfix.order_items",
+      "kind": "contains",
+      "to": "sgfix.order_items.order_id@index"
+    },
+    {
+      "from": "sgfix.order_items",
+      "kind": "contains",
+      "to": "sgfix.order_items.order_items_ibfk_1"
+    },
+    {
+      "from": "sgfix.order_items",
+      "kind": "contains",
+      "to": "sgfix.order_items.order_items_ibfk_2"
+    },
+    {
+      "from": "sgfix.order_items",
+      "kind": "contains",
+      "to": "sgfix.order_items.product_id"
+    },
+    {
+      "from": "sgfix.order_items",
+      "kind": "contains",
+      "to": "sgfix.order_items.product_id@index"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk order_items_ibfk_1: sgfix.order_items(order_id) -> sgfix.orders(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.order_items",
+      "kind": "references",
+      "to": "sgfix.orders"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk order_items_ibfk_2: sgfix.order_items(product_id) -> sgfix.products(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.order_items",
+      "kind": "references",
+      "to": "sgfix.products"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk order_items_ibfk_1: order_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.order_items.order_id",
+      "kind": "references",
+      "to": "sgfix.orders.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk order_items_ibfk_2: product_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.order_items.product_id",
+      "kind": "references",
+      "to": "sgfix.products.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "view sgfix.order_totals reads sgfix.customers",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "to": "sgfix.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "view sgfix.order_totals reads sgfix.customers.name",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "from": "sgfix.order_totals",
+      "kind": "contains",
+      "to": "sgfix.order_totals.customer_name"
+    },
+    {
+      "from": "sgfix.order_totals",
+      "kind": "contains",
+      "to": "sgfix.order_totals.order_id"
+    },
+    {
+      "from": "sgfix.order_totals",
+      "kind": "contains",
+      "to": "sgfix.order_totals.total"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "view sgfix.order_totals reads sgfix.orders",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "to": "sgfix.orders"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "view sgfix.order_totals reads sgfix.orders.id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "to": "sgfix.orders.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "view sgfix.order_totals reads sgfix.orders.total",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "to": "sgfix.orders.total"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk orders_customer_fk: sgfix.orders(customer_id) -> sgfix.customers(id)",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.orders",
+      "kind": "references",
+      "to": "sgfix.customers"
+    },
+    {
+      "from": "sgfix.orders",
+      "kind": "contains",
+      "to": "sgfix.orders.PRIMARY"
+    },
+    {
+      "from": "sgfix.orders",
+      "kind": "contains",
+      "to": "sgfix.orders.customer_id"
+    },
+    {
+      "from": "sgfix.orders",
+      "kind": "contains",
+      "to": "sgfix.orders.id"
+    },
+    {
+      "from": "sgfix.orders",
+      "kind": "contains",
+      "to": "sgfix.orders.idx_orders_customer"
+    },
+    {
+      "from": "sgfix.orders",
+      "kind": "contains",
+      "to": "sgfix.orders.orders_customer_fk"
+    },
+    {
+      "from": "sgfix.orders",
+      "kind": "contains",
+      "to": "sgfix.orders.total"
+    },
+    {
+      "from": "sgfix.orders",
+      "kind": "contains",
+      "to": "sgfix.orders.trg_orders_touch"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "fk orders_customer_fk: customer_id -> id",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.orders.customer_id",
+      "kind": "references",
+      "to": "sgfix.customers.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.orders.trg_orders_touch Writes sgfix.customers",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "writes",
+      "to": "sgfix.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "trigger trg_orders_touch on orders",
+          "layer": "catalog"
+        }
+      ],
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "fires",
+      "to": "sgfix.orders"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "trigger sgfix.orders.trg_orders_touch reads NEW/OLD.customer_id on orders",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "reads",
+      "to": "sgfix.orders.customer_id"
+    },
+    {
+      "from": "sgfix.products",
+      "kind": "contains",
+      "to": "sgfix.products.PRIMARY"
+    },
+    {
+      "from": "sgfix.products",
+      "kind": "contains",
+      "to": "sgfix.products.id"
+    },
+    {
+      "from": "sgfix.products",
+      "kind": "contains",
+      "to": "sgfix.products.sku"
+    },
+    {
+      "from": "sgfix.products",
+      "kind": "contains",
+      "to": "sgfix.products.sku@constraint"
+    },
+    {
+      "from": "sgfix.products",
+      "kind": "contains",
+      "to": "sgfix.products.sku@index"
+    },
+    {
+      "from": "sgfix.standalone",
+      "kind": "contains",
+      "to": "sgfix.standalone.PRIMARY"
+    },
+    {
+      "from": "sgfix.standalone",
+      "kind": "contains",
+      "to": "sgfix.standalone.id"
+    },
+    {
+      "from": "sgfix.standalone",
+      "kind": "contains",
+      "to": "sgfix.standalone.note"
+    },
+    {
+      "from": "sgfix.tickets",
+      "kind": "contains",
+      "to": "sgfix.tickets.PRIMARY"
+    },
+    {
+      "from": "sgfix.tickets",
+      "kind": "contains",
+      "to": "sgfix.tickets.id"
+    },
+    {
+      "from": "sgfix.tickets",
+      "kind": "contains",
+      "to": "sgfix.tickets.note"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.touch_customer(int(11)) Writes sgfix.customers",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.touch_customer(int(11))",
+      "kind": "writes",
+      "to": "sgfix.customers"
+    }
+  ],
+  "limitations": [
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.a.a_b_fk\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.a.a_b_fk@index\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.b.b_a_fk\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.b.b_a_fk@index\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.loop_self.parent_id\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.loop_self.parent_id@index\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.order_items.order_id\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.order_items.order_id@index\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.order_items.product_id\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.order_items.product_id@index\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.products.sku\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 constraint \uc815\uc810\uc740 sgfix.products.sku@constraint\ub85c \ubd84\ub9ac",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.products.sku\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.products.sku@index\ub85c \ubd84\ub9ac"
+  ],
+  "version": 1,
+  "vertices": [
+    {
+      "id": "sgfix",
+      "kind": "schema",
+      "level": "schema",
+      "name": "sgfix",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.a",
+      "kind": "table",
+      "level": "object",
+      "name": "a",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.a.PRIMARY",
+      "kind": "constraint",
+      "level": "member",
+      "name": "PRIMARY",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.a.a_b_fk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "a_b_fk",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.a.a_b_fk@index",
+      "kind": "index",
+      "level": "member",
+      "name": "a_b_fk",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.a.b_id",
+      "kind": "column",
+      "level": "member",
+      "name": "b_id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.a.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.b",
+      "kind": "table",
+      "level": "object",
+      "name": "b",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.b.PRIMARY",
+      "kind": "constraint",
+      "level": "member",
+      "name": "PRIMARY",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.b.a_id",
+      "kind": "column",
+      "level": "member",
+      "name": "a_id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.b.b_a_fk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "b_a_fk",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.b.b_a_fk@index",
+      "kind": "index",
+      "level": "member",
+      "name": "b_a_fk",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.b.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.customers",
+      "kind": "table",
+      "level": "object",
+      "name": "customers",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.customers.PRIMARY",
+      "kind": "constraint",
+      "level": "member",
+      "name": "PRIMARY",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.customers.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.customers.name",
+      "kind": "column",
+      "level": "member",
+      "name": "name",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.loop_self",
+      "kind": "table",
+      "level": "object",
+      "name": "loop_self",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.loop_self.PRIMARY",
+      "kind": "constraint",
+      "level": "member",
+      "name": "PRIMARY",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.loop_self.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.loop_self.loop_self_ibfk_1",
+      "kind": "constraint",
+      "level": "member",
+      "name": "loop_self_ibfk_1",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.loop_self.parent_id",
+      "kind": "column",
+      "level": "member",
+      "name": "parent_id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.loop_self.parent_id@index",
+      "kind": "index",
+      "level": "member",
+      "name": "parent_id",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.order_count",
+      "kind": "function",
+      "level": "object",
+      "name": "order_count",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_items",
+      "kind": "table",
+      "level": "object",
+      "name": "order_items",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.order_items.PRIMARY",
+      "kind": "constraint",
+      "level": "member",
+      "name": "PRIMARY",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_items.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_items.order_id",
+      "kind": "column",
+      "level": "member",
+      "name": "order_id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_items.order_id@index",
+      "kind": "index",
+      "level": "member",
+      "name": "order_id",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.order_items.order_items_ibfk_1",
+      "kind": "constraint",
+      "level": "member",
+      "name": "order_items_ibfk_1",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_items.order_items_ibfk_2",
+      "kind": "constraint",
+      "level": "member",
+      "name": "order_items_ibfk_2",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_items.product_id",
+      "kind": "column",
+      "level": "member",
+      "name": "product_id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_items.product_id@index",
+      "kind": "index",
+      "level": "member",
+      "name": "product_id",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.order_totals",
+      "kind": "view",
+      "level": "object",
+      "name": "order_totals",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_totals.customer_name",
+      "kind": "column",
+      "level": "member",
+      "name": "customer_name",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_totals.order_id",
+      "kind": "column",
+      "level": "member",
+      "name": "order_id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.order_totals.total",
+      "kind": "column",
+      "level": "member",
+      "name": "total",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.orders",
+      "kind": "table",
+      "level": "object",
+      "name": "orders",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.orders.PRIMARY",
+      "kind": "constraint",
+      "level": "member",
+      "name": "PRIMARY",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.orders.customer_id",
+      "kind": "column",
+      "level": "member",
+      "name": "customer_id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.orders.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.orders.idx_orders_customer",
+      "kind": "index",
+      "level": "member",
+      "name": "idx_orders_customer",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.orders.orders_customer_fk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "orders_customer_fk",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.orders.total",
+      "kind": "column",
+      "level": "member",
+      "name": "total",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.orders.trg_orders_touch",
+      "kind": "trigger",
+      "level": "member",
+      "name": "trg_orders_touch",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.products",
+      "kind": "table",
+      "level": "object",
+      "name": "products",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.products.PRIMARY",
+      "kind": "constraint",
+      "level": "member",
+      "name": "PRIMARY",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.products.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.products.sku",
+      "kind": "column",
+      "level": "member",
+      "name": "sku",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.products.sku@constraint",
+      "kind": "constraint",
+      "level": "member",
+      "name": "sku",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.products.sku@index",
+      "kind": "index",
+      "level": "member",
+      "name": "sku",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.standalone",
+      "kind": "table",
+      "level": "object",
+      "name": "standalone",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.standalone.PRIMARY",
+      "kind": "constraint",
+      "level": "member",
+      "name": "PRIMARY",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.standalone.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.standalone.note",
+      "kind": "column",
+      "level": "member",
+      "name": "note",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.tickets",
+      "kind": "table",
+      "level": "object",
+      "name": "tickets",
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
+    },
+    {
+      "id": "sgfix.tickets.PRIMARY",
+      "kind": "constraint",
+      "level": "member",
+      "name": "PRIMARY",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.tickets.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.tickets.note",
+      "kind": "column",
+      "level": "member",
+      "name": "note",
+      "schema": "sgfix"
+    },
+    {
+      "id": "sgfix.touch_customer(int(11))",
+      "kind": "procedure",
+      "level": "object",
+      "name": "touch_customer",
+      "schema": "sgfix"
+    }
+  ]
+}

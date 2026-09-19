@@ -340,6 +340,130 @@ else
     echo "주의: MySQL을 찾지 못해 MySQL 검증 건너뜀 (SG_MYSQL_URL 또는 docker)" >&2
 fi
 
+# ── MariaDB ─────────────────────────────────────────────────────────────
+# MySQL 리더의 MariaDB 호환 검증 — 같은 fixture를 쓰고, 온전한 스캔의 그래프는
+# MySQL 골든과 동일해야 한다. SG_MARIADB_URL이 있으면 그 서버를 쓰고
+# (fixture를 새로 적용한다 — 폐기용 DB만), 없으면 docker로 띄운다.
+# MariaDB는 performance_schema=OFF가 기본값이라, 소유 컨테이너는 두 단계로
+# 띄워 OFF limitation 경로와 ON 수확 경로를 둘 다 본다(런타임 전환 불가라
+# 컨테이너 재생성이 필요하다).
+maria_url=""
+maria_container=""
+maria_own=""
+maria_port=""
+
+maria_up() {  # $*=추가 mysqld 옵션
+    docker rm -f "$maria_container" >/dev/null 2>&1 || true
+    docker run -d --name "$maria_container" \
+        -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1 -e MARIADB_DATABASE=sgfix \
+        -p "$maria_port":3306 mariadb:11.4 "$@" >/dev/null
+    for _ in $(seq 1 60); do
+        docker exec "$maria_container" mariadb-admin ping -uroot --silent 2>/dev/null && break
+        sleep 2
+    done
+    for _ in $(seq 1 30); do
+        docker exec "$maria_container" mariadb -uroot sgfix -e "SELECT 1" >/dev/null 2>&1 && break
+        sleep 2
+    done
+    docker exec -i "$maria_container" mariadb -uroot sgfix < "$MYFIX/basic.sql"
+}
+
+if [ -n "${SG_MARIADB_URL:-}" ]; then
+    maria_url="$SG_MARIADB_URL"
+    if ! command -v mysql >/dev/null && ! command -v mariadb >/dev/null; then
+        echo "주의: SG_MARIADB_URL이 있는데 mysql/mariadb 클라이언트가 없어 MariaDB 검증 건너뜀" >&2
+        maria_url=""
+    fi
+elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+    maria_container="sg-verify-mariadb-$$"
+    maria_port=$((33500 + RANDOM % 90))
+    maria_own=1
+    trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; [ -n "${maria_own:-}" ] && docker rm -f "${maria_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
+
+    # 1단계: 기본값(PFS OFF) — 통계 미수집이 limitation으로 보고돼야 하고
+    # usage가 붙은 정점이 없어야 한다(0행을 관측된 0으로 읽지 않는 계약).
+    maria_up
+    maria_url="mysql://root@localhost:$maria_port/sgfix"
+    "$BIN" scan "$maria_url" -o "$tmp/graph-maria-off.json"
+    python3 - "$tmp/graph-maria-off.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+lims = g.get("limitations", [])
+if not any("performance_schema=OFF" in l for l in lims):
+    sys.exit(f"MariaDB: performance_schema=OFF limitation 미보고: {lims}")
+used = [v["id"] for v in g["vertices"] if v.get("usage")]
+if used:
+    sys.exit(f"MariaDB: PFS OFF인데 usage 부착: {used[:5]}")
+EOF
+
+    # 2단계: PFS ON — 수확 경로까지 검증한다.
+    maria_up --performance-schema=ON
+else
+    :
+fi
+
+if [ -n "$maria_url" ]; then
+    if [ -z "$maria_own" ]; then
+        # 외부 서버 — fixture를 새로 적용한다(폐기용 DB 계약). mysql과 같은
+        # 와이어 프로토콜이라 같은 클라이언트로 적용한다.
+        if [[ "$maria_url" =~ mysql://([^:/@]+)(:([^@]*))?@([^:/]+)(:([0-9]+))?/([^?]+) ]]; then
+            MARIA_CLI="$(command -v mariadb || command -v mysql)"
+            MYSQL_PWD="${BASH_REMATCH[3]}" "$MARIA_CLI" -h "${BASH_REMATCH[4]}" \
+                -P "${BASH_REMATCH[6]:-3306}" -u "${BASH_REMATCH[1]}" \
+                "${BASH_REMATCH[7]}" < "$MYFIX/basic.sql"
+        else
+            echo "주의: SG_MARIADB_URL 형식을 못 풀어 fixture 적용 건너뜀" >&2
+        fi
+    fi
+
+    "$BIN" scan "$maria_url" -o "$tmp/graph-maria.json"
+
+    # 골든은 MariaDB 전용이다 — MySQL과 구조는 같아도 시그니처 표기
+    # (int(11))와 sys 뷰 범위가 다르다.
+    MARIAFIX="Fixtures/mariadb"
+    if [ -f "$MARIAFIX/basic.graph.golden.json" ]; then
+        # usage 값(시각·카운트)은 환경 의존 — 정규화 후 비교한다.
+        diff -u <(norm_usage "$MARIAFIX/basic.graph.golden.json") \
+                <(norm_usage "$tmp/graph-maria.json")
+    else
+        echo "주의: MariaDB 골든이 없다. 첫 출력을 검토하고 골든으로 고정해라:" >&2
+        echo "  norm_usage $tmp/graph-maria.json > $MARIAFIX/basic.graph.golden.json" >&2
+    fi
+
+    python3 - "$tmp/graph-maria.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+edges = {(e["kind"], e["from"], e["to"]) for e in g["edges"]}
+want = {
+    ("writes", "sgfix.orders.trg_orders_touch", "sgfix.customers"),
+    ("fires", "sgfix.orders.trg_orders_touch", "sgfix.orders"),
+    ("reads", "sgfix.order_totals", "sgfix.orders"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"MariaDB 간선 미검출: {sorted(missing)}")
+# routine 시그니처는 방언 표기를 따른다 — MariaDB는 int(11)이라
+# 정확한 id 대신 접두로 본다.
+if not any(k == "writes" and f.startswith("sgfix.touch_customer(")
+           and t == "sgfix.customers" for k, f, t in edges):
+    sys.exit("MariaDB: touch_customer writes 간선 미검출")
+verts = {v["id"] for v in g["vertices"]}
+if "sgfix.order_items.order_id@index" not in verts:
+    sys.exit("MariaDB: 충돌 분리 정점 order_id@index 없음")
+lims = g.get("limitations", [])
+pfs_off = any("performance_schema=OFF" in l for l in lims)
+used = {v["id"] for v in g["vertices"] if v.get("usage")}
+if pfs_off:
+    # 외부 서버가 OFF면 미수집이 정직한 결과다 — usage가 없어야 한다.
+    if used:
+        sys.exit(f"MariaDB: PFS OFF인데 usage 부착: {sorted(used)[:5]}")
+elif "sgfix.orders" not in used:
+    sys.exit(f"MariaDB: PFS ON인데 sgfix.orders usage 없음: {sorted(used)[:10]}")
+EOF
+else
+    echo "주의: MariaDB를 찾지 못해 MariaDB 검증 건너뜀 (SG_MARIADB_URL 또는 docker)" >&2
+fi
+
 # ── JDBC probe ──────────────────────────────────────────────────────────
 # probe는 java + fat jar이 필요하다. macOS /usr/bin/java는 스텁이라 실기동을
 # 확인하고, 없으면 homebrew openjdk를 본다. jar이 없고 gradle이 있으면 빌드.
@@ -386,6 +510,26 @@ want = {
 missing = want - edges
 if missing:
     sys.exit(f"probe(H2) 간선 미검출: {sorted(missing)}")
+EOF
+
+    # SQLite — sqlite-jdbc도 번들이다. 스키마 귀속(TABLE_SCHEM이 null → main)과
+    # sqlite_master 몸체 수확이 네이티브와 같은 간선을 내야 한다.
+    sqlite3 "$tmp/probe-sqlite.db" < "$FIX/basic.sql"
+    "$JAVABIN" -jar "$JAR" --url "jdbc:sqlite:$tmp/probe-sqlite.db" \
+        -o "$tmp/probe-sqlite-doc.json"
+    "$BIN" scan --document "$tmp/probe-sqlite-doc.json" -o "$tmp/probe-sqlite-graph.json"
+    python3 - "$tmp/graph.json" "$tmp/probe-sqlite-graph.json" <<'EOF'
+import json, sys
+def load(p):
+    g = json.load(open(p))
+    return ({v["id"] for v in g["vertices"]},
+            {(e["kind"], e["from"], e["to"]) for e in g["edges"]})
+nv, ne = load(sys.argv[1])
+pv, pe = load(sys.argv[2])
+if nv != pv or ne != pe:
+    sys.exit(f"probe(SQLite) 패리티 불일치 — verts only-native: {sorted(nv-pv)} "
+             f"only-probe: {sorted(pv-nv)} | edges only-native: {sorted(ne-pe)} "
+             f"only-probe: {sorted(pe-ne)}")
 EOF
 
     # PG parity — pgjdbc가 번들이라 PG가 떠 있으면 같은 DB를 JDBC로도 읽어
@@ -438,6 +582,220 @@ if missing:
     sys.exit(f"probe(MySQL) 간선 미검출: {sorted(missing)}")
 EOF
         fi
+    fi
+
+    # MariaDB probe — mysql 드라이버로 같은 와이어 프로토콜을 탄다.
+    if [ -n "${maria_url:-}" ] && [ -n "${SG_MYSQL_JAR:-}" ] && [ -f "${SG_MYSQL_JAR:-}" ]; then
+        if [[ "$maria_url" =~ mysql://([^:/@]+)(:([^@]*))?@([^:/]+)(:([0-9]+))?/([^?]+) ]]; then
+            jdbc_maria="jdbc:mysql://${BASH_REMATCH[4]}:${BASH_REMATCH[6]:-3306}/${BASH_REMATCH[7]}"
+            "$JAVABIN" -jar "$JAR" --url "$jdbc_maria" --user "${BASH_REMATCH[1]}" \
+                --driver "$SG_MYSQL_JAR" -o "$tmp/probe-maria-doc.json"
+            "$BIN" scan --document "$tmp/probe-maria-doc.json" -o "$tmp/probe-maria-graph.json"
+            python3 - "$tmp/probe-maria-graph.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+edges = {(e["kind"], e["from"], e["to"]) for e in g["edges"]}
+want = {
+    ("references", "sgfix.order_items", "sgfix.orders"),
+    ("fires", "sgfix.orders.trg_orders_touch", "sgfix.orders"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"probe(MariaDB) 간선 미검출: {sorted(missing)}")
+# MariaDB는 파라미터 표기가 int(11) — 정확한 id 대신 접두로 본다.
+if not any(k == "writes" and f.startswith("sgfix.touch_customer(")
+           and t == "sgfix.customers" for k, f, t in edges):
+    sys.exit("probe(MariaDB): touch_customer writes 간선 미검출")
+EOF
+        fi
+    fi
+
+    # mysql/mariadb/PG가 필요한 구간은 여기까지다 — 소유 리소스를 여기서
+    # 내린다. MSSQL·Oracle과 동시 기동하면 4GiB급 docker VM에서 OOM-kill이
+    # 난다(실제로 oracle 컨테이너가 OOMKilled로 죽은 적이 있다).
+    if [ -n "${my_own:-}" ]; then
+        docker rm -f "$my_container" >/dev/null 2>&1 || true
+        my_own=""
+    fi
+    if [ -n "${maria_own:-}" ]; then
+        docker rm -f "$maria_container" >/dev/null 2>&1 || true
+        maria_own=""
+    fi
+    if [ -n "${pg_own:-}" ]; then
+        "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1 || true
+        pg_own=""
+    fi
+
+    # ── MSSQL probe ─────────────────────────────────────────────────────
+    # 네이티브 리더가 없어 프로브가 유일한 경로다 — mssql-jdbc는 MIT라 번들.
+    # SG_MSSQL_URL(jdbc:sqlserver://…;databaseName=<폐기용DB>)이 있으면 그
+    # 서버에 fixture를 적용해 쓰고, 없으면 docker로 Azure SQL Edge를 띄운다
+    # (arm64/amd64 모두 돈다 — 공식 SQL Server 이미지는 ARM QEMU에서 죽는다).
+    # fixture 적용은 sqlcmd가 없는 이미지라 Scripts/ApplySql.java로 한다.
+    mssql_jdbc=""
+    mssql_container=""
+    ms_user="${SG_MSSQL_USER:-sa}"
+    ms_pass="${SG_MSSQL_PASSWORD:-Strong!Passw0rd}"
+
+    if [ -n "${SG_MSSQL_URL:-}" ]; then
+        mssql_jdbc="$SG_MSSQL_URL"
+    elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+        mssql_container="sg-verify-mssql-$$"
+        ms_port=$((33600 + RANDOM % 90))
+        docker run -d --name "$mssql_container" \
+            -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD="$ms_pass" \
+            -p "$ms_port":1433 mcr.microsoft.com/azure-sql-edge:latest >/dev/null
+        trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; [ -n "${maria_own:-}" ] && docker rm -f "${maria_container:-}" >/dev/null 2>&1; docker rm -f "${mssql_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
+
+        # 기동 대기 — sqlcmd가 없어 SELECT 1 한 장으로 tcp가 열릴 때까지 본다.
+        # ApplySql은 ServiceLoader로 드라이버를 찾으므로 fat jar을 -cp로 준다
+        # (프로브 자체는 BUNDLED_DRIVERS 명시 로딩이라 -jar만으로 동작한다).
+        # Azure SQL Edge는 arm64에서도 수 분 걸릴 수 있어 여유를 둔다.
+        echo "SELECT 1" > "$tmp/ms-ping.sql"
+        ms_ready=""
+        for _ in $(seq 1 120); do
+            if "$JAVABIN" -cp "$JAR" "$PWD/Scripts/ApplySql.java" \
+                "jdbc:sqlserver://localhost:$ms_port;encrypt=false" \
+                "$ms_user" "$ms_pass" "$tmp/ms-ping.sql" >/dev/null 2>&1; then
+                ms_ready=1
+                break
+            fi
+            sleep 3
+        done
+        if [ -z "$ms_ready" ]; then
+            echo "주의: MSSQL 컨테이너가 기동하지 않아 probe-MSSQL 검증 건너뜀" >&2
+        else
+            # 폐기용 DB를 만들고 fixture를 적용한다.
+            echo "IF DB_ID('sgfix') IS NULL CREATE DATABASE sgfix;" > "$tmp/ms-ddl.sql"
+            "$JAVABIN" -cp "$JAR" "$PWD/Scripts/ApplySql.java" \
+                "jdbc:sqlserver://localhost:$ms_port;encrypt=false" \
+                "$ms_user" "$ms_pass" "$tmp/ms-ddl.sql"
+            mssql_jdbc="jdbc:sqlserver://localhost:$ms_port;databaseName=sgfix;encrypt=false"
+        fi
+    fi
+
+    if [ -n "$mssql_jdbc" ]; then
+        # 외부 서버든 소유 컨테이너든 대상 DB에 fixture를 적용한다(폐기용 DB
+        # 계약 — 재실행하면 CREATE가 충돌해 실패하니 검증 전용 서버만 지정).
+        "$JAVABIN" -cp "$JAR" "$PWD/Scripts/ApplySql.java" \
+            "$mssql_jdbc" "$ms_user" "$ms_pass" "$PWD/Fixtures/mssql/basic.sql"
+
+        "$JAVABIN" -jar "$JAR" --url "$mssql_jdbc" \
+            --user "$ms_user" --password "$ms_pass" -o "$tmp/probe-ms-doc.json"
+        "$BIN" scan --document "$tmp/probe-ms-doc.json" -o "$tmp/probe-ms-graph.json"
+        python3 - "$tmp/probe-ms-graph.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+edges = {(e["kind"], e["from"], e["to"]) for e in g["edges"]}
+want = {
+    ("references", "dbo.order_items", "dbo.orders"),
+    ("fires", "dbo.orders.trg_orders_touch", "dbo.orders"),
+    ("writes", "dbo.orders.trg_orders_touch", "dbo.customers"),
+    ("writes", "dbo.touch_customer(int)", "dbo.customers"),
+    ("reads", "dbo.order_totals", "dbo.orders"),
+    ("reads", "dbo.order_count", "dbo.orders"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"probe(MSSQL) 간선 미검출: {sorted(missing)}")
+# numbered procedure 접미사(;0/;1)는 정규화돼야 한다 — 유령 routine 금지.
+ghosts = [v["id"] for v in g["vertices"] if ";" in v["id"]]
+if ghosts:
+    sys.exit(f"probe(MSSQL): ;N 유령 정점: {ghosts}")
+EOF
+    else
+        echo "주의: MSSQL을 찾지 못해 probe-MSSQL 검증 건너뜀 (SG_MSSQL_URL 또는 docker)" >&2
+    fi
+
+    # MSSQL도 여기서 끝 — Oracle(2GB+)과 동시 기동하지 않게 소유 컨테이너를 내린다.
+    if [ -n "$mssql_container" ]; then
+        docker rm -f "$mssql_container" >/dev/null 2>&1 || true
+        mssql_container=""
+    fi
+
+    # ── Oracle probe ────────────────────────────────────────────────────
+    # ojdbc는 OTN 계열 라이선스라 번들하지 않는다 — SG_ORACLE_JAR로 jar을
+    # 지정해야 한다. SG_ORACLE_URL이 있으면 그 서버를 쓰고(폐기용 스키마
+    # 계정), 없으면 docker로 gvenzl/oracle-free를 띄운다 — XE엔 ARM 빌드가
+    # 없고 23ai Free는 arm64/amd64 모두 돈다. 접속은 APP_USER 스키마로 한다.
+    oracle_jdbc=""
+    oracle_user="${SG_ORACLE_USER:-sgfix}"
+    oracle_pass="${SG_ORACLE_PASSWORD:-Strong!Passw0rd}"
+    OJAR="${SG_ORACLE_JAR:-}"
+
+    if [ -z "$OJAR" ] || [ ! -f "$OJAR" ]; then
+        echo "주의: SG_ORACLE_JAR가 없어 probe-Oracle 검증 건너뜀 (ojdbc jar 경로)" >&2
+    elif [ -n "${SG_ORACLE_URL:-}" ]; then
+        oracle_jdbc="$SG_ORACLE_URL"
+    elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+        oracle_container="sg-verify-oracle-$$"
+        or_port=$((33700 + RANDOM % 90))
+        docker run -d --name "$oracle_container" \
+            -e ORACLE_PASSWORD="$oracle_pass" \
+            -e APP_USER="$oracle_user" -e APP_USER_PASSWORD="$oracle_pass" \
+            -p "$or_port":1521 gvenzl/oracle-free:slim >/dev/null
+        trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; [ -n "${maria_own:-}" ] && docker rm -f "${maria_container:-}" >/dev/null 2>&1; [ -n "${mssql_container:-}" ] && docker rm -f "${mssql_container:-}" >/dev/null 2>&1; docker rm -f "${oracle_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
+
+        # 기동 대기 — 첫 기동은 DB 초기화라 몇 분 걸릴 수 있다.
+        echo "SELECT 1 FROM DUAL" > "$tmp/or-ping.sql"
+        or_ready=""
+        for _ in $(seq 1 90); do
+            if "$JAVABIN" -cp "$OJAR" "$PWD/Scripts/ApplySql.java" \
+                "jdbc:oracle:thin:@localhost:$or_port/FREEPDB1" \
+                "$oracle_user" "$oracle_pass" "$tmp/or-ping.sql" >/dev/null 2>&1; then
+                or_ready=1
+                break
+            fi
+            sleep 3
+        done
+        if [ -z "$or_ready" ]; then
+            echo "주의: Oracle 컨테이너가 기동하지 않아 probe-Oracle 검증 건너뜀" >&2
+        else
+            oracle_jdbc="jdbc:oracle:thin:@localhost:$or_port/FREEPDB1"
+        fi
+    fi
+
+    if [ -n "$oracle_jdbc" ]; then
+        # 폐기용 스키마 계약 — fixture를 새로 적용한다.
+        "$JAVABIN" -cp "$OJAR" "$PWD/Scripts/ApplySql.java" \
+            "$oracle_jdbc" "$oracle_user" "$oracle_pass" \
+            "$PWD/Fixtures/oracle/basic.sql"
+
+        "$JAVABIN" -jar "$JAR" --url "$oracle_jdbc" \
+            --user "$oracle_user" --password "$oracle_pass" \
+            --driver "$OJAR" -o "$tmp/probe-or-doc.json"
+        "$BIN" scan --document "$tmp/probe-or-doc.json" -o "$tmp/probe-or-graph.json"
+        python3 - "$tmp/probe-or-graph.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+# 스키마는 ORDERS 정점에서 유도한다 — Oracle은 미인용 식별자를 대문자로
+# 접으므로 SGFIX가 되고, 외부 서버는 접속 계정 스키마를 따른다.
+schema = next(v["id"].split(".")[0] for v in g["vertices"]
+            if v["id"].endswith(".ORDERS"))
+edges = {(e["kind"], e["from"], e["to"]) for e in g["edges"]}
+want = {
+    ("references", f"{schema}.ORDER_ITEMS", f"{schema}.ORDERS"),
+    ("fires", f"{schema}.ORDERS.TRG_ORDERS_TOUCH", f"{schema}.ORDERS"),
+    ("writes", f"{schema}.ORDERS.TRG_ORDERS_TOUCH", f"{schema}.CUSTOMERS"),
+    ("reads", f"{schema}.ORDER_TOTALS", f"{schema}.ORDERS"),
+    # 대소문자 접힘 해석 — 몸체의 소문자 참조가 대문자 멤버까지 닿아야 한다.
+    ("reads", f"{schema}.ORDER_TOTALS", f"{schema}.ORDERS.ID"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"probe(Oracle) 간선 미검출: {sorted(missing)}")
+verts = {v["id"] for v in g["vertices"]}
+if f"{schema}.ORDER_COUNT" not in verts:
+    sys.exit(f"probe(Oracle): ORDER_COUNT routine 정점 없음")
+if not any(v.startswith(f"{schema}.TOUCH_CUSTOMER(") for v in verts):
+    sys.exit(f"probe(Oracle): TOUCH_CUSTOMER routine 정점 없음")
+lims = g.get("limitations", [])
+if not any("plsql" in l for l in lims):
+    sys.exit(f"probe(Oracle): plsql 미지원 limitation 미보고: {lims}")
+EOF
+    else
+        [ -n "$OJAR" ] && [ -f "$OJAR" ] && \
+            echo "주의: Oracle을 찾지 못해 probe-Oracle 검증 건너뜀 (SG_ORACLE_URL 또는 docker)" >&2
     fi
 else
     echo "주의: java/probe jar이 없어 probe 검증 건너뜀 (brew openjdk 또는 gradle shadowJar)" >&2
