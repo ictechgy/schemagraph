@@ -476,7 +476,8 @@
     }
   ],
   "limitations": [
-    "routine public.trg_orders_touch_fn: 언어 plpgsql의 몸체 파싱 미지원 — 몸체 간선 없음"
+    "\uba64\ubc84 id \ucda9\ub3cc: public.products.products_sku_key\ub294 Constraint\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
+    "routine public.trg_orders_touch_fn: \uc5b8\uc5b4 plpgsql\uc758 \ubab8\uccb4 \ud30c\uc2f1 \ubbf8\uc9c0\uc6d0 \u2014 \ubab8\uccb4 \uac04\uc120 \uc5c6\uc74c"
   ],
   "version": 1,
   "vertices": [
@@ -492,7 +493,12 @@
       "kind": "table",
       "level": "object",
       "name": "a",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.a.a_b_fk",
@@ -527,7 +533,12 @@
       "kind": "table",
       "level": "object",
       "name": "b",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.b.a_id",
@@ -562,7 +573,12 @@
       "kind": "table",
       "level": "object",
       "name": "customers",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.customers.customers_pkey",
@@ -590,7 +606,12 @@
       "kind": "table",
       "level": "object",
       "name": "loop_self",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.loop_self.id",
@@ -625,7 +646,12 @@
       "kind": "table",
       "level": "object",
       "name": "order_items",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.order_items.id",
@@ -702,7 +728,12 @@
       "kind": "table",
       "level": "object",
       "name": "orders",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.orders.customer_id",
@@ -723,7 +754,12 @@
       "kind": "index",
       "level": "member",
       "name": "idx_orders_customer",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.orders.orders_customer_id_fkey",
@@ -758,7 +794,12 @@
       "kind": "table",
       "level": "object",
       "name": "products",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.products.id",
@@ -779,7 +820,12 @@
       "kind": "constraint",
       "level": "member",
       "name": "products_sku_key",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.products.sku",
@@ -793,7 +839,12 @@
       "kind": "table",
       "level": "object",
       "name": "standalone",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.standalone.id",
@@ -821,7 +872,12 @@
       "kind": "table",
       "level": "object",
       "name": "tickets",
-      "schema": "public"
+      "schema": "public",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "public.tickets.id",

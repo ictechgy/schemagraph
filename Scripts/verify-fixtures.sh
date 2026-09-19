@@ -21,6 +21,19 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# usage 통계는 환경 의존이다(시각·누적 카운트) — 골든 비교 전에 값을
+# 정규화해 "usage가 있었다" 사실만 비교한다. 골든도 이 형태로 저장한다.
+norm_usage() {
+    python3 - "$1" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+for v in g.get("vertices", []):
+    if isinstance(v.get("usage"), dict):
+        v["usage"] = {k: "<value>" for k in v["usage"]}
+print(json.dumps(g, indent=2, sort_keys=True))
+EOF
+}
+
 sqlite3 "$tmp/basic.db" < "$FIX/basic.sql"
 
 "$BIN" scan "sqlite:$tmp/basic.db" -o "$tmp/graph.json"
@@ -165,11 +178,26 @@ if [ -n "$pg_url" ]; then
     "$BIN" scan "$pg_url" -o "$tmp/graph-pg.json"
 
     if [ -f "$PGFIX/basic.graph.golden.json" ]; then
-        diff -u "$PGFIX/basic.graph.golden.json" "$tmp/graph-pg.json"
+        # usage 값(시각·카운트)은 환경 의존 — 정규화 후 비교한다.
+        diff -u <(norm_usage "$PGFIX/basic.graph.golden.json") \
+                <(norm_usage "$tmp/graph-pg.json")
     else
         echo "주의: PG 골든이 없다. 첫 출력을 검토하고 골든으로 고정해라:" >&2
-        echo "  cp $tmp/graph-pg.json $PGFIX/basic.graph.golden.json" >&2
+        echo "  norm_usage $tmp/graph-pg.json > $PGFIX/basic.graph.golden.json" >&2
     fi
+
+    # P3: stats — pg_stat 사용량이 since와 함께 수확돼야 한다.
+    "$BIN" stats --graph "$tmp/graph-pg.json" > "$tmp/stats-pg.json"
+    python3 - "$tmp/stats-pg.json" <<'EOF'
+import json, sys
+r = json.load(open(sys.argv[1]))
+stats = {s["id"]: s for s in r["stats"]}
+assert r["totals"]["observed"] >= 1, f"관측 정점 없음: {r}"
+orders = stats.get("public.orders")
+assert orders is not None, f"public.orders usage 없음: {sorted(stats)}"
+assert isinstance(orders["reads"], int) and orders["reads"] >= 0, orders
+assert "since" in orders, f"since 없음 — 유효 구간을 알 수 없다: {orders}"
+EOF
 
     # PG 스모크: a↔b 순환, view member reads, EXECUTE FUNCTION calls,
     # plpgsql 미지원 limitation 보고.
@@ -262,11 +290,25 @@ if [ -n "$my_url" ]; then
     "$BIN" scan "$my_url" -o "$tmp/graph-my.json"
 
     if [ -f "$MYFIX/basic.graph.golden.json" ]; then
-        diff -u "$MYFIX/basic.graph.golden.json" "$tmp/graph-my.json"
+        # usage 값(시각·카운트)은 환경 의존 — 정규화 후 비교한다.
+        diff -u <(norm_usage "$MYFIX/basic.graph.golden.json") \
+                <(norm_usage "$tmp/graph-my.json")
     else
         echo "주의: MySQL 골든이 없다. 첫 출력을 검토하고 골든으로 고정해라:" >&2
-        echo "  cp $tmp/graph-my.json $MYFIX/basic.graph.golden.json" >&2
+        echo "  norm_usage $tmp/graph-my.json > $MYFIX/basic.graph.golden.json" >&2
     fi
+
+    # P3: stats — sys 스키마 통계가 since와 함께 수확돼야 한다.
+    "$BIN" stats --graph "$tmp/graph-my.json" > "$tmp/stats-my.json"
+    python3 - "$tmp/stats-my.json" <<'EOF'
+import json, sys
+r = json.load(open(sys.argv[1]))
+stats = {s["id"]: s for s in r["stats"]}
+assert r["totals"]["observed"] >= 1, f"관측 정점 없음: {r}"
+orders = stats.get("sgfix.orders")
+assert orders is not None, f"sgfix.orders usage 없음: {sorted(stats)}"
+assert isinstance(orders["reads"], int) and orders["reads"] >= 0, orders
+EOF
 
     # MySQL 스모크: a↔b 순환, view member reads, trigger writes+fires,
     # procedure의 writes.

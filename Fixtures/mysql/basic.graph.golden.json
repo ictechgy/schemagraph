@@ -503,6 +503,14 @@
       "to": "sgfix.customers"
     }
   ],
+  "limitations": [
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.a.a_b_fk\ub294 Constraint\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.b.b_a_fk\ub294 Constraint\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.loop_self.parent_id\ub294 Column\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.order_items.order_id\ub294 Column\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.order_items.product_id\ub294 Column\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4",
+    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.products.sku\ub294 Column\uc640 index \uc591\ucabd \uc774\ub984\uc774\ub2e4 \u2014 index \uc815\uc810\uc774 \uc0dd\ub7b5\ub418\uace0 usage\uac00 \uacf5\uc720 \uc815\uc810\uc5d0 \ubd99\ub294\ub2e4"
+  ],
   "version": 1,
   "vertices": [
     {
@@ -517,7 +525,12 @@
       "kind": "table",
       "level": "object",
       "name": "a",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.a.PRIMARY",
@@ -531,7 +544,12 @@
       "kind": "constraint",
       "level": "member",
       "name": "a_b_fk",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.a.b_id",
@@ -552,7 +570,12 @@
       "kind": "table",
       "level": "object",
       "name": "b",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.b.PRIMARY",
@@ -573,7 +596,12 @@
       "kind": "constraint",
       "level": "member",
       "name": "b_a_fk",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.b.id",
@@ -587,7 +615,12 @@
       "kind": "table",
       "level": "object",
       "name": "customers",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.customers.PRIMARY",
@@ -615,7 +648,12 @@
       "kind": "table",
       "level": "object",
       "name": "loop_self",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.loop_self.PRIMARY",
@@ -643,7 +681,12 @@
       "kind": "column",
       "level": "member",
       "name": "parent_id",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.order_count",
@@ -657,7 +700,12 @@
       "kind": "table",
       "level": "object",
       "name": "order_items",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.order_items.PRIMARY",
@@ -678,7 +726,12 @@
       "kind": "column",
       "level": "member",
       "name": "order_id",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.order_items.order_items_ibfk_1",
@@ -699,7 +752,12 @@
       "kind": "column",
       "level": "member",
       "name": "product_id",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.order_totals",
@@ -734,7 +792,12 @@
       "kind": "table",
       "level": "object",
       "name": "orders",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.orders.PRIMARY",
@@ -762,7 +825,12 @@
       "kind": "index",
       "level": "member",
       "name": "idx_orders_customer",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.orders.orders_customer_fk",
@@ -790,7 +858,12 @@
       "kind": "table",
       "level": "object",
       "name": "products",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.products.PRIMARY",
@@ -818,7 +891,12 @@
       "kind": "table",
       "level": "object",
       "name": "standalone",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.standalone.PRIMARY",
@@ -846,7 +924,12 @@
       "kind": "table",
       "level": "object",
       "name": "tickets",
-      "schema": "sgfix"
+      "schema": "sgfix",
+      "usage": {
+        "reads": "<value>",
+        "since": "<value>",
+        "writes": "<value>"
+      }
     },
     {
       "id": "sgfix.tickets.PRIMARY",
