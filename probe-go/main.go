@@ -915,8 +915,9 @@ func slicePackageBody(impl string, members map[string]bool) map[string]string {
 	return out
 }
 
-// toNDJSON — engine/source/src/ndjson.rs 및 probe/Model.kt의 toNdjson과
-// 같은 레이아웃: document 헤더 → 스키마별 schema 행 + object·routine 행.
+// toNDJSON — engine/source/src/ndjson.rs 및 Extractor.extractStreaming과
+// 같은 정본 레이아웃: document 헤더( limitations 비움) → 스키마별 schema
+// 행 + object·routine 행 → limitations 트레일러.
 func toNDJSON(doc CatalogDocument) string {
 	var b strings.Builder
 	line := func(v any) {
@@ -926,7 +927,7 @@ func toNDJSON(doc CatalogDocument) string {
 	}
 	line(map[string]any{
 		"type": "document", "version": doc.Version, "dialect": doc.Dialect,
-		"reader": doc.Reader, "limitations": doc.Limitations,
+		"reader": doc.Reader, "limitations": []string{},
 	})
 	for _, s := range doc.Schemas {
 		line(map[string]any{"type": "schema", "name": s.Name})
@@ -937,5 +938,6 @@ func toNDJSON(doc CatalogDocument) string {
 			line(map[string]any{"type": "routine", "schema": s.Name, "data": r})
 		}
 	}
+	line(map[string]any{"type": "limitations", "data": doc.Limitations})
 	return b.String()
 }

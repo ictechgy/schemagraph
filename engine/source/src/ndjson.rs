@@ -3,7 +3,9 @@
 //! 단일 JSON 문서와 같은 정보를 담지만 레코드가 한 줄씩이어서, 큰 카탈로그를
 //! 통째로 메모리에 올리지 않고 순차적으로 읽고 쓸 수 있다. 첫 줄은 반드시
 //! `{"type":"document", ...}` 헤더이고, 이후 스키마마다 `schema` 행 하나와
-//! 그 스키마의 `object`·`routine` 행들이 온다.
+//! 그 스키마의 `object`·`routine` 행들이 오며, 끝에 `limitations` 행이 온다.
+//! 스트리밍 프로브는 마지막까지 한계를 모르므로 헤더의 limitations는 비어
+//! 있고 트레일러가 진짜 목록을 싣는다 — 리더는 둘을 합집합으로 읽는다.
 //!
 //! 알 수 없는 레코드 타입은 조용히 건너뛰지 않고 오류로 거부한다 — 소비자가
 //! "못 읽은 행이 있었는데 없는 척"하는 그래프를 믿게 만들면 안 되기 때문이다.
@@ -31,6 +33,7 @@ pub fn is_ndjson_document(text: &str) -> bool {
 pub fn document_from_ndjson(text: &str) -> Result<CatalogDocument, String> {
     let mut header: Option<(u32, String, String, Vec<String>)> = None;
     let mut schemas: Vec<SchemaDoc> = Vec::new();
+    let mut trailer_limitations: Vec<String> = Vec::new();
 
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -101,6 +104,16 @@ pub fn document_from_ndjson(text: &str) -> Result<CatalogDocument, String> {
                     .map_err(|e| format!("NDJSON {}행 routine 파싱 실패: {e}", n + 1))?;
                 schema.routines.push(r);
             }
+            "limitations" => {
+                // 스트리밍 프로브는 마지막까지 한계를 모르므로 헤더를 비우고
+                // 트레일러에 싣는다 — 헤더의 것과 합집합으로 받는다.
+                let data = v
+                    .get("data")
+                    .ok_or_else(|| format!("NDJSON {}행 limitations에 data가 없다", n + 1))?;
+                let mut rows: Vec<String> = serde_json::from_value(data.clone())
+                    .map_err(|e| format!("NDJSON {}행 limitations 파싱 실패: {e}", n + 1))?;
+                trailer_limitations.append(&mut rows);
+            }
             other => {
                 return Err(format!(
                     "NDJSON {}행: 알 수 없는 레코드 타입 '{other}' — 지원되지 않는 행을 건너뛰지 않는다",
@@ -110,13 +123,18 @@ pub fn document_from_ndjson(text: &str) -> Result<CatalogDocument, String> {
         }
     }
 
-    let (version, dialect, reader, limitations) =
+    let (version, dialect, reader, mut limitations) =
         header.ok_or("NDJSON에 document 헤더 행이 없다")?;
     if version != DOCUMENT_VERSION {
         return Err(format!(
             "document 버전 {version}은 지원하지 않는다 (이 엔진은 v{DOCUMENT_VERSION})"
         ));
     }
+    // 헤더·트레일러 어느 쪽에 실렸든 문서 계약은 하나다 — 정렬·중복 제거해
+    // 단일 JSON 경로와 같은 모양으로 맞춘다.
+    limitations.append(&mut trailer_limitations);
+    limitations.sort();
+    limitations.dedup();
     Ok(CatalogDocument {
         version,
         dialect,
@@ -134,12 +152,14 @@ pub fn document_to_ndjson(doc: &CatalogDocument) -> String {
         out.push_str(&serde_json::to_string(&v).unwrap_or_default());
         out.push('\n');
     };
+    // 헤더의 limitations는 비워 두고 트레일러 행에 싣는다 — 스트리밍
+    // 프로브와 같은 정본 레이아웃이다(리더는 둘을 합집합으로 읽는다).
     push(serde_json::json!({
         "type": "document",
         "version": doc.version,
         "dialect": doc.dialect,
         "reader": doc.reader,
-        "limitations": doc.limitations,
+        "limitations": [],
     }));
     for schema in &doc.schemas {
         push(serde_json::json!({"type": "schema", "name": schema.name}));
@@ -158,6 +178,10 @@ pub fn document_to_ndjson(doc: &CatalogDocument) -> String {
             }));
         }
     }
+    push(serde_json::json!({
+        "type": "limitations",
+        "data": doc.limitations,
+    }));
     out
 }
 
@@ -235,5 +259,21 @@ mod tests {
     fn ndjson_rejects_wrong_version() {
         let text = "{\"type\":\"document\",\"version\":99,\"dialect\":\"sqlite\",\"reader\":\"x\",\"limitations\":[]}\n";
         assert!(document_from_ndjson(text).is_err());
+    }
+
+    #[test]
+    fn ndjson_trailer_limitations() {
+        // 스트리밍 정본 — 헤더는 비어 있고 트레일러가 진짜 목록을 싣는다.
+        // 헤더·트레일러는 합집합으로 정렬·중복 제거된다.
+        let text = concat!(
+            "{\"type\":\"document\",\"version\":1,\"dialect\":\"sqlite\",\"reader\":\"x\",\"limitations\":[\"b\",\"a\"]}\n",
+            "{\"type\":\"schema\",\"name\":\"main\"}\n",
+            "{\"type\":\"limitations\",\"data\":[\"b\",\"c\"]}\n",
+        );
+        let doc = document_from_ndjson(text).unwrap();
+        assert_eq!(
+            doc.limitations,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 }
