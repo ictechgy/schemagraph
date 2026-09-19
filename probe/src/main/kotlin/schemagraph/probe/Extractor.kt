@@ -306,9 +306,9 @@ class Extractor(
                         TriggerDoc(rs.getString(3), rs.getString(4))
                 }
                 // routine — ALL_OBJECTS가 kind를, ALL_SOURCE가 LINE순 몸체를 준다.
-                // 멤버 단위 귀속은 미지원이라 PACKAGE BODY는 패키지 정점
-                // 하나로 수확한다 — 몸체 간선이 패키지에 귀속되는 것이
-                // 멤버 추측보다 정직하다(엔진이 limitation으로 남긴다).
+                // PACKAGE는 스펙과 BODY를 따로 보관한다 — 멤버 몸체는 BODY
+                // 텍스트를 멤버 헤더로 나눠 귀속하고, 경계를 못 찾은 멤버는
+                // body 없이 limitation으로 센다(추측 귀속 금지).
                 val oracleBodies = mutableMapOf<Triple<String, String, String>, StringBuilder>()
                 bestEffort("routines",
                     "SELECT o.OWNER, o.OBJECT_NAME, o.OBJECT_TYPE, s.LINE, s.TEXT " +
@@ -320,28 +320,84 @@ class Extractor(
                     val key = Triple(rs.getString(1), rs.getString(2), rs.getString(3))
                     oracleBodies.getOrPut(key) { StringBuilder() }.append(rs.getString(5))
                 }
-                // PACKAGE와 PACKAGE BODY는 같은 이름의 별개 OBJECT — 정점은
-                // 하나다. 몸체는 PACKAGE BODY를 우선하고 없으면 스펙이 대표다.
-                val grouped = mutableMapOf<Pair<String, String>, Pair<String, String>>()
+                // 패키지 멤버 목록 — ALL_PROCEDURES가 카탈로그상 멤버를
+                // SUBPROGRAM_ID(선언 순)로 준다. OVERLOAD는 같은 이름의
+                // 오버로드를 구분한다(NULL이면 비오버로드).
+                val pkgMembers = mutableMapOf<Pair<String, String>, MutableList<Pair<String, String?>>>()
+                bestEffort("package members",
+                    "SELECT OWNER, OBJECT_NAME, PROCEDURE_NAME, OVERLOAD " +
+                        "FROM ALL_PROCEDURES WHERE PROCEDURE_NAME IS NOT NULL " +
+                        "ORDER BY OWNER, OBJECT_NAME, SUBPROGRAM_ID") { rs ->
+                    pkgMembers.getOrPut(rs.getString(1) to rs.getString(2)) { mutableListOf() } +=
+                        (rs.getString(3) to rs.getString(4))
+                }
+                // 멤버 시그니처와 kind — PACKAGE_NAME이 있는 인자 행.
+                // POSITION=0은 반환값이라 함수의 표시다.
+                val memberParams = mutableMapOf<Triple<String, String, String>, String>()
+                val memberFunctions = mutableSetOf<Triple<String, String, String>>()
+                bestEffort("package member arguments",
+                    "SELECT OWNER, PACKAGE_NAME, OBJECT_NAME, DATA_TYPE, POSITION, OVERLOAD " +
+                        "FROM ALL_ARGUMENTS WHERE PACKAGE_NAME IS NOT NULL " +
+                        "ORDER BY OWNER, PACKAGE_NAME, OBJECT_NAME, OVERLOAD, SEQUENCE") { rs ->
+                    val key = Triple(rs.getString(1), rs.getString(2),
+                        rs.getString(3) + (rs.getString(6)?.let { "#$it" } ?: ""))
+                    if (rs.getInt(5) == 0) memberFunctions += key
+                    else memberParams.merge(key, rs.getString(4).lowercase()) { a, b -> "$a, $b" }
+                }
+                val specBodies = mutableMapOf<Pair<String, String>, String>()
+                val implBodies = mutableMapOf<Pair<String, String>, String>()
                 for ((key, body) in oracleBodies) {
-                    val name = key.first to key.second
-                    val cur = grouped[name]
-                    if (cur == null || (key.third == "PACKAGE BODY" && cur.first == "PACKAGE")) {
-                        grouped[name] = key.third to body.toString()
+                    when (key.third) {
+                        "PACKAGE" -> specBodies[key.first to key.second] = body.toString()
+                        "PACKAGE BODY" -> implBodies[key.first to key.second] = body.toString()
+                        else -> routines += Triple(key.first, key.second, RoutineDoc(
+                            name = key.second,
+                            kind = key.third.lowercase(),
+                            // PL/SQL — plpgsql과 같은 계약이라 엔진이 문장 추출로 파싱한다.
+                            language = "plsql",
+                            body = body.toString(),
+                        ))
                     }
                 }
-                for ((name, src) in grouped) {
-                    routines += Triple(name.first, name.second, RoutineDoc(
-                        name = name.second,
-                        kind = when (src.first) {
-                            "PROCEDURE" -> "procedure"
-                            "FUNCTION" -> "function"
-                            else -> "package"
-                        },
-                        // PL/SQL — plpgsql과 같은 계약이라 엔진이 문장 추출로 파싱한다.
+                for (pkg in (specBodies.keys + implBodies.keys).sortedBy { it.second }) {
+                    val (owner, pname) = pkg
+                    val spec = specBodies[pkg]
+                    val impl = implBodies[pkg]
+                    val members = if (impl != null) pkgMembers[pkg].orEmpty() else emptyList()
+                    val memberDocs = mutableListOf<Triple<String, String, RoutineDoc>>()
+                    if (impl != null && members.isNotEmpty()) {
+                        val slices = slicePackageBody(impl, members.map { it.first }.toSet())
+                        val seen = mutableMapOf<String, Int>()
+                        for ((mname, overload) in members) {
+                            // 같은 이름의 n번째 오버로드는 본문의 n번째 헤더와 짝짓는다.
+                            val nth = seen.merge(mname, 1) { a, b -> a + b }!! - 1
+                            val ov = overload?.let { "#$it" } ?: ""
+                            // specific 키는 `pkg.m#ov` — 같은 이름의 독립 routine이나
+                            // 오버로드된 형제 멤버와 병합 키가 충돌하지 않게 한다.
+                            memberDocs += Triple(owner, "$pname.$mname$ov", RoutineDoc(
+                                name = mname,
+                                kind = if (Triple(owner, pname, "$mname$ov") in memberFunctions)
+                                    "function" else "procedure",
+                                language = "plsql",
+                                body = slices["$mname#$nth"],
+                                signature = memberParams[Triple(owner, pname, "$mname$ov")],
+                                memberOf = pname,
+                            ))
+                            if (slices["$mname#$nth"] == null) {
+                                limitations += "$owner.$pname.$mname: 패키지 본문에서 멤버 경계를 " +
+                                    "못 찾음 — 해당 멤버의 몸체 간선 없음"
+                            }
+                        }
+                    }
+                    // 멤버를 냈으면 패키지 몸체는 스펙이 대표다 — 실행 문장은
+                    // 멤버 몸체에 있다. 못 냈으면 옛 동작(BODY 통째 귀속)을 유지.
+                    routines += Triple(owner, pname, RoutineDoc(
+                        name = pname,
+                        kind = "package",
                         language = "plsql",
-                        body = src.second,
+                        body = if (memberDocs.isNotEmpty()) spec ?: impl else impl ?: spec,
                     ))
+                    routines += memberDocs
                 }
                 // 파라미터 — POSITION=0은 반환값이라 제외(MySQL ordinal=0 함정과 같다).
                 bestEffort("routine parameters",
@@ -473,14 +529,18 @@ class Extractor(
     private fun collectRoutines(bodies: BodyHarvest): Map<String, List<RoutineDoc>> {
         val byKey = linkedMapOf<Pair<String, String>, RoutineDoc>()
 
-        fun merge(schema: String, name: String, kind: String, language: String?, body: String?, specific: String?) {
+        fun merge(schema: String, name: String, kind: String, language: String?, body: String?, specific: String?,
+                  signature: String? = null, memberOf: String? = null) {
             // MSSQL의 JDBC 메타는 이름을 `touch_customer;1`(numbered procedure
             // 명명)로 돌려준다 — sys.objects의 이름과 맞추려면 ;N을 떼야 한다.
             val normName = if (dialect == "sqlserver") name.substringBefore(';') else name
             // 키는 specific_name 우선 — 오버로드는 ROUTINE_NAME이 같아도 다르다.
             // meta 행이 먼저 이름키로 들어갔으면 특정키로 옮겨 흡수한다.
             val key = schema to (specific ?: normName)
-            val stale = if (key != schema to normName) byKey.remove(schema to normName) else null
+            // 멤버 행의 키는 `pkg.m` 형태라 이름키 흡수를 하면 같은 이름의
+            // 독립 routine이 통째로 멤버 문서에 흡수된다 — 멤버는 흡수 안 한다.
+            val stale = if (memberOf == null && key != schema to normName)
+                byKey.remove(schema to normName) else null
             val prior = byKey[key] ?: stale
             val sig = bodies.routineParams[key] ?: bodies.routineParams[schema to normName]
             byKey[key] = RoutineDoc(
@@ -488,7 +548,10 @@ class Extractor(
                 kind = prior?.kind ?: kind,
                 language = prior?.language ?: language,
                 body = prior?.body ?: body,
-                signature = prior?.signature ?: sig,
+                signature = prior?.signature ?: signature ?: sig,
+                // memberOf·signature는 수확 단계에서만 온다 — 재조립 때 떨구면
+                // 멤버 귀속과 오버로드 구분이 함께 사라진다.
+                memberOf = prior?.memberOf ?: memberOf,
             )
         }
 
@@ -526,7 +589,8 @@ class Extractor(
 
         // information_schema 수확분 — 이미 수확 단계에서 스키마·specific_name이 붙어 있다.
         for ((rschema, specific, doc) in bodies.routines) {
-            merge(rschema, doc.name, doc.kind, doc.language, doc.body, specific)
+            merge(rschema, doc.name, doc.kind, doc.language, doc.body, specific,
+                signature = doc.signature, memberOf = doc.memberOf)
         }
 
         return byKey.entries.groupBy({ it.key.first }, { it.value })
@@ -648,6 +712,34 @@ class Extractor(
         indexes.keys.removeIf { !keep(it.first) }
         functions.keys.removeIf { !keep(it.first) }
         return UsageHarvest(tables, indexes, functions)
+    }
+
+    /**
+     * PACKAGE BODY 텍스트를 멤버 선언 헤더로 나눈다.
+     *
+     * 경계는 카탈로그 멤버 이름과 매칭되는 `PROCEDURE|FUNCTION <name>`
+     * 헤더뿐이다 — 멤버 안의 로컬 서브프로그램이나 주석 속 단어를 경계로
+     * 오인하지 않기 위해 카탈로그 대조를 요구한다. 같은 이름의 오버로드는
+     * 텍스트 순서대로 n번째로 구분해 카탈로그 SUBPROGRAM_ID 순과 짝짓는다.
+     * 반환 키는 "이름#n"(대문자 멤버명, 0-base).
+     */
+    private fun slicePackageBody(impl: String, members: Set<String>): Map<String, String> {
+        val re = Regex("(?im)^\\s*(?:PROCEDURE|FUNCTION)\\s+\"?([A-Za-z0-9_$#]+)\"?")
+        // 텍스트 순서대로 (canonical 이름, 시작 위치).
+        val heads = re.findAll(impl).mapNotNull { m ->
+            members.firstOrNull { it.equals(m.groupValues[1], ignoreCase = true) }
+                ?.let { it to m.range.first }
+        }.toList()
+        if (heads.isEmpty()) return emptyMap()
+        val starts = heads.map { it.second }
+        val out = mutableMapOf<String, String>()
+        val perName = mutableMapOf<String, Int>()
+        for ((name, start) in heads) {
+            val nth = perName.merge(name, 1) { a, b -> a + b }!! - 1
+            val end = starts.firstOrNull { it > start } ?: impl.length
+            out["$name#$nth"] = impl.substring(start, end).trim()
+        }
+        return out
     }
 
     /** best-effort 쿼리 — 실패를 limitation으로 변환해 숨기지 않는다. */

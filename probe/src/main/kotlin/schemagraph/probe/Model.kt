@@ -90,6 +90,8 @@ data class RoutineDoc(
     val body: String? = null,
     val signature: String? = null,
     val usage: UsageDoc? = null,
+    /** 패키지 멤버면 부모 패키지 이름 — 독립 routine이면 null. */
+    val memberOf: String? = null,
 )
 
 // serde_json::to_string_pretty와 같은 모양: snake_case 키, null 키 생략,
