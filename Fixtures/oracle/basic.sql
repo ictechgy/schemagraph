@@ -78,3 +78,24 @@ BEGIN
     RETURN n;
 END;
 /
+
+-- 패키지: 멤버별 귀속은 미지원 — 멤버 몸체의 간선이 패키지 정점에
+-- 귀속되고, 부분 귀속이라는 한계가 보고돼야 한다.
+CREATE OR REPLACE PACKAGE order_ops AS
+    PROCEDURE touch(cid IN NUMBER);
+    FUNCTION count_all RETURN NUMBER;
+END order_ops;
+/
+CREATE OR REPLACE PACKAGE BODY order_ops AS
+    PROCEDURE touch(cid IN NUMBER) IS
+    BEGIN
+        UPDATE customers SET name = name WHERE id = cid;
+    END touch;
+    FUNCTION count_all RETURN NUMBER IS
+        n NUMBER;
+    BEGIN
+        SELECT COUNT(*) INTO n FROM orders;
+        RETURN n;
+    END count_all;
+END order_ops;
+/

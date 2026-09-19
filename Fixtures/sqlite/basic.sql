@@ -46,6 +46,14 @@ CREATE TABLE standalone (
     note TEXT
 );
 
+-- 선언되지 않은 참조: customer_id에 REFERENCES가 없다 — inferred
+-- 휴리스틱(--inferred)의 이름 규칙 추정 대상이다.
+CREATE TABLE shipments (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER,
+    note TEXT
+);
+
 CREATE INDEX idx_orders_customer ON orders(customer_id);
 
 CREATE TRIGGER trg_orders_touch

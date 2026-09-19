@@ -478,12 +478,22 @@
       "from": "public.tickets",
       "kind": "contains",
       "to": "public.tickets.tickets_pkey"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.trg_orders_touch_fn Writes public.customers",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.trg_orders_touch_fn",
+      "kind": "writes",
+      "to": "public.customers"
     }
   ],
   "limitations": [
     "track_functions=none \u2014 routine usage \ubbf8\uc218\uc9d1(\ud568\uc218 \ud1b5\uacc4 \ube44\ud65c\uc131)",
-    "\uba64\ubc84 id \ucda9\ub3cc: public.products.products_sku_key\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 public.products.products_sku_key@index\ub85c \ubd84\ub9ac",
-    "routine public.trg_orders_touch_fn: \uc5b8\uc5b4 plpgsql\uc758 \ubab8\uccb4 \ud30c\uc2f1 \ubbf8\uc9c0\uc6d0 \u2014 \ubab8\uccb4 \uac04\uc120 \uc5c6\uc74c"
+    "\uba64\ubc84 id \ucda9\ub3cc: public.products.products_sku_key\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 public.products.products_sku_key@index\ub85c \ubd84\ub9ac"
   ],
   "version": 1,
   "vertices": [

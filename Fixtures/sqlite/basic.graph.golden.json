@@ -43,6 +43,11 @@
     {
       "from": "main",
       "kind": "contains",
+      "to": "main.shipments"
+    },
+    {
+      "from": "main",
+      "kind": "contains",
       "to": "main.standalone"
     },
     {
@@ -441,6 +446,26 @@
       "to": "main.products.sqlite_autoindex_products_1"
     },
     {
+      "from": "main.shipments",
+      "kind": "contains",
+      "to": "main.shipments.customer_id"
+    },
+    {
+      "from": "main.shipments",
+      "kind": "contains",
+      "to": "main.shipments.id"
+    },
+    {
+      "from": "main.shipments",
+      "kind": "contains",
+      "to": "main.shipments.note"
+    },
+    {
+      "from": "main.shipments",
+      "kind": "contains",
+      "to": "main.shipments.shipments_pk"
+    },
+    {
       "from": "main.standalone",
       "kind": "contains",
       "to": "main.standalone.id"
@@ -767,6 +792,41 @@
       "kind": "index",
       "level": "member",
       "name": "sqlite_autoindex_products_1",
+      "schema": "main"
+    },
+    {
+      "id": "main.shipments",
+      "kind": "table",
+      "level": "object",
+      "name": "shipments",
+      "schema": "main"
+    },
+    {
+      "id": "main.shipments.customer_id",
+      "kind": "column",
+      "level": "member",
+      "name": "customer_id",
+      "schema": "main"
+    },
+    {
+      "id": "main.shipments.id",
+      "kind": "column",
+      "level": "member",
+      "name": "id",
+      "schema": "main"
+    },
+    {
+      "id": "main.shipments.note",
+      "kind": "column",
+      "level": "member",
+      "name": "note",
+      "schema": "main"
+    },
+    {
+      "id": "main.shipments.shipments_pk",
+      "kind": "constraint",
+      "level": "member",
+      "name": "shipments_pk",
       "schema": "main"
     },
     {

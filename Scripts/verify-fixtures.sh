@@ -124,6 +124,23 @@ code=$?
 set -e
 [ "$code" -eq 1 ] || { echo "rules --strict 종료 코드가 1이 아니다: $code" >&2; exit 1; }
 
+# --inferred: shipments.customer_id는 선언 FK가 없어 이름 규칙으로 추정된다.
+# 기본 스캔에는 없어야 하고, 의존성 질의(impact)에는 섞이면 안 된다.
+"$BIN" scan "sqlite:$tmp/basic.db" --inferred -o "$tmp/graph-inf.json"
+python3 - "$tmp/graph-inf.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+edges = {(e["kind"], e["from"], e["to"]) for e in g["edges"]}
+if ("inferred", "main.shipments", "main.customers") not in edges:
+    sys.exit("--inferred: shipments->customers 추정 간선 미검출")
+# 선언 FK가 있는 customer_id(orders)는 추정하지 않는다.
+if any(k == "inferred" and f == "main.orders" for k, f, t in edges):
+    sys.exit("--inferred: 선언 FK 컬럼을 추정했다")
+EOF
+"$BIN" impact main.customers --graph "$tmp/graph-inf.json" > "$tmp/impact-inf.json"
+! grep -q '"main.shipments"' "$tmp/impact-inf.json" \
+    || { echo "--inferred: inferred 간선이 impact에 섞였다" >&2; exit 1; }
+
 # ── PostgreSQL ──────────────────────────────────────────────────────────
 # 네이티브 리더 검증은 실제 서버가 필요하다. SG_PG_URL이 있으면 그 서버를 쓰고
 # (fixture를 새로 적용한다 — 검증 DB를 공유하지 마라), 없으면 로컬 postgres
@@ -200,7 +217,7 @@ assert "since" in orders, f"since 없음 — 유효 구간을 알 수 없다: {o
 EOF
 
     # PG 스모크: a↔b 순환, view member reads, EXECUTE FUNCTION calls,
-    # plpgsql 미지원 limitation 보고.
+    # plpgsql 몸체 추출 간선.
     "$BIN" cycles --graph "$tmp/graph-pg.json" --level object > "$tmp/cycles-pg.json"
     grep -q '"public.a"' "$tmp/cycles-pg.json" || { echo "PG cycles: public.a 미검출" >&2; exit 1; }
     grep -q '"selfLoop": true' "$tmp/cycles-pg.json" || { echo "PG cycles: 자기루프 미검출" >&2; exit 1; }
@@ -213,13 +230,12 @@ want = {
     ("calls", "public.orders.trg_orders_touch", "public.trg_orders_touch_fn"),
     ("reads", "public.order_totals", "public.orders.id"),
     ("fires", "public.orders.trg_orders_touch", "public.orders"),
+    # plpgsql 몸체의 UPDATE는 문장 추출로 writes 간선이 돼야 한다.
+    ("writes", "public.trg_orders_touch_fn", "public.customers"),
 }
 missing = want - edges
 if missing:
     sys.exit(f"PG 간선 미검출: {sorted(missing)}")
-lims = g.get("limitations", [])
-if not any("plpgsql" in l for l in lims):
-    sys.exit(f"plpgsql 미지원 limitation 미보고: {lims}")
 EOF
 
     # rules — 같은 규칙 파일이 PG 그래프에서도 의도적 위반을 잡아야 한다.
@@ -532,6 +548,24 @@ if nv != pv or ne != pe:
              f"only-probe: {sorted(pe-ne)}")
 EOF
 
+    # NDJSON 전송 — 같은 DB를 --format ndjson으로 긁으면 엔진이 행 단위
+    # document를 자동 감지해 같은 그래프를 내야 한다.
+    "$JAVABIN" -jar "$JAR" --url "jdbc:sqlite:$tmp/probe-sqlite.db" \
+        -o "$tmp/probe-sqlite-doc.ndjson" --format ndjson
+    "$BIN" scan --document "$tmp/probe-sqlite-doc.ndjson" -o "$tmp/probe-sqlite-ndjson-graph.json"
+    python3 - "$tmp/graph.json" "$tmp/probe-sqlite-ndjson-graph.json" <<'EOF'
+import json, sys
+def load(p):
+    g = json.load(open(p))
+    return ({v["id"] for v in g["vertices"]},
+            {(e["kind"], e["from"], e["to"]) for e in g["edges"]})
+nv, ne = load(sys.argv[1])
+pv, pe = load(sys.argv[2])
+if nv != pv or ne != pe:
+    sys.exit(f"probe(SQLite/NDJSON) 패리티 불일치 — verts diff: {sorted(nv^pv)} "
+             f"edges diff: {sorted(ne^pe)}")
+EOF
+
     # PG parity — pgjdbc가 번들이라 PG가 떠 있으면 같은 DB를 JDBC로도 읽어
     # 네이티브와 같은 판정 간선이 나오는지 확인한다.
     if [ -n "${pg_url:-}" ]; then
@@ -789,10 +823,50 @@ if f"{schema}.ORDER_COUNT" not in verts:
     sys.exit(f"probe(Oracle): ORDER_COUNT routine 정점 없음")
 if not any(v.startswith(f"{schema}.TOUCH_CUSTOMER(") for v in verts):
     sys.exit(f"probe(Oracle): TOUCH_CUSTOMER routine 정점 없음")
+# plsql 몸체는 문장 추출로 간선이 돼야 한다 — TOUCH_CUSTOMER의 UPDATE와
+# ORDER_COUNT의 SELECT .. INTO 둘 다 살아 있어야 한다.
+if not any(k == "writes" and f.startswith(f"{schema}.TOUCH_CUSTOMER(")
+           and t == f"{schema}.CUSTOMERS" for k, f, t in edges):
+    sys.exit("probe(Oracle): TOUCH_CUSTOMER의 plsql 몸체 writes 미검출")
+if ("reads", f"{schema}.ORDER_COUNT", f"{schema}.ORDERS") not in edges:
+    sys.exit("probe(Oracle): ORDER_COUNT의 SELECT .. INTO reads 미검출")
+# PACKAGE BODY — 멤버별 귀속은 미지원, 몸체 간선은 패키지 정점에 귀속.
+if f"{schema}.ORDER_OPS" not in verts:
+    sys.exit("probe(Oracle): ORDER_OPS 패키지 정점 없음")
+if ("writes", f"{schema}.ORDER_OPS", f"{schema}.CUSTOMERS") not in edges:
+    sys.exit("probe(Oracle): 패키지 멤버 UPDATE의 패키지 귀속 미검출")
+if ("reads", f"{schema}.ORDER_OPS", f"{schema}.ORDERS") not in edges:
+    sys.exit("probe(Oracle): 패키지 멤버 SELECT의 패키지 귀속 미검출")
 lims = g.get("limitations", [])
-if not any("plsql" in l for l in lims):
-    sys.exit(f"probe(Oracle): plsql 미지원 limitation 미보고: {lims}")
+if not any("멤버별 귀속" in l for l in lims):
+    sys.exit(f"probe(Oracle): 패키지 귀속 한계 미보고: {lims}")
 EOF
+
+        # Go 프로브(probe-go) — JVM 없는 경로가 JVM 프로브와 같은 그래프를
+        # 내는지 패리티로 검증한다. go 도구체인이 없거나 thin URL을
+        # oracle:// 형태로 못 바꾸면 건너뛴다(선택 검증).
+        if command -v go >/dev/null 2>&1 && \
+            [[ "$oracle_jdbc" =~ jdbc:oracle:thin:@(//)?([^:/]+):([0-9]+)/(.+) ]]; then
+            go_url="oracle://${oracle_user}:${oracle_pass}@${BASH_REMATCH[2]}:${BASH_REMATCH[3]}/${BASH_REMATCH[4]}"
+            (cd "$PWD/probe-go" && go build -o "$tmp/schemagraph-probe-go" .) || \
+                { echo "probe-go 빌드 실패" >&2; exit 1; }
+            "$tmp/schemagraph-probe-go" --url "$go_url" -o "$tmp/probe-go-doc.json"
+            "$BIN" scan --document "$tmp/probe-go-doc.json" -o "$tmp/probe-go-graph.json"
+            python3 - "$tmp/probe-or-graph.json" "$tmp/probe-go-graph.json" <<'EOF'
+import json, sys
+def load(p):
+    g = json.load(open(p))
+    return ({v["id"] for v in g["vertices"]},
+            {(e["kind"], e["from"], e["to"]) for e in g["edges"]})
+jv, je = load(sys.argv[1])
+gv, ge = load(sys.argv[2])
+if jv != gv or je != ge:
+    sys.exit(f"probe-go(Oracle) 패리티 불일치 — verts diff: {sorted(jv^gv)} "
+             f"edges diff: {sorted(je^ge)}")
+EOF
+        else
+            echo "주의: go가 없거나 Oracle URL을 변환 못 해 probe-go 검증 건너뜀" >&2
+        fi
     else
         [ -n "$OJAR" ] && [ -f "$OJAR" ] && \
             echo "주의: Oracle을 찾지 못해 probe-Oracle 검증 건너뜀 (SG_ORACLE_URL 또는 docker)" >&2
