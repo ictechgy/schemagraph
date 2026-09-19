@@ -146,3 +146,130 @@ pub struct RoutineDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageDoc>,
 }
+
+/// 역직렬화로 읽은 문서에서 serde가 조용히 무시한 필드를 찾는다.
+/// additive 필드는 같은 버전 안에서 허용하지만, reader가 의미를 실어 보낸
+/// 키를 엔진이 못 읽었으면 소비자에게 알려야 한다 — "모른다"와 "없다"를
+/// 구분하는 것이 이 도구의 계약이다. 경로는 `schemas[].objects[].x` 꼴로
+/// 인덱스 없이 정규화해 중복을 합친다.
+pub fn unknown_field_paths(doc: &serde_json::Value) -> Vec<String> {
+    use std::collections::BTreeSet;
+    const MAX: usize = 20;
+
+    // 알려진 컨테이너 키 → 하위 레코드의 알려진 키 집합. 나머지 키는
+    // 잎(scalar·문자열 배열)이라 내려갈 곳이 없다.
+    fn container_keys(key: &str) -> Option<&'static [&'static str]> {
+        Some(match key {
+            "schemas" => SCHEMA_KEYS,
+            "objects" => OBJECT_KEYS,
+            "routines" => ROUTINE_KEYS,
+            "columns" => COLUMN_KEYS,
+            "constraints" => CONSTRAINT_KEYS,
+            "referenced" => REFERENCED_KEYS,
+            "indexes" => INDEX_KEYS,
+            "triggers" => TRIGGER_KEYS,
+            "usage" => USAGE_KEYS,
+            _ => return None,
+        })
+    }
+
+    fn walk(v: &serde_json::Value, path: &str, known: &[&str], out: &mut BTreeSet<String>) {
+        let Some(map) = v.as_object() else { return };
+        for (k, child) in map {
+            if !known.contains(&k.as_str()) {
+                out.insert(if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                });
+                continue;
+            }
+            let Some(keys) = container_keys(k) else {
+                continue;
+            };
+            let base = if path.is_empty() {
+                k.clone()
+            } else {
+                format!("{path}.{k}")
+            };
+            if let Some(items) = child.as_array() {
+                for item in items {
+                    walk(item, &format!("{base}[]"), keys, out);
+                }
+            } else {
+                walk(child, &base, keys, out);
+            }
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    walk(doc, "", DOC_KEYS, &mut out);
+    out.into_iter().take(MAX).collect()
+}
+
+const DOC_KEYS: &[&str] = &["version", "dialect", "reader", "schemas", "limitations"];
+const SCHEMA_KEYS: &[&str] = &["name", "objects", "routines"];
+const OBJECT_KEYS: &[&str] = &[
+    "name",
+    "kind",
+    "columns",
+    "constraints",
+    "indexes",
+    "triggers",
+    "body",
+    "usage",
+];
+const COLUMN_KEYS: &[&str] = &[
+    "name",
+    "data_type",
+    "nullable",
+    "default",
+    "ordinal",
+    "pk_position",
+];
+const CONSTRAINT_KEYS: &[&str] = &["name", "kind", "columns", "referenced"];
+const REFERENCED_KEYS: &[&str] = &["schema", "table", "columns"];
+const INDEX_KEYS: &[&str] = &["name", "unique", "columns", "usage"];
+const TRIGGER_KEYS: &[&str] = &["name", "body"];
+const ROUTINE_KEYS: &[&str] = &["name", "kind", "language", "body", "signature", "usage"];
+const USAGE_KEYS: &[&str] = &["since", "reads", "writes", "total_ms", "self_ms"];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_fields_are_reported_with_paths() {
+        let doc = serde_json::json!({
+            "version": 1, "dialect": "sqlite", "reader": "x",
+            "future_field": true,
+            "schemas": [{
+                "name": "main",
+                "objects": [{
+                    "name": "t", "kind": "table",
+                    "columns": [{"name": "id", "data_type": "int", "nullable": false,
+                                 "ordinal": 1, "pk_position": 1, "checks": []}],
+                    "constraints": [], "indexes": [], "triggers": []
+                }],
+                "routines": []
+            }],
+            "limitations": []
+        });
+        let paths = unknown_field_paths(&doc);
+        assert!(paths.contains(&"future_field".to_string()), "{paths:?}");
+        assert!(
+            paths.contains(&"schemas[].objects[].columns[].checks".to_string()),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn known_fields_produce_no_warnings() {
+        let doc = serde_json::json!({
+            "version": 1, "dialect": "sqlite", "reader": "x",
+            "schemas": [{"name": "main", "objects": [], "routines": []}],
+            "limitations": []
+        });
+        assert!(unknown_field_paths(&doc).is_empty());
+    }
+}

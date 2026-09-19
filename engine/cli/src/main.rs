@@ -276,6 +276,16 @@ fn load_document(path: &std::path::Path) -> Result<source::CatalogDocument> {
             source::document::DOCUMENT_VERSION
         );
     }
+    let mut doc = doc;
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+        let unknown = source::document::unknown_field_paths(&v);
+        if !unknown.is_empty() {
+            doc.limitations.push(format!(
+                "document에 엔진이 모르는 필드가 있어 무시했다: {}",
+                unknown.join(", ")
+            ));
+        }
+    }
     Ok(doc)
 }
 
