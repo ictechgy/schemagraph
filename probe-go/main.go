@@ -1,15 +1,17 @@
-// schemagraph-probe-go — JVM 없는 카탈로그 프로브. Oracle 전용.
+// schemagraph-probe-go — JVM 없는 카탈로그 프로브. Oracle과 SQL Server.
 //
 // JVM 프로브(probe/)는 번들 드라이버로 대부분의 DB를 커버하지만 Oracle만은
-// ojdbc가 OTN 라이선스라 jar을 직접 내려받아 --driver로 넘겨야 했다.
-// go-ora는 pure Go Oracle 드라이버라 이 바이너리 하나면 JVM도 외부 jar도
-// 없이 Oracle 카탈로그를 CatalogDocument v1로 뱉을 수 있다.
+// ojdbc가 OTN 라이선스라 jar을 직접 내려받아 --driver로 넘겨야 했고,
+// JVM 자체가 없는 환경엔 애초에 프로브가 없었다. go-ora·go-mssqldb는 pure
+// Go 드라이버라 이 바이너리 하나면 JVM도 외부 jar도 없이 카탈로그를
+// CatalogDocument v1로 뱉을 수 있다.
 //
 //	engine 쪽 소비는 JVM 프로브와 동일:
 //	  schemagraph-probe-go --url oracle://u:p@host:1521/FREEPDB1 -o doc.json
+//	  schemagraph-probe-go --url sqlserver://u:p@host:1433/db -o doc.json
 //	  schemagraph scan --document doc.json -o graph.json
 //
-// 수확 의미론은 probe/Extractor.kt의 oracle 분기와 1:1 대응시킨다 —
+// 수확 의미론은 probe/Extractor.kt의 방언 분기와 1:1 대응시킨다 —
 // 둘이 다른 문서를 내면 같은 DB에서 그래프가 갈라진다.
 package main
 
@@ -18,12 +20,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	nurl "net/url"
 	"os"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
+	_ "github.com/microsoft/go-mssqldb"
 	_ "github.com/sijms/go-ora/v2"
 )
 
@@ -118,10 +122,13 @@ var systemSchemas = map[string]bool{
 	"APPQOSSYS": true, "AUDSYS": true, "GSMADMIN_INTERNAL": true, "LBACSYS": true,
 	"REMOTE_SCHEDULER_AGENT": true,
 	"DIP":                    true, "ORACLE_OCM": true, "PUBLIC": true, "DVF": true, "DVSYS": true,
+	// MSSQL의 시스템 스키마 — sys는 Oracle의 SYS와 같은 이름이라 이미 위에 있다.
+	"INFORMATION_SCHEMA": true,
 }
 
 type harvester struct {
 	db           *sql.DB
+	dialect      string
 	schemaFilter map[string]bool
 	limitations  []string
 }
@@ -179,7 +186,34 @@ func main() {
 		os.Exit(2)
 	}
 
-	db, err := sql.Open("oracle", *url)
+	// URL 스킴으로 드라이버와 방언을 고른다 — 프로브는 한 접속에 한 방언이다.
+	// oracle:// → go-ora, sqlserver://(mssql:// 별칭) → go-mssqldb.
+	scheme := strings.ToLower(strings.SplitN(*url, "://", 2)[0])
+	var driver, dialect string
+	switch scheme {
+	case "oracle":
+		driver, dialect = "oracle", "oracle"
+	case "sqlserver", "mssql":
+		driver, dialect = "sqlserver", "sqlserver"
+		// go-mssqldb는 sqlserver:// 스킴만 안다 — mssql://은 사용자 별칭.
+		if scheme == "mssql" {
+			*url = "sqlserver://" + strings.SplitN(*url, "://", 2)[1]
+		}
+		// sqlserver://u:p@host:port/db 형태도 받는다 — db는 go-mssqldb의
+		// database 쿼리 파라미터로 옮긴다(oracle의 /service와 같은 자리).
+		if u, err := nurl.Parse(*url); err == nil && u.Path != "" && u.Query().Get("database") == "" {
+			q := u.Query()
+			q.Set("database", strings.TrimPrefix(u.Path, "/"))
+			u.Path = ""
+			u.RawQuery = q.Encode()
+			*url = u.String()
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "error: --url 스킴 %q는 지원하지 않는다 (oracle://, sqlserver://)\n", scheme)
+		os.Exit(2)
+	}
+
+	db, err := sql.Open(driver, *url)
 	if err != nil {
 		fatal("드라이버 열기 실패", err)
 	}
@@ -188,7 +222,7 @@ func main() {
 		fatal("접속 실패", err)
 	}
 
-	h := &harvester{db: db, schemaFilter: map[string]bool{}}
+	h := &harvester{db: db, dialect: dialect, schemaFilter: map[string]bool{}}
 	if *schemaArg != "" {
 		for _, s := range strings.Split(*schemaArg, ",") {
 			if s = strings.TrimSpace(s); s != "" {
@@ -239,6 +273,9 @@ func sortedDistinct(in []string) []string {
 }
 
 func (h *harvester) extract() CatalogDocument {
+	if h.dialect == "sqlserver" {
+		return h.extractMSSQL()
+	}
 	objects := h.collectObjects()
 	views := h.collectViews()
 	triggers := h.collectTriggers()
@@ -258,7 +295,7 @@ func (h *harvester) extract() CatalogDocument {
 	sort.Strings(schemas)
 
 	doc := CatalogDocument{
-		Version: documentVersion, Dialect: "oracle", Reader: "probe-go",
+		Version: documentVersion, Dialect: h.dialect, Reader: "probe-go",
 		Schemas: []SchemaDoc{},
 		// 빈 배열이 null로 직렬화되면 Kotlin 측 문서와 모양이 갈린다.
 		Limitations: append([]string{}, h.limitations...),
@@ -877,7 +914,6 @@ func slicePackageBody(impl string, members map[string]bool) map[string]string {
 	}
 	return out
 }
-
 
 // toNDJSON — engine/source/src/ndjson.rs 및 probe/Model.kt의 toNdjson과
 // 같은 레이아웃: document 헤더 → 스키마별 schema 행 + object·routine 행.
