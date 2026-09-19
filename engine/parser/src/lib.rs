@@ -17,7 +17,9 @@ use sqlparser::ast::{
     visit_expressions, visit_relations, Expr, JoinConstraint, JoinOperator, ObjectName, Query,
     SelectItem, SetExpr, Statement, TableFactor, TableObject,
 };
-use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{
+    Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
+};
 
 /// document의 몸체들을 파싱해 그래프에 간선을 보강한다.
 ///
@@ -118,7 +120,26 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                         apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
                         enriched += 1;
                     }
-                    Err(msg) => notes.push(format!("routine {owner} 몸체 파싱 실패: {msg}")),
+                    Err(msg) => {
+                        // 도매 파싱이 실패한 몸체 — T-SQL의 DECLARE/IF/TRY
+                        // 같은 절차형 구문이 섞이면 sqlparser가 문장 목록째
+                        // 거부한다. 문장 추출로 부분 복구해 파싱된 문장의
+                        // 간선만 취하고, 미추출은 limitation으로 센다.
+                        let (parsed, unextracted) = parse_procedural_body(dialect.as_deref(), body);
+                        if parsed.has_edges() {
+                            apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                            // 미추출 0건은 완전 복구 — 한계가 아니므로 조용히 둔다.
+                            if unextracted > 0 {
+                                notes.push(format!(
+                                    "routine {owner}: 몸체 문장 {unextracted}건 미추출\
+                                     (절차형 구문) — 몸체 간선 불완전 ({msg})"
+                                ));
+                            }
+                            enriched += 1;
+                        } else {
+                            notes.push(format!("routine {owner} 몸체 파싱 실패: {msg}"));
+                        }
+                    }
                 },
                 // plpgsql·plsql은 문장 단위 추출기로 SQL 문장만 꺼내 파싱한다.
                 // 꺼내지 못한 문장(동적 SQL 등)은 수를 세어 limitation으로 남긴다.
@@ -237,6 +258,9 @@ fn dialect_for(dialect: &str) -> Option<Box<dyn Dialect>> {
         "sqlite" => Box::new(SQLiteDialect {}),
         "postgres" => Box::new(PostgreSqlDialect {}),
         "mysql" => Box::new(MySqlDialect {}),
+        // MsSqlDialect는 [bracket] 식별자·TOP 같은 T-SQL 표면을 이해한다 —
+        // Generic으로 파싱하면 문장째 실패하던 것이 풀린다.
+        "sqlserver" | "mssql" => Box::new(MsSqlDialect {}),
         _ => Box::new(GenericDialect {}),
     })
 }
@@ -514,6 +538,17 @@ struct ParsedTrigger {
     calls: Vec<(Option<String>, String)>,
 }
 
+impl ParsedTrigger {
+    /// 간선이 될 수확이 하나라도 있나 — 부분 복구 폴백이 "못 읽은 몸체"와
+    /// "읽을 게 없던 몸체"를 구분하는 기준이다.
+    fn has_edges(&self) -> bool {
+        !(self.writes.is_empty()
+            && self.reads.is_empty()
+            && self.fired_columns.is_empty()
+            && self.calls.is_empty())
+    }
+}
+
 /// `CREATE TRIGGER ... BEGIN <문장들> END`를 파싱한다. sqlparser는
 /// CREATE TRIGGER 자체를 못 파는 방언이 많아 껍질(BEGIN..END)은 직접
 /// 벗기고 안쪽 문장만 파서에 넘긴다. 껍질이 없는 몸체(reader가 내부
@@ -737,7 +772,9 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
     for chunk in split_top_level(body) {
         let mut rest = chunk;
         loop {
-            rest = rest.trim_start();
+            // 주석이 선두를 가리면 문장 머리 판별이 깨져 조각째 버려진다 —
+            // 프로브 몸체는 `--` 주석을 그대로 담고 오므로 매 반복 건너뛴다.
+            rest = skip_ws_comments(rest);
             if rest.is_empty() {
                 break;
             }
@@ -767,17 +804,33 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                         rest = &rest.trim_start()[tail_len..];
                     }
                 }
-                "LOOP" | "ELSE" | "EXCEPTION" | "REPEAT" => {
+                // T-SQL의 TRY/CATCH·TRAN/TRANSACTION은 BEGIN/END의 꼬리로만
+                // 오는 한정자라 소비한다 — 독립 문장 머리가 아니다.
+                "LOOP" | "ELSE" | "EXCEPTION" | "REPEAT" | "TRY" | "CATCH" | "TRAN"
+                | "TRANSACTION" => {
                     rest = &rest[wlen..];
                 }
+                // T-SQL은 조건 뒤가 THEN/LOOP가 아니라 BEGIN이라 둘 다 본다.
                 "IF" | "ELSIF" | "ELSEIF" | "WHEN" => {
-                    rest = strip_condition(rest, wlen, "THEN", &mut stmts, &mut unextracted);
+                    rest = strip_condition(
+                        rest,
+                        wlen,
+                        &["THEN", "BEGIN"],
+                        &mut stmts,
+                        &mut unextracted,
+                    );
                 }
                 "WHILE" => {
-                    rest = strip_condition(rest, wlen, "LOOP", &mut stmts, &mut unextracted);
+                    rest = strip_condition(
+                        rest,
+                        wlen,
+                        &["LOOP", "BEGIN"],
+                        &mut stmts,
+                        &mut unextracted,
+                    );
                 }
                 "UNTIL" => {
-                    rest = strip_condition(rest, wlen, "END", &mut stmts, &mut unextracted);
+                    rest = strip_condition(rest, wlen, &["END"], &mut stmts, &mut unextracted);
                 }
                 "FOR" => rest = strip_for(rest, wlen, &mut stmts, &mut unextracted),
                 "CASE" => rest = strip_case_operand(rest, wlen, &mut unextracted),
@@ -796,6 +849,30 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                 }
                 "EXECUTE" => {
                     strip_execute(rest, wlen, &mut stmts, &mut unextracted);
+                    break;
+                }
+                "EXEC" => {
+                    // T-SQL `EXEC proc <args>`는 CALL의 별칭 — EXECUTE와
+                    // 달리 동적 SQL이 아니라 routine 호출이 기본이다.
+                    strip_exec_call(rest, wlen, &mut stmts, &mut unextracted);
+                    break;
+                }
+                "SET" => {
+                    // T-SQL `SET @v = <expr>`은 변수 대입 — 우변에 질의가
+                    // 있으면 살린다. `SET NOCOUNT ON` 같은 환경 설정은
+                    // 문장째 파서에 넘겨 성공하면 간선 없음, 실패하면
+                    // 미추출로 세게 둔다.
+                    let tail = rest[wlen..].trim_start();
+                    if tail.starts_with('@') {
+                        if let Some(eq) = find_top_level(tail, "=", false) {
+                            let rhs = tail[eq + 1..].trim();
+                            if rhs.contains('(') {
+                                stmts.push(format!("SELECT {rhs}"));
+                            }
+                        }
+                    } else {
+                        stmts.push(rest.trim().to_owned());
+                    }
                     break;
                 }
                 "EXIT" | "CONTINUE" | "ASSERT" => {
@@ -817,11 +894,14 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                     }
                 }
                 "GOTO" | "GET" | "RAISE" | "SIGNAL" | "RESIGNAL" | "NULL" | "PRAGMA" | "CLOSE"
-                | "FETCH" | "MOVE" | "LEAVE" | "ITERATE" => break,
+                | "FETCH" | "MOVE" | "LEAVE" | "ITERATE" | "PRINT" | "THROW" | "RAISERROR"
+                | "WAITFOR" | "DEALLOCATE" | "BREAK" => break,
                 _ => {
-                    if in_declare {
-                        extract_decl_default(rest, &mut stmts);
-                    } else if is_statement_head(&word) {
+                    // 문장 머리가 오면 선언 섹션은 끝났다 — T-SQL은 DECLARE가
+                    // BEGIN..END 안의 문장이라 뒤따르는 UPDATE 등이 선언으로
+                    // 오인되지 않게 실제 SQL 문장을 우선 본다.
+                    if is_statement_head(&word) {
+                        in_declare = false;
                         // SELECT .. INTO <변수>·RETURNING .. INTO <변수>는
                         // 변수 귀속 절 — 벗기지 않으면 변수가 테이블로 오인된다.
                         let stmt = match word.to_ascii_uppercase().as_str() {
@@ -837,6 +917,8 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                         if !stmt.is_empty() {
                             stmts.push(stmt);
                         }
+                    } else if in_declare {
+                        extract_decl_default(rest, &mut stmts);
                     } else if let Some(p) = find_top_level(rest, ":=", false) {
                         // 대입문 — 우변의 서브쿼리·함수 호출만 SELECT로 살린다.
                         let rhs = rest[p + 2..].trim();
@@ -1028,6 +1110,27 @@ fn q_quote_end(s: &str, i: usize) -> Option<usize> {
     None
 }
 
+/// 공백과 주석(`--…`, `/*…*/`)을 건너뛴다 — 조각 선두·중간의 주석이
+/// 문장 머리 판별을 가리지 않게 추출 루프에서 매 반복 적용한다.
+fn skip_ws_comments(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            match rest.find('\n') {
+                Some(p) => s = &rest[p + 1..],
+                None => return "",
+            }
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(p) => s = &rest[p + 2..],
+                None => return "",
+            }
+        } else {
+            return s;
+        }
+    }
+}
+
 /// 조각 선두의 식별자 단어 — (단어, 바이트 길이). 선두가 식별자 문자가
 /// 아니면 ("", 0)이다. Oracle은 `$`·`#`도 식별자 문자다.
 fn head_word(s: &str) -> (&str, usize) {
@@ -1063,26 +1166,51 @@ fn dotted_name_len(s: &str) -> usize {
 /// `IF/ELSIF/WHEN <cond> THEN`·`WHILE <cond> LOOP`의 조건식을 추출한다.
 /// 조건 안의 EXISTS/IN 서브쿼리가 테이블을 읽을 수 있어 `(`가 있으면
 /// SELECT로 싼다 — 없으면 스칼라 조건이라 간선이 생기지 않는다.
+/// 종결자는 가장 먼저 오는 것을 쓴다 — T-SQL은 THEN/LOOP 대신 BEGIN이
+/// 몸체를 여는 언어라 호출부에서 후보를 둘 다 넘긴다.
 fn strip_condition<'a>(
     rest: &'a str,
     kwlen: usize,
-    term: &str,
+    terms: &[&str],
     stmts: &mut Vec<String>,
     unextracted: &mut usize,
 ) -> &'a str {
     let tail = &rest[kwlen..];
-    match find_top_level(tail, term, true) {
-        Some(p) => {
+    let hit = terms
+        .iter()
+        .filter_map(|t| find_top_level(tail, t, true).map(|p| (p, t.len())))
+        .min_by_key(|(p, _)| *p);
+    match hit {
+        Some((p, tlen)) => {
             let cond = tail[..p].trim();
             if cond.contains('(') {
                 stmts.push(format!("SELECT {cond}"));
             }
-            &tail[p + term.len()..]
+            &tail[p + tlen..]
         }
         None => {
             *unextracted += 1;
             ""
         }
+    }
+}
+
+/// T-SQL `EXEC <routine> <args>` — EXECUTE와 달리 기본이 routine 호출이다.
+/// 문자열 리터럴·`@변수`·`EXEC('SQL')` 꼴은 동적 실행이라 미추출로 센다
+/// (리터럴만 복구한다).
+fn strip_exec_call(rest: &str, kwlen: usize, stmts: &mut Vec<String>, unextracted: &mut usize) {
+    let tail = rest[kwlen..].trim_start();
+    if tail.starts_with('\'') {
+        if let Some(inner) = unquote_sql_string(tail) {
+            stmts.push(inner.into_owned());
+            return;
+        }
+    }
+    let len = dotted_name_len(tail);
+    if len > 0 && !tail[..len].starts_with('(') {
+        stmts.push(format!("CALL {}()", &tail[..len]));
+    } else {
+        *unextracted += 1;
     }
 }
 
@@ -1304,13 +1432,22 @@ fn strip_returning_into(stmt: &str, returning_pos: usize) -> String {
     }
 }
 
-/// 선언부 조각 — `x int DEFAULT f()`·`x := (SELECT..)`의 기본값만 살린다.
+/// 선언 조각에서 의존이 될 수 있는 질의만 꺼낸다 — `:=`·`DEFAULT`의
+/// 서브쿼리와 `CURSOR FOR <질의>`(plpgsql·T-SQL 공통). 선언 그 자체는
+/// 미추출로 세지 않는다 — 의존이 아니라 변수 선언일 뿐이다.
 fn extract_decl_default(chunk: &str, stmts: &mut Vec<String>) {
     let rhs = find_top_level(chunk, ":=", false)
         .map(|p| &chunk[p + 2..])
         .or_else(|| find_top_level(chunk, "DEFAULT", true).map(|p| &chunk[p + "DEFAULT".len()..]));
     if let Some(rhs) = rhs.map(str::trim).filter(|r| r.contains('(')) {
         stmts.push(format!("SELECT {rhs}"));
+        return;
+    }
+    if let Some(p) = find_top_level(chunk, "FOR", true) {
+        let tail = chunk[p + "FOR".len()..].trim();
+        if is_query_text(tail) {
+            stmts.push(tail.to_owned());
+        }
     }
 }
 
@@ -1387,11 +1524,18 @@ fn is_query_text(s: &str) -> bool {
 
 /// 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
 fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger) {
+    // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
+    // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
     let write_targets = write_targets(stmt);
-    parsed.writes.extend(write_targets.iter().cloned());
+    for t in &write_targets {
+        if !parsed.writes.contains(t) {
+            parsed.writes.push(t.clone());
+        }
+    }
     let _ = visit_relations(stmt, |name| {
         let t = object_name_parts(name);
-        if !t.1.is_empty() && !write_targets.contains(&t) {
+        // 재귀 방문으로 중첩 문장이 여러 번 오므로 중복을 거른다.
+        if !t.1.is_empty() && !write_targets.contains(&t) && !parsed.reads.contains(&t) {
             parsed.reads.push(t);
         }
         ControlFlow::<()>::Continue(())
@@ -1401,8 +1545,9 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger) {
             Expr::CompoundIdentifier(parts) => {
                 if parts.len() == 2 {
                     let q = parts[0].value.to_ascii_lowercase();
-                    if q == "new" || q == "old" {
-                        parsed.fired_columns.push(parts[1].value.clone());
+                    let col = parts[1].value.clone();
+                    if (q == "new" || q == "old") && !parsed.fired_columns.contains(&col) {
+                        parsed.fired_columns.push(col);
                     }
                 }
             }
@@ -1424,6 +1569,12 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger) {
         if !t.1.is_empty() && !parsed.calls.contains(&t) {
             parsed.calls.push(t);
         }
+    }
+    // 절차형 블록(IF/WHILE/CASE) 안의 문장 — 도매 파싱이 성공해도 DML·CALL이
+    // 블록 안에 중첩돼 있어 재귀로 내려가지 않으면 writes가 reads로 오분류되고
+    // CALL이 조용히 빠진다. 관계·식 수확은 visitor가 이미 트리 전체를 본다.
+    for s in nested_statements(stmt) {
+        collect_trigger_stmt(s, parsed);
     }
 }
 
@@ -1487,8 +1638,38 @@ fn is_builtin_function(name: &str) -> bool {
     )
 }
 
-/// DML 문장의 쓰기 대상. SELECT-only 문장은 빈 벡터다.
+/// DML 문장의 쓰기 대상 — 절차형 블록 안의 문장까지 재귀로 본다.
+/// SELECT-only 문장은 빈 벡터다.
 fn write_targets(stmt: &Statement) -> Vec<(Option<String>, String)> {
+    let mut targets = write_targets_shallow(stmt);
+    for s in nested_statements(stmt) {
+        targets.extend(write_targets(s));
+    }
+    targets
+}
+
+/// 절차형 블록(IF/ELSEIF/ELSE, WHILE, CASE) 안에 중첩된 문장들.
+/// T-SQL 몸체는 도매 파싱이 성공해도 DML이 블록 안에 들어간다.
+fn nested_statements(stmt: &Statement) -> Vec<&Statement> {
+    match stmt {
+        Statement::If(s) => std::iter::once(&s.if_block)
+            .chain(s.elseif_blocks.iter())
+            .chain(s.else_block.iter())
+            .flat_map(|b| b.statements().iter())
+            .collect(),
+        Statement::While(s) => s.while_block.statements().iter().collect(),
+        Statement::Case(s) => s
+            .when_blocks
+            .iter()
+            .chain(s.else_block.iter())
+            .flat_map(|b| b.statements().iter())
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// 한 문장의 표면 쓰기 대상 — 중첩 블록은 write_targets가 본다.
+fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
     match stmt {
         Statement::Update { table, .. } => table_factor_name(&table.relation).into_iter().collect(),
         Statement::Insert(insert) => match &insert.table {
@@ -2184,6 +2365,153 @@ mod tests {
             .edges()
             .iter()
             .any(|e| e.kind == EdgeKind::Calls && e.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn tsql의_try_if_exec_declare가_전부_추출된다() {
+        // T-SQL 절차형 구문 — DECLARE/SET @v=/IF..BEGIN/TRY..CATCH/EXEC가
+        // 모두 도매 파싱을 깨뜨리지만 문장 추출로 전부 간선이 된다.
+        let mut doc = doc_with_routine(
+            vec![
+                routine("audit_orders", Some("sql"), "BEGIN END"),
+                routine(
+                    "sync_orders",
+                    Some("sql"),
+                    "BEGIN \
+                     SET NOCOUNT ON; \
+                     DECLARE @n INT; \
+                     SET @n = (SELECT COUNT(*) FROM customers); \
+                     IF @n > 0 BEGIN \
+                       UPDATE orders SET customer_id = 1 WHERE id = @n; \
+                     END \
+                     BEGIN TRY \
+                       EXEC audit_orders @n; \
+                     END TRY \
+                     BEGIN CATCH \
+                       INSERT INTO customers (name) VALUES ('err'); \
+                     END CATCH \
+                     END",
+                ),
+            ],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (g, notes) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.sync_orders"
+            && e.to.as_str() == "public.customers"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.sync_orders"
+            && e.to.as_str() == "public.orders"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+            && e.from.as_str() == "public.sync_orders"
+            && e.to.as_str() == "public.audit_orders"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.sync_orders"
+            && e.to.as_str() == "public.customers"));
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.contains("sync_orders") && n.contains("파싱 실패")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn tsql의_while_begin과_cursor_for_select가_추출된다() {
+        let mut doc = doc_with_routine(
+            vec![routine(
+                "drain",
+                Some("sql"),
+                "BEGIN \
+                 DECLARE c CURSOR FOR SELECT id FROM customers; \
+                 DECLARE @i INT = 0; \
+                 WHILE @i < 10 BEGIN \
+                   UPDATE orders SET customer_id = @i WHERE id = @i; \
+                   SET @i = @i + 1; \
+                 END \
+                 END",
+            )],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (g, _) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.drain"
+            && e.to.as_str() == "public.customers"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.drain"
+            && e.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn tsql_부분복구는_간선과_불완전_한계를_함께_남긴다() {
+        // EXEC('..'+@t)는 동적 실행이라 못 읽지만 UPDATE는 살아야 한다 —
+        // 도매 실패가 몸체 전체를 버리는 일은 없어야 한다.
+        let mut doc = doc_with_routine(
+            vec![routine(
+                "wipe",
+                Some("sql"),
+                "BEGIN UPDATE customers SET name = 'x' WHERE id = 1; \
+                 EXEC('DELETE FROM ' + @t); END",
+            )],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (g, notes) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.wipe"
+            && e.to.as_str() == "public.customers"));
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("wipe") && n.contains("미추출")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn 몸체_선두의_주석이_첫_문장을_삼키지_않는다() {
+        // 프로브는 CREATE 앞의 -- 주석을 몸체에 그대로 싣는다 — 주석이
+        // 문장 머리 판별을 가리면 첫 조각째 버려져 간선이 빠진다.
+        let mut doc = doc_with_routine(
+            vec![routine(
+                "drain",
+                Some("sql"),
+                "-- cursor가 읽는 대상\n\
+                 CREATE PROCEDURE drain AS \
+                 BEGIN DECLARE c CURSOR FOR SELECT id FROM customers; END",
+            )],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (g, _) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.drain"
+            && e.to.as_str() == "public.customers"));
+    }
+
+    #[test]
+    fn tsql_복구불가_몸체는_파싱실패로_정직하게_보고한다() {
+        // 간선이 하나도 안 나오면 부분 복구 성공으로 꾸미지 않고
+        // 원래 파싱 실패를 그대로 보고한다.
+        let mut doc = doc_with_routine(
+            vec![routine(
+                "noop",
+                Some("sql"),
+                "BEGIN PRINT 'x'; THROW 50001, 'e', 1; END",
+            )],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (g, notes) = build(&doc);
+        assert!(!g.edges().iter().any(|e| e.from.as_str() == "public.noop"));
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("noop") && n.contains("파싱 실패")),
+            "notes: {notes:?}"
+        );
     }
 
     #[test]
