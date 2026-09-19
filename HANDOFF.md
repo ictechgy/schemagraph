@@ -129,6 +129,28 @@
     단일 정적 바이너리. ojdbc(OTN)도 JVM도 없이 JVM 프로브와
     85/85 간선 완전 패리티(실검증). verify-fixtures가 go가 있으면
     Oracle 섹션에서 패리티를 검증한다.
+- 2026-09-19: **P6 완료 — T-SQL·패키지 멤버·Go MSSQL·진짜 스트리밍·배포 준비**.
+  - T-SQL(`4c84052`) — `sqlserver→MsSqlDialect` 매핑. 도매 파싱이 실패하면
+    문장 추출기로 폴백해 `IF`/`TRY`/`EXEC`/`WHILE`/커서 안의 SQL을 복구.
+    `write_targets`를 재귀로 고쳐 블록 안 DML이 reads로 오분류되던 것도
+    같이 고쳤다. 앞 `--` 주석이 첫 조각을 통째로 삼키는 버그도 수정.
+  - Oracle 패키지 멤버(`c31be9d`…) — `RoutineDoc.member_of` additive 필드.
+    프로브 둘 다 멤버를 `pkg.member#ov` 키로 수확하고 몸체를 슬라이스해
+    싣는다. 그래프는 멤버 정점+`contains` 간선, `pkg.member()` 호출은
+    멤버로 해석(모호·미발견은 추측하지 않고 limitation). 두 패스 루프로
+    정렬 순서 무관하게 패키지가 먼저 생긴다. JVM↔Go 문서·그래프 완전
+    패리티. Kotlin merge()가 memberOf·signature를 떨구던 버그도 수정.
+  - Go 프로브 MSSQL(`mssql.go`) — go-mssqldb로 sys.* 수확. JVM과 정점·
+    간선·limitation 완전 패리티(Azure SQL Edge, encrypt=disable 필요).
+  - 진짜 스트리밍(`ef08ae4`) — Extractor가 스키마 단위로 수확·방출한다.
+    NDJSON 정본: 헤더 limitations는 비우고 마지막에
+    `{"type":"limitations","data":[…]}` 트레일러. 리더는 헤더+트레일러
+    합집합·정렬·중복 제거. SQLite·Oracle·MSSQL에서 JSON 경로와 그래프
+    동일 확인. 스키마 후보는 getSchemas ∪ 전역 테이블 스캔으로 옛 전역
+    수집과 같은 커버리지 보장.
+  - 배포 준비(`e51bc95`) — LICENSE-MIT·LICENSE-APACHE, path 의존성
+    버전, keywords·categories. `schemagraph-core` dry-run 패키징 통과.
+    미게시 형제 의존은 dry-run 해석이 안 되므로 실게시는 의존 순서로.
 
 ## 확정된 결정
 
@@ -213,7 +235,7 @@
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 58개 테스트
+cd engine && cargo build && cargo test        # 빌드 + 88개 테스트
 Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + JDBC probe 양방향 검증
 # PG는 initdb로, MySQL·MariaDB·MSSQL·Oracle은 docker로 자동 프로비전한다.
 #   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh      (폐기용 DB만!)
@@ -228,14 +250,18 @@ Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + 
 
 ## 다음 할 일
 
-1. 배포 준비 — crates.io `schemagraph`·Maven `schemagraph` 모두 비어
-   있음(2026-09-19 확인). 선점·퍼블리시는 아직 하지 않았다.
-2. routine 파싱 잔여 — T-SQL 전용 구문(TRY/CATCH·CURSOR), Oracle 패키지
-   멤버별 귀속(ALL_ARGUMENTS의 PACKAGE_NAME으로 시그니처 복원).
-3. 프로브 측 진짜 스트리밍 — NDJSON은 직렬화만 행 단위다. Extractor를
-   행 방출로 고치면 대형 카탈로그도 상수 메모리로 수확된다.
-4. Go 프로브 확장 — Oracle만 커버. pure-Go 드라이버가 있는 방언
-   (pgwire·mysql·sqlserver·sqlite)으로 수요별 확장.
+1. crates.io 실게시 — `schemagraph*` 이름 모두 비어 있음(2026-09-19
+   확인). 메타데이터·LICENSE·path 버전은 준비됐고 `schemagraph-core`
+   dry-run 통과. 미게시 형제는 dry-run 해석이 불가하므로 의존 순서
+   (core → source → parser/analysis → export → cli)대로 실게시해야 한다.
+   원격 git 저장소도 아직 없다 — 저장소 URL이 생기면 `repository` 필드를
+   채운다.
+2. routine 파싱 잔여 — T-SQL `TRY/CATCH`·`EXEC`·`WHILE`·커서는 복구됐고
+   남은 건 추출기가 못 가르는 드물고 동적인 구문뿐. 패키지 멤버 귀속은
+   완료 — 남은 것은 멤버 경계가 모호한 경우의 추가 정밀도뿐이다.
+3. Go 프로브 확장 — Oracle·SQL Server를 커버. pure-Go 드라이버가 있는
+   방언(pgwire·mysql·sqlite)으로 수요별 확장.
+4. document v2 — additive 필드 너머의 협상(변경·제거 필드의 버전 계약).
 
 ## 미결
 

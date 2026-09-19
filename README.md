@@ -60,15 +60,20 @@ Dialect notes:
 
 - **MSSQL** — routines come from `sys.objects` + `sys.parameters` (JDBC
   metadata mislabels them and appends `;N` numbered-procedure suffixes,
-  which the probe normalizes away). T-SQL bodies parse through the generic
-  SQL path; `inserted`/`deleted` pseudo-tables land in `limitations`.
+  which the probe normalizes away). T-SQL bodies parse through
+  `MsSqlDialect` with a statement-extractor fallback — `IF`/`TRY`/`EXEC`/
+  `WHILE`/cursor scaffolding is consumed and the SQL inside is recovered
+  statement by statement; `inserted`/`deleted` pseudo-tables land in
+  `limitations`.
 - **Oracle** — `ALL_*` + `ALL_SOURCE`; `PUBLIC` synonyms and Database Vault
   schemas are suppressed (they would exhaust cursors, ORA-01000). Unquoted
   identifiers fold to uppercase, so lowercase body references resolve to
   UPPERCASE vertices case-insensitively; genuinely ambiguous case
-  collisions are reported, never guessed. `PACKAGE BODY` bodies attach to a
-  single `package` vertex — per-member attribution is reported as a
-  limitation.
+  collisions are reported, never guessed. Package members are harvested
+  with `member_of` — each member becomes a `schema.package.member` vertex
+  under a `contains` edge, member bodies attribute edges to the member,
+  and `pkg.member()` calls resolve to it. Members the body slicer cannot
+  bound are kept with a limitation, never guessed.
 - **SQLite** — JDBC `TABLE_SCHEM`/`TABLE_CAT` come back null, so objects map
   to `main`; bodies come from `sqlite_master` (same source as the native
   reader → vertex and edge parity, verified).
@@ -79,25 +84,29 @@ Dialect notes:
 On SQLite, MySQL and MariaDB the probe's dependency edges match the native
 reader's exactly.
 
-`--format ndjson` emits the document as newline-delimited JSON (one record
-per line: a `document` header, then `schema`/`object`/`routine` rows) —
-`scan --document` detects the format automatically, so large catalogs can
-be streamed rather than held as one JSON value.
+`--format ndjson` streams the document as newline-delimited JSON — a
+`document` header (with an empty `limitations`), then per-schema
+`schema`/`object`/`routine` rows emitted as each schema is harvested, and
+a final `limitations` record carrying whatever was found along the way.
+`scan --document` detects the format automatically, so large catalogs are
+never held as one JSON value on either side.
 
-### Go probe (no JVM — Oracle)
+### Go probe (no JVM — Oracle, SQL Server)
 
 `probe-go/` builds a single static binary covering Oracle via the pure-Go
-`go-ora` driver — the path where the JVM probe still needs an external
-OTN-licensed `ojdbc` jar:
+`go-ora` driver and SQL Server via `go-mssqldb` — the paths where the JVM
+probe still needs an external jar (OTN-licensed `ojdbc`, Microsoft's
+`mssql-jdbc`):
 
 ```
 cd probe-go && go build -o schemagraph-probe-go .
 ./schemagraph-probe-go --url oracle://u:p@host:1521/FREEPDB1 -o catalog.json
+./schemagraph-probe-go --url "sqlserver://u:p@host:1433?database=db" -o catalog.json
 ```
 
-Harvest semantics mirror the Kotlin probe's Oracle branch (`ALL_*` +
-`ALL_SOURCE`); on the same database it produces a graph identical to the
-JVM probe (verified live — 85/85 edges, 63/63 vertices).
+Harvest semantics mirror the Kotlin probe's branches (`ALL_*` +
+`ALL_SOURCE`, `sys.*` + `sys.sql_modules`); on the same database each
+produces a graph identical to the JVM probe (verified live on both).
 
 ## Commands
 
@@ -178,6 +187,8 @@ the graph.
   visible SQL (`IF/FOR/LOOP` conditions, `PERFORM`, `EXECUTE 'literal'`,
   `SELECT … INTO`, `RETURNING … INTO`, bare PL/SQL calls) produces real
   edges; unextractable dynamic constructs are counted in `limitations`.
+  T-SQL parses via `MsSqlDialect`, and when a body wholesale-fails the same
+  extractor recovers what it can (`IF`/`TRY`/`EXEC`/`WHILE`/cursors).
   Other languages (`plpython3u`, …) are reported, not guessed.
 - Deterministic JSON everywhere; unknown targets never become ghost vertices —
   they land in `limitations`. Documents carrying fields the engine does not
@@ -193,7 +204,11 @@ the graph.
 - **P4** — MSSQL/Oracle rich probes — done (live-verified)
 - **P5** — `diff`, `plpgsql`/`plsql` statement extraction, opt-in `inferred`
   edges, Oracle package harvest, NDJSON transport, Go probe (Oracle) — done
-  (live-verified); next: document v2 negotiation beyond additive fields,
-  wider procedural coverage, publishing
+  (live-verified)
+- **P6** — T-SQL (`MsSqlDialect` + procedural recovery), Oracle package
+  members (`member_of` vertices + `contains`), Go probe SQL Server,
+  real probe streaming (limitations trailer), publish metadata — done
+  (live-verified); next: crates.io publish in dependency order, document
+  v2 negotiation beyond additive fields, wider procedural coverage
 
 Details and trade-offs: [DESIGN.md](DESIGN.md).
