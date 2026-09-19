@@ -105,7 +105,12 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 "package" => (VertexKind::Package, "package"),
                 _ => (VertexKind::Function, "function"),
             };
-            let Some(owner) = resolve_object(g, &schema.name, &id_name, kind, suffix, ci) else {
+            // 패키지 멤버는 schema.pkg.member 정점 — schema 직속이 아니다.
+            let owner = match &routine.member_of {
+                Some(pkg) => resolve_member(g, &schema.name, pkg, &id_name, kind, suffix, ci),
+                None => resolve_object(g, &schema.name, &id_name, kind, suffix, ci),
+            };
+            let Some(owner) = owner else {
                 notes.push(format!(
                     "routine {}.{id_name}: 정점을 못 찾음 — 몸체 간선 생략",
                     schema.name
@@ -146,11 +151,13 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 Some("plpgsql" | "plsql" | "pl/sql") => {
                     let (parsed, unextracted) = parse_procedural_body(dialect.as_deref(), body);
                     apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
-                    if routine.kind == "package" {
-                        // PACKAGE BODY의 멤버 몸체는 패키지 정점에 귀속된다 —
-                        // 멤버별 정점 분리는 미지원이라 소비자가 알아야 한다.
+                    // 멤버가 member_of로 나오는 문서에서 패키지 몸체는 스펙이라
+                    // 실행 간선이 거의 없다 — 패키지 정점에 간선이 붙는다는 건
+                    // 멤버 몸체가 통째로 실린 옛 형식이라는 뜻이라 그때만 알린다.
+                    if routine.kind == "package" && parsed.has_edges() {
                         notes.push(format!(
-                            "routine {owner}: 패키지 멤버별 귀속 미지원 — 멤버 몸체 간선은 패키지 정점에 귀속"
+                            "routine {owner}: 패키지 몸체 간선은 패키지 정점에 귀속 \
+                             — 멤버 구분은 문서의 member_of를 쓴다"
                         ));
                     }
                     if unextracted > 0 {
@@ -1943,7 +1950,18 @@ fn apply_call_edges(
 ) {
     for (ref_schema, name) in calls {
         let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-        match resolve_routine(g, &target_schema, name, ci) {
+        let hit = match resolve_routine(g, &target_schema, name, ci) {
+            RoutineHit::None => {
+                // `pkg.member()` 꼴 — qualifier가 스키마가 아니라 패키지면
+                // 멤버 정점 schema.pkg.member를 찾는다.
+                ref_schema
+                    .as_ref()
+                    .map(|pkg| resolve_pkg_member(g, schema, pkg, name, ci))
+                    .unwrap_or(RoutineHit::None)
+            }
+            hit => hit,
+        };
+        match hit {
             RoutineHit::One(target) => {
                 g.add_edge(Edge {
                     from: from.clone(),
@@ -1963,6 +1981,36 @@ fn apply_call_edges(
                 "{from}이(가) 부르는 {target_schema}.{name}에 {n}개 오버로드가 있어 간선 생략"
             )),
         }
+    }
+}
+
+/// `schema.pkg.member` 정점을 찾는다 — 멤버 kind는 procedure/function 둘
+/// 다 될 수 있어 둘을 시도하고, 시그니처가 붙은 id(`pkg.m(int)`)는
+/// `schema.pkg.` 접두 안의 이름 스캔으로 찾는다. 오버로드가 여럿이면
+/// Ambiguous — resolve_routine과 같이 추측하지 않는다.
+fn resolve_pkg_member(g: &Graph, schema: &str, pkg: &str, name: &str, ci: bool) -> RoutineHit {
+    let base = VertexId::member(schema, pkg, name);
+    if let Some(id) = resolve_renamed(g, base.clone(), VertexKind::Procedure, "procedure", ci)
+        .or_else(|| resolve_renamed(g, base, VertexKind::Function, "function", ci))
+    {
+        return RoutineHit::One(id);
+    }
+    let prefix = format!("{schema}.{pkg}.");
+    let name_eq = |a: &str, b: &str| a == b || (ci && a.eq_ignore_ascii_case(b));
+    let hits: Vec<VertexId> = g
+        .vertices()
+        .filter(|v| {
+            name_eq(&v.name, name)
+                && matches!(v.kind, VertexKind::Procedure | VertexKind::Function)
+                && v.id.as_str().len() >= prefix.len()
+                && v.id.as_str()[..prefix.len()].eq_ignore_ascii_case(&prefix)
+        })
+        .map(|v| v.id.clone())
+        .collect();
+    match hits.len() {
+        0 => RoutineHit::None,
+        1 => RoutineHit::One(hits.into_iter().next().unwrap()),
+        n => RoutineHit::Ambiguous(n),
     }
 }
 
@@ -2279,6 +2327,7 @@ mod tests {
             body: Some(body.to_owned()),
             signature: None,
             usage: None,
+            member_of: None,
         }
     }
 
@@ -2711,9 +2760,80 @@ mod tests {
             && e.from.as_str() == "public.order_ops"
             && e.to.as_str() == "public.orders"));
         assert!(
-            notes.iter().any(|n| n.contains("멤버별 귀속")),
+            notes.iter().any(|n| n.contains("패키지 정점에 귀속")),
             "notes: {notes:?}"
         );
+    }
+
+    #[test]
+    fn member_of_멤버는_패키지_아래_정점과_contains_간선이_된다() {
+        // member_of가 실린 멤버는 schema.pkg.member 정점이 되고 몸체
+        // 간선은 멤버에 귀속된다 — 패키지 정점에는 스펙만 남는다.
+        let mut pkg = routine(
+            "order_ops",
+            Some("plsql"),
+            "PACKAGE order_ops IS END order_ops;",
+        );
+        pkg.kind = "package".into();
+        let mut touch = routine(
+            "touch",
+            Some("plsql"),
+            "PROCEDURE touch(cid IN NUMBER) IS \
+             BEGIN UPDATE customers SET name = name WHERE id = cid; END touch;",
+        );
+        touch.kind = "procedure".into();
+        touch.member_of = Some("order_ops".into());
+        let mut count_all = routine(
+            "count_all",
+            Some("plsql"),
+            "FUNCTION count_all RETURN NUMBER IS n NUMBER; \
+             BEGIN SELECT count(*) INTO n FROM orders; RETURN n; END count_all;",
+        );
+        count_all.member_of = Some("order_ops".into());
+        let doc = doc_with_routine(vec![pkg, touch, count_all], "");
+        let (g, _) = build(&doc);
+        // 멤버 정점 + 패키지→멤버 contains.
+        assert!(g
+            .vertex(&VertexId::from_raw("public.order_ops.touch"))
+            .is_some());
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Contains
+            && e.from.as_str() == "public.order_ops"
+            && e.to.as_str() == "public.order_ops.touch"));
+        // 멤버 몸체 간선은 멤버에 귀속 — 패키지 정점에는 붙지 않는다.
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.order_ops.touch"
+            && e.to.as_str() == "public.customers"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.order_ops.count_all"
+            && e.to.as_str() == "public.orders"));
+        assert!(!g
+            .edges()
+            .iter()
+            .any(|e| e.from.as_str() == "public.order_ops" && e.kind != EdgeKind::Contains));
+    }
+
+    #[test]
+    fn pkg_member_꼴_호출은_멤버_정점으로_해석된다() {
+        // CALL order_ops.touch()의 qualifier는 스키마가 아니라 패키지다.
+        let mut pkg = routine(
+            "order_ops",
+            Some("plsql"),
+            "PACKAGE order_ops IS END order_ops;",
+        );
+        pkg.kind = "package".into();
+        let mut touch = routine(
+            "touch",
+            Some("plsql"),
+            "PROCEDURE touch IS BEGIN NULL; END touch;",
+        );
+        touch.kind = "procedure".into();
+        touch.member_of = Some("order_ops".into());
+        let caller = routine("nightly", Some("plsql"), "BEGIN order_ops.touch(1); END");
+        let doc = doc_with_routine(vec![pkg, touch, caller], "");
+        let (g, _) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+            && e.from.as_str() == "public.nightly"
+            && e.to.as_str() == "public.order_ops.touch"));
     }
 
     #[test]
