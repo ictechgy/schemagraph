@@ -15,7 +15,7 @@ use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId}
 use schemagraph_source::document::CatalogDocument;
 use sqlparser::ast::{
     visit_expressions, visit_relations, Expr, JoinConstraint, JoinOperator, ObjectName, Query,
-    SelectItem, SetExpr, Statement, TableFactor,
+    SelectItem, SetExpr, Statement, TableFactor, TableObject,
 };
 use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 
@@ -31,24 +31,32 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
 
     for schema in &doc.schemas {
         for obj in &schema.objects {
-            let Some(body) = &obj.body else { continue };
-            if body.trim().is_empty() {
-                continue;
+            if let Some(body) = obj.body.as_ref().filter(|b| !b.trim().is_empty()) {
+                let owner = VertexId::object(&schema.name, &obj.name);
+                match obj.kind.as_str() {
+                    "view" => match parse_view(dialect.as_deref(), body) {
+                        Ok(parsed) => {
+                            apply_view(g, &schema.name, &owner, &parsed, &mut notes);
+                            enriched += 1;
+                        }
+                        Err(msg) => notes.push(format!(
+                            "view {}.{} 몸체 파싱 실패: {msg}",
+                            schema.name, obj.name
+                        )),
+                    },
+                    _ => {}
+                }
             }
-            let owner = VertexId::object(&schema.name, &obj.name);
-            match obj.kind.as_str() {
-                "view" => match parse_view(dialect.as_deref(), body) {
+            for trg in &obj.triggers {
+                let Some(body) = &trg.body else { continue };
+                let trigger_id = VertexId::member(&schema.name, &obj.name, &trg.name);
+                match parse_trigger_body(dialect.as_deref(), body) {
                     Ok(parsed) => {
-                        apply_view(g, &schema.name, &owner, &parsed, &mut notes);
+                        apply_trigger(g, &schema.name, &obj.name, &trigger_id, &parsed, &mut notes);
                         enriched += 1;
                     }
-                    Err(msg) => notes.push(format!(
-                        "view {}.{} 몸체 파싱 실패: {msg}",
-                        schema.name, obj.name
-                    )),
-                },
-                // 테이블 DDL 인라인 제약·트리거·routine 몸체는 다음 파싱 대상이다.
-                _ => {}
+                    Err(msg) => notes.push(format!("trigger {trigger_id} 몸체 파싱 실패: {msg}")),
+                }
             }
         }
     }
@@ -302,6 +310,197 @@ fn apply_view(
     }
 }
 
+/// trigger 본문 파싱 결과.
+struct ParsedTrigger {
+    /// INSERT/UPDATE/DELETE의 쓰기 대상 (스키마?, 테이블).
+    writes: Vec<(Option<String>, String)>,
+    /// 쓰기 대상을 제외한 관계 — 조인·서브쿼리의 읽기 대상.
+    reads: Vec<(Option<String>, String)>,
+    /// NEW./OLD.로 읽은 발사 테이블의 컬럼.
+    fired_columns: Vec<String>,
+}
+
+/// `CREATE TRIGGER ... BEGIN <문장들> END`를 파싱한다. sqlparser는
+/// CREATE TRIGGER 자체를 못 파는 방언이 많아 껍질(BEGIN..END)은 직접
+/// 벗기고 안쪽 문장만 파서에 넘긴다. 껍질이 없는 몸체(reader가 내부
+/// 문장만 저장한 경우)는 통째로 파싱한다.
+fn parse_trigger_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedTrigger, String> {
+    let default = GenericDialect {};
+    let dialect = dialect.unwrap_or(&default);
+    let inner = extract_trigger_inner(body).unwrap_or(body);
+    let statements =
+        sqlparser::parser::Parser::parse_sql(dialect, inner.trim()).map_err(|e| e.to_string())?;
+    if statements.is_empty() {
+        return Err("본문에서 문장을 찾지 못함".to_owned());
+    }
+    let mut parsed = ParsedTrigger {
+        writes: Vec::new(),
+        reads: Vec::new(),
+        fired_columns: Vec::new(),
+    };
+    for stmt in &statements {
+        collect_trigger_stmt(stmt, &mut parsed);
+    }
+    Ok(parsed)
+}
+
+/// BEGIN..END 안쪽을 꺼낸다. 단어 경계가 아닌 BEGIN/END는 무시한다 —
+/// 문자열 리터럴 안의 BEGIN까지 정확히 거르지는 못하지만, 못 벗기면
+/// 파싱 실패로 limitations에 남는다(조용히 틀리지 않는다).
+fn extract_trigger_inner(body: &str) -> Option<&str> {
+    // 대문자 사본을 만들지 않는다 — to_uppercase는 비ASCII에서 바이트
+    // 오프셋을 바꿔 슬라이스를 틀어뜨린다. 원문에서 case-insensitive로 찾는다.
+    let begin = find_all_keywords(body, "BEGIN").first().copied()? + "BEGIN".len();
+    let end = find_all_keywords(body, "END").last().copied()?;
+    (end > begin).then_some(body[begin..end].trim())
+}
+
+/// 원문에서 대소문자 무관·단어 경계인 키워드의 모든 위치를 돌린다.
+fn find_all_keywords(s: &str, kw: &str) -> Vec<usize> {
+    let bytes = s.as_bytes();
+    (0..=bytes.len().saturating_sub(kw.len()))
+        .filter(|&i| {
+            bytes[i..i + kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+                && word_boundary(s, i, kw.len())
+        })
+        .collect()
+}
+
+/// 위치 i부터 len 바이트가 독립 단어인지 — 식별자 문자로 붙어 있으면
+/// 키워드가 아니다.
+fn word_boundary(s: &str, i: usize, len: usize) -> bool {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let before_ok = i == 0 || !ident(s.as_bytes()[i - 1]);
+    let after_ok = i + len >= s.len() || !ident(s.as_bytes()[i + len]);
+    before_ok && after_ok
+}
+
+/// 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
+fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger) {
+    let write_targets = write_targets(stmt);
+    parsed.writes.extend(write_targets.iter().cloned());
+    let _ = visit_relations(stmt, |name| {
+        let t = object_name_parts(name);
+        if !t.1.is_empty() && !write_targets.contains(&t) {
+            parsed.reads.push(t);
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    let _ = visit_expressions(stmt, |e| {
+        if let Expr::CompoundIdentifier(parts) = e {
+            if parts.len() == 2 {
+                let q = parts[0].value.to_ascii_lowercase();
+                if q == "new" || q == "old" {
+                    parsed.fired_columns.push(parts[1].value.clone());
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// DML 문장의 쓰기 대상. SELECT-only 문장은 빈 벡터다.
+fn write_targets(stmt: &Statement) -> Vec<(Option<String>, String)> {
+    match stmt {
+        Statement::Update { table, .. } => table_factor_name(&table.relation).into_iter().collect(),
+        Statement::Insert(insert) => match &insert.table {
+            TableObject::TableName(name) => {
+                let t = object_name_parts(name);
+                if t.1.is_empty() {
+                    vec![]
+                } else {
+                    vec![t]
+                }
+            }
+            _ => vec![],
+        },
+        Statement::Delete(delete) => {
+            if !delete.tables.is_empty() {
+                delete.tables.iter().map(object_name_parts).collect()
+            } else {
+                // DELETE FROM t — from 절이 쓰기 대상이다.
+                let tables: &[sqlparser::ast::TableWithJoins] = match &delete.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(t)
+                    | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
+                };
+                tables
+                    .iter()
+                    .filter_map(|twj| table_factor_name(&twj.relation))
+                    .collect()
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// TableFactor::Table이면 (스키마?, 테이블)을 돌린다.
+fn table_factor_name(factor: &TableFactor) -> Option<(Option<String>, String)> {
+    if let TableFactor::Table { name, .. } = factor {
+        let t = object_name_parts(name);
+        (!t.1.is_empty()).then_some(t)
+    } else {
+        None
+    }
+}
+
+/// trigger 파싱 결과를 그래프 간선으로 반영한다 — writes/reads/fired-columns.
+fn apply_trigger(
+    g: &mut Graph,
+    schema: &str,
+    owner_table: &str,
+    trigger_id: &VertexId,
+    parsed: &ParsedTrigger,
+    notes: &mut Vec<String>,
+) {
+    if g.vertex(trigger_id).is_none() {
+        notes.push(format!(
+            "trigger {trigger_id}의 정점이 카탈로그에 없음 — 간선 생략"
+        ));
+        return;
+    }
+    for (kind, targets) in [
+        (EdgeKind::Writes, &parsed.writes),
+        (EdgeKind::Reads, &parsed.reads),
+    ] {
+        for (ref_schema, table) in targets {
+            let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
+            let target = VertexId::object(&target_schema, table);
+            if g.vertex(&target).is_none() {
+                notes.push(format!(
+                    "trigger {trigger_id}가 참조하는 {target_schema}.{table}이 카탈로그에 없음"
+                ));
+                continue;
+            }
+            g.add_edge(Edge {
+                from: trigger_id.clone(),
+                to: target.clone(),
+                kind,
+                evidence: vec![Evidence {
+                    layer: EvidenceLayer::BodyParse,
+                    detail: format!("trigger {trigger_id} {:?} {target}", kind),
+                }],
+            });
+        }
+    }
+    // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다.
+    let mut made = std::collections::BTreeSet::new();
+    for column in &parsed.fired_columns {
+        let target = VertexId::member(schema, owner_table, column);
+        if g.vertex(&target).is_none() || !made.insert(target.clone()) {
+            continue;
+        }
+        g.add_edge(Edge {
+            from: trigger_id.clone(),
+            to: target.clone(),
+            kind: EdgeKind::Reads,
+            evidence: vec![Evidence {
+                layer: EvidenceLayer::BodyParse,
+                detail: format!("trigger {trigger_id} reads NEW/OLD.{column} on {owner_table}"),
+            }],
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +550,32 @@ mod tests {
                         triggers: vec![],
                         body: Some(body.to_owned()),
                     },
+                ],
+            }],
+        }
+    }
+
+    /// trigger 하나가 달린 orders 테이블만 있는 document — view 없이 만든다
+    /// (view 몸체 파싱 실패 notes가 섞이지 않도록).
+    fn doc_with_trigger(body: &str) -> CatalogDocument {
+        CatalogDocument {
+            version: 1,
+            dialect: "sqlite".into(),
+            reader: "test".into(),
+            limitations: vec![],
+            schemas: vec![SchemaDoc {
+                name: "main".into(),
+                routines: vec![],
+                objects: vec![
+                    {
+                        let mut t = table("orders", vec![col("id", 1), col("customer_id", 2)]);
+                        t.triggers.push(TriggerDoc {
+                            name: "trg_touch".into(),
+                            body: Some(body.to_owned()),
+                        });
+                        t
+                    },
+                    table("customers", vec![col("id", 1), col("name", 2)]),
                 ],
             }],
         }
@@ -412,5 +637,65 @@ mod tests {
         );
         let (_g, notes) = build(&doc);
         assert!(notes.iter().any(|n| n.contains("미해석")));
+    }
+
+    #[test]
+    fn trigger의_update_대상이_writes_간선이_된다() {
+        let doc = doc_with_trigger(
+            "CREATE TRIGGER trg_touch AFTER INSERT ON orders \
+             BEGIN UPDATE customers SET name = name WHERE id = NEW.customer_id; END",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "main.orders.trg_touch"
+            && e.to.as_str() == "main.customers"));
+    }
+
+    #[test]
+    fn trigger의_new_컬럼은_발사테이블_member_reads가_된다() {
+        let doc = doc_with_trigger(
+            "CREATE TRIGGER trg_touch AFTER INSERT ON orders \
+             BEGIN UPDATE customers SET name = name WHERE id = NEW.customer_id; END",
+        );
+        let (g, _) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "main.orders.trg_touch"
+            && e.to.as_str() == "main.orders.customer_id"));
+    }
+
+    #[test]
+    fn trigger_본문의_조인테이블은_reads가_된다() {
+        let doc = doc_with_trigger(
+            "CREATE TRIGGER trg_touch AFTER INSERT ON orders \
+             BEGIN UPDATE customers SET name = name \
+             WHERE id IN (SELECT customer_id FROM orders); END",
+        );
+        let (g, _) = build(&doc);
+        // 쓰기 대상 customers는 writes, 서브쿼리의 orders는 reads.
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "main.orders.trg_touch"
+            && e.to.as_str() == "main.customers"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "main.orders.trg_touch"
+            && e.to.as_str() == "main.orders"));
+    }
+
+    #[test]
+    fn trigger_껍질이_없으면_통째로_파싱한다() {
+        // reader가 내부 문장만 저장한 경우를 흉내낸다.
+        let doc = doc_with_trigger("DELETE FROM customers WHERE id = 1");
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "main.orders.trg_touch"
+            && e.to.as_str() == "main.customers"));
+    }
+
+    #[test]
+    fn trigger_파싱_실패는_notes로_보고된다() {
+        let doc = doc_with_trigger("CREATE TRIGGER t BEGIN ((( 깨짐; END");
+        let (_g, notes) = build(&doc);
+        assert!(notes.iter().any(|n| n.contains("파싱 실패")));
     }
 }

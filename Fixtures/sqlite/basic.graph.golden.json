@@ -390,6 +390,17 @@
     {
       "evidence": [
         {
+          "detail": "trigger main.orders.trg_orders_touch Writes main.customers",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.orders.trg_orders_touch",
+      "kind": "writes",
+      "to": "main.customers"
+    },
+    {
+      "evidence": [
+        {
           "detail": "trigger trg_orders_touch on orders",
           "layer": "catalog"
         }
@@ -397,6 +408,17 @@
       "from": "main.orders.trg_orders_touch",
       "kind": "fires",
       "to": "main.orders"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "trigger main.orders.trg_orders_touch reads NEW/OLD.customer_id on orders",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "to": "main.orders.customer_id"
     },
     {
       "from": "main.products",

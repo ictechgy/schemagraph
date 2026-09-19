@@ -7,10 +7,11 @@
 - 2026-09-19: **P0 완료** (`651fb12`). `engine/` Rust 워크스페이스에 core·source·
   analysis·export·cli 크레이트. SQLite 네이티브 reader가 카탈로그를 읽어
   그래프를 만들고, `scan`/`graph`/`query`/`cycles`가 동작한다.
-- 2026-09-19: **P1 완료** (미커밋 시점에 이 파일 갱신). `parser` 크레이트가
-  sqlparser-rs로 view 본문을 파싱해 `reads` 간선을 만든다(객체·멤버 둘 다).
-  `impact` 명령이 역방향 전이 클로저를 보고한다. 24개 단위 테스트 통과,
-  `Scripts/verify-fixtures.sh`가 reads·impact까지 fixture로 양방향 검증한다.
+- 2026-09-19: **P1 완료** (`56869e0` + trigger 후속). `parser` 크레이트가
+  sqlparser-rs로 view 본문을 파싱해 `reads` 간선을 만들고(객체·멤버 둘 다),
+  trigger 본문을 파싱해 `writes`·`reads`·`NEW./OLD.` member 간선을 만든다.
+  `impact` 명령이 역방향 전이 클로저를 보고한다. 29개 단위 테스트 통과,
+  `Scripts/verify-fixtures.sh`가 reads·writes·impact까지 fixture로 양방향 검증한다.
 
 ## 확정된 결정
 
@@ -40,6 +41,12 @@
 - 파싱 실패·없는 대상 참조는 유령 정점을 만들지 않고 notes로 보고한다.
 - `impact`는 `query`의 dependents를 무제한 깊이로 펼친 것 — distance가 전파 거리.
   `--max`(기본 1024)로 잘림을 `truncated`로 보고한다.
+- **trigger는 BEGIN..END 껍질을 직접 벗긴다** — sqlparser는 CREATE TRIGGER를
+  못 파는 방언이 많다. 내부 문장만 파서에 넘기고, 껍질이 없는 몸체는 통째로
+  파싱한다(reader가 내부 문장만 저장한 경우). 키워드 탐색은 원문에서
+  case-insensitive + 단어 경계 — to_uppercase는 비ASCII 오프셋을 틀어뜨린다.
+- `NEW.x`/`OLD.x`는 발사 테이블의 member reads로 해석한다. DML 대상은
+  writes, 나머지 관계는 reads — routine 몸체 파싱이 오면 같은 골격을 쓴다.
 
 ## 검증 명령
 
@@ -51,8 +58,8 @@ Scripts/verify-fixtures.sh                    # fixture 양방향 검증 (골든
 ## 다음 할 일
 
 1. PG·MySQL 네이티브 reader — docker로 로컬 DB 띄워 fixture 검증.
-2. routine/trigger 몸체 파싱 → `writes`/`calls`/`fires` 간선 보강
-   (현재 trigger는 카탈로그 기반 `fires`만 있다).
+2. routine(function/procedure) 몸체 파싱 → `calls` 간선 (PG `pg_proc.prosrc`,
+   MySQL `information_schema.ROUTINES`). routine은 SQLite에 없어 PG reader와 같이.
 3. `dead` — roots 선언 설정 + 도달성 + (통계는 P3 증거).
 4. `rules` — 레이어/순환 규칙 선언.
 5. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).

@@ -66,6 +66,19 @@ if missing:
     sys.exit(f"reads 간선 미검출: {sorted(missing)}")
 EOF
 
+# P1: trigger 몸체 파싱 — UPDATE 대상은 writes, NEW.컬럼은 member reads.
+python3 - "$tmp/graph.json" <<'EOF'
+import json, sys
+edges = {(e["kind"], e["from"], e["to"]) for e in json.load(open(sys.argv[1]))["edges"]}
+want = {
+    ("writes", "main.orders.trg_orders_touch", "main.customers"),
+    ("reads", "main.orders.trg_orders_touch", "main.orders.customer_id"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"trigger 간선 미검출: {sorted(missing)}")
+EOF
+
 # P1: impact — customers를 바꾸면 view와 trigger가 전이로 깨진다.
 "$BIN" impact main.customers --graph "$tmp/graph.json" > "$tmp/impact.json"
 grep -q '"main.order_totals"' "$tmp/impact.json" || { echo "impact: order_totals 미검출" >&2; exit 1; }
