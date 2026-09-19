@@ -151,6 +151,10 @@
   - 배포 준비(`e51bc95`) — LICENSE-MIT·LICENSE-APACHE, path 의존성
     버전, keywords·categories. `schemagraph-core` dry-run 패키징 통과.
     미게시 형제 의존은 dry-run 해석이 안 되므로 실게시는 의존 순서로.
+  - 검증 상태(`5292b12`, `feature/p0-engine`): cargo test 88개,
+    verify-fixtures.sh 전 섹션 통과(주의·건너뜀 0 — Oracle 패키지 멤버
+    assertion과 JVM↔Go 패리티 포함), fmt·go vet·gradle shadowJar 깨끗.
+    작업 트리 clean, 원격 없음 — P6 커밋 13개(4c84052..5292b12).
 
 ## 확정된 결정
 
@@ -169,7 +173,20 @@
 - `add_edge` 병합은 in/out 양쪽 인덱스에 적용 — 방향마다 evidence가 달라지면 안 된다.
 - SQLite는 `mode=ro`로 읽기 전용 접속. attached db도 `database_list`로 다 읽는다.
 - `cargo test`는 CLI 바이너리를 갱신하지 않을 수 있다 — verify 전 `cargo build` 필수
-  (verify-fixtures.sh 주석에도 명시).
+  (verify-fixtures.sh 주석에도 명시). **실행 중 `cargo build`로 바이너리를
+  교체해도 안 된다** — 검증이 낡은/새 바이너리를 섞어 써 오탐이 난 적 있다.
+- **verify-fixtures의 "주의: … 건너뜀"은 stderr에만 찍히고 종료 코드는
+  0이다** — 성공한 섹션은 무출력이라, 끝부분 출력에 주의가 없는지로
+  전 섹션 실행을 확인한다. oracle-free 컨테이너는 무거워 다른 Oracle
+  인스턴스와 동시 기동하면 기동 실패로 Oracle 섹션이 건너뛴다 —
+  돌리기 전 `docker ps`로 남은 sg-* 컨테이너를 정리한다.
+- **프로브에 문서 필드를 추가할 때는 세 경로를 같이 갱신한다** — 수확
+  조립, merge() 재조립, NDJSON 라인. Kotlin merge()가 `memberOf`·
+  `signature`를 떨궈 JVM 출력에서만 null이 된 적 있다(실검증에서 발견,
+  단위 검사만으로는 안 잡힘).
+- Azure SQL Edge는 자체 서명 인증서라 go-mssqldb가 TLS 검증에 실패한다 —
+  연결 문자열에 `encrypt=disable`을 넣는다(테스트용, JVM은 trustServer
+  Certificate를 따로 쓴다).
 - **몸체 파싱은 reader 밖, 엔진의 일** — sqlite.rs는 원문 SQL만 옮기고,
   cli의 scan 경로가 `parser::enrich_from_document`를 불러 간선을 보강한다.
   파서 노트는 그래프 limitations에 합류한다.
@@ -202,9 +219,12 @@
 - PG trigger는 `EXECUTE FUNCTION fn()` 호출이라 BEGIN..END가 없다 —
   `extract_execute_targets`가 껍질에서 직접 채취하고, `resolve_routine`이
   정확 id → 이름 매치 순으로 보수적 해석한다(모호하면 간선 생략+notes).
-- routine 몸체는 `language=sql`/무표기만 파싱한다. `pg_get_functiondef`의
-  `AS $$…$$`·`AS '…'` 껍질은 `extract_as_body`가 벗긴다. plpgsql 등은
+- routine 몸체 파싱 게이트는 언어별 세 갈래다 — `sql`/무표기는 방언
+  파서로 통째 파싱(T-SQL은 MsSqlDialect, 도매 실패 시 문장 추출 폴백),
+  `plpgsql`/`plsql`은 문장 추출기로 보이는 SQL만 회수, 그 외 언어는
   파싱하지 않고 limitation — 몸체 간선이 없다는 사실을 숨기지 않는다.
+  `pg_get_functiondef`의 `AS $$…$$`·`AS '…'` 껍질은 `extract_as_body`가
+  벗긴다.
 - **MySQL information_schema는 문자열 컬럼이 binary collation으로 온다** —
   모든 문자열 컬럼에 `CAST(x AS CHAR)`가 필요하고, ENUM 컬럼
   (table_type·constraint_type·routine_type·is_nullable)도 마찬가지다.
