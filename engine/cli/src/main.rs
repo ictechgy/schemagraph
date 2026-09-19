@@ -39,6 +39,9 @@ enum Command {
         /// Build the graph from a catalog document (probe output) instead of a live URL.
         #[arg(long)]
         document: Option<PathBuf>,
+        /// Add name-heuristic `inferred` edges (opt-in — never a dependency basis).
+        #[arg(long)]
+        inferred: bool,
     },
     /// Render the graph as mermaid/json/dot.
     Graph {
@@ -169,12 +172,14 @@ async fn run(cli: Cli) -> Result<i32> {
             output,
             emit_document,
             document,
+            inferred,
         } => {
             scan(
                 url.as_deref(),
                 document.as_deref(),
                 &output,
                 emit_document.as_deref(),
+                inferred,
             )
             .await
         }
@@ -217,6 +222,7 @@ async fn scan(
     document: Option<&std::path::Path>,
     output: &str,
     emit_document: Option<&std::path::Path>,
+    inferred: bool,
 ) -> Result<i32> {
     let doc = match (url, document) {
         (Some(url), None) => source::read(url)
@@ -236,6 +242,14 @@ async fn scan(
     let (_enriched, notes) = schemagraph_parser::enrich_from_document(&mut graph, &doc);
     for note in notes {
         graph.add_limitation(note);
+    }
+    if inferred {
+        // 이름 규칙 추정은 opt-in — 카탈로그·몸체 증거와 섞이지 않게
+        // 별도 패스로 돌리고 한계도 그대로 limitations에 싣는다.
+        let (_n, inotes) = schemagraph_parser::enrich_inferred(&mut graph, &doc);
+        for note in inotes {
+            graph.add_limitation(note);
+        }
     }
     let graph_doc = export::graph_to_doc(&graph);
     let json = export::to_pretty_json(&graph_doc)?;

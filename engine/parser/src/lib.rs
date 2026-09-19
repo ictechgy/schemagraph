@@ -8,11 +8,11 @@
 //! 컬럼 참조는 최상위 select의 별칭 맵으로만 해석한다 — 서브쿼리 스코프를
 //! 섞으면 오귀속되므로, 그 존재는 limitation으로 보고한다.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId, VertexKind};
-use schemagraph_source::document::CatalogDocument;
+use schemagraph_source::document::{CatalogDocument, ObjectDoc};
 use sqlparser::ast::{
     visit_expressions, visit_relations, Expr, JoinConstraint, JoinOperator, ObjectName, Query,
     SelectItem, SetExpr, Statement, TableFactor, TableObject,
@@ -147,6 +147,87 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
         }
     }
     (enriched, notes)
+}
+
+/// `--inferred` opt-in 이름 규칙 추정 — 선언된 FK가 없는 `xxx_id` 컬럼을
+/// 같은 스키마의 `xxx`/`xxxs`/`xxxes`/`xxies` 테이블의 `id` 컬럼으로 추정해
+/// `inferred` 간선을 만든다. 추정은 판정 근거가 아니라 탐색 보조다 —
+/// EdgeKind::Inferred는 is_dependency()가 걸러 의존성 질의에 섞이지 않고,
+/// 후보가 둘 이상이면 추측하지 않고 수만 센다.
+pub fn enrich_inferred(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<String>) {
+    let mut made = 0usize;
+    let mut notes = Vec::new();
+    let mut ambiguous = 0usize;
+    for schema in &doc.schemas {
+        // 스키마 안 테이블명 인덱스 — 추정이라 카탈로그 접힘(Oracle 대문자
+        // 등)을 흡수하려고 대소문자를 무시한다.
+        let tables: BTreeMap<String, &ObjectDoc> = schema
+            .objects
+            .iter()
+            .filter(|o| o.kind == "table")
+            .map(|o| (o.name.to_ascii_lowercase(), o))
+            .collect();
+        for obj in schema.objects.iter().filter(|o| o.kind == "table") {
+            // 선언된 FK가 덮는 컬럼은 추정 대상이 아니다 — 추정은 선언이
+            // 없는 틈만 메운다.
+            let declared: BTreeSet<&str> = obj
+                .constraints
+                .iter()
+                .filter(|c| c.kind == "fk")
+                .flat_map(|c| c.columns.iter().map(|s| s.as_str()))
+                .collect();
+            for col in &obj.columns {
+                let lower = col.name.to_ascii_lowercase();
+                let Some(stem) = lower.strip_suffix("_id") else {
+                    continue;
+                };
+                if stem.is_empty() || declared.contains(col.name.as_str()) {
+                    continue;
+                }
+                // 후보 테이블명: 단수·복수·-es·-ies 변형.
+                let mut names = vec![stem.to_owned(), format!("{stem}s"), format!("{stem}es")];
+                if let Some(y) = stem.strip_suffix('y') {
+                    names.push(format!("{y}ies"));
+                }
+                // 대상 테이블이 id 컬럼을 가질 때만 추정 근거가 성립한다.
+                let candidates: Vec<&ObjectDoc> = names
+                    .iter()
+                    .filter_map(|n| tables.get(n.as_str()).copied())
+                    .filter(|t| t.columns.iter().any(|c| c.name.eq_ignore_ascii_case("id")))
+                    .collect();
+                match candidates.as_slice() {
+                    [target] => {
+                        let from = VertexId::object(&schema.name, &obj.name);
+                        let to = VertexId::object(&schema.name, &target.name);
+                        if g.vertex(&from).is_none() || g.vertex(&to).is_none() {
+                            continue;
+                        }
+                        g.add_edge(Edge {
+                            from: from.clone(),
+                            to: to.clone(),
+                            kind: EdgeKind::Inferred,
+                            evidence: vec![Evidence {
+                                layer: EvidenceLayer::Inferred,
+                                detail: format!(
+                                    "{}.{}.{} ~ {to}.id 이름 규칙 추정(선언된 FK 없음)",
+                                    schema.name, obj.name, col.name
+                                ),
+                            }],
+                        });
+                        made += 1;
+                    }
+                    [] => {}
+                    _ => ambiguous += 1,
+                }
+            }
+        }
+    }
+    if ambiguous > 0 {
+        notes.push(format!(
+            "inferred: 컬럼 {ambiguous}건이 후보 테이블 모호로 생략됨"
+        ));
+    }
+    (made, notes)
 }
 
 /// doc.dialect 문자열 → sqlparser 방언. 모르는 방언은 Generic으로 돌린다 —
@@ -2305,6 +2386,61 @@ mod tests {
             notes.iter().any(|n| n.contains("멤버별 귀속")),
             "notes: {notes:?}"
         );
+    }
+
+    #[test]
+    fn inferred_간선은_fk_없는_이름_규칙만_추정한다() {
+        // shipments.product_id는 선언 FK가 없어 추정되고, order_items.product_id는
+        // 선언 FK가 있어 추정 대상이 아니다. customer+customers 양쪽이 있으면
+        // 모호라 추측하지 않는다.
+        let mut order_items = table(
+            "order_items",
+            vec![col("id", 1), col("product_id", 2), col("qty", 3)],
+        );
+        order_items.constraints.push(ConstraintDoc {
+            name: "oi_fk".into(),
+            kind: "fk".into(),
+            columns: vec!["product_id".into()],
+            referenced: None,
+        });
+        let doc = CatalogDocument {
+            version: 1,
+            dialect: "postgres".into(),
+            reader: "test".into(),
+            limitations: vec![],
+            schemas: vec![SchemaDoc {
+                name: "public".into(),
+                routines: vec![],
+                objects: vec![
+                    table("customers", vec![col("id", 1), col("name", 2)]),
+                    table("products", vec![col("id", 1)]),
+                    table("shipments", vec![col("id", 1), col("product_id", 2)]),
+                    order_items,
+                    // customer와 customers가 공존해 customer_id 후보가 모호.
+                    table("customer", vec![col("id", 1)]),
+                    table("returns", vec![col("id", 1), col("customer_id", 2)]),
+                ],
+            }],
+        };
+        let mut g = schemagraph_source::graph::document_to_graph(&doc);
+        let (made, notes) = enrich_inferred(&mut g, &doc);
+        assert_eq!(made, 1);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Inferred
+            && e.from.as_str() == "public.shipments"
+            && e.to.as_str() == "public.products"));
+        // 선언 FK가 있는 product_id는 추정하지 않는다.
+        assert!(!g
+            .edges()
+            .iter()
+            .any(|e| e.kind == EdgeKind::Inferred && e.from.as_str() == "public.order_items"));
+        // 모호한 customer_id(returns)는 추측하지 않고 수만 센다.
+        assert!(!g
+            .edges()
+            .iter()
+            .any(|e| e.kind == EdgeKind::Inferred && e.from.as_str() == "public.returns"));
+        assert!(notes.iter().any(|n| n.contains("모호")), "notes: {notes:?}");
+        // inferred는 의존성 질의 근거가 아니다.
+        assert!(!EdgeKind::Inferred.is_dependency());
     }
 
     #[test]
