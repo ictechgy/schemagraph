@@ -122,7 +122,14 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
         }
     }
 
-    for routine in &schema.routines {
+    // 멤버는 두 번째 패스에서 만든다 — 정렬상 멤버가 부모 패키지보다
+    // 먼저 오면 find_package가 실패해 스키마 직속으로 잘못 귀속된다.
+    for routine in schema
+        .routines
+        .iter()
+        .filter(|r| r.member_of.is_none())
+        .chain(schema.routines.iter().filter(|r| r.member_of.is_some()))
+    {
         let kind = match routine.kind.as_str() {
             "procedure" => VertexKind::Procedure,
             "package" => VertexKind::Package,
@@ -141,6 +148,43 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
             VertexKind::Package => "package",
             _ => "function",
         };
+        if let Some(pkg) = &routine.member_of {
+            // 패키지 멤버 — schema.pkg.member id로 패키지 아래에 둔다.
+            // 스키마 직속 contains 대신 패키지→멤버 contains를 만든다.
+            let Some(mem_id) = resolve_collision(
+                g,
+                VertexId::member(&schema.name, pkg, &id_name),
+                &routine.name,
+                kind,
+                suffix,
+                "routine",
+            ) else {
+                continue;
+            };
+            g.add_vertex(Vertex {
+                id: mem_id.clone(),
+                kind,
+                name: routine.name.clone(),
+                schema: schema.name.clone(),
+            });
+            if let Some(u) = &routine.usage {
+                g.set_usage(mem_id.clone(), to_usage(u));
+            }
+            match find_package(g, &schema.name, pkg) {
+                Some(pkg_id) => g.add_edge(contains(&pkg_id, &mem_id)),
+                // 부모 패키지가 수확 안 됐으면 멤버를 버리지 않고 스키마
+                // 직속으로 둔다 — 고립보다 귀속 없음이 덜 거짓이다.
+                None => {
+                    g.add_edge(contains(&schema_id, &mem_id));
+                    g.add_limitation(format!(
+                        "{}.{pkg}.{id_name}: 부모 패키지 정점이 카탈로그에 없음 \
+                         — 스키마 직속으로 둠",
+                        schema.name
+                    ));
+                }
+            }
+            continue;
+        }
         let Some(rt_id) = resolve_collision(
             g,
             VertexId::object(&schema.name, &id_name),
@@ -162,6 +206,20 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
         }
         g.add_edge(contains(&schema_id, &rt_id));
     }
+}
+
+/// 스키마 안의 패키지 정점을 찾는다 — 정확 id 우선, `@package` 분리본도 본다.
+fn find_package(g: &Graph, schema: &str, pkg: &str) -> Option<VertexId> {
+    let exact = VertexId::object(schema, pkg);
+    if g.vertex(&exact)
+        .map(|v| v.kind == VertexKind::Package)
+        .unwrap_or(false)
+    {
+        return Some(exact);
+    }
+    g.vertices()
+        .find(|v| v.schema == schema && v.name == pkg && v.kind == VertexKind::Package)
+        .map(|v| v.id.clone())
 }
 
 /// fk 제약 하나를 object 레벨 + column 레벨 간선으로 푼다.
@@ -508,6 +566,7 @@ mod tests {
                     total_ms: Some(120.5),
                     self_ms: Some(80.0),
                 }),
+                member_of: None,
             },
             RoutineDoc {
                 name: "helper".into(),
@@ -522,6 +581,7 @@ mod tests {
                     total_ms: None,
                     self_ms: None,
                 }),
+                member_of: None,
             },
         ];
 
@@ -547,5 +607,43 @@ mod tests {
             .limitations()
             .iter()
             .any(|l| l.contains("routine id 충돌")));
+    }
+
+    #[test]
+    fn 패키지_멤버가_문서에서_패키지보다_먼저_와도_귀속된다() {
+        // 정렬상 멤버 이름이 패키지보다 앞설 때 — 패키지 정점이 아직 없는
+        // 시점에 멤버를 만들면 스키마 직속으로 잘못 떨어진다(실검증 발견).
+        let mut doc = doc_with_fk();
+        doc.schemas[0].routines = vec![
+            RoutineDoc {
+                name: "aaa_touch".into(), // zzz_ops보다 정렬이 빠르다
+                kind: "procedure".into(),
+                language: Some("plsql".into()),
+                body: None,
+                signature: None,
+                usage: None,
+                member_of: Some("zzz_ops".into()),
+            },
+            RoutineDoc {
+                name: "zzz_ops".into(),
+                kind: "package".into(),
+                language: Some("plsql".into()),
+                body: None,
+                signature: None,
+                usage: None,
+                member_of: None,
+            },
+        ];
+
+        let g = document_to_graph(&doc);
+        let mem = VertexId::member("main", "zzz_ops", "aaa_touch");
+        assert_eq!(g.vertex(&mem).map(|v| v.kind), Some(VertexKind::Procedure));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Contains
+            && e.from == VertexId::object("main", "zzz_ops")
+            && e.to == mem));
+        assert!(!g
+            .limitations()
+            .iter()
+            .any(|l| l.contains("부모 패키지 정점이 카탈로그에 없음")));
     }
 }

@@ -426,6 +426,7 @@ mod tests {
             body: Some(body.into()),
             signature: Some("int".into()),
             usage: None,
+            member_of: None,
         };
         let old = doc(vec![], vec![r("select 1")]);
         let new = doc(vec![], vec![r("select 2")]);

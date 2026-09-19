@@ -506,6 +506,7 @@ async fn read_routines(
             body,
             signature,
             usage: None,
+            member_of: None,
         });
     }
     if null_bodies > 0 {

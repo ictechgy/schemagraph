@@ -518,6 +518,7 @@ async fn read_routines(
             body: r.get::<Option<String>, _>("def"),
             signature: Some(r.get("sig")),
             usage: None,
+            member_of: None,
         });
     }
     if skipped > 0 {

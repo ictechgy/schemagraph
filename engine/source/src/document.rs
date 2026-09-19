@@ -145,6 +145,10 @@ pub struct RoutineDoc {
     /// kind에 따라 다르다 — routine에선 호출 횟수다. 없는 reader는 None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageDoc>,
+    /// 패키지 멤버면 부모 패키지 이름 — 독립 routine이면 생략. 멤버는
+    /// `schema.package.member` 정점이 되고 패키지→멤버 contains 간선이 생긴다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_of: Option<String>,
 }
 
 /// 역직렬화로 읽은 문서에서 serde가 조용히 무시한 필드를 찾는다.
@@ -231,7 +235,15 @@ const CONSTRAINT_KEYS: &[&str] = &["name", "kind", "columns", "referenced"];
 const REFERENCED_KEYS: &[&str] = &["schema", "table", "columns"];
 const INDEX_KEYS: &[&str] = &["name", "unique", "columns", "usage"];
 const TRIGGER_KEYS: &[&str] = &["name", "body"];
-const ROUTINE_KEYS: &[&str] = &["name", "kind", "language", "body", "signature", "usage"];
+const ROUTINE_KEYS: &[&str] = &[
+    "name",
+    "kind",
+    "language",
+    "body",
+    "signature",
+    "usage",
+    "member_of",
+];
 const USAGE_KEYS: &[&str] = &["since", "reads", "writes", "total_ms", "self_ms"];
 
 #[cfg(test)]
