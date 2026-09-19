@@ -7,11 +7,12 @@
 - 2026-09-19: **P0 완료** (`651fb12`). `engine/` Rust 워크스페이스에 core·source·
   analysis·export·cli 크레이트. SQLite 네이티브 reader가 카탈로그를 읽어
   그래프를 만들고, `scan`/`graph`/`query`/`cycles`가 동작한다.
-- 2026-09-19: **P1 완료** (`56869e0` + trigger 후속). `parser` 크레이트가
+- 2026-09-19: **P1 완료** (`56869e0`, `f2170bb` + dead 후속). `parser` 크레이트가
   sqlparser-rs로 view 본문을 파싱해 `reads` 간선을 만들고(객체·멤버 둘 다),
   trigger 본문을 파싱해 `writes`·`reads`·`NEW./OLD.` member 간선을 만든다.
-  `impact` 명령이 역방향 전이 클로저를 보고한다. 29개 단위 테스트 통과,
-  `Scripts/verify-fixtures.sh`가 reads·writes·impact까지 fixture로 양방향 검증한다.
+  `impact` 명령이 역방향 전이 클로저를, `dead`가 DB 내부 도달성 후보를 보고한다.
+  32개 단위 테스트 통과, `Scripts/verify-fixtures.sh`가 reads·writes·impact·dead까지
+  fixture로 양방향 검증한다.
 
 ## 확정된 결정
 
@@ -47,11 +48,16 @@
   case-insensitive + 단어 경계 — to_uppercase는 비ASCII 오프셋을 틀어뜨린다.
 - `NEW.x`/`OLD.x`는 발사 테이블의 member reads로 해석한다. DML 대상은
   writes, 나머지 관계는 reads — routine 몸체 파싱이 오면 같은 골격을 쓴다.
+- `dead`의 후보 kind는 "존재하려면 호출자가 필요한" 것들뿐 — view·
+  materialized-view·function·procedure·package. table은 직접 조회,
+  trigger는 자동 발사, 나머지는 내부 장치다. fixpoint로 의존자 전부가
+  dead인 객체도 연쇄 판정한다. "앱 쿼리는 그래프에 없다"는 고정
+  limitation이 항상 실린다 — 삭제 판정 아님의 계약.
 
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 24개 테스트
+cd engine && cargo build && cargo test        # 빌드 + 32개 테스트
 Scripts/verify-fixtures.sh                    # fixture 양방향 검증 (골든 diff 포함)
 ```
 
@@ -60,9 +66,8 @@ Scripts/verify-fixtures.sh                    # fixture 양방향 검증 (골든
 1. PG·MySQL 네이티브 reader — docker로 로컬 DB 띄워 fixture 검증.
 2. routine(function/procedure) 몸체 파싱 → `calls` 간선 (PG `pg_proc.prosrc`,
    MySQL `information_schema.ROUTINES`). routine은 SQLite에 없어 PG reader와 같이.
-3. `dead` — roots 선언 설정 + 도달성 + (통계는 P3 증거).
-4. `rules` — 레이어/순환 규칙 선언.
-5. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).
+3. `rules` — 레이어/순환 규칙 선언 (config 파일이 P2와 같이 온다).
+4. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).
 
 ## 미결
 

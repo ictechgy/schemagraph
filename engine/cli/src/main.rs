@@ -70,6 +70,17 @@ enum Command {
         #[arg(long, default_value_t = 1024)]
         max: usize,
     },
+    /// Dead-object candidates: consumers nothing in the database references.
+    Dead {
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        /// Max candidates before `truncated` is reported.
+        #[arg(long, default_value_t = 1024)]
+        max: usize,
+        /// Exit 1 when any candidate is reported (for CI).
+        #[arg(long)]
+        strict: bool,
+    },
     /// Report dependency cycles (delete ordering / deadlock analysis).
     Cycles {
         #[arg(short, long, default_value = "graph.json")]
@@ -139,6 +150,7 @@ async fn run(cli: Cli) -> Result<i32> {
             max,
         } => query(&name, &graph, depth, max),
         Command::Impact { name, graph, max } => impact(&name, &graph, max),
+        Command::Dead { graph, max, strict } => dead(&graph, max, strict),
         Command::Cycles {
             graph,
             level,
@@ -280,6 +292,20 @@ fn impact(name: &str, path: &std::path::Path, max: usize) -> Result<i32> {
             Ok(1)
         }
     }
+}
+
+fn dead(path: &std::path::Path, max: usize, strict: bool) -> Result<i32> {
+    let graph = load_graph(path)?;
+    let report = analysis::dead(&graph, max);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&export::dead_to_value(&report))?
+    );
+    Ok(if strict && !report.candidates.is_empty() {
+        1
+    } else {
+        0
+    })
 }
 
 fn cycles(path: &std::path::Path, level: Level, strict: bool) -> Result<i32> {

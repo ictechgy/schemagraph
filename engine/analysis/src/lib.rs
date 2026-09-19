@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use schemagraph_core::{EdgeKind, Graph, Level, Vertex, VertexId};
+use schemagraph_core::{EdgeKind, Graph, Level, Vertex, VertexId, VertexKind};
 
 /// 질의 대상을 못 찾았을 때. `notFound`에도 limitations를 싣는다 —
 /// 없는 것과 이 도구가 못 보는 것을 소비자가 구분해야 한다.
@@ -131,6 +131,106 @@ pub fn impact(graph: &Graph, subject: &VertexId, max_neighbors: usize) -> Impact
         impacted,
         truncated,
         limitations: graph.limitations().to_vec(),
+    }
+}
+
+/// `dead` 후보 하나의 판정 근거.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadReason {
+    /// DB 내부에서 이 객체를 참조하는 의존 간선이 하나도 없다.
+    NoDependents,
+    /// 의존자가 있었지만 전부 이미 dead 후보다 — 참조자가 죽으면 피참조도 죽는다.
+    AllDependentsDead,
+}
+
+/// dead 후보 — 그래프 사실만 보고한다("지워도 된다"는 판정이 아니다).
+#[derive(Debug)]
+pub struct DeadCandidate {
+    pub vertex: Vertex,
+    pub reason: DeadReason,
+}
+
+/// `dead` 보고.
+#[derive(Debug)]
+pub struct DeadReport {
+    /// id 순 정렬된 후보들.
+    pub candidates: Vec<DeadCandidate>,
+    pub truncated: bool,
+    pub limitations: Vec<String>,
+}
+
+/// 존재 가치가 "다른 객체가 호출/조회해줘야" 생기는 kind들.
+/// table은 직접 조회되는 기본 객체, trigger는 자동 발사, index/constraint/
+/// sequence/type/column은 내부 장치라 후보가 아니다.
+fn is_consumer_kind(kind: VertexKind) -> bool {
+    matches!(
+        kind,
+        VertexKind::View
+            | VertexKind::MaterializedView
+            | VertexKind::Function
+            | VertexKind::Procedure
+            | VertexKind::Package
+    )
+}
+
+/// DB 내부 도달성 기반 dead 후보 판정 — fixpoint.
+///
+/// 애플리케이션 쿼리는 그래프에 없으므로 "후보"는 "DB 내부 참조 없음"의
+/// 뜻이지 "삭제 가능"의 뜻이 아니다. 이 계약은 출력 limitations에도 실린다.
+pub fn dead(graph: &Graph, max_candidates: usize) -> DeadReport {
+    let mut dead_set: BTreeSet<VertexId> = BTreeSet::new();
+    let mut reasons: BTreeMap<VertexId, DeadReason> = BTreeMap::new();
+    loop {
+        let mut changed = false;
+        for v in graph.vertices() {
+            if !is_consumer_kind(v.kind) || dead_set.contains(&v.id) {
+                continue;
+            }
+            let dependents: Vec<&VertexId> = graph
+                .incoming(&v.id)
+                .iter()
+                .filter(|e| e.kind.is_dependency())
+                .map(|e| &e.from)
+                .collect();
+            let reason = if dependents.is_empty() {
+                Some(DeadReason::NoDependents)
+            } else if dependents.iter().all(|d| dead_set.contains(*d)) {
+                Some(DeadReason::AllDependentsDead)
+            } else {
+                None
+            };
+            if let Some(r) = reason {
+                dead_set.insert(v.id.clone());
+                reasons.insert(v.id.clone(), r);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut candidates: Vec<DeadCandidate> = dead_set
+        .iter()
+        .filter_map(|id| {
+            graph.vertex(id).map(|v| DeadCandidate {
+                vertex: v.clone(),
+                reason: reasons[id],
+            })
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.vertex.id.as_str().cmp(b.vertex.id.as_str()));
+    let truncated = candidates.len() > max_candidates;
+    candidates.truncate(max_candidates);
+    let mut limitations = graph.limitations().to_vec();
+    limitations.push(
+        "application queries are not in the graph — candidates mean no \
+         in-database dependents, not safe to delete"
+            .to_owned(),
+    );
+    DeadReport {
+        candidates,
+        truncated,
+        limitations,
     }
 }
 
@@ -423,5 +523,88 @@ mod tests {
         let report = cycles(&g, Level::Object);
         assert_eq!(report.cycles.len(), 1);
         assert_eq!(report.cycles[0].members.len(), 2);
+    }
+
+    fn view(schema: &str, name: &str) -> Vertex {
+        Vertex {
+            id: VertexId::object(schema, name),
+            kind: VertexKind::View,
+            name: name.into(),
+            schema: schema.into(),
+        }
+    }
+
+    fn reads(from: &VertexId, to: &VertexId) -> Edge {
+        Edge {
+            kind: EdgeKind::Reads,
+            ..dep(from, to)
+        }
+    }
+
+    #[test]
+    fn dead는_아무도_안_보는_view를_후보로_잡는다() {
+        // t는 테이블이라 후보 아님. v1은 t를 읽지만 아무도 v1을 안 읽는다.
+        let mut g = Graph::new();
+        g.add_vertex(table("s", "t"));
+        g.add_vertex(view("s", "v1"));
+        g.add_edge(reads(
+            &VertexId::object("s", "v1"),
+            &VertexId::object("s", "t"),
+        ));
+        let report = dead(&g, 256);
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].vertex.id.as_str(), "s.v1");
+        assert_eq!(report.candidates[0].reason, DeadReason::NoDependents);
+        // 삭제 판정 금지 계약이 limitations에 실려 있어야 한다.
+        assert!(report
+            .limitations
+            .iter()
+            .any(|l| l.contains("not safe to delete")));
+    }
+
+    #[test]
+    fn dead는_dead만을_보는_view까지_연쇄로_잡는다() {
+        // v_dead -> v_mid -> t: v_dead를 아무도 안 보고(씨앗),
+        // v_mid의 유일한 의존자가 v_dead라 연쇄로 죽는다.
+        let mut g = Graph::new();
+        g.add_vertex(table("s", "t"));
+        g.add_vertex(view("s", "v_mid"));
+        g.add_vertex(view("s", "v_dead"));
+        g.add_edge(reads(
+            &VertexId::object("s", "v_mid"),
+            &VertexId::object("s", "t"),
+        ));
+        g.add_edge(reads(
+            &VertexId::object("s", "v_dead"),
+            &VertexId::object("s", "v_mid"),
+        ));
+        let report = dead(&g, 256);
+        assert_eq!(report.candidates.len(), 2);
+        let mid = report
+            .candidates
+            .iter()
+            .find(|c| c.vertex.id.as_str() == "s.v_mid")
+            .unwrap();
+        assert_eq!(mid.reason, DeadReason::AllDependentsDead);
+    }
+
+    #[test]
+    fn 살아있는_의존자가_있으면_후보가_아니다() {
+        // trigger가 v1을 읽는다 — trigger는 자동 발사라 죽지 않으므로 v1은 산다.
+        let mut g = Graph::new();
+        g.add_vertex(table("s", "t"));
+        g.add_vertex(view("s", "v1"));
+        g.add_vertex(Vertex {
+            id: VertexId::member("s", "t", "trg"),
+            kind: VertexKind::Trigger,
+            name: "trg".into(),
+            schema: "s".into(),
+        });
+        g.add_edge(reads(
+            &VertexId::member("s", "t", "trg"),
+            &VertexId::object("s", "v1"),
+        ));
+        let report = dead(&g, 256);
+        assert!(report.candidates.is_empty());
     }
 }

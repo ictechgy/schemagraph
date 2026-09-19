@@ -85,4 +85,14 @@ grep -q '"main.order_totals"' "$tmp/impact.json" || { echo "impact: order_totals
 grep -q '"main.order_items"' "$tmp/impact.json" || { echo "impact: order_items 전이 미검출" >&2; exit 1; }
 grep -q '"reads"' "$tmp/impact.json" || { echo "impact: reads 간선 종류 미보고" >&2; exit 1; }
 
+# P1: dead — 아무도 읽지 않는 order_totals view가 후보여야 하고,
+# 삭제 판정 금지 계약이 limitations에 실려야 한다.
+"$BIN" dead --graph "$tmp/graph.json" > "$tmp/dead.json"
+grep -q '"main.order_totals"' "$tmp/dead.json" || { echo "dead: order_totals 후보 미검출" >&2; exit 1; }
+grep -q '"noDependents"' "$tmp/dead.json" || { echo "dead: reason 미보고" >&2; exit 1; }
+grep -q 'not safe to delete' "$tmp/dead.json" || { echo "dead: 삭제 금지 계약 누락" >&2; exit 1; }
+# standalone 테이블과 trigger는 후보가 아니어야 한다.
+! grep -q '"main.standalone"' "$tmp/dead.json" || { echo "dead: 테이블 오탐" >&2; exit 1; }
+! grep -q '"main.orders.trg_orders_touch"' "$tmp/dead.json" || { echo "dead: trigger 오탐" >&2; exit 1; }
+
 echo "verify-fixtures: OK"

@@ -5,7 +5,7 @@
 //! 같은 입력이 같은 바이트여야 리포트 diff와 캐시가 성립한다
 //! (AGENTS.md "JSON 출력은 결정적이어야 합니다").
 
-use schemagraph_analysis::{CyclesReport, ImpactReport, QueryReport};
+use schemagraph_analysis::{CyclesReport, DeadReason, DeadReport, ImpactReport, QueryReport};
 use schemagraph_core::{Edge, EdgeKind, EvidenceLayer, Graph, Level, Vertex, VertexKind};
 use serde::{Deserialize, Serialize};
 
@@ -320,6 +320,24 @@ pub fn impact_to_value(report: &ImpactReport) -> serde_json::Value {
         "impacted": neighbors_value(&report.impacted),
         "limitations": report.limitations,
         "subject": subject_value(&report.subject),
+        "truncated": report.truncated,
+    })
+}
+
+/// DeadReport → JSON Value.
+pub fn dead_to_value(report: &DeadReport) -> serde_json::Value {
+    serde_json::json!({
+        "candidates": report.candidates.iter().map(|c| {
+            serde_json::json!({
+                "id": c.vertex.id.as_str(),
+                "kind": vertex_kind_str(c.vertex.kind),
+                "reason": match c.reason {
+                    DeadReason::NoDependents => "noDependents",
+                    DeadReason::AllDependentsDead => "allDependentsDead",
+                },
+            })
+        }).collect::<Vec<_>>(),
+        "limitations": report.limitations,
         "truncated": report.truncated,
     })
 }
