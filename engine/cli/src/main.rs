@@ -28,14 +28,17 @@ struct Cli {
 enum Command {
     /// Read a database catalog and write the dependency graph (the artifact).
     Scan {
-        /// Connection URL: sqlite:PATH, sqlite://PATH, or a bare .db path.
-        url: String,
+        /// Connection URL: sqlite:PATH, postgres://…, mysql://… — omit with --document.
+        url: Option<String>,
         /// Output path for graph.json ('-' for stdout).
         #[arg(short, long, default_value = "graph.json")]
         output: String,
         /// Also dump the raw catalog document to this path (debugging / fixtures).
         #[arg(long)]
         emit_document: Option<PathBuf>,
+        /// Build the graph from a catalog document (probe output) instead of a live URL.
+        #[arg(long)]
+        document: Option<PathBuf>,
     },
     /// Render the graph as mermaid/json/dot.
     Graph {
@@ -148,7 +151,16 @@ async fn run(cli: Cli) -> Result<i32> {
             url,
             output,
             emit_document,
-        } => scan(&url, &output, emit_document.as_deref()).await,
+            document,
+        } => {
+            scan(
+                url.as_deref(),
+                document.as_deref(),
+                &output,
+                emit_document.as_deref(),
+            )
+            .await
+        }
         Command::Graph {
             graph,
             format,
@@ -175,10 +187,20 @@ async fn run(cli: Cli) -> Result<i32> {
     }
 }
 
-async fn scan(url: &str, output: &str, emit_document: Option<&std::path::Path>) -> Result<i32> {
-    let doc = source::read(url)
-        .await
-        .with_context(|| format!("스캔 실패: {url}"))?;
+async fn scan(
+    url: Option<&str>,
+    document: Option<&std::path::Path>,
+    output: &str,
+    emit_document: Option<&std::path::Path>,
+) -> Result<i32> {
+    let doc = match (url, document) {
+        (Some(url), None) => source::read(url)
+            .await
+            .with_context(|| format!("스캔 실패: {url}"))?,
+        (None, Some(path)) => load_document(path)?,
+        (None, None) => bail!("URL 또는 --document 중 하나는 필요하다"),
+        (Some(_), Some(_)) => bail!("URL과 --document는 같이 쓸 수 없다 — 둘 중 하나만"),
+    };
     if let Some(path) = emit_document {
         let json = export::to_pretty_json(&doc)?;
         std::fs::write(path, format!("{json}\n"))
@@ -194,6 +216,23 @@ async fn scan(url: &str, output: &str, emit_document: Option<&std::path::Path>) 
     let json = export::to_pretty_json(&graph_doc)?;
     write_output(output, &json)?;
     Ok(0)
+}
+
+/// 프로브가 만든 catalog document를 읽는다. 버전이 다르면 명확히 거절한다 —
+/// 조용히 읽으면 스키마가 어긋난 채 그래프가 나와 소비자가 모른다.
+fn load_document(path: &std::path::Path) -> Result<source::CatalogDocument> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("catalog document를 못 읽음: {}", path.display()))?;
+    let doc: source::CatalogDocument = serde_json::from_str(&text)
+        .with_context(|| format!("catalog document 파싱 실패: {}", path.display()))?;
+    if doc.version != source::document::DOCUMENT_VERSION {
+        bail!(
+            "catalog document 버전 {}는 이 바이너리({})와 다르다 — 프로브 버전을 확인해라",
+            doc.version,
+            source::document::DOCUMENT_VERSION
+        );
+    }
+    Ok(doc)
 }
 
 fn load_graph(path: &std::path::Path) -> Result<Graph> {
