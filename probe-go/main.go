@@ -19,7 +19,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	_ "github.com/sijms/go-ora/v2"
@@ -103,6 +105,8 @@ type RoutineDoc struct {
 	Body      *string   `json:"body,omitempty"`
 	Signature *string   `json:"signature,omitempty"`
 	Usage     *UsageDoc `json:"usage,omitempty"`
+	// 패키지 멤버면 부모 패키지 이름 — Kotlin RoutineDoc.memberOf와 같은 키.
+	MemberOf *string `json:"member_of,omitempty"`
 }
 
 // Oracle 카탈로그가 노출하는 시스템 스키마 — probe/Extractor.kt의 목록과 동일.
@@ -621,8 +625,9 @@ func (h *harvester) collectTriggers() map[string][]TriggerDoc {
 }
 
 // collectRoutines — ALL_OBJECTS가 kind를, ALL_SOURCE가 LINE순 몸체를 준다.
-// PACKAGE와 PACKAGE BODY는 하나의 정점으로 합치고 BODY 몸체를 우선한다 —
-// Kotlin Extractor의 규칙과 같다(멤버별 귀속은 엔진이 limitation으로 남긴다).
+// PACKAGE는 스펙과 BODY를 따로 보관해 멤버 몸체를 멤버 헤더로 나눠 귀속한다 —
+// Kotlin Extractor의 slicePackageBody와 같은 규칙이다(경계를 못 찾은 멤버는
+// body 없이 limitation으로 센다).
 func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 	type key struct{ schema, name, typ string }
 	bodies := map[key]*strings.Builder{}
@@ -666,39 +671,213 @@ func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 			return nil
 		})
 
-	type pair struct{ schema, name string }
-	grouped := map[pair]key{}
-	for k := range bodies {
-		p := pair{k.schema, k.name}
-		cur, ok := grouped[p]
-		if !ok || (k.typ == "PACKAGE BODY" && cur.typ == "PACKAGE") {
-			grouped[p] = k
-		}
+	// 패키지 멤버 — ALL_PROCEDURES가 SUBPROGRAM_ID(선언 순)로 멤버를 준다.
+	// OVERLOAD는 같은 이름의 오버로드 구분자(NULL이면 비오버로드).
+	type member struct {
+		name     string
+		overload string
 	}
+	pkgMembers := map[string][]member{}
+	h.bestEffort("package members",
+		`SELECT OWNER, OBJECT_NAME, PROCEDURE_NAME, OVERLOAD
+		 FROM ALL_PROCEDURES WHERE PROCEDURE_NAME IS NOT NULL
+		 ORDER BY OWNER, OBJECT_NAME, SUBPROGRAM_ID`,
+		func(rs *sql.Rows) error {
+			var schema, pkg, mname string
+			var ov sql.NullString
+			if err := rs.Scan(&schema, &pkg, &mname, &ov); err != nil {
+				return err
+			}
+			k := schema + "." + pkg
+			pkgMembers[k] = append(pkgMembers[k], member{mname, ov.String})
+			return nil
+		})
+
+	// 멤버 시그니처와 kind — PACKAGE_NAME이 있는 인자 행. POSITION=0은
+	// 반환값이라 함수의 표시다. 키는 "owner.pkg.member[#overload]".
+	memberParams := map[string]string{}
+	memberFunctions := map[string]bool{}
+	h.bestEffort("package member arguments",
+		`SELECT OWNER, PACKAGE_NAME, OBJECT_NAME, DATA_TYPE, POSITION, OVERLOAD
+		 FROM ALL_ARGUMENTS WHERE PACKAGE_NAME IS NOT NULL
+		 ORDER BY OWNER, PACKAGE_NAME, OBJECT_NAME, OVERLOAD, SEQUENCE`,
+		func(rs *sql.Rows) error {
+			var schema, pkg, mname, dtype string
+			var pos int
+			var ov sql.NullString
+			if err := rs.Scan(&schema, &pkg, &mname, &dtype, &pos, &ov); err != nil {
+				return err
+			}
+			k := schema + "." + pkg + "." + mname
+			if ov.Valid {
+				k += "#" + ov.String
+			}
+			if pos == 0 {
+				memberFunctions[k] = true
+			} else if cur := memberParams[k]; cur != "" {
+				memberParams[k] = cur + ", " + strings.ToLower(dtype)
+			} else {
+				memberParams[k] = strings.ToLower(dtype)
+			}
+			return nil
+		})
+
+	specBodies := map[string]string{}
+	implBodies := map[string]string{}
 	out := map[string][]RoutineDoc{}
 	plsql := "plsql"
-	for p, k := range grouped {
-		if !h.keepSchema(p.schema) {
+	for k, b := range bodies {
+		p := k.schema + "." + k.name
+		switch k.typ {
+		case "PACKAGE":
+			specBodies[p] = b.String()
+		case "PACKAGE BODY":
+			implBodies[p] = b.String()
+		default:
+			if !h.keepSchema(k.schema) {
+				continue
+			}
+			body := b.String()
+			var sig *string
+			if s := params[p]; s != "" {
+				sig = &s
+			}
+			kind := "procedure"
+			if k.typ == "FUNCTION" {
+				kind = "function"
+			}
+			out[k.schema] = append(out[k.schema], RoutineDoc{
+				Name: k.name, Kind: kind, Language: &plsql, Body: &body, Signature: sig,
+			})
+		}
+	}
+	pkgSet := map[string]bool{}
+	for p := range specBodies {
+		pkgSet[p] = true
+	}
+	for p := range implBodies {
+		pkgSet[p] = true
+	}
+	pkgs := make([]string, 0, len(pkgSet))
+	for p := range pkgSet {
+		pkgs = append(pkgs, p)
+	}
+	sort.Strings(pkgs)
+	for _, p := range pkgs {
+		schema := strings.SplitN(p, ".", 2)[0]
+		if !h.keepSchema(schema) {
 			continue
 		}
-		kind := "package"
-		switch k.typ {
-		case "PROCEDURE":
-			kind = "procedure"
-		case "FUNCTION":
-			kind = "function"
+		spec, hasSpec := specBodies[p]
+		impl, hasImpl := implBodies[p]
+		var memberDocs []RoutineDoc
+		if hasImpl && len(pkgMembers[p]) > 0 {
+			names := map[string]bool{}
+			for _, m := range pkgMembers[p] {
+				names[m.name] = true
+			}
+			slices := slicePackageBody(impl, names)
+			seen := map[string]int{}
+			for _, m := range pkgMembers[p] {
+				// 같은 이름의 n번째 오버로드는 본문의 n번째 헤더와 짝짓는다.
+				nth := seen[m.name]
+				seen[m.name]++
+				ov := ""
+				if m.overload != "" {
+					ov = "#" + m.overload
+				}
+				mk := p + "." + m.name + ov
+				kind := "procedure"
+				if memberFunctions[mk] {
+					kind = "function"
+				}
+				slice, ok := slices[m.name+"#"+strconv.Itoa(nth)]
+				var body *string
+				if ok {
+					body = &slice
+				} else {
+					h.limitations = append(h.limitations,
+						mk+": 패키지 본문에서 멤버 경계를 못 찾음 — 해당 멤버의 몸체 간선 없음")
+				}
+				var sig *string
+				if s := memberParams[mk]; s != "" {
+					sig = &s
+				}
+				pname := strings.SplitN(p, ".", 2)[1]
+				memberDocs = append(memberDocs, RoutineDoc{
+					Name: m.name, Kind: kind, Language: &plsql,
+					Body: body, Signature: sig, MemberOf: &pname,
+				})
+			}
 		}
-		body := bodies[k].String()
-		var sig *string
-		if s := params[p.schema+"."+p.name]; s != "" {
-			sig = &s
+		// 멤버를 냈으면 패키지 몸체는 스펙이 대표다 — 실행 문장은 멤버
+		// 몸체에 있다. 못 냈으면 옛 동작(BODY 통째 귀속)을 유지한다.
+		var body string
+		if len(memberDocs) > 0 {
+			if hasSpec {
+				body = spec
+			} else {
+				body = impl
+			}
+		} else if hasImpl {
+			body = impl
+		} else {
+			body = spec
 		}
-		out[p.schema] = append(out[p.schema], RoutineDoc{
-			Name: p.name, Kind: kind, Language: &plsql, Body: &body, Signature: sig,
+		pname := strings.SplitN(p, ".", 2)[1]
+		out[schema] = append(out[schema], RoutineDoc{
+			Name: pname, Kind: "package", Language: &plsql, Body: &body,
 		})
+		out[schema] = append(out[schema], memberDocs...)
 	}
 	return out
 }
+
+// slicePackageBody — PACKAGE BODY 텍스트를 멤버 선언 헤더로 나눈다.
+// 경계는 카탈로그 멤버 이름과 매칭되는 `PROCEDURE|FUNCTION <name>` 헤더뿐
+// — 멤버 안의 로컬 서브프로그램을 경계로 오인하지 않기 위해 카탈로그 대조를
+// 요구한다. 반환 키는 "이름#n"(카탈로그 이름, 0-base) — Kotlin과 같다.
+func slicePackageBody(impl string, members map[string]bool) map[string]string {
+	re := regexp.MustCompile(`(?im)^\s*(?:PROCEDURE|FUNCTION)\s+"?([A-Za-z0-9_$#]+)"?`)
+	type head struct {
+		name  string
+		start int
+	}
+	var heads []head
+	for _, m := range re.FindAllStringSubmatchIndex(impl, -1) {
+		got := impl[m[2]:m[3]]
+		for canon := range members {
+			if strings.EqualFold(canon, got) {
+				heads = append(heads, head{canon, m[0]})
+				break
+			}
+		}
+	}
+	if len(heads) == 0 {
+		return nil
+	}
+	var starts []int
+	for _, hd := range heads {
+		starts = append(starts, hd.start)
+	}
+	sort.Ints(starts)
+	out := map[string]string{}
+	perName := map[string]int{}
+	for _, hd := range heads {
+		nth := perName[hd.name]
+		perName[hd.name]++
+		end := len(impl)
+		for _, s := range starts {
+			if s > hd.start {
+				end = s
+				break
+			}
+		}
+		out[hd.name+"#"+strconv.Itoa(nth)] = strings.TrimSpace(impl[hd.start:end])
+	}
+	return out
+}
+
 
 // toNDJSON — engine/source/src/ndjson.rs 및 probe/Model.kt의 toNdjson과
 // 같은 레이아웃: document 헤더 → 스키마별 schema 행 + object·routine 행.
