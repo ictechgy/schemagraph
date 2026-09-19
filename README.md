@@ -32,10 +32,32 @@ The engine never touches a database directly; the probe is a dumb extractor
 that moves catalog rows and body text. Parse failures are measured and
 reported in `limitations`, not hidden.
 
+## JDBC probe (any database with a driver)
+
+For databases without a native reader, `probe/` builds a fat jar that emits
+the same versioned catalog document over JDBC:
+
+```
+gradle -p probe shadowJar
+java -jar probe/build/libs/schemagraph-probe-all.jar \
+    --url jdbc:h2:file:/tmp/mydb -o catalog.json
+schemagraph scan --document catalog.json -o graph.json
+```
+
+Bundled drivers: PostgreSQL, H2, SQLite (permissive licenses only). Any other
+database — Oracle, MSSQL, MySQL, DB2 — works via `--driver /path/to.jar`
+(and `--driver-class` when ServiceLoader can't find the implementation).
+`DatabaseMetaData` provides the portable baseline (schemas, tables, columns,
+PK/FK, indexes); view/trigger/routine bodies are harvested best-effort from
+`INFORMATION_SCHEMA` (`ALL_*` on Oracle), with failures reported in
+`limitations`. On MySQL the probe's dependency edges match the native
+reader's exactly.
+
 ## Commands
 
 ```
 schemagraph scan <url> [-o graph.json]   # sqlite:PATH, postgres://…, mysql://…
+schemagraph scan --document catalog.json # probe output → graph
 schemagraph graph --format mermaid|json|dot [--level schema|object|column]
 schemagraph query <object> [--depth N]
 schemagraph impact <object>
@@ -71,12 +93,13 @@ rules were evaluated — not "pass".
 
 ## Current state
 
-- Readers: SQLite, PostgreSQL, MySQL (native `sqlx`). `mysqlx://` is explicitly
-  unsupported.
+- Readers: SQLite, PostgreSQL, MySQL (native `sqlx`), plus every JDBC
+  database via the probe. `mysqlx://` is explicitly unsupported.
 - Body parsing: views (`reads`, object + member level), triggers
   (`writes`/`reads`/`NEW.`/`OLD.`, `EXECUTE FUNCTION` → `calls`), SQL-language
-  routines (`reads`/`writes`/`calls`). `plpgsql` and other procedural
-  languages are reported in `limitations`, not parsed.
+  routines (`reads`/`writes`/`calls`, including in-body `CALL`/function
+  invocations). `plpgsql` and other procedural languages are reported in
+  `limitations`, not parsed.
 - Deterministic JSON everywhere; unknown targets never become ghost vertices —
   they land in `limitations`.
 
@@ -84,7 +107,7 @@ rules were evaluated — not "pass".
 
 - **P0** — core graph model + native readers + `scan`/`graph`/`query`/`cycles` — done
 - **P1** — body parsing + `impact` + `dead` — done
-- **P2** — catalog document protocol + Kotlin JDBC probe ("any JDBC database")
+- **P2** — catalog document protocol + Kotlin JDBC probe + `rules` — done
 - **P3** — `stats` evidence, mermaid polish, `skill`
 - **P4** — MSSQL/Oracle rich probes, `diff`, inferred edges
 

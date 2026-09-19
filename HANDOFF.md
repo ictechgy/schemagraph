@@ -23,11 +23,19 @@
   없으면 시스템 스키마를 뺀 전부를 읽는다. `mysqlx://`(X Protocol)는
   명시적 미지원 오류다. verify-fixtures.sh가 docker로 임시 MySQL을 띄워
   골든까지 검증한다(없으면 건너뛰고 안내).
-- 2026-09-19: **몸체 내부 호출 + rules 명령 완료** (커밋 예정).
+- 2026-09-19: **몸체 내부 호출 + rules 명령 완료** (`f60fbc7`, `9985c97`).
   routine/trigger 몸체의 `Expr::Function`·`Statement::Call`이 calls 간선이
   된다(내장 함수 필터로 노이즈 차단). `schemagraph rules --config
   schemagraph.toml`이 `from`/`to` 글롭 규칙을 간선 단위로 검사해 위반을
-  보고하고 `--strict`로 CI 게이트가 된다. 46개 테스트 통과.
+  보고하고 `--strict`로 CI 게이트가 된다.
+- 2026-09-19: **P2 완료 — Kotlin/JDBC 프로브** (커밋 예정). `probe/`가
+  `DatabaseMetaData`(스키마·테이블·컬럼·PK·FK·인덱스·routine) + best-effort
+  몸체 쿼리(INFORMATION_SCHEMA, Oracle은 ALL_*)로 버전 달린 catalog
+  document를 뱉고, `schemagraph scan --document`가 먹는다. 번들 드라이버는
+  허용 라이선스만(pgjdbc·H2·sqlite-jdbc), 나머지는 `--driver`로 주입.
+  MySQL 실검증에서 네이티브 reader와 의존성 간선 22개 완전 일치. PG는
+  trigger calls까지 패리티. H2 임베디드로 서버 없는 end-to-end 검증이
+  verify-fixtures.sh에 들어갔다.
 
 ## 확정된 결정
 
@@ -99,22 +107,25 @@
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 40개 테스트
-Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL fixture 양방향 검증
+cd engine && cargo build && cargo test        # 빌드 + 46개 테스트
+Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + JDBC probe 양방향 검증
 # PG는 initdb로, MySQL은 docker로 임시 인스턴스를 자동 프로비전한다. 직접 지정:
 #   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh      (폐기용 DB만!)
 #   SG_MYSQL_URL=mysql://user@host/db SG_MYSQL_CONTAINER=<이름> ...   (컨테이너면 docker exec로 적용)
+# probe는 java를 자동 탐색하고 jar이 없으면 gradle로 빌드한다. H2 임베디드가
+# 기본이고, PG가 떠 있으면 pgjdbc로 네이티브 패리티를 확인한다. MySQL까지:
+#   SG_MYSQL_JAR=/path/mysql-connector-j.jar ...
 ```
 
 ## 다음 할 일
 
-1. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).
+1. `stats` — pg_stat·information_schema.table_statistics 같은 사용 통계를
+   증거 계층으로 붙여 `dead` 후보의 근거를 강화한다 (P3).
 2. MariaDB 검증 — reader는 같은 information_schema지만 시퀀스·
    tx_read_only 등 차이가 있어 별도 fixture가 필요하다.
-3. `stats` — pg_stat·information_schema.table_statistics 같은 사용 통계를
-   증거 계층으로 붙여 `dead` 후보의 근거를 강화한다.
-4. rules 확장 — 지금은 "금지 간선"만. 허용 목록·필수 간선·스키마 계층
-   규칙 같은 방향은 수요가 생기면.
+3. `skill` — 에이전트용 스킬 문서 출력 (P3).
+4. 프로브 보강 — MSSQL `sys.*` 몸체 소스, Oracle ALL_* 실서버 검증,
+   SQLite JDBC의 스키마 귀속 확인.
 
 ## 미결
 

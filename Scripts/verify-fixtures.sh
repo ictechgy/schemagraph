@@ -298,4 +298,107 @@ else
     echo "주의: MySQL을 찾지 못해 MySQL 검증 건너뜀 (SG_MYSQL_URL 또는 docker)" >&2
 fi
 
+# ── JDBC probe ──────────────────────────────────────────────────────────
+# probe는 java + fat jar이 필요하다. macOS /usr/bin/java는 스텁이라 실기동을
+# 확인하고, 없으면 homebrew openjdk를 본다. jar이 없고 gradle이 있으면 빌드.
+JAVABIN=""
+for j in "$(command -v java 2>/dev/null || true)" \
+         /opt/homebrew/opt/openjdk/bin/java \
+         /usr/local/opt/openjdk/bin/java \
+         "$HOME/.sdkman/candidates/java/current/bin/java"; do
+    if [ -n "$j" ] && [ -x "$j" ] && "$j" -version >/dev/null 2>&1; then
+        JAVABIN="$j"
+        break
+    fi
+done
+
+JAR="probe/build/libs/schemagraph-probe-all.jar"
+if [ -n "$JAVABIN" ] && [ ! -f "$JAR" ] && command -v gradle >/dev/null; then
+    JAVA_HOME="$(cd "$(dirname "$JAVABIN")/.." && pwd)" \
+        gradle -p probe shadowJar --console=plain -q \
+        || echo "주의: probe 빌드 실패 — probe 검증 건너뜀" >&2
+fi
+
+if [ -n "$JAVABIN" ] && [ -f "$JAR" ]; then
+    # H2 — 번들 드라이버 + 임베디드라 서버 없이 document→graph end-to-end가 돈다.
+    "$JAVABIN" -jar "$JAR" \
+        --url "jdbc:h2:file:$tmp/sgfix-h2;INIT=RUNSCRIPT FROM '$PWD/Fixtures/h2/basic.sql'" \
+        -o "$tmp/probe-doc.json"
+    "$BIN" scan --document "$tmp/probe-doc.json" -o "$tmp/probe-graph.json"
+
+    "$BIN" cycles --graph "$tmp/probe-graph.json" > "$tmp/cycles-h2.json"
+    grep -q '"PUBLIC.LOOP_A"' "$tmp/cycles-h2.json" \
+        || { echo "probe(H2): LOOP_A 순환 미검출" >&2; exit 1; }
+    grep -q '"selfLoop": true' "$tmp/cycles-h2.json" \
+        || { echo "probe(H2): 자기루프 미검출" >&2; exit 1; }
+
+    python3 - "$tmp/probe-graph.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+edges = {(e["kind"], e["from"], e["to"]) for e in g["edges"]}
+want = {
+    ("references", "PUBLIC.ORDERS", "PUBLIC.CUSTOMERS"),
+    ("reads", "PUBLIC.ORDER_TOTALS", "PUBLIC.ORDERS"),
+    ("reads", "PUBLIC.ORDER_TOTALS", "PUBLIC.CUSTOMERS.ID"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"probe(H2) 간선 미검출: {sorted(missing)}")
+EOF
+
+    # PG parity — pgjdbc가 번들이라 PG가 떠 있으면 같은 DB를 JDBC로도 읽어
+    # 네이티브와 같은 판정 간선이 나오는지 확인한다.
+    if [ -n "${pg_url:-}" ]; then
+        if [[ "$pg_url" =~ (postgres|postgresql)://([^:/@]+)(:([^@]*))?@([^:/]+)(:([0-9]+))?/([^?]+) ]]; then
+            jdbc_pg="jdbc:postgresql://${BASH_REMATCH[5]}:${BASH_REMATCH[7]:-5432}/${BASH_REMATCH[8]}"
+            probe_pg_args=(--url "$jdbc_pg" --user "${BASH_REMATCH[2]}")
+            [ -n "${BASH_REMATCH[4]:-}" ] && probe_pg_args+=(--password "${BASH_REMATCH[4]}")
+            "$JAVABIN" -jar "$JAR" "${probe_pg_args[@]}" -o "$tmp/probe-pg-doc.json"
+            "$BIN" scan --document "$tmp/probe-pg-doc.json" -o "$tmp/probe-pg-graph.json"
+            python3 - "$tmp/probe-pg-graph.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+edges = {(e["kind"], e["from"], e["to"]) for e in g["edges"]}
+want = {
+    ("calls", "public.orders.trg_orders_touch", "public.trg_orders_touch_fn"),
+    ("fires", "public.orders.trg_orders_touch", "public.orders"),
+    ("reads", "public.order_totals", "public.orders"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"probe(PG) 간선 미검출: {sorted(missing)}")
+EOF
+        else
+            echo "주의: SG_PG_URL 형식을 못 풀어 probe-PG 패리티 건너뜀" >&2
+        fi
+    fi
+
+    # MySQL probe — 드라이버는 GPL이라 번들하지 않는다. SG_MYSQL_JAR로 jar을
+    # 지정하면 --driver 경로와 MySQL 수확을 함께 검증한다.
+    if [ -n "${my_url:-}" ] && [ -n "${SG_MYSQL_JAR:-}" ] && [ -f "${SG_MYSQL_JAR:-}" ]; then
+        if [[ "$my_url" =~ mysql://([^:/@]+)(:([^@]*))?@([^:/]+)(:([0-9]+))?/([^?]+) ]]; then
+            jdbc_my="jdbc:mysql://${BASH_REMATCH[4]}:${BASH_REMATCH[6]:-3306}/${BASH_REMATCH[7]}"
+            "$JAVABIN" -jar "$JAR" --url "$jdbc_my" --user "${BASH_REMATCH[1]}" \
+                --driver "$SG_MYSQL_JAR" -o "$tmp/probe-my-doc.json"
+            "$BIN" scan --document "$tmp/probe-my-doc.json" -o "$tmp/probe-my-graph.json"
+            python3 - "$tmp/probe-my-graph.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+edges = {(e["kind"], e["from"], e["to"]) for e in g["edges"]}
+want = {
+    ("references", "sgfix.order_items", "sgfix.orders"),
+    ("fires", "sgfix.orders.trg_orders_touch", "sgfix.orders"),
+    ("writes", "sgfix.touch_customer(int)", "sgfix.customers"),
+    ("reads", "sgfix.order_totals", "sgfix.orders"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"probe(MySQL) 간선 미검출: {sorted(missing)}")
+EOF
+        fi
+    fi
+else
+    echo "주의: java/probe jar이 없어 probe 검증 건너뜀 (brew openjdk 또는 gradle shadowJar)" >&2
+fi
+
 echo "verify-fixtures: OK"

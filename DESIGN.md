@@ -126,7 +126,7 @@ engine/                # Rust workspace — CLI와 모든 판정
 ├── export             # json·mermaid·dot
 ├── source             # CatalogSource — native | probe, 같은 document를 뱉는다
 └── cli                # clap 엔트리
-probe-jdbc/            # Kotlin — JDBC로 카탈로그+몸체 원문을 읽어 document 출력 (P2~)
+probe/                 # Kotlin — JDBC로 카탈로그+몸체 원문을 읽어 document 출력 (P2~)
 ```
 
 `core`에 외부 의존성 금지. sqlx와 프로세스 spawn은 `source` 안에서만,
@@ -170,7 +170,9 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
 - **P1**: view·routine·trigger·sequence 수집 + sqlparser-rs 몸체 파싱 →
   `reads`/`writes`/`calls` 간선 + `impact`.
 - **P2**: catalog document 스키마 고정(프로브 프로토콜) + Kotlin JVM 프로브
-  (Tier 0 Generic → "JDBC 전부" 성립) + `rules` + config(retain roots).
+  (Tier 0 Generic → "JDBC 전부" 성립) + `rules` — **완료**:
+  `probe/`가 `DatabaseMetaData` + best-effort 몸체 쿼리로 document를 뱉고,
+  `scan --document`가 먹는다. MySQL에서 네이티브와 간선 완전 일치를 확인.
 - **P3**: `stats`(pg_stat·sys) + `dead` + mermaid export + `skill`.
 - **P4**: MSSQL·Oracle Tier 1 프로브, `diff`, `inferred` 간선,
   Go 프로브("JVM 없는 배포" 수요가 생기면).
@@ -190,10 +192,13 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
 
 ## 미결 사항
 
-- **catalog document 스키마** — P2에서 프로브 프로토콜로 고정. 버전 필드 필수.
-  P0의 네이티브 경로가 뱉는 document가 곧 프로토콜의 씨앗이다.
-- **routine 몸체 파싱 커버리지** — P1에서 sqlparser-rs 실측 후, 부족한 방언은
-  파서 개선 기여 vs JSqlParser 폴백(프로브가 파싱된 참조를 증거로 싣는 방식)으로 결정.
-- **프로브 전송 방식** — stdout 스트리밍 NDJSON vs 임시 파일. 큰 스키마에서 결정.
+- **catalog document 스키마** — version 1로 고정됨(`document.rs`의
+  `DOCUMENT_VERSION`). 필드 추가는 하위호환으로, 이름 변경·의미 변경은 버전을 올린다.
+- **routine 몸체 파싱 커버리지** — `language=sql`은 파싱됨. plpgsql·pl/sql 등은
+  limitation으로 보고 중. 파서 개선 기여 vs 프로브 측 "파싱된 참조" 증거로 결정.
+- **프로브 전송 방식** — 현재 파일(`-o`) 또는 stdout(`-o -`). 큰 스키마의
+  스트리밍 NDJSON은 수요가 생기면.
 - **crates.io / Maven Central 이름 충돌** — `schemagraph` 선점 여부 릴리스 전 확인.
 - **`inferred` 간선 휴리스틱 세부** — P4에서 Azimutt 방식 벤치마크 후 결정.
+- **프로브 Tier 1 확장** — Oracle용 `ALL_*` 딕셔너리 경로는 있으나 실서버
+  미검증. MSSQL(`sys.*`), DB2, Informix 등의 몸체 소스는 수요별로 추가.
