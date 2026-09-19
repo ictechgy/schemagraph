@@ -119,10 +119,11 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
             "package" => VertexKind::Package,
             _ => VertexKind::Function,
         };
-        // signature는 오버로드 구분자 — 있으면 정점 id에 붙인다.
+        // signature는 오버로드 구분자 — 비어 있지 않을 때만 정점 id에 붙인다.
+        // (PG의 인자 없는 함수는 시그니처가 빈 문자열이라 "fn()"가 되면 안 된다)
         let id_name = match &routine.signature {
-            Some(sig) => format!("{}({})", routine.name, sig),
-            None => routine.name.clone(),
+            Some(sig) if !sig.is_empty() => format!("{}({})", routine.name, sig),
+            _ => routine.name.clone(),
         };
         let rt_id = VertexId::object(&schema.name, &id_name);
         g.add_vertex(Vertex {

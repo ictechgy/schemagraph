@@ -390,7 +390,7 @@
     {
       "evidence": [
         {
-          "detail": "trigger main.orders.trg_orders_touch Writes main.customers",
+          "detail": "main.orders.trg_orders_touch Writes main.customers",
           "layer": "body-parse"
         }
       ],

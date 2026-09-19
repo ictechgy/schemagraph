@@ -11,8 +11,15 @@
   sqlparser-rs로 view 본문을 파싱해 `reads` 간선을 만들고(객체·멤버 둘 다),
   trigger 본문을 파싱해 `writes`·`reads`·`NEW./OLD.` member 간선을 만든다.
   `impact` 명령이 역방향 전이 클로저를, `dead`가 DB 내부 도달성 후보를 보고한다.
-  32개 단위 테스트 통과, `Scripts/verify-fixtures.sh`가 reads·writes·impact·dead까지
-  fixture로 양방향 검증한다.
+- 2026-09-19: **PG 네이티브 reader + routine 파싱 완료** (커밋 예정).
+  `source::read`가 URL 스킴으로 디스패치한다 — postgres(계열)는 sqlx로 읽고,
+  mysql은 명시적 미지원 오류, 나머지는 SQLite. PG 리더는 read-only 세션으로
+  스키마·테이블·컬럼·제약·인덱스·trigger·시퀀스·routine을 수집한다.
+  파서는 PG trigger의 `EXECUTE FUNCTION`을 껍질에서 직접 채취해 첫 `calls`
+  간선을 만들고, `language=sql` routine 몸체의 `AS $$…$$` 껍질을 벗겨
+  reads/writes를 파싱한다. plpgsql 등 미지원 언어는 limitation으로 보고한다.
+  38개 테스트 통과, verify-fixtures.sh가 임시 PG 인스턴스를 자동으로 띄워
+  골든까지 검증한다(없으면 건너뛰고 안내).
 
 ## 확정된 결정
 
@@ -53,21 +60,38 @@
   trigger는 자동 발사, 나머지는 내부 장치다. fixpoint로 의존자 전부가
   dead인 객체도 연쇄 판정한다. "앱 쿼리는 그래프에 없다"는 고정
   limitation이 항상 실린다 — 삭제 판정 아님의 계약.
+- `source::read(url)`이 스킴 디스패치다 — postgres/postgresql→sqlx PG,
+  mysql/mysqlx→미지원 오류(또라이 SQLite로 읽지 않는다), 나머지→SQLite.
+- PG 리더는 `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`로
+  읽기 전용을 강제한다. 카탈로그 `"char"` 컬럼(contype·prokind)은
+  `::text`로 캐스팅해야 sqlx 디코딩이 된다. `conkey`는 NULL 가능 →
+  `Option<Vec<i16>>`. 시그니처 빈 routine id는 `()`를 붙이지 않는다.
+- PG `pg_get_viewdef`는 FROM 전체를 괄호로 감싼 `NestedJoin`을 만든다 —
+  별칭 수집이 재귀해야 member reads가 생긴다.
+- PG trigger는 `EXECUTE FUNCTION fn()` 호출이라 BEGIN..END가 없다 —
+  `extract_execute_targets`가 껍질에서 직접 채취하고, `resolve_routine`이
+  정확 id → 이름 매치 순으로 보수적 해석한다(모호하면 간선 생략+notes).
+- routine 몸체는 `language=sql`/무표기만 파싱한다. `pg_get_functiondef`의
+  `AS $$…$$`·`AS '…'` 껍질은 `extract_as_body`가 벗긴다. plpgsql 등은
+  파싱하지 않고 limitation — 몸체 간선이 없다는 사실을 숨기지 않는다.
 
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 32개 테스트
-Scripts/verify-fixtures.sh                    # fixture 양방향 검증 (골든 diff 포함)
+cd engine && cargo build && cargo test        # 빌드 + 38개 테스트
+Scripts/verify-fixtures.sh                    # SQLite + PG fixture 양방향 검증
+# PG 검증은 임시 인스턴스를 자동 프로비전한다. 직접 지정하려면:
+#   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh  (폐기용 DB만!)
 ```
 
 ## 다음 할 일
 
-1. PG·MySQL 네이티브 reader — docker로 로컬 DB 띄워 fixture 검증.
-2. routine(function/procedure) 몸체 파싱 → `calls` 간선 (PG `pg_proc.prosrc`,
-   MySQL `information_schema.ROUTINES`). routine은 SQLite에 없어 PG reader와 같이.
-3. `rules` — 레이어/순환 규칙 선언 (config 파일이 P2와 같이 온다).
-4. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).
+1. MySQL 네이티브 reader — 지금은 mysql:// URL이 명시적 미지원 오류.
+   information_schema.ROUTINES·TRIGGERS 수집 + docker/로컬 fixture.
+2. `rules` — 레이어/순환 규칙 선언 (config 파일이 P2와 같이 온다).
+3. catalog document 스키마 고정 → Kotlin/JDBC 프로브(P2).
+4. routine `calls`의 몸체 내부 호출 — 지금은 trigger의 EXECUTE FUNCTION만
+   잡는다. routine 몸체의 CALL/함수 호출 식 추출은 파서 커버리지와 같이.
 
 ## 미결
 

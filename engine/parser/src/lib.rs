@@ -59,6 +59,31 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 }
             }
         }
+        for routine in &schema.routines {
+            let Some(body) = routine.body.as_ref().filter(|b| !b.trim().is_empty()) else {
+                continue;
+            };
+            // routine 정점 id는 graph.rs와 같은 규칙 — 시그니처가 있으면 괄호로 붙는다.
+            let id_name = match &routine.signature {
+                Some(sig) if !sig.is_empty() => format!("{}({})", routine.name, sig),
+                _ => routine.name.clone(),
+            };
+            let owner = VertexId::object(&schema.name, &id_name);
+            match routine.language.as_deref() {
+                // SQL 언어 함수는 몸체가 그대로 SQL이라 파싱 가능 — 나머지
+                // 언어(plpgsql 등)는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
+                Some("sql") | None => match parse_routine_body(dialect.as_deref(), body) {
+                    Ok(parsed) => {
+                        apply_routine(g, &schema.name, &owner, &parsed, &mut notes);
+                        enriched += 1;
+                    }
+                    Err(msg) => notes.push(format!("routine {owner} 몸체 파싱 실패: {msg}")),
+                },
+                Some(lang) => notes.push(format!(
+                    "routine {owner}: 언어 {lang}의 몸체 파싱 미지원 — 몸체 간선 없음"
+                )),
+            }
+        }
     }
     (enriched, notes)
 }
@@ -148,13 +173,7 @@ fn collect_query(query: &Query, parsed: &mut ParsedView) {
     if let SetExpr::Select(select) = &*query.body {
         let mut aliases: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
         for twj in &select.from {
-            fill_alias(&twj.relation, &mut aliases);
-            for join in &twj.joins {
-                fill_alias(&join.relation, &mut aliases);
-                if let Some(on) = join_on(&join.join_operator) {
-                    collect_expr_columns(on, &aliases, parsed);
-                }
-            }
+            fill_twj(twj, &mut aliases, parsed);
         }
         for item in &select.projection {
             let expr = match item {
@@ -182,18 +201,49 @@ fn is_derived(factor: &TableFactor) -> bool {
     matches!(factor, TableFactor::Derived { .. })
 }
 
-/// 테이블 인자에서 별칭 → (스키마?, 테이블)을 채운다.
-fn fill_alias(factor: &TableFactor, aliases: &mut BTreeMap<String, (Option<String>, String)>) {
-    if let TableFactor::Table { name, alias, .. } = factor {
-        let (schema, table) = object_name_parts(name);
-        if table.is_empty() {
-            return;
+/// TableWithJoins 하나의 별칭을 순서대로 채우고, 조인 ON 식의 컬럼 참조를
+/// 모은다. ON은 자기 왼쪽의 테이블만 참조할 수 있으므로 문서 순서대로
+/// 채우면서 모으는 게 맞다.
+fn fill_twj(
+    twj: &sqlparser::ast::TableWithJoins,
+    aliases: &mut BTreeMap<String, (Option<String>, String)>,
+    parsed: &mut ParsedView,
+) {
+    fill_alias(&twj.relation, aliases, parsed);
+    for join in &twj.joins {
+        fill_alias(&join.relation, aliases, parsed);
+        if let Some(on) = join_on(&join.join_operator) {
+            collect_expr_columns(on, aliases, parsed);
         }
-        let key = alias
-            .as_ref()
-            .map(|a| a.name.value.clone())
-            .unwrap_or_else(|| table.clone());
-        aliases.insert(key, (schema, table));
+    }
+}
+
+/// 테이블 인자에서 별칭 → (스키마?, 테이블)을 채운다.
+///
+/// NestedJoin((a JOIN b ON ...))은 괄호일 뿐 스코프를 새로 열지 않는다 —
+/// PG의 pg_get_viewdef가 FROM 절 전체를 괄호로 감싸 출력하므로 재귀가
+/// 없으면 그쪽 view의 컬럼 해석이 전부 비게 된다.
+fn fill_alias(
+    factor: &TableFactor,
+    aliases: &mut BTreeMap<String, (Option<String>, String)>,
+    parsed: &mut ParsedView,
+) {
+    match factor {
+        TableFactor::Table { name, alias, .. } => {
+            let (schema, table) = object_name_parts(name);
+            if table.is_empty() {
+                return;
+            }
+            let key = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| table.clone());
+            aliases.insert(key, (schema, table));
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => fill_twj(table_with_joins, aliases, parsed),
+        _ => {}
     }
 }
 
@@ -318,6 +368,8 @@ struct ParsedTrigger {
     reads: Vec<(Option<String>, String)>,
     /// NEW./OLD.로 읽은 발사 테이블의 컬럼.
     fired_columns: Vec<String>,
+    /// EXECUTE FUNCTION/PROCEDURE로 부르는 routine (스키마?, 이름).
+    calls: Vec<(Option<String>, String)>,
 }
 
 /// `CREATE TRIGGER ... BEGIN <문장들> END`를 파싱한다. sqlparser는
@@ -327,21 +379,138 @@ struct ParsedTrigger {
 fn parse_trigger_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedTrigger, String> {
     let default = GenericDialect {};
     let dialect = dialect.unwrap_or(&default);
+    let calls = extract_execute_targets(body);
     let inner = extract_trigger_inner(body).unwrap_or(body);
-    let statements =
-        sqlparser::parser::Parser::parse_sql(dialect, inner.trim()).map_err(|e| e.to_string())?;
-    if statements.is_empty() {
-        return Err("본문에서 문장을 찾지 못함".to_owned());
-    }
+    let statements = sqlparser::parser::Parser::parse_sql(dialect, inner.trim());
     let mut parsed = ParsedTrigger {
         writes: Vec::new(),
         reads: Vec::new(),
         fired_columns: Vec::new(),
+        calls,
     };
-    for stmt in &statements {
-        collect_trigger_stmt(stmt, &mut parsed);
+    match statements {
+        Ok(stmts) if !stmts.is_empty() => {
+            for stmt in &stmts {
+                collect_trigger_stmt(stmt, &mut parsed);
+            }
+            Ok(parsed)
+        }
+        // EXECUTE FUNCTION 꼴 trigger는 본문 자체는 못 파지만 호출 대상은
+        // 채취됐다 — 문장 파싱 실패를 호출 간선 포기 이유로 쓰지 않는다.
+        _ if !parsed.calls.is_empty() => Ok(parsed),
+        Ok(_) => Err("본문에서 문장을 찾지 못함".to_owned()),
+        Err(e) => Err(e.to_string()),
     }
-    Ok(parsed)
+}
+
+/// routine 몸체 파싱 — CREATE FUNCTION 전문이 들어오면 AS 뒤의 몸체만
+/// 꺼내고, 나머지는 trigger와 같은 문장 수집 골격으로 파싱한다.
+fn parse_routine_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedTrigger, String> {
+    let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
+    parse_trigger_body(dialect, &inner)
+}
+
+/// `AS $$...$$`·`AS $tag$...$tag$`·`AS '...'` 안의 몸체를 꺼낸다 —
+/// pg_get_functiondef·SHOW CREATE FUNCTION류 정의문은 몸체를 AS 뒤에
+/// 문자열로 담으므로, 그 껍질을 벗겨야 SQL 문장이 나온다.
+fn extract_as_body(body: &str) -> Option<std::borrow::Cow<'_, str>> {
+    for i in find_all_keywords(body, "AS") {
+        let rest = body[i + "AS".len()..].trim_start();
+        if rest.starts_with('\'') {
+            if let Some(inner) = unquote_sql_string(rest) {
+                return Some(inner);
+            }
+        } else if rest.starts_with('$') {
+            if let Some(inner) = undollar_quote(rest) {
+                return Some(inner);
+            }
+        }
+    }
+    None
+}
+
+/// '...' 리터럴의 내용 — '' 이스케이프는 따옴표 하나로 되돌린다.
+fn unquote_sql_string(rest: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let bytes = rest.as_bytes();
+    let mut j = 1;
+    while j < bytes.len() {
+        if bytes[j] == b'\'' {
+            if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                j += 2;
+                continue;
+            }
+            let inner = &rest[1..j];
+            return Some(if inner.contains("''") {
+                std::borrow::Cow::Owned(inner.replace("''", "'"))
+            } else {
+                std::borrow::Cow::Borrowed(inner)
+            });
+        }
+        j += 1;
+    }
+    None
+}
+
+/// $tag$body$tag$ dollar-quote의 내용 — 태그는 $ 사이의 식별자다.
+fn undollar_quote(rest: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let tag_end = rest[1..].find('$').map(|k| k + 1)?;
+    let tag = &rest[..=tag_end]; // "$tag$"
+    let inner_start = tag.len();
+    let close = rest[inner_start..].find(tag).map(|k| inner_start + k)?;
+    Some(std::borrow::Cow::Borrowed(rest[inner_start..close].trim()))
+}
+
+/// `EXECUTE FUNCTION f(...)`·`EXECUTE PROCEDURE p(...)` 꼴의 호출 대상을
+/// 껍질에서 직접 채취한다 — PG·Oracle 계열은 trigger가 내부 문장 대신
+/// routine을 호출하고, 그 이름은 파서가 못 읽는 CREATE TRIGGER 안에 있다.
+fn extract_execute_targets(body: &str) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+    for i in find_all_keywords(body, "EXECUTE") {
+        let rest = body[i + "EXECUTE".len()..].trim_start();
+        let name_part = if starts_with_keyword(rest, "FUNCTION") {
+            rest["FUNCTION".len()..].trim_start()
+        } else if starts_with_keyword(rest, "PROCEDURE") {
+            rest["PROCEDURE".len()..].trim_start()
+        } else {
+            continue;
+        };
+        let name: String = name_part
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | '$'))
+            .collect();
+        let name = name.trim_matches('"').replace("\".\"", ".");
+        if !name.is_empty() {
+            let (schema, table) = split_qualified(&name);
+            if !table.is_empty() {
+                out.push((schema, table));
+            }
+        }
+    }
+    out
+}
+
+/// "a.b.c" 꼴 이름을 (스키마?, 말단)으로 나눈다 — object_name_parts와 같은
+/// 규칙: 셋 이상이면 마지막 둘. 따옴표는 이미 벗겨졌다고 가정한다.
+fn split_qualified(name: &str) -> (Option<String>, String) {
+    let parts: Vec<&str> = name.split('.').filter(|p| !p.is_empty()).collect();
+    match parts.as_slice() {
+        [] => (None, String::new()),
+        [t] => (None, (*t).to_owned()),
+        rest => (
+            Some(rest[rest.len() - 2].to_string()),
+            rest[rest.len() - 1].to_string(),
+        ),
+    }
+}
+
+/// 대소문자 무관 접두 + 단어 경계 검사.
+fn starts_with_keyword(s: &str, kw: &str) -> bool {
+    s.len() >= kw.len()
+        && s.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+        && (s.len() == kw.len() || {
+            let b = s.as_bytes()[kw.len()];
+            !b.is_ascii_alphanumeric() && b != b'_'
+        })
 }
 
 /// BEGIN..END 안쪽을 꺼낸다. 단어 경계가 아닌 BEGIN/END는 무시한다 —
@@ -352,7 +521,12 @@ fn extract_trigger_inner(body: &str) -> Option<&str> {
     // 오프셋을 바꿔 슬라이스를 틀어뜨린다. 원문에서 case-insensitive로 찾는다.
     let begin = find_all_keywords(body, "BEGIN").first().copied()? + "BEGIN".len();
     let end = find_all_keywords(body, "END").last().copied()?;
-    (end > begin).then_some(body[begin..end].trim())
+    let mut inner = body.get(begin..end)?.trim();
+    // SQL/PSM의 BEGIN ATOMIC — ATOMIC은 문장이 아니라 벗겨야 파싱된다.
+    if starts_with_keyword(inner, "ATOMIC") {
+        inner = inner["ATOMIC".len()..].trim_start();
+    }
+    (!inner.is_empty()).then_some(inner)
 }
 
 /// 원문에서 대소문자 무관·단어 경계인 키워드의 모든 위치를 돌린다.
@@ -443,7 +617,44 @@ fn table_factor_name(factor: &TableFactor) -> Option<(Option<String>, String)> {
     }
 }
 
-/// trigger 파싱 결과를 그래프 간선으로 반영한다 — writes/reads/fired-columns.
+/// routine 이름 해석 결과 — 오버로드는 호출 정확도상 구분 못 하므로
+/// 모호함을 숨기지 않고 별도로 보고한다.
+enum RoutineHit {
+    One(VertexId),
+    None,
+    Ambiguous(usize),
+}
+
+/// 스키마 안에서 routine 정점을 이름으로 찾는다. 정확한 id(name 그대로)가
+/// 먼저이고, 없으면 routine kind 정점의 표시 이름과 비교한다 — 호출자는
+/// 시그니처를 모르므로 이름이 유일할 때만 받아들인다(resolve()와 같은 철학).
+fn resolve_routine(g: &Graph, schema: &str, name: &str) -> RoutineHit {
+    let exact = VertexId::object(schema, name);
+    if g.vertex(&exact).is_some() {
+        return RoutineHit::One(exact);
+    }
+    let hits: Vec<VertexId> = g
+        .vertices()
+        .filter(|v| {
+            v.schema == schema
+                && v.name == name
+                && matches!(
+                    v.kind,
+                    schemagraph_core::VertexKind::Function
+                        | schemagraph_core::VertexKind::Procedure
+                        | schemagraph_core::VertexKind::Package
+                )
+        })
+        .map(|v| v.id.clone())
+        .collect();
+    match hits.len() {
+        0 => RoutineHit::None,
+        1 => RoutineHit::One(hits.into_iter().next().unwrap()),
+        n => RoutineHit::Ambiguous(n),
+    }
+}
+
+/// trigger 파싱 결과를 그래프 간선으로 반영한다 — DML + calls + fired-columns.
 fn apply_trigger(
     g: &mut Graph,
     schema: &str,
@@ -458,30 +669,8 @@ fn apply_trigger(
         ));
         return;
     }
-    for (kind, targets) in [
-        (EdgeKind::Writes, &parsed.writes),
-        (EdgeKind::Reads, &parsed.reads),
-    ] {
-        for (ref_schema, table) in targets {
-            let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-            let target = VertexId::object(&target_schema, table);
-            if g.vertex(&target).is_none() {
-                notes.push(format!(
-                    "trigger {trigger_id}가 참조하는 {target_schema}.{table}이 카탈로그에 없음"
-                ));
-                continue;
-            }
-            g.add_edge(Edge {
-                from: trigger_id.clone(),
-                to: target.clone(),
-                kind,
-                evidence: vec![Evidence {
-                    layer: EvidenceLayer::BodyParse,
-                    detail: format!("trigger {trigger_id} {:?} {target}", kind),
-                }],
-            });
-        }
-    }
+    apply_dml_edges(g, schema, trigger_id, parsed, notes);
+    apply_call_edges(g, schema, trigger_id, &parsed.calls, notes);
     // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다.
     let mut made = std::collections::BTreeSet::new();
     for column in &parsed.fired_columns {
@@ -498,6 +687,92 @@ fn apply_trigger(
                 detail: format!("trigger {trigger_id} reads NEW/OLD.{column} on {owner_table}"),
             }],
         });
+    }
+}
+
+/// routine 파싱 결과를 그래프 간선으로 반영한다 — trigger와 같은 DML/calls
+/// 규칙이지만 발사 테이블(NEW/OLD)은 없다.
+fn apply_routine(
+    g: &mut Graph,
+    schema: &str,
+    owner: &VertexId,
+    parsed: &ParsedTrigger,
+    notes: &mut Vec<String>,
+) {
+    if g.vertex(owner).is_none() {
+        notes.push(format!(
+            "routine {owner}의 정점이 카탈로그에 없음 — 간선 생략"
+        ));
+        return;
+    }
+    apply_dml_edges(g, schema, owner, parsed, notes);
+    apply_call_edges(g, schema, owner, &parsed.calls, notes);
+}
+
+/// 몸체 문장의 writes/reads 대상을 간선으로 만든다 — trigger와 routine이 공유.
+fn apply_dml_edges(
+    g: &mut Graph,
+    schema: &str,
+    from: &VertexId,
+    parsed: &ParsedTrigger,
+    notes: &mut Vec<String>,
+) {
+    for (kind, targets) in [
+        (EdgeKind::Writes, &parsed.writes),
+        (EdgeKind::Reads, &parsed.reads),
+    ] {
+        for (ref_schema, table) in targets {
+            let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
+            let target = VertexId::object(&target_schema, table);
+            if g.vertex(&target).is_none() {
+                notes.push(format!(
+                    "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
+                ));
+                continue;
+            }
+            g.add_edge(Edge {
+                from: from.clone(),
+                to: target.clone(),
+                kind,
+                evidence: vec![Evidence {
+                    layer: EvidenceLayer::BodyParse,
+                    detail: format!("{from} {:?} {target}", kind),
+                }],
+            });
+        }
+    }
+}
+
+/// EXECUTE FUNCTION/PROCEDURE 호출 대상을 간선으로 — routine 정점 id는
+/// 시그니처를 포함할 수 있어 이름으로 해석한다.
+fn apply_call_edges(
+    g: &mut Graph,
+    schema: &str,
+    from: &VertexId,
+    calls: &[(Option<String>, String)],
+    notes: &mut Vec<String>,
+) {
+    for (ref_schema, name) in calls {
+        let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
+        match resolve_routine(g, &target_schema, name) {
+            RoutineHit::One(target) => {
+                g.add_edge(Edge {
+                    from: from.clone(),
+                    to: target.clone(),
+                    kind: EdgeKind::Calls,
+                    evidence: vec![Evidence {
+                        layer: EvidenceLayer::BodyParse,
+                        detail: format!("{from} calls {target}"),
+                    }],
+                });
+            }
+            RoutineHit::None => notes.push(format!(
+                "{from}이(가) 부르는 {target_schema}.{name}이 카탈로그에 없음"
+            )),
+            RoutineHit::Ambiguous(n) => notes.push(format!(
+                "{from}이(가) 부르는 {target_schema}.{name}에 {n}개 오버로드가 있어 간선 생략"
+            )),
+        }
     }
 }
 
@@ -697,5 +972,133 @@ mod tests {
         let doc = doc_with_trigger("CREATE TRIGGER t BEGIN ((( 깨짐; END");
         let (_g, notes) = build(&doc);
         assert!(notes.iter().any(|n| n.contains("파싱 실패")));
+    }
+
+    /// routine이 달린 document — PG 방언의 EXECUTE FUNCTION trigger도 실험한다.
+    fn doc_with_routine(routines: Vec<RoutineDoc>, trigger_body: &str) -> CatalogDocument {
+        CatalogDocument {
+            version: 1,
+            dialect: "postgres".into(),
+            reader: "test".into(),
+            limitations: vec![],
+            schemas: vec![SchemaDoc {
+                name: "public".into(),
+                routines,
+                objects: vec![
+                    {
+                        let mut t = table("orders", vec![col("id", 1), col("customer_id", 2)]);
+                        if !trigger_body.is_empty() {
+                            t.triggers.push(TriggerDoc {
+                                name: "trg_touch".into(),
+                                body: Some(trigger_body.to_owned()),
+                            });
+                        }
+                        t
+                    },
+                    table("customers", vec![col("id", 1), col("name", 2)]),
+                ],
+            }],
+        }
+    }
+
+    fn routine(name: &str, language: Option<&str>, body: &str) -> RoutineDoc {
+        RoutineDoc {
+            name: name.into(),
+            kind: "function".into(),
+            language: language.map(|l| l.to_owned()),
+            body: Some(body.to_owned()),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn sql_routine의_질의가_reads_간선이_된다() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "order_count",
+                Some("sql"),
+                "SELECT count(*) FROM orders",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.order_count"
+            && e.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn create_function_껍질의_as_몸체를_벗겨_파싱한다() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "touch_customer",
+                Some("sql"),
+                "CREATE FUNCTION touch_customer() RETURNS int AS $$ UPDATE customers SET name = name WHERE id = 1; $$ LANGUAGE sql",
+            )],
+            "",
+        );
+        let (g, _) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.touch_customer"
+            && e.to.as_str() == "public.customers"));
+    }
+
+    #[test]
+    fn plpgsql_routine은_파싱대신_한계를_보고한다() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "touch_customer",
+                Some("plpgsql"),
+                "BEGIN UPDATE customers SET name = name WHERE id = 1; END",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.iter().any(|n| n.contains("plpgsql")));
+        assert!(!g
+            .edges()
+            .iter()
+            .any(|e| e.from.as_str() == "public.touch_customer"));
+    }
+
+    #[test]
+    fn trigger의_execute_function이_calls_간선이_된다() {
+        let doc = doc_with_routine(
+            vec![routine("trg_orders_touch_fn", Some("plpgsql"), "BEGIN END")],
+            "CREATE TRIGGER trg_touch AFTER INSERT ON orders EXECUTE FUNCTION trg_orders_touch_fn()",
+        );
+        let (g, _) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+            && e.from.as_str() == "public.orders.trg_touch"
+            && e.to.as_str() == "public.trg_orders_touch_fn"));
+    }
+
+    #[test]
+    fn 없는_routine_호출은_유령을_만들지_않고_notes를_남긴다() {
+        let doc = doc_with_routine(
+            vec![],
+            "CREATE TRIGGER trg_touch AFTER INSERT ON orders EXECUTE FUNCTION ghost_fn()",
+        );
+        let (g, notes) = build(&doc);
+        assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Calls));
+        assert!(notes.iter().any(|n| n.contains("ghost_fn")));
+    }
+
+    #[test]
+    fn 오버로드가_모호하면_간선을_생략하고_notes를_남긴다() {
+        // 양쪽 다 시그니처가 있으면 이름만으로는 못 고른다 — 정점 id가
+        // `name(sig)` 꼴이라 정확 일치가 없고 이름 매치만 2개다.
+        let mut int_ver = routine("touch_customer", Some("plpgsql"), "BEGIN END");
+        int_ver.signature = Some("integer".into());
+        let mut text_ver = routine("touch_customer", Some("plpgsql"), "BEGIN END");
+        text_ver.signature = Some("text".into());
+        let doc = doc_with_routine(
+            vec![int_ver, text_ver],
+            "CREATE TRIGGER trg_touch AFTER INSERT ON orders EXECUTE FUNCTION touch_customer()",
+        );
+        let (g, notes) = build(&doc);
+        assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Calls));
+        assert!(notes.iter().any(|n| n.contains("오버로드")));
     }
 }

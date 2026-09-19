@@ -160,7 +160,7 @@ async fn run(cli: Cli) -> Result<i32> {
 }
 
 async fn scan(url: &str, output: &str, emit_document: Option<&std::path::Path>) -> Result<i32> {
-    let doc = source::sqlite::read(url)
+    let doc = source::read(url)
         .await
         .with_context(|| unsupported_dialect_hint(url))?;
     if let Some(path) = emit_document {
@@ -182,11 +182,8 @@ async fn scan(url: &str, output: &str, emit_document: Option<&std::path::Path>) 
 
 /// 지원 안 하는 방언에 걸렸을 때 힌트를 단다.
 fn unsupported_dialect_hint(url: &str) -> String {
-    if url.starts_with("postgres") || url.starts_with("mysql") {
-        format!(
-            "{url}: 이 방언의 네이티브 reader는 아직 없다 (P0은 sqlite만). \
-                 다른 DB는 P2의 JDBC 프로브를 기다려라"
-        )
+    if url.starts_with("mysql") {
+        format!("{url}: mysql 네이티브 reader는 아직 없다 — P2의 JDBC 프로브를 기다려라")
     } else {
         format!("스캔 실패: {url}")
     }

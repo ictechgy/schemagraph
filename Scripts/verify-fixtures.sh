@@ -95,4 +95,90 @@ grep -q 'not safe to delete' "$tmp/dead.json" || { echo "dead: 삭제 금지 계
 ! grep -q '"main.standalone"' "$tmp/dead.json" || { echo "dead: 테이블 오탐" >&2; exit 1; }
 ! grep -q '"main.orders.trg_orders_touch"' "$tmp/dead.json" || { echo "dead: trigger 오탐" >&2; exit 1; }
 
+# ── PostgreSQL ──────────────────────────────────────────────────────────
+# 네이티브 리더 검증은 실제 서버가 필요하다. SG_PG_URL이 있으면 그 서버를 쓰고
+# (fixture를 새로 적용한다 — 검증 DB를 공유하지 마라), 없으면 로컬 postgres
+# 바이너리로 임시 인스턴스를 띄운다. 둘 다 없으면 건너뛴다 — PG가 없는
+# 환경에서 전체 검증을 실패시키지 않되, 건너뛴 사실은 출력한다.
+PGFIX="Fixtures/postgres"
+pg_url=""
+pg_own=""
+
+if [ -n "${SG_PG_URL:-}" ]; then
+    pg_url="$SG_PG_URL"
+    # URL에서 psql용 접속 정보를 그대로 쓴다.
+    PGBIN="$(dirname "$(command -v psql 2>/dev/null || echo missing)")"
+    if [ ! -x "$PGBIN/psql" ]; then
+        echo "주의: SG_PG_URL이 있는데 psql이 없어 PG 검증 건너뜀" >&2
+        pg_url=""
+    fi
+else
+    # initdb/postgres/psql 바이너리를 찾는다(PATH → homebrew 순).
+    PGBIN=""
+    for d in "$(dirname "$(command -v initdb 2>/dev/null || echo missing)")" \
+             /opt/homebrew/opt/postgresql@*/bin /opt/homebrew/opt/postgresql/bin \
+             /usr/local/opt/postgresql@*/bin /usr/lib/postgresql/*/bin; do
+        if [ -x "$d/initdb" ] && [ -x "$d/postgres" ] && [ -x "$d/psql" ]; then
+            PGBIN="$d"
+            break
+        fi
+    done
+fi
+
+if [ -z "$pg_url" ] && [ -n "$PGBIN" ] && [ -x "$PGBIN/initdb" ]; then
+    pg_data="$tmp/pgdata"
+    pg_port=$((55400 + RANDOM % 90))
+    "$PGBIN/initdb" -D "$pg_data" -U postgres --no-instructions >/dev/null 2>&1
+    "$PGBIN/pg_ctl" -D "$pg_data" -l "$tmp/pg.log" -o "-p $pg_port -k $tmp" \
+        -w start >/dev/null
+    pg_own=1
+    trap '"$PGBIN/pg_ctl" -D "$pg_data" -m fast stop >/dev/null 2>&1; rm -rf "$tmp"' EXIT
+    "$PGBIN/createdb" -h "$tmp" -p "$pg_port" -U postgres sgfix
+    pg_url="postgres://postgres@localhost:$pg_port/sgfix"
+    PGHOST_TMP="$tmp"
+fi
+
+if [ -n "$pg_url" ]; then
+    if [ -n "$pg_own" ]; then
+        "$PGBIN/psql" -h "$PGHOST_TMP" -p "$pg_port" -U postgres -d sgfix \
+            -v ON_ERROR_STOP=1 -qf "$PGFIX/basic.sql"
+    else
+        psql "$pg_url" -v ON_ERROR_STOP=1 -qf "$PGFIX/basic.sql"
+    fi
+
+    "$BIN" scan "$pg_url" -o "$tmp/graph-pg.json"
+
+    if [ -f "$PGFIX/basic.graph.golden.json" ]; then
+        diff -u "$PGFIX/basic.graph.golden.json" "$tmp/graph-pg.json"
+    else
+        echo "주의: PG 골든이 없다. 첫 출력을 검토하고 골든으로 고정해라:" >&2
+        echo "  cp $tmp/graph-pg.json $PGFIX/basic.graph.golden.json" >&2
+    fi
+
+    # PG 스모크: a↔b 순환, view member reads, EXECUTE FUNCTION calls,
+    # plpgsql 미지원 limitation 보고.
+    "$BIN" cycles --graph "$tmp/graph-pg.json" --level object > "$tmp/cycles-pg.json"
+    grep -q '"public.a"' "$tmp/cycles-pg.json" || { echo "PG cycles: public.a 미검출" >&2; exit 1; }
+    grep -q '"selfLoop": true' "$tmp/cycles-pg.json" || { echo "PG cycles: 자기루프 미검출" >&2; exit 1; }
+
+    python3 - "$tmp/graph-pg.json" <<'EOF'
+import json, sys
+g = json.load(open(sys.argv[1]))
+edges = {(e["kind"], e["from"], e["to"]) for e in g["edges"]}
+want = {
+    ("calls", "public.orders.trg_orders_touch", "public.trg_orders_touch_fn"),
+    ("reads", "public.order_totals", "public.orders.id"),
+    ("fires", "public.orders.trg_orders_touch", "public.orders"),
+}
+missing = want - edges
+if missing:
+    sys.exit(f"PG 간선 미검출: {sorted(missing)}")
+lims = g.get("limitations", [])
+if not any("plpgsql" in l for l in lims):
+    sys.exit(f"plpgsql 미지원 limitation 미보고: {lims}")
+EOF
+else
+    echo "주의: PostgreSQL을 찾지 못해 PG 검증 건너뜀 (SG_PG_URL로 지정 가능)" >&2
+fi
+
 echo "verify-fixtures: OK"

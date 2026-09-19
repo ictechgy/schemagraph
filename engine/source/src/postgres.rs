@@ -1,0 +1,397 @@
+//! PostgreSQL 네이티브 reader — pg 카탈로그를 읽어 CatalogDocument를 만든다.
+//!
+//! information_schema는 표준인 척하는 반쪽이라(FK의 컬럼 대응·trigger
+//! 몸체·routine 언어가 빠진다) pg_catalog를 주로 쓴다. 세션은 읽기 전용으로
+//! 고정한다 — 스캐너가 DB를 바꾸는 일은 없어야 한다(sqlite의 mode=ro와 같은 의도).
+
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::Row;
+use std::str::FromStr;
+
+use crate::document::*;
+use crate::SourceError;
+
+/// `postgres://…` URL로 접속해 카탈로그를 읽는다.
+pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
+    let options = PgConnectOptions::from_str(url)
+        .map_err(|e| SourceError::Connect(format!("postgres URL 해석 실패: {e}")))?;
+    let pool = PgPoolOptions::new()
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                // 읽기 전용 세션 고정 — sqlite reader의 read_only(true)와 같은 의도.
+                sqlx::Executor::execute(
+                    conn,
+                    "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+                )
+                .await
+                .map(|_| ())
+            })
+        })
+        .connect_with(options)
+        .await
+        .map_err(|e| SourceError::Connect(format!("postgres 접속 실패: {e}")))?;
+
+    let mut doc = CatalogDocument {
+        version: DOCUMENT_VERSION,
+        dialect: "postgres".to_owned(),
+        reader: "native-sqlx".to_owned(),
+        schemas: Vec::new(),
+        limitations: Vec::new(),
+    };
+
+    for schema in schema_list(&pool).await? {
+        doc.schemas
+            .push(read_schema(&pool, &schema, &mut doc.limitations).await?);
+    }
+    doc.schemas.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(doc)
+}
+
+/// 사용자 스키마 목록 — pg_%(시스템)과 information_schema는 제외한다.
+async fn schema_list(pool: &PgPool) -> Result<Vec<String>, SourceError> {
+    let rows = sqlx::query(
+        "SELECT nspname FROM pg_namespace \
+         WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema' \
+         ORDER BY nspname",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(SourceError::Query)?;
+    Ok(rows.iter().map(|r| r.get::<String, _>("nspname")).collect())
+}
+
+async fn read_schema(
+    pool: &PgPool,
+    schema: &str,
+    limitations: &mut Vec<String>,
+) -> Result<SchemaDoc, SourceError> {
+    let mut objects = read_objects(pool, schema).await?;
+    for obj in &mut objects {
+        obj.columns = read_columns(pool, schema, &obj.name).await?;
+        obj.constraints = read_constraints(pool, schema, &obj.name).await?;
+        obj.indexes = read_indexes(pool, schema, &obj.name).await?;
+        obj.triggers = read_triggers(pool, schema, &obj.name).await?;
+    }
+    let mut routines = read_routines(pool, schema, limitations).await?;
+    sort_all(&mut objects, &mut routines);
+    Ok(SchemaDoc {
+        name: schema.to_owned(),
+        objects,
+        routines,
+    })
+}
+
+/// table·view·materialized-view·sequence 목록.
+async fn read_objects(pool: &PgPool, schema: &str) -> Result<Vec<ObjectDoc>, SourceError> {
+    let mut objects: Vec<ObjectDoc> = Vec::new();
+
+    let rows = sqlx::query(
+        "SELECT table_name AS name, table_type AS kind \
+         FROM information_schema.tables WHERE table_schema = $1",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .map_err(SourceError::Query)?;
+    for r in &rows {
+        let raw_kind = r.get::<String, _>("kind");
+        let kind = match raw_kind.as_str() {
+            "BASE TABLE" | "FOREIGN" => "table",
+            "VIEW" => "view",
+            other => other,
+        };
+        objects.push(ObjectDoc {
+            name: r.get("name"),
+            kind: kind.to_owned(),
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            triggers: vec![],
+            body: None,
+        });
+    }
+
+    // view 정의 원문 — 파싱은 엔진의 일, reader는 옮기기만 한다.
+    let views = sqlx::query("SELECT viewname, definition FROM pg_views WHERE schemaname = $1")
+        .bind(schema)
+        .fetch_all(pool)
+        .await
+        .map_err(SourceError::Query)?;
+    for r in &views {
+        let name: String = r.get("viewname");
+        if let Some(obj) = objects.iter_mut().find(|o| o.name == name) {
+            obj.body = r.get::<Option<String>, _>("definition");
+        }
+    }
+
+    // materialized view — information_schema.tables에 없어 따로 읽는다.
+    let mvs = sqlx::query("SELECT matviewname, definition FROM pg_matviews WHERE schemaname = $1")
+        .bind(schema)
+        .fetch_all(pool)
+        .await
+        .map_err(SourceError::Query)?;
+    for r in &mvs {
+        objects.push(ObjectDoc {
+            name: r.get("matviewname"),
+            kind: "materialized-view".to_owned(),
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            triggers: vec![],
+            body: r.get::<Option<String>, _>("definition"),
+        });
+    }
+
+    let seqs = sqlx::query("SELECT sequencename FROM pg_sequences WHERE schemaname = $1")
+        .bind(schema)
+        .fetch_all(pool)
+        .await
+        .map_err(SourceError::Query)?;
+    for r in &seqs {
+        objects.push(ObjectDoc {
+            name: r.get("sequencename"),
+            kind: "sequence".to_owned(),
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            triggers: vec![],
+            body: None,
+        });
+    }
+    Ok(objects)
+}
+
+async fn read_columns(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ColumnDoc>, SourceError> {
+    let rows = sqlx::query(
+        "SELECT column_name, data_type, is_nullable, column_default, ordinal_position \
+         FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(SourceError::Query)?;
+    Ok(rows
+        .iter()
+        .map(|r| ColumnDoc {
+            name: r.get("column_name"),
+            data_type: r.get("data_type"),
+            nullable: r.get::<String, _>("is_nullable") == "YES",
+            default: r.get::<Option<String>, _>("column_default"),
+            ordinal: r.get::<i32, _>("ordinal_position") as u32,
+            // pk_position은 제약 조회에서 별도로 채운다 — information_schema의
+            // constraint_column_usage는 PK 순서를 안 준다.
+            pk_position: 0,
+        })
+        .collect())
+}
+
+/// PK·FK·UNIQUE·CHECK 제약. 컬럼 대응은 pg_constraint의 conkey/confkey를
+/// ordinality로 풀어 member 레벨까지 정확히 만든다.
+async fn read_constraints(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ConstraintDoc>, SourceError> {
+    let rows = sqlx::query(
+        "SELECT con.conname, con.contype::text AS contype, con.conkey, con.confkey, \
+                frel.relname AS ftable, fn.nspname AS fschema \
+         FROM pg_constraint con \
+         JOIN pg_class rel ON rel.oid = con.conrelid \
+         JOIN pg_namespace n ON n.oid = rel.relnamespace \
+         LEFT JOIN pg_class frel ON frel.oid = con.confrelid \
+         LEFT JOIN pg_namespace fn ON fn.oid = frel.relnamespace \
+         WHERE n.nspname = $1 AND rel.relname = $2 AND con.contype IN ('p','f','u')",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(SourceError::Query)?;
+
+    let mut constraints = Vec::new();
+    for r in &rows {
+        let contype = r.get::<String, _>("contype");
+        let conkey = r.get::<Option<Vec<i16>>, _>("conkey").unwrap_or_default();
+        // attnum 배열을 컬럼명으로 번역한다.
+        let columns = attnames(pool, schema, table, &conkey).await?;
+        let referenced = if contype == "f" {
+            let ftable = r.get::<String, _>("ftable");
+            let fschema = r.get::<Option<String>, _>("fschema");
+            let fkey = r.get::<Option<Vec<i16>>, _>("confkey").unwrap_or_default();
+            Some(ReferencedDoc {
+                // 대상 컬럼은 대상 스키마에서 번역해야 한다 — 같은 이름의
+                // 테이블이 다른 스키마에 있으면 엉뚱한 컬럼을 가리킨다.
+                columns: attnames(pool, fschema.as_deref().unwrap_or(schema), &ftable, &fkey)
+                    .await?,
+                schema: fschema,
+                table: ftable,
+            })
+        } else {
+            None
+        };
+        constraints.push(ConstraintDoc {
+            name: r.get("conname"),
+            kind: match contype.as_str() {
+                "p" => "pk",
+                "f" => "fk",
+                _ => "unique",
+            }
+            .to_owned(),
+            columns,
+            referenced,
+        });
+    }
+    Ok(constraints)
+}
+
+/// attnum 배열을 컬럼명으로 번역한다 — 한 쿼리로 묶는다.
+async fn attnames(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+    attnums: &[i16],
+) -> Result<Vec<String>, SourceError> {
+    if attnums.is_empty() {
+        return Ok(vec![]);
+    }
+    let rows = sqlx::query(
+        "SELECT a.attname, u.ord FROM pg_attribute a \
+         JOIN pg_class rel ON rel.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = rel.relnamespace \
+         JOIN unnest($3::int2[]) WITH ORDINALITY u(attnum, ord) ON u.attnum = a.attnum \
+         WHERE n.nspname = $1 AND rel.relname = $2 ORDER BY u.ord",
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(attnums)
+    .fetch_all(pool)
+    .await
+    .map_err(SourceError::Query)?;
+    Ok(rows.iter().map(|r| r.get::<String, _>("attname")).collect())
+}
+
+async fn read_indexes(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<IndexDoc>, SourceError> {
+    let rows = sqlx::query(
+        "SELECT cls.relname AS index_name, idx.indisunique, \
+                array_remove(array_agg(a.attname ORDER BY u.ord), NULL) AS cols \
+         FROM pg_index idx \
+         JOIN pg_class cls ON cls.oid = idx.indexrelid \
+         JOIN pg_class tbl ON tbl.oid = idx.indrelid \
+         JOIN pg_namespace n ON n.oid = tbl.relnamespace \
+         JOIN unnest(idx.indkey) WITH ORDINALITY u(attnum, ord) ON true \
+         LEFT JOIN pg_attribute a ON a.attrelid = tbl.oid AND a.attnum = u.attnum \
+         WHERE n.nspname = $1 AND tbl.relname = $2 AND NOT idx.indisprimary \
+         GROUP BY cls.relname, idx.indisunique",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(SourceError::Query)?;
+    Ok(rows
+        .iter()
+        .map(|r| IndexDoc {
+            name: r.get("index_name"),
+            unique: r.get("indisunique"),
+            // indkey=0(식 인덱스)은 attname이 NULL이라 array_remove로 뺐다.
+            columns: r.get::<Option<Vec<String>>, _>("cols").unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// 사용자 트리거 — tgisinternal=false로 제약 트리거(FK enforce 등)를 뺀다.
+async fn read_triggers(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<TriggerDoc>, SourceError> {
+    let rows = sqlx::query(
+        "SELECT tg.tgname, pg_get_triggerdef(tg.oid) AS def \
+         FROM pg_trigger tg \
+         JOIN pg_class cls ON cls.oid = tg.tgrelid \
+         JOIN pg_namespace n ON n.oid = cls.relnamespace \
+         WHERE NOT tg.tgisinternal AND n.nspname = $1 AND cls.relname = $2",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(SourceError::Query)?;
+    Ok(rows
+        .iter()
+        .map(|r| TriggerDoc {
+            name: r.get("tgname"),
+            body: r.get::<Option<String>, _>("def"),
+        })
+        .collect())
+}
+
+/// function/procedure 몸체 — aggregate·window 함수는 제외한다.
+async fn read_routines(
+    pool: &PgPool,
+    schema: &str,
+    limitations: &mut Vec<String>,
+) -> Result<Vec<RoutineDoc>, SourceError> {
+    let rows = sqlx::query(
+        "SELECT p.proname, l.lanname, p.prokind::text AS prokind, \
+                pg_get_function_identity_arguments(p.oid) AS sig, \
+                pg_get_functiondef(p.oid) AS def \
+         FROM pg_proc p \
+         JOIN pg_namespace n ON n.oid = p.pronamespace \
+         JOIN pg_language l ON l.oid = p.prolang \
+         WHERE n.nspname = $1",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .map_err(SourceError::Query)?;
+
+    let mut routines = Vec::new();
+    let mut skipped = 0usize;
+    for r in &rows {
+        let prokind = r.get::<String, _>("prokind");
+        let kind = match prokind.as_str() {
+            "f" => "function",
+            "p" => "procedure",
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        };
+        routines.push(RoutineDoc {
+            name: r.get("proname"),
+            kind: kind.to_owned(),
+            language: Some(r.get("lanname")),
+            body: r.get::<Option<String>, _>("def"),
+            signature: Some(r.get("sig")),
+        });
+    }
+    if skipped > 0 {
+        limitations.push(format!(
+            "{schema}: aggregate/window 함수 {skipped}개는 routine이 아니라 수집하지 않음"
+        ));
+    }
+    Ok(routines)
+}
+
+/// 컬렉션 정렬 — 결정적 출력 계약.
+fn sort_all(objects: &mut [ObjectDoc], routines: &mut [RoutineDoc]) {
+    objects.sort_by(|a, b| a.name.cmp(&b.name));
+    routines.sort_by(|a, b| a.name.cmp(&b.name).then(a.signature.cmp(&b.signature)));
+    for obj in objects.iter_mut() {
+        obj.columns.sort_by_key(|c| c.ordinal);
+        obj.constraints.sort_by(|a, b| a.name.cmp(&b.name));
+        obj.indexes.sort_by(|a, b| a.name.cmp(&b.name));
+        obj.triggers.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+}
