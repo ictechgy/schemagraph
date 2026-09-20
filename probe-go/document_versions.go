@@ -20,29 +20,33 @@ type documentProducer struct {
 }
 
 type documentV2 struct {
-	Version          int              `json:"version"`
-	Dialect          string           `json:"dialect"`
-	Producer         documentProducer `json:"producer"`
-	RequiredFeatures []string         `json:"required_features"`
-	Schemas          []SchemaDoc      `json:"schemas"`
-	Limitations      []string         `json:"limitations"`
+	Version          int                 `json:"version"`
+	Dialect          string              `json:"dialect"`
+	Producer         documentProducer    `json:"producer"`
+	RequiredFeatures []string            `json:"required_features"`
+	Schemas          []SchemaDoc         `json:"schemas"`
+	Limitations      []string            `json:"limitations"`
+	Context          *CollectionContext  `json:"context,omitempty"`
+	Dependencies     []CatalogDependency `json:"dependencies,omitempty"`
 }
 
 type ndjsonDocumentV1 struct {
-	Type        string   `json:"type"`
-	Version     int      `json:"version"`
-	Dialect     string   `json:"dialect"`
-	Reader      string   `json:"reader"`
-	Limitations []string `json:"limitations"`
+	Type        string             `json:"type"`
+	Version     int                `json:"version"`
+	Dialect     string             `json:"dialect"`
+	Reader      string             `json:"reader"`
+	Limitations []string           `json:"limitations"`
+	Context     *CollectionContext `json:"context,omitempty"`
 }
 
 type ndjsonDocumentV2 struct {
-	Type             string           `json:"type"`
-	Version          int              `json:"version"`
-	Dialect          string           `json:"dialect"`
-	Producer         documentProducer `json:"producer"`
-	RequiredFeatures []string         `json:"required_features"`
-	Limitations      []string         `json:"limitations"`
+	Type             string             `json:"type"`
+	Version          int                `json:"version"`
+	Dialect          string             `json:"dialect"`
+	Producer         documentProducer   `json:"producer"`
+	RequiredFeatures []string           `json:"required_features"`
+	Limitations      []string           `json:"limitations"`
+	Context          *CollectionContext `json:"context,omitempty"`
 }
 
 // encodeDocument은 JSON과 NDJSON 모두에 같은 v1/v2 envelope 규칙을 적용한다.
@@ -76,6 +80,7 @@ func encodeDocumentJSON(doc CatalogDocument, version int) ([]byte, error) {
 			Producer:         documentProducer{Name: doc.Reader},
 			RequiredFeatures: documentFeatures(doc),
 			Schemas:          doc.Schemas, Limitations: doc.Limitations,
+			Context: doc.Context, Dependencies: doc.Dependencies,
 		}
 	}
 	encoded, err := json.MarshalIndent(value, "", "  ")
@@ -101,6 +106,7 @@ func encodeDocumentNDJSON(doc CatalogDocument, version int) ([]byte, error) {
 		if err := line(ndjsonDocumentV1{
 			Type: "document", Version: version, Dialect: doc.Dialect,
 			Reader: doc.Reader, Limitations: []string{},
+			Context: doc.Context,
 		}); err != nil {
 			return nil, err
 		}
@@ -108,6 +114,7 @@ func encodeDocumentNDJSON(doc CatalogDocument, version int) ([]byte, error) {
 		Type: "document", Version: version, Dialect: doc.Dialect,
 		Producer:         documentProducer{Name: doc.Reader},
 		RequiredFeatures: documentFeatures(doc), Limitations: []string{},
+		Context: doc.Context,
 	}); err != nil {
 		return nil, err
 	}
@@ -131,6 +138,11 @@ func encodeDocumentNDJSON(doc CatalogDocument, version int) ([]byte, error) {
 			}
 		}
 	}
+	for _, dependency := range doc.Dependencies {
+		if err := line(map[string]any{"type": "dependency", "data": dependency}); err != nil {
+			return nil, err
+		}
+	}
 	if err := line(map[string]any{"type": "limitations", "data": doc.Limitations}); err != nil {
 		return nil, err
 	}
@@ -152,6 +164,9 @@ func documentFeatures(doc CatalogDocument) []string {
 		}
 	}
 	features := make([]string, 0, 2)
+	if len(doc.Dependencies) > 0 {
+		features = append(features, "catalog-dependencies-v1")
+	}
 	if members {
 		features = append(features, "package-members-v1")
 	}

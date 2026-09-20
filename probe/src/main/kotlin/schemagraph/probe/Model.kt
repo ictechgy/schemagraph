@@ -16,6 +16,35 @@ data class CatalogDocument(
     val reader: String,
     val schemas: List<SchemaDoc>,
     val limitations: List<String>,
+    val context: CollectionContext? = null,
+    @get:JsonInclude(JsonInclude.Include.NON_EMPTY)
+    val dependencies: List<CatalogDependency> = emptyList(),
+)
+
+/** 논리적인 수집 범위만 기록하며 연결 URL과 인증정보는 포함하지 않는다. */
+data class CollectionContext(
+    val sourceId: String,
+    val database: String? = null,
+    val schemaFilter: List<String>? = null,
+    val catalogComplete: Boolean,
+)
+
+/** DB가 제공한 이름을 보존하며 실제 그래프 id 해석은 엔진에 맡긴다. */
+data class CatalogObjectRef(
+    val schema: String,
+    val name: String,
+    val kind: String? = null,
+    val member: String? = null,
+    val signature: String? = null,
+    val database: String? = null,
+)
+
+/** 카탈로그의 참조 사실을 그대로 전달한다. 읽기/쓰기 간선은 생성하지 않는다. */
+data class CatalogDependency(
+    val source: CatalogObjectRef,
+    val target: CatalogObjectRef,
+    val catalog: String,
+    val dependencyType: String,
 )
 
 data class SchemaDoc(
@@ -62,6 +91,9 @@ data class IndexDoc(
     val unique: Boolean,
     val columns: List<String>,
     val usage: UsageDoc? = null,
+    val definitionComplete: Boolean? = null,
+    val hasPredicate: Boolean? = null,
+    val predicate: String? = null,
 )
 
 /**
@@ -91,6 +123,8 @@ data class RoutineDoc(
     val usage: UsageDoc? = null,
     /** 패키지 멤버면 부모 패키지 이름 — 독립 routine이면 null. */
     val memberOf: String? = null,
+    /** 외부 SQL 생산자가 제공할 때만 상대 경로를 옮긴다. */
+    val source: String? = null,
 )
 
 // serde_json::to_string_pretty와 같은 모양: snake_case 키, null 키 생략,

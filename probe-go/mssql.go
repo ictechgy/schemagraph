@@ -179,6 +179,9 @@ func (h *harvester) streamMSSQL(stream *ndjsonStreamWriter) error {
 		if err := stream.schema(h.mssqlSchema(schema)); err != nil {
 			return err
 		}
+		if err := h.streamDependencies(stream, schema); err != nil {
+			return err
+		}
 	}
 	return nil
 }

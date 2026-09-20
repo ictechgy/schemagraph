@@ -28,6 +28,8 @@ usage: schemagraph-probe --url <jdbc-url> [options]
   -o, --output <path>  catalog document path (default: catalog.json, '-' stdout)
   --format <json|ndjson>  output format (default: json — ndjson은 행 단위 스트리밍)
   --document-version <1|2>  catalog wire version (default: 1)
+  --catalog-dependencies   collect DB dependency catalog facts (PostgreSQL/Oracle/SQL Server)
+  --source-id <label>      logical source label for comparing snapshots (never a URL)
   -h, --help           this help
 """
 
@@ -63,7 +65,7 @@ fun main(args: Array<String>) {
             DriverManager.getConnection(url, props).use { conn ->
                 val writer = if (opts.output == "-") System.out.bufferedWriter()
                     else File(opts.output).bufferedWriter()
-                Extractor(conn, dialect, opts.schemas).extractStreaming(opts.documentVersion) { line ->
+                Extractor(conn, dialect, opts.schemas, opts.catalogDependencies, opts.sourceId).extractStreaming(opts.documentVersion) { line ->
                     writer.write(line)
                     writer.newLine()
                 }
@@ -76,7 +78,7 @@ fun main(args: Array<String>) {
     if (opts.format != "json") fatal("--format은 json|ndjson 중 하나다: ${opts.format}")
     val doc = runCatching {
         DriverManager.getConnection(url, props).use { conn ->
-            Extractor(conn, dialect, opts.schemas).extract()
+            Extractor(conn, dialect, opts.schemas, opts.catalogDependencies, opts.sourceId).extract()
         }
     }.getOrElse { fatal("추출 실패: ${it.message}") }
 
@@ -100,6 +102,8 @@ private data class Opts(
     var output: String = "catalog.json",
     var format: String = "json",
     var documentVersion: Int = 1,
+    var catalogDependencies: Boolean = false,
+    var sourceId: String = "",
     var help: Boolean = false,
 )
 
@@ -116,6 +120,8 @@ private fun parseArgs(args: Array<String>): Opts {
             "--driver" -> o.driverJars = next(a).split(',').filter { it.isNotBlank() }
             "--driver-class" -> o.driverClass = next(a)
             "--schema" -> o.schemas = next(a).split(',').filter { it.isNotBlank() }
+            "--catalog-dependencies" -> o.catalogDependencies = true
+            "--source-id" -> o.sourceId = next(a).also { value -> if (!value.matches(Regex("[A-Za-z0-9_.\\-/]{1,128}"))) fatal("source id must be a logical label, not a connection URL") }
             "-o", "--output" -> o.output = next(a)
             "--format" -> o.format = next(a)
             "--document-version" -> o.documentVersion = next(a).toIntOrNull()?.takeIf { it in 1..2 }

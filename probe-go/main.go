@@ -33,11 +33,13 @@ const documentVersion = 1
 // ---- document.rs / probe Model.kt와 1:1 대응하는 와이어 타입 ----
 
 type CatalogDocument struct {
-	Version     int         `json:"version"`
-	Dialect     string      `json:"dialect"`
-	Reader      string      `json:"reader"`
-	Schemas     []SchemaDoc `json:"schemas"`
-	Limitations []string    `json:"limitations"`
+	Version      int                 `json:"version"`
+	Dialect      string              `json:"dialect"`
+	Reader       string              `json:"reader"`
+	Schemas      []SchemaDoc         `json:"schemas"`
+	Limitations  []string            `json:"limitations"`
+	Context      *CollectionContext  `json:"context,omitempty"`
+	Dependencies []CatalogDependency `json:"dependencies,omitempty"`
 }
 
 type SchemaDoc struct {
@@ -80,10 +82,13 @@ type ReferencedDoc struct {
 }
 
 type IndexDoc struct {
-	Name    string    `json:"name"`
-	Unique  bool      `json:"unique"`
-	Columns []string  `json:"columns"`
-	Usage   *UsageDoc `json:"usage,omitempty"`
+	Name               string    `json:"name"`
+	Unique             bool      `json:"unique"`
+	Columns            []string  `json:"columns"`
+	Usage              *UsageDoc `json:"usage,omitempty"`
+	DefinitionComplete *bool     `json:"definition_complete,omitempty"`
+	HasPredicate       *bool     `json:"has_predicate,omitempty"`
+	Predicate          *string   `json:"predicate,omitempty"`
 }
 
 type UsageDoc struct {
@@ -108,7 +113,10 @@ type RoutineDoc struct {
 	Usage     *UsageDoc `json:"usage,omitempty"`
 	// 패키지 멤버면 부모 패키지 이름 — Kotlin RoutineDoc.memberOf와 같은 키.
 	MemberOf *string `json:"member_of,omitempty"`
+	Source   *string `json:"source,omitempty"`
 }
+
+func boolValue(value bool) *bool { return &value }
 
 // Oracle 카탈로그가 노출하는 시스템 스키마 — probe/Extractor.kt의 목록과 동일.
 // PUBLIC은 시노님이 수천 개라 커서를 고갈시킨다 — 항상 억제한다.
@@ -124,11 +132,16 @@ var systemSchemas = map[string]bool{
 }
 
 type harvester struct {
-	db           *sql.DB
-	dialect      string
-	schemaFilter map[string]bool
-	limitations  []string
-	activeSchema *string
+	db                  *sql.DB
+	dialect             string
+	schemaFilter        map[string]bool
+	limitations         []string
+	activeSchema        *string
+	catalogDependencies bool
+	catalogIncomplete   bool
+	sourceID            string
+	databaseName        *string
+	contextReady        bool
 }
 
 // bestEffort — 수확 실패를 limitation으로 변환한다. Kotlin Extractor의 규칙과
@@ -140,6 +153,7 @@ func (h *harvester) bestEffort(label, query string, row func(rows *sql.Rows) err
 func (h *harvester) bestEffortArgs(label, query string, args []any, row func(rows *sql.Rows) error) {
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
+		h.catalogIncomplete = true
 		h.limitations = append(h.limitations,
 			fmt.Sprintf("%s 원문 미수확(%s) — 간선이 빠질 수 있다", label, oneLine(err.Error())))
 		return
@@ -147,12 +161,14 @@ func (h *harvester) bestEffortArgs(label, query string, args []any, row func(row
 	defer rows.Close()
 	for rows.Next() {
 		if err := row(rows); err != nil {
+			h.catalogIncomplete = true
 			h.limitations = append(h.limitations,
 				fmt.Sprintf("%s 행 읽기 실패(%s) — 간선이 빠질 수 있다", label, oneLine(err.Error())))
 			return
 		}
 	}
 	if err := rows.Err(); err != nil {
+		h.catalogIncomplete = true
 		h.limitations = append(h.limitations,
 			fmt.Sprintf("%s 원문 미수확(%s) — 간선이 빠질 수 있다", label, oneLine(err.Error())))
 	}
@@ -177,13 +193,24 @@ func ns(s sql.NullString) *string {
 
 func main() {
 	var (
-		rawURL      = flag.String("url", "", "sqlite:, postgres://, mysql://, oracle://, sqlserver://")
-		schemaArg   = flag.String("schema", "", "comma-separated schema allowlist (default: non-system schemas)")
-		output      = flag.String("o", "catalog.json", "output path ('-' for stdout)")
-		format      = flag.String("format", "json", "json | ndjson")
-		wireVersion = flag.Int("document-version", 1, "catalog wire version: 1 or 2")
+		rawURL              = flag.String("url", "", "sqlite:, postgres://, mysql://, oracle://, sqlserver://")
+		schemaArg           = flag.String("schema", "", "comma-separated schema allowlist (default: non-system schemas)")
+		output              = flag.String("o", "catalog.json", "output path ('-' for stdout)")
+		format              = flag.String("format", "json", "json | ndjson")
+		wireVersion         = flag.Int("document-version", 1, "catalog wire version: 1 or 2")
+		catalogDependencies = flag.Bool("catalog-dependencies", false, "collect DB dependency catalog facts")
+		sourceID            = flag.String("source-id", "", "logical source label for snapshot comparison (never a URL)")
 	)
 	flag.Parse()
+	sourceIDProvided := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "source-id" {
+			sourceIDProvided = true
+		}
+	})
+	if sourceIDProvided && !validSourceID(*sourceID) {
+		fatal("invalid source label", fmt.Errorf("use a logical label, not a connection URL"))
+	}
 	if *rawURL == "" {
 		fatal("connection URL is required", fmt.Errorf("set --url to a supported database URL"))
 	}
@@ -205,7 +232,7 @@ func main() {
 	if err := db.Ping(); err != nil {
 		fatal("database connection failed", err)
 	}
-	h := &harvester{db: db, dialect: spec.dialect, schemaFilter: map[string]bool{}}
+	h := &harvester{db: db, dialect: spec.dialect, schemaFilter: map[string]bool{}, catalogDependencies: *catalogDependencies, sourceID: *sourceID}
 	h.configureReadOnly()
 	if *schemaArg == "" && spec.schema != "" {
 		h.schemaFilter[spec.schema] = true
@@ -258,7 +285,7 @@ func fatal(msg string, err error) {
 
 func sortedDistinct(in []string) []string {
 	seen := map[string]bool{}
-	out := in[:0]
+	out := make([]string, 0, len(in))
 	for _, s := range in {
 		if !seen[s] {
 			seen[s] = true
@@ -270,6 +297,19 @@ func sortedDistinct(in []string) []string {
 }
 
 func (h *harvester) extract() CatalogDocument {
+	h.prepareCollectionContext()
+	doc := h.extractCatalog()
+	if h.catalogDependencies {
+		for _, schema := range doc.Schemas {
+			doc.Dependencies = append(doc.Dependencies, h.readCatalogDependencies(schema.Name)...)
+		}
+	}
+	doc.Context = h.collectionContext(true)
+	doc.Limitations = sortedDistinct(h.limitations)
+	return doc
+}
+
+func (h *harvester) extractCatalog() CatalogDocument {
 	switch h.dialect {
 	case "postgres":
 		return h.extractPostgres()

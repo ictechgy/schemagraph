@@ -10,7 +10,7 @@ plugins {
 }
 
 group = providers.gradleProperty("probeGroup").orElse("io.github.ictechgy").get()
-version = providers.gradleProperty("probeVersion").orElse("0.3.0").get()
+version = providers.gradleProperty("probeVersion").orElse("0.4.0").get()
 
 repositories {
     mavenCentral()
@@ -82,6 +82,11 @@ tasks.named<Jar>("javadocJar") {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+// 카탈로그 조회문은 Rust source의 정본을 패키징해 JDBC와 의미가 갈라지지 않게 한다.
+tasks.processResources {
+    from("../engine/source/src/sql") { into("catalog") }
 }
 
 tasks.withType<AbstractArchiveTask>().configureEach {

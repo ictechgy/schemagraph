@@ -91,6 +91,14 @@ func sqliteConnection(raw string) (connectionSpec, error) {
 
 // 연결 하나로 고정해 읽기 전용 세션 설정이 모든 카탈로그 조회에 적용되게 한다.
 func (h *harvester) configureReadOnly() {
+	if h.dialect == "postgres" {
+		h.db.SetMaxOpenConns(1)
+		// 서버가 반환하는 뷰 정의를 스키마 한정 이름으로 고정한다.
+		if _, err := h.db.Exec("SET search_path = pg_catalog"); err != nil {
+			h.catalogIncomplete = true
+			h.limitations = append(h.limitations, "PostgreSQL definition namespace could not be pinned; object resolution may be incomplete")
+		}
+	}
 	var statements []string
 	switch h.dialect {
 	case "sqlite":
