@@ -4,6 +4,19 @@
 
 ## 지금 상태
 
+- 2026-09-20: **v0.1.0 배포 검증 완료, crates.io 인증 대기** (`f55b837`).
+  CLI의 `include_str!`가 크레이트 밖의 스킬 파일을 읽던 패키징 결함을 수정했다.
+  원본 `skills/schemagraph/SKILL.md`와 패키지용 `engine/cli/SKILL.md`는 같은
+  내용을 유지해야 한다. 6개 크레이트가 영어 README를 상속하며 각 패키지에
+  MIT·Apache 라이선스 사본을 포함한다. 라이선스 원문을 바꾸면 사본도 갱신한다.
+  Rust 빌드·테스트·fmt, JDBC shadowJar, 전체 DB fixture(건너뜀 0), 6개
+  크레이트의 격리 패키지 빌드와 `cargo publish --workspace --dry-run --locked`가
+  통과했다. **Cargo 1.96에서는 workspace dry-run이 임시 레지스트리로 미게시
+  형제 의존성을 검증할 수 있다.** 실제 게시 요청은 첫 크레이트에서
+  `403 authentication failed`로 거절됐으며 게시된 크레이트는 없다.
+  로컬 `cargo login`으로 인증을 갱신한 뒤 아래 게시 명령을 재실행하고,
+  레지스트리 설치 검증·GitHub 릴리스를 마무리한다. 배포 준비 커밋은 개발
+  브랜치에만 올리고 `main`과 버전 태그는 실제 게시 성공 후 갱신한다.
 - 2026-09-20: **공개 GitHub 저장소 생성** —
   [ictechgy/schemagraph](https://github.com/ictechgy/schemagraph).
   공개 기본 브랜치는 `main`, 개발 브랜치는 `feature/p0-engine`이다.
@@ -281,11 +294,12 @@ Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + 
 
 ## 다음 할 일
 
-1. crates.io 실게시 — `schemagraph*` 이름 모두 비어 있음(2026-09-19
-   확인). 메타데이터·LICENSE·path 버전은 준비됐고 `schemagraph-core`
-   dry-run 통과. 미게시 형제는 dry-run 해석이 불가하므로 의존 순서
-   (core → source → parser/analysis → export → cli)대로 실게시해야 한다.
-   GitHub 공개 저장소와 `repository` 필드는 준비됐다.
+1. crates.io 인증 갱신 후 실게시 — 6개 크레이트 전체 검증은 끝났으며,
+   첫 업로드가 인증 실패로 거절돼 아직 미게시 상태다. `cargo login` 후
+   `cargo publish --manifest-path engine/Cargo.toml --workspace --locked`로
+   의존 순서대로 게시한다. 이어서 `cargo install schemagraph-cli --version
+   0.1.0 --locked`로 레지스트리 설치를 검증하고 `main`·`v0.1.0` 릴리스를
+   갱신한다. GitHub 저장소 URL과 게시용 README·LICENSE는 준비됐다.
 2. routine 파싱 잔여 — T-SQL `TRY/CATCH`·`EXEC`·`WHILE`·커서는 복구됐고
    남은 건 추출기가 못 가르는 드물고 동적인 구문뿐. 패키지 멤버 귀속은
    완료 — 남은 것은 멤버 경계가 모호한 경우의 추가 정밀도뿐이다.
