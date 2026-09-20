@@ -102,7 +102,7 @@ func (h *harvester) sqliteObjects(schema string) []sqliteObject {
 	})
 	if inlineConstraints {
 		h.limitations = append(h.limitations,
-			"DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (인라인 제약 파싱 미지원)")
+			"inline UNIQUE/CHECK constraints are not exposed by the catalog; inline DDL constraint parsing is unsupported")
 	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].name < objects[j].name })
 	return objects
@@ -252,7 +252,7 @@ func (h *harvester) sqliteTriggers(schema string, objects []ObjectDoc) {
 		table := sqliteString(v, "tbl_name")
 		obj := byName[table]
 		if obj == nil {
-			h.limitations = append(h.limitations, fmt.Sprintf("trigger %s.%s의 대상 %s을 스캔에서 찾지 못함", schema, sqliteString(v, "name"), table))
+			h.limitations = append(h.limitations, fmt.Sprintf("trigger %s.%s targets %s, which is missing from the scanned catalog", schema, sqliteString(v, "name"), table))
 			return nil
 		}
 		obj.Triggers = append(obj.Triggers, TriggerDoc{Name: sqliteString(v, "name"), Body: sqliteStringPtr(v, "sql")})

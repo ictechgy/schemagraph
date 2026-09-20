@@ -632,7 +632,9 @@ fn parse_trigger_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<Parse
             // 절차형 추출기로 다시 읽어야 한다. trigger의 EXECUTE FUNCTION은
             // 위에서 calls를 이미 채취했으므로 예외로 둔다.
             if parsed.calls.is_empty() && needs_procedural_recovery(body) {
-                return Err("절차형 변수·동적 SQL 추출이 필요함".to_owned());
+                return Err(
+                    "procedural variables or dynamic SQL require statement extraction".to_owned(),
+                );
             }
             for stmt in &stmts {
                 collect_trigger_stmt(stmt, &mut parsed);
@@ -2570,7 +2572,7 @@ fn note_ignored_relations(from: &VertexId, relations: &BTreeSet<String>, notes: 
         return;
     }
     notes.push(format!(
-        "{from}: database 한정 관계 {}건은 catalog identity가 없어 간선 생략 ({})",
+        "{from}: skipped {} database-qualified relations without catalog identities ({})",
         relations.len(),
         relations.iter().cloned().collect::<Vec<_>>().join(", ")
     ));
