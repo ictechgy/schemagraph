@@ -1,151 +1,195 @@
 # schemagraph
 
-schemagraph builds a dependency graph of a database schema — tables, columns,
-views, routines, triggers, foreign keys — and answers **judgment queries** on it:
+English is the canonical version of this README. [한국어 참고 번역](README.ko.md)
 
-- `impact` — what breaks if this column or table is changed or dropped
-- `cycles` — circular dependencies (delete ordering, batch deadlock analysis)
-- `dead` — objects nothing reaches inside the database (candidates, never verdicts)
-- `rules` — team architecture rules evaluated over the schema graph
-- `query` — who uses this / what does it use (deterministic JSON, agent-first)
+schemagraph builds a dependency graph of a database schema and helps you assess
+the effects of a schema change. It combines declared foreign keys with
+`reads`, `writes`, and `calls` dependencies extracted from view, routine, and
+trigger bodies.
 
-Most schema tools stop at diagrams and documentation. schemagraph goes further
-in two ways: it parses view/routine/trigger **bodies** — not only declared
-foreign keys — to build `reads`/`writes`/`calls` edges, and it emits
-deterministic JSON designed for coding agents, reporting graph facts and
-evidence rather than verdicts ("unreachable", never "safe to drop").
+**The graph is the artifact; analysis runs as queries over it.** Scan once,
+then inspect dependencies, trace impact, find cycles, check architecture
+rules, or compare snapshots without reconnecting to the database. Reports
+use deterministic JSON for scripts and coding agents; diagrams are available
+as Mermaid and Graphviz DOT.
 
-## Architecture
+## Quick start
 
-A Rust engine (graph model, `sqlparser-rs` body parsing, analysis, CLI) consumes
-a single versioned **catalog document**. Documents are produced by built-in
-native readers (PostgreSQL, MySQL, SQLite via `sqlx`) or — from phase P2 — by an
-external JDBC probe (Kotlin) that reaches any database with a JDBC driver.
+Clone the repository, then install the CLI with Rust and Cargo:
 
-```
-DB ──native/sqlx──┐
-                  ├──> catalog document ──> graph ──> judgment queries
-DB ──jdbc probe───┘        (versioned contract)
+```sh
+git clone https://github.com/ictechgy/schemagraph.git
+cd schemagraph
+cargo install --path engine/cli --locked
 ```
 
-The engine never touches a database directly; the probe is a dumb extractor
-that moves catalog rows and body text. Parse failures are measured and
-reported in `limitations`, not hidden.
+With `schemagraph` on your `PATH` and the `sqlite3` CLI installed, try the
+included fixture. It creates a sample database in a new temporary directory:
 
-## JDBC probe (any database with a driver)
+```sh
+sg_demo_dir="$(mktemp -d)"
+sqlite3 "$sg_demo_dir/shop.db" < Fixtures/sqlite/basic.sql
 
-For databases without a native reader, `probe/` builds a fat jar that emits
-the same versioned catalog document over JDBC:
-
-```
-gradle -p probe shadowJar
-java -jar probe/build/libs/schemagraph-probe-all.jar \
-    --url jdbc:h2:file:/tmp/mydb -o catalog.json
-schemagraph scan --document catalog.json -o graph.json
+schemagraph scan "sqlite:$sg_demo_dir/shop.db" -o "$sg_demo_dir/shop.graph.json"
+schemagraph query main.orders --graph "$sg_demo_dir/shop.graph.json"
+schemagraph impact main.customers --graph "$sg_demo_dir/shop.graph.json"
+schemagraph graph --graph "$sg_demo_dir/shop.graph.json" --format mermaid
 ```
 
-Bundled drivers: PostgreSQL, H2, SQLite, MSSQL (permissive licenses only —
-MIT/BSD/Apache). Oracle (`ojdbc`, OTN) and MySQL (GPL) drivers are supplied
-externally via `--driver /path/to.jar` (and `--driver-class` when
-ServiceLoader can't find the implementation).
+The fixture includes a foreign-key chain, a view, a trigger, and dependency
+cycles. `query main.orders` shows its dependency on `main.customers`;
+`impact main.customers` also reaches the view and trigger that use it.
 
-`DatabaseMetaData` provides the portable baseline (schemas, tables, columns,
-PK/FK, indexes); view/trigger/routine bodies are harvested best-effort from
-dialect-specific catalogs — `INFORMATION_SCHEMA` where it exists,
-`sys.sql_modules` on MSSQL (its INFORMATION_SCHEMA truncates bodies at 4000
-chars), `ALL_*`/`ALL_SOURCE` on Oracle, `sqlite_master` on SQLite — with
-failures reported in `limitations`.
+## Database support
 
-Dialect notes:
+| Database | Native reader | JDBC probe | Go probe |
+| --- | --- | --- | --- |
+| SQLite | Yes | Bundled driver | — |
+| PostgreSQL | Yes | Bundled driver | — |
+| MySQL / MariaDB | Yes | External MySQL driver | — |
+| SQL Server | — | Bundled driver | Yes |
+| Oracle | — | External Oracle driver | Yes |
+| H2 | — | Bundled driver | — |
+| Other JDBC databases | — | Metadata baseline, with a compatible driver | — |
 
-- **MSSQL** — routines come from `sys.objects` + `sys.parameters` (JDBC
-  metadata mislabels them and appends `;N` numbered-procedure suffixes,
-  which the probe normalizes away). T-SQL bodies parse through
-  `MsSqlDialect` with a statement-extractor fallback — `IF`/`TRY`/`EXEC`/
-  `WHILE`/cursor scaffolding is consumed and the SQL inside is recovered
-  statement by statement; `inserted`/`deleted` pseudo-tables land in
-  `limitations`.
-- **Oracle** — `ALL_*` + `ALL_SOURCE`; `PUBLIC` synonyms and Database Vault
-  schemas are suppressed (they would exhaust cursors, ORA-01000). Unquoted
-  identifiers fold to uppercase, so lowercase body references resolve to
-  UPPERCASE vertices case-insensitively; genuinely ambiguous case
-  collisions are reported, never guessed. Package members are harvested
-  with `member_of` — each member becomes a `schema.package.member` vertex
-  under a `contains` edge, member bodies attribute edges to the member,
-  and `pkg.member()` calls resolve to it. Members the body slicer cannot
-  bound are kept with a limitation, never guessed.
-- **SQLite** — JDBC `TABLE_SCHEM`/`TABLE_CAT` come back null, so objects map
-  to `main`; bodies come from `sqlite_master` (same source as the native
-  reader → vertex and edge parity, verified).
-- **MariaDB** — reachable via `jdbc:mysql://` with an external MySQL
-  driver; `performance_schema=OFF` (the default) is reported as a
-  limitation, not silently read as zero usage.
+Native readers accept `sqlite:PATH`, `postgres://…` (or `postgresql://…`),
+and `mysql://…`. MariaDB uses `mysql://`; MySQL X Protocol (`mysqlx://`) is
+unsupported. JDBC URLs go to the probe, whose output the CLI reads with
+`scan --document`.
 
-On SQLite, MySQL and MariaDB the probe's dependency edges match the native
-reader's exactly.
-
-`--format ndjson` streams the document as newline-delimited JSON — a
-`document` header (with an empty `limitations`), then per-schema
-`schema`/`object`/`routine` rows emitted as each schema is harvested, and
-a final `limitations` record carrying whatever was found along the way.
-`scan --document` detects the format automatically, so large catalogs are
-never held as one JSON value on either side.
-
-### Go probe (no JVM — Oracle, SQL Server)
-
-`probe-go/` builds a single static binary covering Oracle via the pure-Go
-`go-ora` driver and SQL Server via `go-mssqldb` — the paths where the JVM
-probe still needs an external jar (OTN-licensed `ojdbc`, Microsoft's
-`mssql-jdbc`):
-
-```
-cd probe-go && go build -o schemagraph-probe-go .
-./schemagraph-probe-go --url oracle://u:p@host:1521/FREEPDB1 -o catalog.json
-./schemagraph-probe-go --url "sqlserver://u:p@host:1433?database=db" -o catalog.json
-```
-
-Harvest semantics mirror the Kotlin probe's branches (`ALL_*` +
-`ALL_SOURCE`, `sys.*` + `sys.sql_modules`); on the same database each
-produces a graph identical to the JVM probe (verified live on both).
+The JDBC baseline collects schemas, tables, columns, keys, indexes, and
+routine metadata exposed by the driver. Body and usage collection depend on
+the database dialect, permissions, and available catalogs. Collection gaps
+are reported in `limitations`.
 
 ## Commands
 
+`scan` writes `graph.json` by default. Commands that query or render a graph
+read that file by default; use `--graph <path>` to select another snapshot.
+
+| Command | Purpose |
+| --- | --- |
+| `scan <url>` | Collect a catalog and build the dependency graph. |
+| `scan --document <path>` | Build a graph from a JSON or NDJSON catalog document. |
+| `graph --format mermaid\|json\|dot` | Render the graph; select `--level schema\|object\|column`. |
+| `query <name> --depth N` | List dependencies and dependents, with supporting edges. |
+| `impact <name>` | Trace dependents that may be affected by a change. |
+| `cycles` | Report dependency cycles and self-loops. |
+| `dead` | Report candidate views and routines with no remaining dependents in the database graph. |
+| `stats` | List collected usage evidence and collection coverage. |
+| `rules --config <path>` | Check dependency edges against TOML rules. |
+| `diff <old> <new>` | Compare two graph snapshots or two catalog documents in JSON format. |
+| `skill` | Print the output contract and usage guide for coding agents. |
+
+`cycles`, `dead`, `rules`, and `diff` accept `--strict`: the command still
+prints its report but exits with code **1** when it finds cycles,
+candidates, violations, or differences, respectively. `query` and `impact`
+also exit **1** when a name cannot be resolved. Usage and engine errors exit
+**2**. Use `schemagraph <command> --help` for all options.
+
+`scan --inferred` adds optional naming-based guesses for undeclared `*_id`
+references. Declared foreign keys take precedence, and ambiguous matches
+are reported in `limitations`. Inferred edges remain separate from dependency
+evidence and do not affect dependency queries or rule checks.
+
+## Probes
+
+### JDBC: Kotlin / JVM
+
+Build with Gradle and JDK 17. This example scans an existing SQLite database:
+
+```sh
+gradle -p probe shadowJar
+java -jar probe/build/libs/schemagraph-probe-all.jar \
+    --url jdbc:sqlite:/path/to/database.db -o catalog.json
+schemagraph scan --document catalog.json -o graph.json
 ```
-schemagraph scan <url> [-o graph.json]   # sqlite:PATH, postgres://…, mysql://…
-schemagraph scan --document catalog.json # probe output (json|ndjson) → graph
-schemagraph scan <url> --inferred        # add naming-heuristic `inferred` edges
-schemagraph graph --format mermaid|json|dot [--level schema|object|column]
-schemagraph query <object> [--depth N]
-schemagraph impact <object>
-schemagraph cycles [--level object|column] [--strict]
-schemagraph dead [--strict]
-schemagraph stats                          # collected usage evidence
-schemagraph rules [--config schemagraph.toml] [--strict]
-schemagraph diff <old> <new> [--strict]  # graph↔graph or document↔document delta
-schemagraph skill                          # agent skill document (stdout)
+
+PostgreSQL, H2, SQLite, and SQL Server drivers are bundled. Supply other
+drivers with `--driver /path/to/driver.jar`; add `--driver-class` if automatic
+driver discovery fails. MySQL and Oracle drivers are supplied externally.
+
+Use `--user` for the database user and `SG_DB_PASSWORD` for the password.
+`--schema app,reporting` restricts collection to the named schemas; by
+default, the probe collects non-system schemas.
+
+### Go: Oracle and SQL Server
+
+The Go probe uses `go-ora` and `go-mssqldb` and runs without a JVM or JDBC
+jars. Use a Go toolchain compatible with [probe-go/go.mod](probe-go/go.mod):
+
+```sh
+(cd probe-go && go build -o schemagraph-probe-go .)
+./probe-go/schemagraph-probe-go --url "$SG_DATABASE_URL" -o catalog.json
+schemagraph scan --document catalog.json -o graph.json
 ```
 
-`--strict` exits 1 when findings are reported, for CI gates.
+Set `SG_DATABASE_URL` to an Oracle (`oracle://…`) or SQL Server
+(`sqlserver://…`) connection URL. The probe also accepts `--schema` and
+`--format json|ndjson`. The fixture suite compares its graphs with those
+produced by the JDBC probe on Oracle and SQL Server.
 
-`--inferred` adds opt-in `inferred` edges: undeclared `*_id` columns whose
-name matches a same-schema table (`products`, `product`→`products`, `ies`
-plurals) with an `id` column. Declared FKs always win, ambiguous candidates
-are skipped and counted in `limitations`, and inferred edges carry
-`EvidenceLayer::inferred` — they never feed `impact`, `cycles`, `dead`, or
-any dependency query.
+### Document formats
 
-## Rules file
+Both probes emit JSON by default and accept `--format ndjson`.
+`scan --document` detects either format automatically. NDJSON uses a
+`document` header, `schema` / `object` / `routine` records, and a final
+`limitations` record.
 
-`schemagraph rules` reads a TOML file (default `schemagraph.toml`). Each rule
-forbids dependency edges matching a `from` glob → `to` glob; `*` covers any
-characters including dots, `?` covers exactly one.
+The JDBC probe emits NDJSON one schema at a time. The Go probe currently
+collects the full document before serialization, and the Rust CLI reads the
+entire input file before constructing the graph. NDJSON therefore does not
+provide bounded memory use throughout the pipeline.
+
+## Interpreting results
+
+Reports describe the dependencies captured in the graph. Application
+queries are outside that graph, so `dead` candidates are **not deletion
+recommendations**. Tables are never `dead` candidates; views, materialized
+views, functions, procedures, and packages can be.
+
+- **Evidence and gaps:** reports carry `limitations` for observed collection
+  and parsing gaps. Unsupported routine languages, unresolved references,
+  and ambiguous names are reported without inventing target vertices.
+- **Partial results:** `query`, `impact`, and `dead` report `truncated` when
+  results are cut short by a result limit. Check it alongside `limitations`
+  before treating a result as complete.
+- **Stable output:** the same input document produces the same graph.
+  Live scans can differ as catalog contents and usage statistics change.
+- **Body coverage:** views and triggers yield table and column dependencies.
+  SQL routines, PL/pgSQL, PL/SQL, and T-SQL have body parsing or statement
+  extraction support, including Oracle package members. Dynamic SQL and
+  nested column scopes can leave gaps, which are reported.
+
+### Usage evidence
+
+PostgreSQL supplies table, index, and routine statistics. MySQL and MariaDB
+supply table statistics and unused-index observations where their statistics
+catalogs are available. `stats` lists the observations; `dead` includes
+available usage evidence with each candidate.
+
+Missing `usage` means no observation was collected. A present record with
+`reads: 0` means zero was observed during the collection window. Read it with
+its `since` timestamp; usage alone cannot establish that an object is unused.
+Disabled statistics, such as `track_functions=none` or
+`performance_schema=OFF`, are reported in `limitations`.
+
+For PostgreSQL routines, `reads` contains the call count, with optional
+`total_ms` and `self_ms` timings. Snapshot diffs exclude usage changes so
+changing counters do not appear as schema changes.
+
+## Architecture rules
+
+`rules` reads `schemagraph.toml` by default. Each `[[rule]]` forbids dependency
+edges matching a `from` glob and a `to` glob. `*` matches any characters,
+including dots; `?` matches one character.
 
 ```toml
 [[rule]]
 name = "reporting must not write to core"
 from = "reporting.*"
 to = "core.*"
-kinds = ["writes"]           # optional; default = all dependency kinds
+kinds = ["writes"]
 
 [[rule]]
 name = "views must not call routines"
@@ -154,61 +198,52 @@ to = "*"
 kinds = ["calls"]
 ```
 
-Output lists every violating edge with its rule name; `checked: 0` means no
-rules were evaluated — not "pass".
+Omit `kinds` to check all dependency kinds. Run
+`schemagraph rules --graph graph.json --config schemagraph.toml --strict`
+to use the result as a CI gate. The report names each rule and violating
+edge; `checked: 0` means no rules were evaluated.
 
-## Usage statistics
+## How it works
 
-PostgreSQL (`pg_stat_user_tables`/`_indexes`, `pg_stat_user_functions`) and
-MySQL (`sys.schema_table_statistics`/`schema_unused_indexes`) readers attach
-observed usage to vertices. `stats` lists it; `dead` candidates carry it as
-evidence. Routine call counts land on `reads` (the unit differs by kind).
+```text
+Database ── native reader (Rust / sqlx) ──┐
+Database ── JDBC probe (Kotlin) ──────────┼── catalog document ── graph ── queries
+Database ── Go probe ────────────────────┘   versioned contract
+```
 
-The contract: a `usage` record is valid only since its `since` timestamp —
-missing usage means "not collected" (SQLite, unsupported views, disabled
-statistics such as `track_functions=none` or `performance_schema=OFF`),
-`reads: 0` with usage present means "observed zero". Statistics are evidence
-to weigh, never proof an object is unused: application queries are not in
-the graph.
+Database access belongs to the native source adapters and probes. Probes
+collect catalog metadata and SQL text; graph construction, body parsing,
+and dependency analysis stay in Rust. The graph core has no external
+dependencies and can be tested from file fixtures without a database.
 
-## Current state
+## Development
 
-- Readers: SQLite, PostgreSQL, MySQL (native `sqlx`), plus every JDBC
-  database via the probe — verified live on MSSQL (Azure SQL Edge),
-  Oracle 23ai/26ai Free, MariaDB 11.4, H2. `mysql://` also covers MariaDB
-  natively. `mysqlx://` is explicitly unsupported.
-- Vertex ids use `schema.object[.member]`; on a cross-kind name collision
-  the later vertex is renamed `name@kind` (`orders.sku@index`) and the
-  rename is reported in `limitations`.
-- Body parsing: views (`reads`, object + member level), triggers
-  (`writes`/`reads`/`NEW.`/`OLD.`, `EXECUTE FUNCTION` → `calls`), SQL-language
-  routines (`reads`/`writes`/`calls`, including in-body `CALL`/function
-  invocations). `plpgsql`/`plsql` bodies go through a statement extractor —
-  visible SQL (`IF/FOR/LOOP` conditions, `PERFORM`, `EXECUTE 'literal'`,
-  `SELECT … INTO`, `RETURNING … INTO`, bare PL/SQL calls) produces real
-  edges; unextractable dynamic constructs are counted in `limitations`.
-  T-SQL parses via `MsSqlDialect`, and when a body wholesale-fails the same
-  extractor recovers what it can (`IF`/`TRY`/`EXEC`/`WHILE`/cursors).
-  Other languages (`plpython3u`, …) are reported, not guessed.
-- Deterministic JSON everywhere; unknown targets never become ghost vertices —
-  they land in `limitations`. Documents carrying fields the engine does not
-  know are accepted (same-version additive contract) but the ignored field
-  paths are reported in `limitations`.
+From the repository root:
 
-## Roadmap
+```sh
+cargo fmt --manifest-path engine/Cargo.toml --all -- --check
+cargo build --manifest-path engine/Cargo.toml --locked
+cargo test --manifest-path engine/Cargo.toml --locked
+Scripts/verify-fixtures.sh
+```
 
-- **P0** — core graph model + native readers + `scan`/`graph`/`query`/`cycles` — done
-- **P1** — body parsing + `impact` + `dead` — done
-- **P2** — catalog document protocol + Kotlin JDBC probe + `rules` — done
-- **P3** — `stats` usage evidence (tables·indexes·routines) + `dead` evidence + `skill` + mermaid — done
-- **P4** — MSSQL/Oracle rich probes — done (live-verified)
-- **P5** — `diff`, `plpgsql`/`plsql` statement extraction, opt-in `inferred`
-  edges, Oracle package harvest, NDJSON transport, Go probe (Oracle) — done
-  (live-verified)
-- **P6** — T-SQL (`MsSqlDialect` + procedural recovery), Oracle package
-  members (`member_of` vertices + `contains`), Go probe SQL Server,
-  real probe streaming (limitations trailer), publish metadata — done
-  (live-verified); next: crates.io publish in dependency order, document
-  v2 negotiation beyond additive fields, wider procedural coverage
+The fixture script uses SQLite, local PostgreSQL tools, Docker, and the
+probe toolchains for database integration checks. External MySQL and Oracle
+JDBC jars can be supplied through `SG_MYSQL_JAR` and `SG_ORACLE_JAR`.
+Unavailable checks print skip warnings; an exit code of zero alone does not
+mean every database was tested. Build the CLI before starting the script
+and keep that binary unchanged until the run finishes.
 
-Details and trade-offs: [DESIGN.md](DESIGN.md).
+The P0–P6 milestones are implemented. Next work includes the first crates.io
+release, broader procedural SQL coverage, more Go probe dialects, and
+document version negotiation beyond additive fields.
+
+See [DESIGN.md](DESIGN.md) for the design and output contract,
+[HANDOFF.md](HANDOFF.md) for implementation status and verification notes,
+and [AGENTS.md](AGENTS.md) for contributor guidance. These maintainer
+documents are written in Korean.
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
+option. Third-party drivers retain their own licenses.
