@@ -64,7 +64,10 @@ application entry-point inventory.
 ## Review a schema change
 
 Capture both documents with a stable logical label and the same producer and
-schema filter. Do not use a connection URL as the label.
+schema filter and catalog-access role. Do not use a connection URL as the label.
+Collection completeness is a producer report, not an independent attestation of
+database privileges: catalogs that silently filter inaccessible objects can hide
+permission changes. Keep catalog visibility unchanged between snapshots.
 
 ```sh
 schemagraph scan "sqlite:before.db" --source-id app --emit-document before.json -o before.graph.json

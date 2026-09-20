@@ -407,6 +407,9 @@ def probe_remote_database(
     oracle_jar: Path | None = None,
 ) -> None:
     """기존 fixture가 살아 있는 JDBC DB에서 JDBC·Go 4-format을 검증한다."""
+    # fixture의 Oracle 계정은 인용 없이 생성되므로 카탈로그 소유자명은 대문자다.
+    # 프로브의 schema allowlist는 실제 식별자와 정확히 비교한다.
+    schema = "dbo" if name == "MSSQL" else user.upper()
     if jdbc_jar is None or not jdbc_jar.is_file():
         raise RuntimeError(f"{name} catalog-dependencies requires the standalone JDBC probe")
     else:
@@ -417,6 +420,7 @@ def probe_remote_database(
                 command = [
                     "java", "-jar", str(jdbc_jar), "--url", jdbc_url,
                     "--user", user, "--password", password,
+                    "--schema", schema,
                     "--source-id", "app", "--catalog-dependencies",
                     "--document-version", str(version), "--format", output_format,
                     "-o", str(document),
@@ -442,16 +446,16 @@ def probe_remote_database(
         raise RuntimeError(f"{name}: JDBC URL could not be converted for Go probe")
     host, port, database = match.groups()
     if name == "Oracle":
-        go_url = f"oracle://{quote(user)}:{quote(password)}@{host}:{port}/{database}"
+        go_url = f"oracle://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}"
     else:
-        go_url = f"sqlserver://{quote(user)}:{quote(password)}@{host}:{port}/{database}?encrypt=disable"
+        go_url = f"sqlserver://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}?encrypt=disable"
     for version in (1, 2):
         for output_format in ("json", "ndjson"):
             document = work / f"{name.lower()}-go-v{version}-{output_format}.document"
             graph = work / f"{name.lower()}-go-v{version}-{output_format}.graph.json"
             run(
                 [
-                    str(go_probe), "--url", go_url, "--schema", "dbo" if name == "MSSQL" else user,
+                    str(go_probe), "--url", go_url, "--schema", schema,
                     "--source-id", "app", "--catalog-dependencies", "--document-version", str(version),
                     "--format", output_format, "-o", str(document),
                 ],
