@@ -15,6 +15,14 @@ as Mermaid and Graphviz DOT.
 
 ## Quick start
 
+Install the CLI with Rust and Cargo:
+
+```sh
+cargo install schemagraph-cli --version 0.1.0 --locked
+```
+
+### Build from source
+
 Clone the repository, then install the CLI with Rust and Cargo:
 
 ```sh
@@ -22,6 +30,8 @@ git clone https://github.com/ictechgy/schemagraph.git
 cd schemagraph
 cargo install --path engine/cli --locked
 ```
+
+### Try a sample database
 
 With `schemagraph` on your `PATH` and the `sqlite3` CLI installed, try the
 included fixture. It creates a sample database in a new temporary directory:
@@ -234,8 +244,8 @@ Unavailable checks print skip warnings; an exit code of zero alone does not
 mean every database was tested. Build the CLI before starting the script
 and keep that binary unchanged until the run finishes.
 
-The P0–P6 milestones are implemented. Next work includes the first crates.io
-release, broader procedural SQL coverage, more Go probe dialects, and
+The P0–P6 milestones are implemented. Next work includes broader procedural
+SQL coverage, more Go probe dialects, and
 document version negotiation beyond additive fields.
 
 See [DESIGN.md](DESIGN.md) for the design and output contract,

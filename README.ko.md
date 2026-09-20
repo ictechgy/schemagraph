@@ -14,6 +14,14 @@ JSON을 출력하며, Mermaid와 Graphviz DOT 다이어그램도 지원합니다
 
 ## 빠른 시작
 
+Rust와 Cargo로 CLI를 설치합니다.
+
+```sh
+cargo install schemagraph-cli --version 0.1.0 --locked
+```
+
+### 소스에서 빌드
+
 Rust와 Cargo가 설치된 환경에서 저장소를 복제하고 CLI를 설치합니다.
 
 ```sh
@@ -21,6 +29,8 @@ git clone https://github.com/ictechgy/schemagraph.git
 cd schemagraph
 cargo install --path engine/cli --locked
 ```
+
+### 샘플 DB 실행
 
 `schemagraph`가 `PATH`에 있고 `sqlite3` CLI가 설치되어 있으면 포함된 fixture로
 시작할 수 있습니다. 다음 예제는 새 임시 디렉터리에 샘플 DB를 만듭니다.
@@ -227,8 +237,8 @@ DB 통합 검증을 수행합니다. 외부 MySQL·Oracle JDBC jar은 `SG_MYSQL_
 스크립트를 시작하기 전에 CLI를 빌드하고 검증이 끝날 때까지 바이너리를
 교체하지 마세요.
 
-P0–P6 단계는 구현되어 있습니다. 다음 작업은 첫 crates.io 배포, 절차형 SQL
-분석 범위 보강, Go 프로브 지원 방언 확장, additive 필드를 넘어서는 문서 버전
+P0–P6 단계는 구현되어 있습니다. 다음 작업은 절차형 SQL 분석 범위 보강,
+Go 프로브 지원 방언 확장, additive 필드를 넘어서는 문서 버전
 협상입니다.
 
 설계와 출력 계약은 [DESIGN.md](DESIGN.md), 구현 상태와 검증 기록은

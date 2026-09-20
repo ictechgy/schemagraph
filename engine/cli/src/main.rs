@@ -204,9 +204,9 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::Stats { graph } => stats(&graph),
         Command::Diff { old, new, strict } => diff(&old, &new, strict),
         Command::Skill => {
-            // 스킬 원본은 저장소의 skills/schemagraph/SKILL.md — 에이전트가
-            // 저장소에서 직접 읽을 수도 있고 이 명령으로 설치할 수도 있다.
-            print!("{}", include_str!("../../../skills/schemagraph/SKILL.md"));
+            // 패키지 밖의 파일은 cargo install에서 사라지므로 사본을 포함한다.
+            // 원본 skills/schemagraph/SKILL.md를 고치면 cli/SKILL.md도 갱신한다.
+            print!("{}", include_str!("../SKILL.md"));
             Ok(0)
         }
         Command::Rules {
