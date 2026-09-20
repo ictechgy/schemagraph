@@ -19,14 +19,22 @@ schemagraph cycles [--level object|column]      # dependency cycles
 schemagraph rules [--strict]                    # declared rules, CI gate
 schemagraph stats                               # collected usage evidence
 schemagraph document-capabilities               # catalog versions and required features
-schemagraph graph --format mermaid|json|dot     # render
+schemagraph graph --format mermaid|json|dot|html # render
+schemagraph diagnostics                         # body coverage and located diagnostics
+schemagraph explain <object>                    # incident evidence and source origins
+schemagraph path <from> <to>                     # shortest dependency paths
+schemagraph review before.json after.json --strict --require-complete
+schemagraph lint --strict                       # schema facts and unresolved references
+schemagraph merge app.json reporting.json       # distinct source-id namespaces
+schemagraph serve --graph graph.json            # read-only MCP over one snapshot
 ```
 
 ## The output contract — read this before interpreting anything
 
 - **Nothing here is a deletion verdict.** `dead` reports objects with no
-  *database-internal* consumer. Application queries are outside the graph —
-  an object with no dependents may be the hottest table in the product.
+  reachable consumer under the declared retention policy. Application queries
+  appear only when collected using `scan --sql-dir`; other uses need explicit
+  retention roots. An object with no dependents may still be heavily used.
   Report candidates with their evidence; let the human decide.
 - **`usage` is evidence, not proof.** `usage.reads`/`usage.writes` come from
   the database's own statistics (`pg_stat_*`, `sys.schema_*`). They cover
@@ -39,7 +47,19 @@ schemagraph graph --format mermaid|json|dot     # render
   tool could not see, not an object that does not exist.
 - **`contains` is structure, not dependency.** It means "this member belongs
   to that object". Only `references`, `reads`, `writes`, `calls`, `fires`,
-  `uses-sequence`, `uses-type` are dependencies.
+  `uses-sequence`, `uses-type`, `derives-from`, and `depends-on` are dependencies.
+- **Lineage and catalog dependencies are distinct.** `derives-from` identifies
+  output-column value sources. `reads` includes filter and join dependencies.
+  `depends-on` preserves a raw DB catalog dependency without inventing its
+  read/write/call meaning.
+- **Coverage is structured.** Object analysis states are `complete`, `partial`,
+  or `unsupported` within a stated scope. Missing analysis is unavailable, not
+  success. Original body hashes and available locations accompany diagnostics
+  and origins; raw SQL is not embedded in graph analysis records.
+- **Traversal and output limits are separate.** Check `complete`, `truncated`,
+  and `truncationReasons`. A `result-limit` can hide results after complete
+  traversal; vertex/edge budgets can leave traversal incomplete. Never infer
+  absence from an incomplete traversal.
 - **Edges carry `evidence`.** `catalog` evidence is schema fact; `body-parse`
   evidence came from parsing routine/trigger/view SQL and is conservative —
   the parser reports what it could not parse rather than guessing.
@@ -53,13 +73,24 @@ schemagraph graph --format mermaid|json|dot     # render
 ## What the queries answer
 
 - `query <x>` — direct neighbors both directions + reachability context.
-- `impact <x>` — transitive dependents: what would break if `x` changed.
+- `impact <x>` — transitive dependents that may be affected if `x` changed.
 - `dead` — objects nothing inside the database consumes. Consumer-kind
   objects (views, routines, packages) with no caller are the usual
   candidates; each carries its usage evidence when collected.
 - `cycles` — dependency cycles, useful for delete ordering and deadlock analysis.
 - `stats` — every collected usage entry with `since`; `totals` shows how
   much of the graph went unobserved.
+- `dead --retain <glob>` protects a root and its dependency closure. TOML
+  suppressions require a reason, and expiry requires an explicit `--as-of`
+  date. Strict mode uses the full unsuppressed count even when output is cut.
+- `review` requires catalog documents for DDL facts; removed objects are traced
+  in the before graph. Strict mode returns 1 for changes requiring review and
+  2 for incomparable snapshots. `--require-complete` also fails on incomplete
+  analysis or truncation. It does not execute migrations or prove runtime breakage.
+- `lint` distinguishes confirmed facts from unverified metadata. Partial indexes
+  may be useful even when no unfiltered FK prefix index was observed.
+- `merge` requires unique logical source IDs. Database catalog references cross
+  namespaces only when the collected target database/object is unambiguous.
 
 ## Workflow
 
@@ -71,8 +102,16 @@ schemagraph graph --format mermaid|json|dot     # render
 
 ## Catalog compatibility
 
-The engine accepts catalog v1 and v2; graph format remains v1. Both probes
+The engine accepts catalog v1 and v2, reads graph v1/v2, and emits graph v2. Both probes
 default to catalog v1. Query `document-capabilities` before selecting
 `--document-version 2`. Unknown required features and incomplete v2 NDJSON
 are errors; do not silently downgrade them. See [CATALOG.md](https://github.com/ictechgy/schemagraph/blob/main/CATALOG.md)
 in the source repository for the producer and required-feature contract.
+
+Catalog v2 query records require `external-queries-v1`. Explicit DB dependencies
+require `catalog-dependencies-v1` in v2. A collection context distinguishes
+logical source identity, database, schema filter, and catalog completeness.
+Do not treat different filters, missing identity, or incomplete collection as a
+verified DROP. Query tools read a graph only; `serve` provides no arbitrary file
+or database access tools. See the [analysis guide](https://github.com/ictechgy/schemagraph/blob/main/ANALYSIS.md)
+for cache, limits, HTML, and MCP usage.
