@@ -6,7 +6,7 @@ import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 
 // catalog document의 Kotlin 측 표현 — engine/source/src/document.rs의 serde
-// 계약과 필드 이름이 1:1로 대응해야 한다. 바꾸면 DOCUMENT_VERSION을 올린다.
+// 내부 모델은 v1을 유지하고, 전송 버전의 필드 변경은 DocumentVersions에서 처리한다.
 
 const val DOCUMENT_VERSION = 1
 

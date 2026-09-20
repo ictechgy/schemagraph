@@ -27,6 +27,7 @@ usage: schemagraph-probe --url <jdbc-url> [options]
   --schema <names>     comma-separated schema allowlist (default: non-system all)
   -o, --output <path>  catalog document path (default: catalog.json, '-' stdout)
   --format <json|ndjson>  output format (default: json — ndjson은 행 단위 스트리밍)
+  --document-version <1|2>  catalog wire version (default: 1)
   -h, --help           this help
 """
 
@@ -62,7 +63,7 @@ fun main(args: Array<String>) {
             DriverManager.getConnection(url, props).use { conn ->
                 val writer = if (opts.output == "-") System.out.bufferedWriter()
                     else File(opts.output).bufferedWriter()
-                Extractor(conn, dialect, opts.schemas).extractStreaming { line ->
+                Extractor(conn, dialect, opts.schemas).extractStreaming(opts.documentVersion) { line ->
                     writer.write(line)
                     writer.newLine()
                 }
@@ -79,7 +80,7 @@ fun main(args: Array<String>) {
         }
     }.getOrElse { fatal("추출 실패: ${it.message}") }
 
-    val json = mapper.writeValueAsString(doc)
+    val json = mapper.writeValueAsString(documentWire(doc, opts.documentVersion))
     if (opts.output == "-") println(json)
     else File(opts.output).writeText("$json\n")
 }
@@ -98,6 +99,7 @@ private data class Opts(
     var schemas: List<String> = emptyList(),
     var output: String = "catalog.json",
     var format: String = "json",
+    var documentVersion: Int = 1,
     var help: Boolean = false,
 )
 
@@ -116,6 +118,8 @@ private fun parseArgs(args: Array<String>): Opts {
             "--schema" -> o.schemas = next(a).split(',').filter { it.isNotBlank() }
             "-o", "--output" -> o.output = next(a)
             "--format" -> o.format = next(a)
+            "--document-version" -> o.documentVersion = next(a).toIntOrNull()?.takeIf { it in 1..2 }
+                ?: fatal("Unsupported document version; choose 1 or 2")
             "-h", "--help" -> o.help = true
             else -> fatal("error: 알 수 없는 인자 '$a'\n$USAGE")
         }

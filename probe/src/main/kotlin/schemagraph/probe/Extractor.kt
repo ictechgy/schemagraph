@@ -70,7 +70,7 @@ class Extractor(
      * limitations 행. 헤더의 limitations는 비워 두고 트레일러가 진짜 목록을
      * 싣는다 — 스트리밍은 마지막까지 무슨 한계가 나올지 모르기 때문이다.
      */
-    fun extractStreaming(emit: (String) -> Unit) {
+    fun extractStreaming(documentVersion: Int = 1, emit: (String) -> Unit) {
         runCatching { conn.isReadOnly = true }
         fun rec(type: String, vararg fields: Pair<String, Any?>) {
             val node = lineMapper.createObjectNode()
@@ -78,13 +78,7 @@ class Extractor(
             for ((k, v) in fields) node.set<JsonNode>(k, lineMapper.valueToTree(v))
             emit(lineMapper.writeValueAsString(node))
         }
-        rec(
-            "document",
-            "version" to DOCUMENT_VERSION,
-            "dialect" to dialect,
-            "reader" to "probe-jdbc",
-            "limitations" to emptyList<String>(),
-        )
+        emit(lineMapper.writeValueAsString(streamingHeader(documentVersion, dialect)))
         val usage = collectUsage()
         var sawObjects = false
         for (schema in candidateSchemas()) {
@@ -415,7 +409,7 @@ class Extractor(
                     val members = if (impl != null) pkgMembers[pkg].orEmpty() else emptyList()
                     val memberDocs = mutableListOf<Triple<String, String, RoutineDoc>>()
                     if (impl != null && members.isNotEmpty()) {
-                        val slices = slicePackageBody(impl, members.map { it.first }.toSet())
+                        val slices = slicePackageBodyLexical(impl, members.map { it.first }.toSet())
                         val seen = mutableMapOf<String, Int>()
                         for ((mname, overload) in members) {
                             // 같은 이름의 n번째 오버로드는 본문의 n번째 헤더와 짝짓는다.
@@ -790,34 +784,6 @@ class Extractor(
         indexes.keys.removeIf { !keep(it.first) }
         functions.keys.removeIf { !keep(it.first) }
         return UsageHarvest(tables, indexes, functions)
-    }
-
-    /**
-     * PACKAGE BODY 텍스트를 멤버 선언 헤더로 나눈다.
-     *
-     * 경계는 카탈로그 멤버 이름과 매칭되는 `PROCEDURE|FUNCTION <name>`
-     * 헤더뿐이다 — 멤버 안의 로컬 서브프로그램이나 주석 속 단어를 경계로
-     * 오인하지 않기 위해 카탈로그 대조를 요구한다. 같은 이름의 오버로드는
-     * 텍스트 순서대로 n번째로 구분해 카탈로그 SUBPROGRAM_ID 순과 짝짓는다.
-     * 반환 키는 "이름#n"(대문자 멤버명, 0-base).
-     */
-    private fun slicePackageBody(impl: String, members: Set<String>): Map<String, String> {
-        val re = Regex("(?im)^\\s*(?:PROCEDURE|FUNCTION)\\s+\"?([A-Za-z0-9_$#]+)\"?")
-        // 텍스트 순서대로 (canonical 이름, 시작 위치).
-        val heads = re.findAll(impl).mapNotNull { m ->
-            members.firstOrNull { it.equals(m.groupValues[1], ignoreCase = true) }
-                ?.let { it to m.range.first }
-        }.toList()
-        if (heads.isEmpty()) return emptyMap()
-        val starts = heads.map { it.second }
-        val out = mutableMapOf<String, String>()
-        val perName = mutableMapOf<String, Int>()
-        for ((name, start) in heads) {
-            val nth = perName.merge(name, 1) { a, b -> a + b }!! - 1
-            val end = starts.firstOrNull { it > start } ?: impl.length
-            out["$name#$nth"] = impl.substring(start, end).trim()
-        }
-        return out
     }
 
     /** best-effort 쿼리 — 실패를 limitation으로 변환해 숨기지 않는다. */

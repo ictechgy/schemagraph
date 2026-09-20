@@ -1,4 +1,4 @@
-// schemagraph-probe-go — JVM 없는 카탈로그 프로브. Oracle과 SQL Server.
+// schemagraph-probe-go — JVM 없는 SQLite·PostgreSQL·MySQL·Oracle·SQL Server 프로브.
 //
 // JVM 프로브(probe/)는 번들 드라이버로 대부분의 DB를 커버하지만 Oracle만은
 // ojdbc가 OTN 라이선스라 jar을 직접 내려받아 --driver로 넘겨야 했고,
@@ -17,12 +17,9 @@ package main
 
 import (
 	"database/sql"
-	"encoding/json"
 	"flag"
 	"fmt"
-	nurl "net/url"
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -175,82 +172,56 @@ func ns(s sql.NullString) *string {
 
 func main() {
 	var (
-		url       = flag.String("url", "", "oracle://user:pass@host:port/service")
-		schemaArg = flag.String("schema", "", "comma-separated schema allowlist (default: non-system all)")
-		output    = flag.String("o", "catalog.json", "output path ('-' stdout)")
-		format    = flag.String("format", "json", "json | ndjson")
+		rawURL      = flag.String("url", "", "sqlite:, postgres://, mysql://, oracle://, sqlserver://")
+		schemaArg   = flag.String("schema", "", "comma-separated schema allowlist (default: non-system schemas)")
+		output      = flag.String("o", "catalog.json", "output path ('-' for stdout)")
+		format      = flag.String("format", "json", "json | ndjson")
+		wireVersion = flag.Int("document-version", 1, "catalog wire version: 1 or 2")
 	)
 	flag.Parse()
-	if *url == "" {
-		fmt.Fprintln(os.Stderr, "error: --url이 필요하다 (oracle://user:pass@host:port/service)")
-		os.Exit(2)
+	if *rawURL == "" {
+		fatal("connection URL is required", fmt.Errorf("set --url to a supported database URL"))
 	}
-
-	// URL 스킴으로 드라이버와 방언을 고른다 — 프로브는 한 접속에 한 방언이다.
-	// oracle:// → go-ora, sqlserver://(mssql:// 별칭) → go-mssqldb.
-	scheme := strings.ToLower(strings.SplitN(*url, "://", 2)[0])
-	var driver, dialect string
-	switch scheme {
-	case "oracle":
-		driver, dialect = "oracle", "oracle"
-	case "sqlserver", "mssql":
-		driver, dialect = "sqlserver", "sqlserver"
-		// go-mssqldb는 sqlserver:// 스킴만 안다 — mssql://은 사용자 별칭.
-		if scheme == "mssql" {
-			*url = "sqlserver://" + strings.SplitN(*url, "://", 2)[1]
-		}
-		// sqlserver://u:p@host:port/db 형태도 받는다 — db는 go-mssqldb의
-		// database 쿼리 파라미터로 옮긴다(oracle의 /service와 같은 자리).
-		if u, err := nurl.Parse(*url); err == nil && u.Path != "" && u.Query().Get("database") == "" {
-			q := u.Query()
-			q.Set("database", strings.TrimPrefix(u.Path, "/"))
-			u.Path = ""
-			u.RawQuery = q.Encode()
-			*url = u.String()
-		}
-	default:
-		fmt.Fprintf(os.Stderr, "error: --url 스킴 %q는 지원하지 않는다 (oracle://, sqlserver://)\n", scheme)
-		os.Exit(2)
+	if err := validateDocumentVersion(*wireVersion); err != nil {
+		fatal("invalid document version", err)
 	}
-
-	db, err := sql.Open(driver, *url)
+	if *format != "json" && *format != "ndjson" {
+		fatal("invalid output format", fmt.Errorf("choose json or ndjson"))
+	}
+	spec, err := parseConnection(*rawURL)
 	if err != nil {
-		fatal("드라이버 열기 실패", err)
+		fatal("invalid connection settings", err)
+	}
+	db, err := sql.Open(spec.driver, spec.dsn)
+	if err != nil {
+		fatal("database driver setup failed", err)
 	}
 	defer db.Close()
 	if err := db.Ping(); err != nil {
-		fatal("접속 실패", err)
+		fatal("database connection failed", err)
 	}
-
-	h := &harvester{db: db, dialect: dialect, schemaFilter: map[string]bool{}}
-	if *schemaArg != "" {
-		for _, s := range strings.Split(*schemaArg, ",") {
-			if s = strings.TrimSpace(s); s != "" {
-				h.schemaFilter[s] = true
-			}
+	h := &harvester{db: db, dialect: spec.dialect, schemaFilter: map[string]bool{}}
+	h.configureReadOnly()
+	if *schemaArg == "" && spec.schema != "" {
+		h.schemaFilter[spec.schema] = true
+	}
+	for _, schema := range strings.Split(*schemaArg, ",") {
+		if schema = strings.TrimSpace(schema); schema != "" {
+			h.schemaFilter[schema] = true
 		}
 	}
-
 	doc := h.extract()
 	doc.Limitations = sortedDistinct(doc.Limitations)
-
-	var text string
-	switch *format {
-	case "json":
-		b, err := json.MarshalIndent(doc, "", "  ")
-		if err != nil {
-			fatal("직렬화 실패", err)
-		}
-		text = string(b)
-	case "ndjson":
-		text = toNDJSON(doc)
-	default:
-		fatal("--format은 json|ndjson 중 하나다", fmt.Errorf("%s", *format))
+	encoded, err := encodeDocument(doc, *wireVersion, *format)
+	if err != nil {
+		fatal("document serialization failed", err)
 	}
 	if *output == "-" {
-		fmt.Println(text)
-	} else if err := os.WriteFile(*output, []byte(text+"\n"), 0o644); err != nil {
-		fatal("쓰기 실패", err)
+		if _, err := os.Stdout.Write(encoded); err != nil {
+			fatal("document output failed", err)
+		}
+	} else if err := os.WriteFile(*output, encoded, 0o644); err != nil {
+		fatal("document write failed", err)
 	}
 }
 
@@ -273,6 +244,14 @@ func sortedDistinct(in []string) []string {
 }
 
 func (h *harvester) extract() CatalogDocument {
+	switch h.dialect {
+	case "postgres":
+		return h.extractPostgres()
+	case "mysql":
+		return h.extractMySQL()
+	case "sqlite":
+		return h.extractSQLite()
+	}
 	if h.dialect == "sqlserver" {
 		return h.extractMSSQL()
 	}
@@ -813,7 +792,7 @@ func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 			for _, m := range pkgMembers[p] {
 				names[m.name] = true
 			}
-			slices := slicePackageBody(impl, names)
+			slices := slicePackageBodyLexical(impl, names)
 			seen := map[string]int{}
 			for _, m := range pkgMembers[p] {
 				// 같은 이름의 n번째 오버로드는 본문의 n번째 헤더와 짝짓는다.
@@ -868,76 +847,4 @@ func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 		out[schema] = append(out[schema], memberDocs...)
 	}
 	return out
-}
-
-// slicePackageBody — PACKAGE BODY 텍스트를 멤버 선언 헤더로 나눈다.
-// 경계는 카탈로그 멤버 이름과 매칭되는 `PROCEDURE|FUNCTION <name>` 헤더뿐
-// — 멤버 안의 로컬 서브프로그램을 경계로 오인하지 않기 위해 카탈로그 대조를
-// 요구한다. 반환 키는 "이름#n"(카탈로그 이름, 0-base) — Kotlin과 같다.
-func slicePackageBody(impl string, members map[string]bool) map[string]string {
-	re := regexp.MustCompile(`(?im)^\s*(?:PROCEDURE|FUNCTION)\s+"?([A-Za-z0-9_$#]+)"?`)
-	type head struct {
-		name  string
-		start int
-	}
-	var heads []head
-	for _, m := range re.FindAllStringSubmatchIndex(impl, -1) {
-		got := impl[m[2]:m[3]]
-		for canon := range members {
-			if strings.EqualFold(canon, got) {
-				heads = append(heads, head{canon, m[0]})
-				break
-			}
-		}
-	}
-	if len(heads) == 0 {
-		return nil
-	}
-	var starts []int
-	for _, hd := range heads {
-		starts = append(starts, hd.start)
-	}
-	sort.Ints(starts)
-	out := map[string]string{}
-	perName := map[string]int{}
-	for _, hd := range heads {
-		nth := perName[hd.name]
-		perName[hd.name]++
-		end := len(impl)
-		for _, s := range starts {
-			if s > hd.start {
-				end = s
-				break
-			}
-		}
-		out[hd.name+"#"+strconv.Itoa(nth)] = strings.TrimSpace(impl[hd.start:end])
-	}
-	return out
-}
-
-// toNDJSON — engine/source/src/ndjson.rs 및 Extractor.extractStreaming과
-// 같은 정본 레이아웃: document 헤더( limitations 비움) → 스키마별 schema
-// 행 + object·routine 행 → limitations 트레일러.
-func toNDJSON(doc CatalogDocument) string {
-	var b strings.Builder
-	line := func(v any) {
-		j, _ := json.Marshal(v)
-		b.Write(j)
-		b.WriteByte('\n')
-	}
-	line(map[string]any{
-		"type": "document", "version": doc.Version, "dialect": doc.Dialect,
-		"reader": doc.Reader, "limitations": []string{},
-	})
-	for _, s := range doc.Schemas {
-		line(map[string]any{"type": "schema", "name": s.Name})
-		for _, o := range s.Objects {
-			line(map[string]any{"type": "object", "schema": s.Name, "data": o})
-		}
-		for _, r := range s.Routines {
-			line(map[string]any{"type": "routine", "schema": s.Name, "data": r})
-		}
-	}
-	line(map[string]any{"type": "limitations", "data": doc.Limitations})
-	return b.String()
 }
