@@ -54,9 +54,64 @@ pub fn document_from_value(mut value: Value) -> Result<CatalogDocument, String> 
         doc.limitations
             .push(format!("ignored catalog fields: {}", unknown.join(", ")));
     }
+    doc.limitations.extend(duplicate_record_notes(&doc));
     doc.limitations.sort();
     doc.limitations.dedup();
     Ok(doc)
+}
+
+/// 같은 식별자의 반복을 버전과 무관하게 세어 그래프 병합이 손실 없이 보이지 않게 한다.
+/// 기존 v1 생산자의 입력은 계속 받되 소비자가 중복의 영향을 알 수 있게 한다.
+fn duplicate_record_notes(doc: &CatalogDocument) -> Vec<String> {
+    let mut counts = std::collections::BTreeMap::from([
+        (
+            "schema",
+            duplicate_count(doc.schemas.iter().map(|schema| &schema.name)),
+        ),
+        ("object", 0),
+        ("routine", 0),
+        ("column", 0),
+        ("constraint", 0),
+        ("index", 0),
+        ("trigger", 0),
+    ]);
+    for schema in &doc.schemas {
+        *counts.entry("object").or_default() += duplicate_count(
+            schema
+                .objects
+                .iter()
+                .map(|object| (&object.name, &object.kind)),
+        );
+        *counts.entry("routine").or_default() +=
+            duplicate_count(schema.routines.iter().map(|routine| {
+                (
+                    &routine.name,
+                    &routine.kind,
+                    routine.signature.as_deref().unwrap_or(""),
+                    &routine.member_of,
+                )
+            }));
+        for object in &schema.objects {
+            *counts.entry("column").or_default() +=
+                duplicate_count(object.columns.iter().map(|column| &column.name));
+            *counts.entry("constraint").or_default() +=
+                duplicate_count(object.constraints.iter().map(|constraint| &constraint.name));
+            *counts.entry("index").or_default() +=
+                duplicate_count(object.indexes.iter().map(|index| &index.name));
+            *counts.entry("trigger").or_default() +=
+                duplicate_count(object.triggers.iter().map(|trigger| &trigger.name));
+        }
+    }
+    counts.into_iter().filter(|(_, count)| *count > 0).map(|(kind, count)| {
+        format!("catalog contains {count} duplicate {kind} identities; repeated records may be merged; emit unique records")
+    }).collect()
+}
+
+fn duplicate_count<T: Ord>(identities: impl IntoIterator<Item = T>) -> usize {
+    let mut seen = BTreeSet::new();
+    identities.into_iter().fold(0, |count, identity| {
+        count + usize::from(!seen.insert(identity))
+    })
 }
 
 fn validate_v2(value: &Value) -> Result<(), String> {
@@ -280,5 +335,47 @@ mod tests {
             .limitations
             .iter()
             .any(|note| note.contains("producer.build")));
+    }
+
+    #[test]
+    fn every_unknown_path_is_reported_without_an_unmarked_cap() {
+        let mut value = sample();
+        for number in 0..25 {
+            value[format!("future_{number:02}")] = json!(true);
+        }
+        let doc = document_from_value(value).unwrap();
+        for number in 0..25 {
+            assert!(doc
+                .limitations
+                .iter()
+                .any(|note| note.contains(&format!("future_{number:02}"))));
+        }
+    }
+
+    #[test]
+    fn repeated_records_are_counted_in_both_versions_and_transports() {
+        let mut value = sample();
+        let object = json!({"name":"items", "kind":"table", "columns":[], "constraints":[], "indexes":[], "triggers":[]});
+        value["schemas"] =
+            json!([{"name":"main", "objects":[object.clone(), object], "routines":[]}]);
+        let original: CatalogDocument = serde_json::from_value(value).unwrap();
+        for version in [1, 2] {
+            let from_json =
+                document_from_value(document_to_value(&original, version).unwrap()).unwrap();
+            let from_ndjson = crate::ndjson::document_from_ndjson(
+                &crate::ndjson::document_to_ndjson_version(&original, version).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(from_json, from_ndjson);
+            assert!(from_json
+                .limitations
+                .iter()
+                .any(|note| note.contains("1 duplicate object identities")));
+            // 재출력·재입력에서도 동일한 한계를 중복으로 늘리지 않는다.
+            assert_eq!(
+                document_from_value(document_to_value(&from_json, version).unwrap()).unwrap(),
+                from_json
+            );
+        }
     }
 }

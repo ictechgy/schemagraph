@@ -158,7 +158,6 @@ pub struct RoutineDoc {
 /// 인덱스 없이 정규화해 중복을 합친다.
 pub fn unknown_field_paths(doc: &serde_json::Value) -> Vec<String> {
     use std::collections::BTreeSet;
-    const MAX: usize = 20;
 
     // 알려진 컨테이너 키 → 하위 레코드의 알려진 키 집합. 나머지 키는
     // 잎(scalar·문자열 배열)이라 내려갈 곳이 없다.
@@ -214,7 +213,7 @@ pub fn unknown_field_paths(doc: &serde_json::Value) -> Vec<String> {
         DOC_KEYS
     };
     walk(doc, "", keys, &mut out);
-    out.into_iter().take(MAX).collect()
+    out.into_iter().collect()
 }
 
 const DOC_KEYS: &[&str] = &["version", "dialect", "reader", "schemas", "limitations"];

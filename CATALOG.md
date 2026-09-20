@@ -35,7 +35,10 @@ change its meaning.
 
 Unknown optional fields are accepted and reported in `limitations`, so an
 unknown field is never silently presented as an absent field. Unknown required
-features remain fatal.
+features remain fatal. Repeated schema, object, routine, or member records are
+accepted for v1 compatibility, but their duplicate identities are counted in
+limitations because graph construction may merge them. Producers should emit
+unique records.
 
 Changing or removing a field is a non-additive protocol change. Such a change
 requires a new major wire version, or a feature that the reader explicitly

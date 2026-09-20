@@ -112,7 +112,7 @@ pub struct RoutineDelta {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutineChange {
-    /// schema.name(signature) — 정점 id와 같은 형태다.
+    /// 새 문서에서의 graph routine id.
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<FieldChange>,
@@ -127,10 +127,11 @@ fn is_false(b: &bool) -> bool {
 }
 
 /// 이름으로 대응되는 컬렉션을 비교한다.
-fn collect<T: Clone + PartialEq>(
+fn collect<T: Clone>(
     old: &[T],
     new: &[T],
     name: impl Fn(&T) -> &str,
+    same: impl Fn(&T, &T) -> bool,
 ) -> CollectionDelta<T> {
     let old_by: BTreeMap<&str, &T> = old.iter().map(|x| (name(x), x)).collect();
     let new_by: BTreeMap<&str, &T> = new.iter().map(|x| (name(x), x)).collect();
@@ -141,7 +142,7 @@ fn collect<T: Clone + PartialEq>(
     };
     for (n, nv) in &new_by {
         match old_by.get(n) {
-            Some(ov) if *ov != *nv => delta.changed.push(PairChange {
+            Some(ov) if !same(ov, nv) => delta.changed.push(PairChange {
                 name: (*n).to_owned(),
                 old: (*ov).clone(),
                 new: (*nv).clone(),
@@ -158,13 +159,33 @@ fn collect<T: Clone + PartialEq>(
     delta
 }
 
-/// routine의 정점 id — document_to_graph와 같은 규칙이어야 diff 산출물의
-/// id가 그래프 id와 통한다.
+/// routine의 graph 정규 id — document_to_graph와 같은 규칙이어야 diff
+/// 산출물의 id가 그래프 id와 통한다.
 fn routine_id(schema: &str, r: &RoutineDoc) -> String {
+    let name = match &r.member_of {
+        Some(parent) => format!("{parent}.{}", r.name),
+        None => r.name.clone(),
+    };
     match &r.signature {
-        Some(sig) if !sig.is_empty() => format!("{schema}.{}({sig})", r.name),
-        _ => format!("{schema}.{}", r.name),
+        Some(sig) if !sig.is_empty() => format!("{schema}.{name}({sig})"),
+        _ => format!("{schema}.{name}"),
     }
+}
+
+fn routine_change(new_id: &str, old: &RoutineDoc, new: &RoutineDoc) -> Option<RoutineChange> {
+    let change = RoutineChange {
+        id: new_id.to_owned(),
+        kind: (old.kind != new.kind).then(|| FieldChange {
+            old: old.kind.clone(),
+            new: new.kind.clone(),
+        }),
+        language: (old.language != new.language).then(|| FieldChange {
+            old: old.language.clone().unwrap_or_default(),
+            new: new.language.clone().unwrap_or_default(),
+        }),
+        body_changed: old.body != new.body,
+    };
+    (change.kind.is_some() || change.language.is_some() || change.body_changed).then_some(change)
 }
 
 /// 두 catalog document를 스키마·객체·routine 기준으로 비교한다.
@@ -263,19 +284,7 @@ pub fn diff_documents(old: &CatalogDocument, new: &CatalogDocument) -> DocumentD
     for (id, nr) in &new_routines {
         match old_routines.get(id) {
             Some(or) => {
-                let change = RoutineChange {
-                    id: id.clone(),
-                    kind: (or.kind != nr.kind).then(|| FieldChange {
-                        old: or.kind.clone(),
-                        new: nr.kind.clone(),
-                    }),
-                    language: (or.language != nr.language).then(|| FieldChange {
-                        old: or.language.clone().unwrap_or_default(),
-                        new: nr.language.clone().unwrap_or_default(),
-                    }),
-                    body_changed: or.body != nr.body,
-                };
-                if change.kind.is_some() || change.language.is_some() || change.body_changed {
+                if let Some(change) = routine_change(id, or, nr) {
                     routines.changed.push(change);
                 }
             }
@@ -321,10 +330,20 @@ fn object_change(
         old: old.kind.clone(),
         new: new.kind.clone(),
     });
-    let columns = collect(&old.columns, &new.columns, |c| &c.name);
-    let constraints = collect(&old.constraints, &new.constraints, |c| &c.name);
-    let indexes = collect(&old.indexes, &new.indexes, |i| &i.name);
-    let triggers = collect(&old.triggers, &new.triggers, |t| &t.name);
+    let columns = collect(&old.columns, &new.columns, |c| &c.name, |a, b| a == b);
+    let constraints = collect(
+        &old.constraints,
+        &new.constraints,
+        |c| &c.name,
+        |a, b| a == b,
+    );
+    let indexes = collect(
+        &old.indexes,
+        &new.indexes,
+        |i| &i.name,
+        |a, b| a.name == b.name && a.unique == b.unique && a.columns == b.columns,
+    );
+    let triggers = collect(&old.triggers, &new.triggers, |t| &t.name, |a, b| a == b);
     let body_changed = old.body != new.body;
 
     if kind.is_none()
@@ -350,7 +369,7 @@ fn object_change(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{ObjectDoc, SchemaDoc};
+    use crate::document::{IndexDoc, ObjectDoc, SchemaDoc, UsageDoc};
 
     fn doc(objects: Vec<ObjectDoc>, routines: Vec<RoutineDoc>) -> CatalogDocument {
         CatalogDocument {
@@ -445,5 +464,80 @@ mod tests {
         });
         let d2 = diff_documents(&old, &doc(vec![], vec![with_usage]));
         assert!(d2.routines.changed.is_empty());
+    }
+
+    #[test]
+    fn index_usage만_바뀌면_document_diff에서_제외한다() {
+        let mut old_table = table("t", vec![]);
+        old_table.indexes = vec![IndexDoc {
+            name: "t_idx".into(),
+            unique: true,
+            columns: vec!["id".into()],
+            usage: None,
+        }];
+        let mut new_table = old_table.clone();
+        new_table.indexes[0].usage = Some(UsageDoc {
+            since: None,
+            reads: 4,
+            writes: 0,
+            total_ms: None,
+            self_ms: None,
+        });
+        let d = diff_documents(
+            &doc(vec![old_table.clone()], vec![]),
+            &doc(vec![new_table.clone()], vec![]),
+        );
+        assert_eq!(d.summary.changed, 0);
+        assert!(d.objects.changed.is_empty());
+
+        let mut structurally_changed = new_table;
+        structurally_changed.indexes[0].unique = false;
+        structurally_changed.indexes[0].columns = vec!["other_id".into()];
+        let d = diff_documents(
+            &doc(vec![old_table], vec![]),
+            &doc(vec![structurally_changed], vec![]),
+        );
+        assert_eq!(d.objects.changed.len(), 1);
+        assert_eq!(d.objects.changed[0].indexes.changed.len(), 1);
+    }
+
+    #[test]
+    fn routine_member_of_이동은_graph_id_add_remove로_보고한다() {
+        let routine = |member_of: &str| RoutineDoc {
+            name: "touch".into(),
+            kind: "procedure".into(),
+            language: Some("plsql".into()),
+            body: Some("BEGIN NULL; END;".into()),
+            signature: None,
+            usage: None,
+            member_of: Some(member_of.into()),
+        };
+        let old = doc(vec![], vec![routine("old_ops")]);
+        let new = doc(vec![], vec![routine("new_ops")]);
+        let d = diff_documents(&old, &new);
+        assert_eq!(d.routines.changed.len(), 0);
+        assert_eq!(d.routines.added[0].id, "main.new_ops.touch");
+        assert_eq!(d.routines.removed[0].id, "main.old_ops.touch");
+    }
+
+    #[test]
+    fn 같은_이름의_다른_패키지_멤버는_동일_문서에서_충돌하지_않는다() {
+        let routine = |parent: &str, name: &str| RoutineDoc {
+            name: name.into(),
+            kind: "procedure".into(),
+            language: Some("plsql".into()),
+            body: Some("BEGIN NULL; END;".into()),
+            signature: None,
+            usage: None,
+            member_of: Some(parent.into()),
+        };
+        let old = doc(
+            vec![],
+            vec![routine("ops_a", "touch"), routine("ops_b", "touch")],
+        );
+        let d = diff_documents(&old, &old.clone());
+        assert_eq!(d.summary.added, 0);
+        assert_eq!(d.summary.removed, 0);
+        assert_eq!(d.summary.changed, 0);
     }
 }

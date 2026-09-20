@@ -17,9 +17,12 @@
   엔진·두 프로브의 `--document-version`, JSON↔NDJSON document diff를 추가했다.
   명세는 [CATALOG.md](CATALOG.md), 조합 검증은
   `Scripts/verify-document-versions.py`·`Scripts/verify-probe-versions.py`다.
-  Rust 127개 테스트, Go test·vet·CGO 없는 빌드, JDBC shadowJar,
+  Rust 132개 테스트, Go test·vet·CGO 없는 빌드, JDBC shadowJar,
   전체 DB fixture(건너뜀 0)와 생산자별 v1/v2 × JSON/NDJSON 조합 14개가
   통과했다. PostgreSQL 골든은 새 동적 SQL 간선만 추가됐음을 확인해 갱신했다.
+  최종 검토에서 index usage를 구조 diff에서 제외하고 package 소속 이동을
+  graph id의 제거·추가로 보고하도록 수정했다. 미지 필드 경로의 무표시 절단을
+  없애고, 중복 카탈로그 식별자는 종류별 실측 수를 limitation으로 남긴다.
   통합 CI·6개 크레이트 게시·레지스트리 설치 검증·GitHub 릴리스를 진행한다.
 - 2026-09-20: **동적 SQL 리터럴 복구와 오탐 방지 보강**.
   PostgreSQL dollar-quote·Oracle q-quote·T-SQL 괄호/N 리터럴을 복구하고,
@@ -332,7 +335,7 @@
 ## 검증 명령
 
 ```bash
-(cd engine && cargo build --workspace --locked && cargo test --workspace --locked) # 127개 테스트
+(cd engine && cargo build --workspace --locked && cargo test --workspace --locked) # 132개 테스트
 Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체 DB/전송 조합 검증
 # PG는 initdb로, MySQL·MariaDB·MSSQL·Oracle은 docker로 자동 프로비전한다.
 #   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh      (폐기용 DB만!)
