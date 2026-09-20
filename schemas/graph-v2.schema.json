@@ -143,7 +143,7 @@
           "additionalProperties": {"$ref": "#/$defs/foreign_key_metadata"}
         }
       },
-      "additionalProperties": false
+      "additionalProperties": true
     },
     "column_metadata": {
       "type": "object",
@@ -154,7 +154,7 @@
         "ordinal": {"type": "integer", "minimum": 0, "maximum": 4294967295},
         "pk_position": {"type": "integer", "minimum": 0, "maximum": 4294967295}
       },
-      "additionalProperties": false
+      "additionalProperties": true
     },
     "index_metadata": {
       "type": "object",
@@ -166,7 +166,7 @@
         "has_predicate": {"type": "boolean"},
         "complete": {"type": "boolean"}
       },
-      "additionalProperties": false
+      "additionalProperties": true
     },
     "foreign_key_metadata": {
       "type": "object",
@@ -178,7 +178,7 @@
         "target_columns": {"type": "array", "items": {"type": "string"}},
         "complete": {"type": "boolean"}
       },
-      "additionalProperties": false
+      "additionalProperties": true
     }
   }
 }

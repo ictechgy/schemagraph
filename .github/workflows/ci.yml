@@ -66,6 +66,17 @@ jobs:
           cargo build --manifest-path engine/Cargo.toml --workspace --locked
           cargo test --manifest-path engine/Cargo.toml --workspace --locked
 
+      - name: Verify JSON contracts and competitive CLI behavior
+        run: |
+          for dialect in postgres sqlserver oracle; do
+            cmp "engine/source/src/sql/catalog-$dialect.sql" "probe-go/sql/catalog-$dialect.sql"
+          done
+          python3 -m venv "$RUNNER_TEMP/jsonschema-venv"
+          "$RUNNER_TEMP/jsonschema-venv/bin/pip" install --disable-pip-version-check --no-input 'jsonschema==4.23.0'
+          "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-contracts.py \
+            --engine engine/target/debug/schemagraph
+          python3 Scripts/verify-competitive.py --engine engine/target/debug/schemagraph
+
       - name: Check bundled documents and licenses
         run: |
           cmp skills/schemagraph/SKILL.md engine/cli/SKILL.md
@@ -128,10 +139,20 @@ jobs:
           echo "69084713593a4aa8d07c383619b9639276f08bccf8faf1c562178147d389b1e1  $RUNNER_TEMP/mysql-connector-j.jar" | sha256sum --check
           echo "a66d27a14f3adee484427cc4de008af85a5c3e78e2e3285a4dba1277332978a5  $RUNNER_TEMP/ojdbc8.jar" | sha256sum --check
 
+      - name: Verify dependency catalogs and index metadata in SQLite and PostgreSQL
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+        run: |
+          python3 Scripts/verify-catalog-dependencies.py \
+            --engine engine/target/debug/schemagraph \
+            --go-probe probe-go/schemagraph-probe-go \
+            --jdbc-jar probe/build/libs/schemagraph-probe-all.jar
+
       - name: Verify every database fixture
         env:
           SG_MYSQL_JAR: ${{ runner.temp }}/mysql-connector-j.jar
           SG_ORACLE_JAR: ${{ runner.temp }}/ojdbc8.jar
+          SG_FIXTURE_ARTIFACTS: ${{ runner.temp }}/fixture-artifacts
         run: |
           # 선택 검증을 건너뛰어도 로컬 스크립트는 성공하므로 CI에서는 경고를 실패로 바꾼다.
           Scripts/verify-fixtures.sh 2>&1 | tee "$RUNNER_TEMP/fixtures.log"
@@ -139,3 +160,12 @@ jobs:
             echo '::error::Fixture coverage is incomplete; resolve the warnings above.'
             exit 1
           fi
+
+      - name: Preserve fixture graphs for review
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fixture-graphs
+          path: ${{ runner.temp }}/fixture-artifacts/*.graph.json
+          if-no-files-found: ignore
+          retention-days: 7

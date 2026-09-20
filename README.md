@@ -11,14 +11,18 @@ trigger bodies.
 then inspect dependencies, trace impact, find cycles, check architecture
 rules, or compare snapshots without reconnecting to the database. Reports
 use deterministic JSON for scripts and coding agents; diagrams are available
-as Mermaid and Graphviz DOT.
+as Mermaid, Graphviz DOT, and a standalone offline HTML explorer.
+
+Column lineage, structured diagnostics, evidence paths, retention policies, and
+catalog change reviews are described in [the analysis guide](ANALYSIS.md).
+See [installation and CI examples](INSTALLATION.md) for release artifacts.
 
 ## Quick start
 
 Install the CLI with Rust and Cargo:
 
 ```sh
-cargo install schemagraph-cli --version 0.3.0 --locked
+cargo install schemagraph-cli --version 0.4.0 --locked
 ```
 
 ### Build from source
@@ -83,11 +87,18 @@ read that file by default; use `--graph <path>` to select another snapshot.
 | --- | --- |
 | `scan <url>` | Collect a catalog and build the dependency graph. |
 | `scan --document <path>` | Build a graph from a JSON or NDJSON catalog document. |
-| `graph --format mermaid\|json\|dot` | Render the graph; select `--level schema\|object\|column`. |
+| `graph --format mermaid\|json\|dot\|html` | Render the graph; select `--level schema\|object\|column`. |
 | `query <name> --depth N` | List dependencies and dependents, with supporting edges. |
 | `impact <name>` | Trace dependents that may be affected by a change. |
 | `cycles` | Report dependency cycles and self-loops. |
-| `dead` | Report candidate views and routines with no remaining dependents in the database graph. |
+| `dead` | Report unreachable view/routine candidates, with declared retention roots and suppressions. |
+| `diagnostics` | Report SQL analysis state and located unresolved or unsupported constructs. |
+| `explain <name>` | Show incident dependencies and their catalog/body provenance. |
+| `path <from> <to>` | Find shortest dependency paths within explicit traversal budgets. |
+| `review <before> <after>` | Combine catalog changes with dependent impact and comparison coverage. |
+| `lint` | Inspect FK index-prefix facts and unresolved/ambiguous references. |
+| `merge <documents>…` | Combine independently parsed DB catalogs under distinct source IDs. |
+| `serve` | Expose read-only MCP tools over one preloaded graph. |
 | `stats` | List collected usage evidence and collection coverage. |
 | `rules --config <path>` | Check dependency edges against TOML rules. |
 | `diff <old> <new>` | Compare two graph snapshots or two JSON/NDJSON catalog documents. |
@@ -171,7 +182,8 @@ memory reductions, reproducible benchmarks, and the remaining limits.
 ## Interpreting results
 
 Reports describe the dependencies captured in the graph. Application
-queries are outside that graph, so `dead` candidates are **not deletion
+queries are represented only when explicitly collected with `--sql-dir`; other
+external uses can be declared with `--retain`. `dead` candidates are **not deletion
 recommendations**. Tables are never `dead` candidates; views, materialized
 views, functions, procedures, and packages can be.
 
@@ -180,7 +192,8 @@ views, functions, procedures, and packages can be.
   and ambiguous names are reported without inventing target vertices.
 - **Partial results:** `query`, `impact`, and `dead` report `truncated` when
   results are cut short by a result limit. Check it alongside `limitations`
-  before treating a result as complete.
+  before treating a result as complete. Budgeted traversals separately report
+  `complete`, visited/edge counts, and `truncationReasons`.
 - **Stable output:** the same input document produces the same graph.
   Live scans can differ as catalog contents and usage statistics change.
 - **Body coverage:** views and triggers yield table and column dependencies.
@@ -193,7 +206,9 @@ views, functions, procedures, and packages can be.
   known text variables in straight-line code are evaluated conservatively.
   Branches, loops, uncertain writes, unsupported conversions, and unknown
   values invalidate that knowledge. A literal prefix is never treated as
-  the full command. Nested column scopes can also leave reported gaps.
+  the full command. Views support scoped column binding, CTEs, derived tables,
+  wildcard expansion, correlated subqueries, set operations, and value lineage.
+  Recursive CTEs and unsupported constructs remain explicitly partial.
 
 ### Usage evidence
 
@@ -274,10 +289,11 @@ Unavailable checks print skip warnings; an exit code of zero alone does not
 mean every database was tested. Build the CLI before starting the script
 and keep that binary unchanged until the run finishes.
 
-The P0–P6 milestones and the v0.2 roadmap are implemented. Version 0.3 adds
-catalog memory improvements, specialized Db2 LUW / Informix JDBC collection,
-and Maven distribution of the JDBC probe. Runtime-dependent SQL remains an
-explicit limitation. [HANDOFF.md](HANDOFF.md) records release and validation status.
+The follow-up to the [competitive review](COMPETITIVE-ANALYSIS.md) adds scoped
+column lineage, evidence diagnostics, change review, declared entry points,
+catalog dependency facts, file SQL, MCP/HTML consumers, traversal budgets, and
+an optional body-analysis cache. Runtime-dependent SQL remains an explicit
+limitation. [HANDOFF.md](HANDOFF.md) records release and validation status.
 
 See [DESIGN.md](DESIGN.md) for the design and output contract,
 [HANDOFF.md](HANDOFF.md) for implementation status and verification notes,

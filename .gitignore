@@ -30,3 +30,4 @@ __pycache__/
 # 산출물
 *.graph.json
 *.catalog.json
+.schemagraph-cache/

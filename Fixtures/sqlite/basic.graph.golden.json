@@ -1,4 +1,20 @@
 {
+  "analysis": [
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "diagnostics": [],
+      "id": "main.order_totals",
+      "scope": "column-dependencies-and-lineage",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "diagnostics": [],
+      "id": "main.orders.trg_orders_touch",
+      "scope": "object-dependencies",
+      "state": "complete"
+    }
+  ],
   "edges": [
     {
       "from": "main",
@@ -279,6 +295,17 @@
     {
       "evidence": [
         {
+          "detail": "view main.order_totals reads main.customers.id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.order_totals",
+      "kind": "reads",
+      "to": "main.customers.id"
+    },
+    {
+      "evidence": [
+        {
           "detail": "view main.order_totals reads main.customers.name",
           "layer": "body-parse"
         }
@@ -316,6 +343,17 @@
     {
       "evidence": [
         {
+          "detail": "view main.order_totals reads main.orders.customer_id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.order_totals",
+      "kind": "reads",
+      "to": "main.orders.customer_id"
+    },
+    {
+      "evidence": [
+        {
           "detail": "view main.order_totals reads main.orders.id",
           "layer": "body-parse"
         }
@@ -333,6 +371,39 @@
       ],
       "from": "main.order_totals",
       "kind": "reads",
+      "to": "main.orders.total"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "main.order_totals.customer_name derives its value from main.customers.name",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.order_totals.customer_name",
+      "kind": "derives-from",
+      "to": "main.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "main.order_totals.order_id derives its value from main.orders.id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.order_totals.order_id",
+      "kind": "derives-from",
+      "to": "main.orders.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "main.order_totals.total derives its value from main.orders.total",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.order_totals.total",
+      "kind": "derives-from",
       "to": "main.orders.total"
     },
     {
@@ -484,7 +555,389 @@
   "limitations": [
     "DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (인라인 제약 파싱 미지원)"
   ],
-  "version": 1,
+  "origins": [
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "from": "main.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 20,
+        "end_column": 31,
+        "end_line": 3,
+        "line": 3
+      },
+      "role": "relation",
+      "to": "main.customers"
+    },
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "from": "main.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 35,
+        "end_column": 39,
+        "end_line": 3,
+        "line": 3
+      },
+      "role": "join",
+      "to": "main.customers.id"
+    },
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "from": "main.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 26,
+        "end_column": 32,
+        "end_line": 2,
+        "line": 2
+      },
+      "role": "projection",
+      "to": "main.customers.name"
+    },
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "from": "main.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 6,
+        "end_column": 14,
+        "end_line": 3,
+        "line": 3
+      },
+      "role": "relation",
+      "to": "main.orders"
+    },
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "from": "main.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 42,
+        "end_column": 55,
+        "end_line": 3,
+        "line": 3
+      },
+      "role": "join",
+      "to": "main.orders.customer_id"
+    },
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "from": "main.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 8,
+        "end_column": 12,
+        "end_line": 2,
+        "line": 2
+      },
+      "role": "projection",
+      "to": "main.orders.id"
+    },
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "from": "main.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 51,
+        "end_column": 58,
+        "end_line": 2,
+        "line": 2
+      },
+      "role": "projection",
+      "to": "main.orders.total"
+    },
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "from": "main.order_totals.customer_name",
+      "kind": "derives-from",
+      "location": {
+        "column": 26,
+        "end_column": 32,
+        "end_line": 2,
+        "line": 2
+      },
+      "role": "value",
+      "to": "main.customers.name"
+    },
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "from": "main.order_totals.order_id",
+      "kind": "derives-from",
+      "location": {
+        "column": 8,
+        "end_column": 12,
+        "end_line": 2,
+        "line": 2
+      },
+      "role": "value",
+      "to": "main.orders.id"
+    },
+    {
+      "body_hash": "sha256:03dde33f32dfb1b66b09f5a0b84712f8da5febe612f0d795267c71a9b9edc7bf",
+      "from": "main.order_totals.total",
+      "kind": "derives-from",
+      "location": {
+        "column": 51,
+        "end_column": 58,
+        "end_line": 2,
+        "line": 2
+      },
+      "role": "value",
+      "to": "main.orders.total"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "main.customers"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "main.orders.customer_id"
+    }
+  ],
+  "schema_metadata": {
+    "columns": {
+      "main.a.b_id": {
+        "data_type": "INTEGER",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "main.a.id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "main.b.a_id": {
+        "data_type": "INTEGER",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "main.b.id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "main.customers.id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "main.customers.name": {
+        "data_type": "TEXT",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "main.loop_self.id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "main.loop_self.parent_id": {
+        "data_type": "INTEGER",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "main.order_items.id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "main.order_items.order_id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "main.order_items.product_id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 3,
+        "pk_position": 0
+      },
+      "main.order_totals.customer_name": {
+        "data_type": "TEXT",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "main.order_totals.order_id": {
+        "data_type": "INTEGER",
+        "nullable": true,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "main.order_totals.total": {
+        "data_type": "REAL",
+        "nullable": true,
+        "ordinal": 3,
+        "pk_position": 0
+      },
+      "main.orders.customer_id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "main.orders.id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "main.orders.total": {
+        "data_type": "REAL",
+        "nullable": false,
+        "ordinal": 3,
+        "pk_position": 0
+      },
+      "main.products.id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "main.products.sku": {
+        "data_type": "TEXT",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "main.shipments.customer_id": {
+        "data_type": "INTEGER",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "main.shipments.id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "main.shipments.note": {
+        "data_type": "TEXT",
+        "nullable": true,
+        "ordinal": 3,
+        "pk_position": 0
+      },
+      "main.standalone.id": {
+        "data_type": "INTEGER",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "main.standalone.note": {
+        "data_type": "TEXT",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      }
+    },
+    "indexes": {
+      "main.orders.idx_orders_customer": {
+        "table": "main.orders",
+        "columns": [
+          "main.orders.customer_id"
+        ],
+        "unique": false,
+        "has_predicate": false,
+        "complete": true
+      },
+      "main.products.sqlite_autoindex_products_1": {
+        "table": "main.products",
+        "columns": [
+          "main.products.sku"
+        ],
+        "unique": true,
+        "has_predicate": false,
+        "complete": true
+      }
+    },
+    "foreign_keys": {
+      "main.a.a_fk_0": {
+        "table": "main.a",
+        "columns": [
+          "main.a.b_id"
+        ],
+        "target_table": "main.b",
+        "target_columns": [
+          "main.b.id"
+        ],
+        "complete": false
+      },
+      "main.b.b_fk_0": {
+        "table": "main.b",
+        "columns": [
+          "main.b.a_id"
+        ],
+        "target_table": "main.a",
+        "target_columns": [
+          "main.a.id"
+        ],
+        "complete": false
+      },
+      "main.loop_self.loop_self_fk_0": {
+        "table": "main.loop_self",
+        "columns": [
+          "main.loop_self.parent_id"
+        ],
+        "target_table": "main.loop_self",
+        "target_columns": [
+          "main.loop_self.id"
+        ],
+        "complete": false
+      },
+      "main.order_items.order_items_fk_0": {
+        "table": "main.order_items",
+        "columns": [
+          "main.order_items.product_id"
+        ],
+        "target_table": "main.products",
+        "target_columns": [
+          "main.products.id"
+        ],
+        "complete": false
+      },
+      "main.order_items.order_items_fk_1": {
+        "table": "main.order_items",
+        "columns": [
+          "main.order_items.order_id"
+        ],
+        "target_table": "main.orders",
+        "target_columns": [
+          "main.orders.id"
+        ],
+        "complete": false
+      },
+      "main.orders.orders_fk_0": {
+        "table": "main.orders",
+        "columns": [
+          "main.orders.customer_id"
+        ],
+        "target_table": "main.customers",
+        "target_columns": [
+          "main.customers.id"
+        ],
+        "complete": false
+      }
+    }
+  },
+  "version": 2,
   "vertices": [
     {
       "id": "main",
