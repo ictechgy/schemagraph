@@ -33,7 +33,7 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
     // Oracle의 미인용 식별자는 대문자로 접힌다 — 카탈로그는 ORDERS인데 몸체는
     // orders라 정확 일치가 없다. 대소문자 구분 방언(PG 등)에 켜면 다른
     // 객체를 잘못 가리키므로 접힘 의미론이 확실한 방언에만 켠다.
-    let ci = doc.dialect == "oracle";
+    let ci = matches!(doc.dialect.as_str(), "oracle" | "db2");
     let format_shadowed = matches!(doc.dialect.as_str(), "postgres" | "postgresql")
         && doc
             .schemas
@@ -81,7 +81,12 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                     ));
                     continue;
                 };
-                match parse_trigger_body(dialect.as_deref(), body) {
+                let parsed_body = match doc.dialect.as_str() {
+                    "db2" => parse_db2_trigger_body(dialect.as_deref(), body),
+                    "informix" => parse_informix_trigger_body(dialect.as_deref(), body),
+                    _ => parse_trigger_body(dialect.as_deref(), body),
+                };
+                match parsed_body {
                     Ok(parsed) => {
                         apply_trigger(
                             g,
@@ -125,6 +130,27 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 ));
                 continue;
             };
+            if matches!(doc.dialect.as_str(), "db2" | "informix")
+                && catalog_routine_language_allowed(&doc.dialect, routine.language.as_deref())
+            {
+                let (parsed, unextracted) = parse_catalog_routine_body(&doc.dialect, body);
+                apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                if unextracted > 0 {
+                    notes.push(format!(
+                        "routine {owner}: body statement(s) {unextracted} could not be extracted"
+                    ));
+                }
+                enriched += 1;
+                continue;
+            }
+            if matches!(doc.dialect.as_str(), "db2" | "informix") {
+                let language = routine.language.as_deref().unwrap_or("unknown");
+                notes.push(format!(
+                    "routine {owner}: language {language} is unsupported for {0} catalog parsing — body edges omitted",
+                    doc.dialect
+                ));
+                continue;
+            }
             match routine.language.as_deref() {
                 // SQL 언어 함수는 몸체가 그대로 SQL이라 파싱 가능 — 나머지
                 // 언어는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
@@ -669,6 +695,222 @@ fn parse_routine_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<Parse
     parse_trigger_body(dialect, &inner)
 }
 
+/// Db2 LUW와 Informix SPL의 catalog text는 `AS` 문자열이 아니라 CREATE
+/// routine 전문이다. 알려진 header와 block 껍질만 벗기고 나머지는 기존
+/// 문장 추출기에 넘긴다 — 동적 SQL의 값을 추측하지 않는다.
+fn parse_catalog_routine_body(dialect_name: &str, body: &str) -> (ParsedTrigger, usize) {
+    let Some(inner) = strip_catalog_routine_header(dialect_name, body) else {
+        return (empty_parsed_trigger(), 1);
+    };
+    let dialect = dialect_for(dialect_name);
+    parse_procedural_body(
+        dialect.as_deref(),
+        inner,
+        constant_sql::dialect(dialect_name),
+        false,
+    )
+}
+
+fn catalog_routine_language_allowed(dialect: &str, language: Option<&str>) -> bool {
+    let Some(language) = language else {
+        return true;
+    };
+    match dialect {
+        "db2" => language.eq_ignore_ascii_case("sql"),
+        "informix" => language.eq_ignore_ascii_case("spl") || language.eq_ignore_ascii_case("sql"),
+        _ => false,
+    }
+}
+
+fn empty_parsed_trigger() -> ParsedTrigger {
+    ParsedTrigger {
+        writes: Vec::new(),
+        reads: Vec::new(),
+        fired_columns: Vec::new(),
+        calls: Vec::new(),
+        ignored_relations: BTreeSet::new(),
+    }
+}
+
+/// Db2 `RETURN`/DML과 Informix `RETURNING;` 뒤를 routine body로 찾는다.
+/// 키워드 검색기는 문자열·주석을 건너뛰므로 quoted fake SQL을 body marker로
+/// 오인하지 않는다.
+fn strip_catalog_routine_header<'a>(dialect: &str, body: &'a str) -> Option<&'a str> {
+    let create = find_all_keywords(body, "CREATE").first().copied()?;
+    let tail = &body[create + "CREATE".len()..];
+    let routine = [
+        find_all_keywords(tail, "FUNCTION").first().copied(),
+        find_all_keywords(tail, "PROCEDURE").first().copied(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()?;
+    let after_routine = &tail[routine + head_word(&tail[routine..]).1..];
+    if dialect == "db2" {
+        return strip_db2_routine_body(after_routine);
+    }
+    strip_informix_routine_body(after_routine)
+}
+
+fn strip_db2_routine_body<'a>(tail: &'a str) -> Option<&'a str> {
+    let markers = [
+        "BEGIN", "RETURN", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CALL", "VALUES",
+    ];
+    let marker = markers
+        .iter()
+        .flat_map(|keyword| find_all_keywords(tail, keyword))
+        .min()?;
+    let body = &tail[marker..];
+    if starts_with_keyword(body, "BEGIN") {
+        return extract_trigger_inner(body).or(Some(body));
+    }
+    Some(body)
+}
+
+fn strip_informix_routine_body<'a>(tail: &'a str) -> Option<&'a str> {
+    if let Some(returning) = find_all_keywords(tail, "RETURNING").first().copied() {
+        let after_returning = &tail[returning + "RETURNING".len()..];
+        let end = find_top_level_semicolon(after_returning)?;
+        return Some(after_returning[end..].trim_start());
+    }
+    if let Some(end) = find_parameter_list_end(tail) {
+        return Some(tail[end..].trim_start());
+    }
+    [
+        "DEFINE", "LET", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "RETURN",
+    ]
+    .iter()
+    .flat_map(|keyword| find_all_keywords(tail, keyword).into_iter())
+    .min()
+    .map(|position| tail[position..].trim_start())
+}
+
+fn find_parameter_list_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut open = None;
+    let mut scan = 0;
+    while scan < bytes.len() {
+        if let Some(end) = quoted_or_comment_end(text, scan) {
+            scan = end;
+            continue;
+        }
+        if bytes[scan] == b'(' {
+            open = Some(scan);
+            break;
+        }
+        scan += 1;
+    }
+    let open = open?;
+    let mut depth = 0usize;
+    let mut index = open;
+    while index < bytes.len() {
+        if let Some(end) = quoted_or_comment_end(text, index) {
+            index = end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn find_top_level_semicolon(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(end) = quoted_or_comment_end(text, index) {
+            index = end;
+            continue;
+        }
+        if bytes[index] == b';' {
+            return Some(index + 1);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn parse_informix_trigger_body(
+    dialect: Option<&dyn Dialect>,
+    body: &str,
+) -> Result<ParsedTrigger, String> {
+    let inner = strip_catalog_trigger_header("informix", body)
+        .and_then(strip_outer_parentheses)
+        .or_else(|| strip_catalog_trigger_header("informix", body))
+        .or_else(|| strip_outer_parentheses(body))
+        .unwrap_or(body);
+    parse_trigger_body(dialect, inner)
+}
+
+fn parse_db2_trigger_body(
+    dialect: Option<&dyn Dialect>,
+    body: &str,
+) -> Result<ParsedTrigger, String> {
+    let inner = strip_catalog_trigger_header("db2", body).unwrap_or(body);
+    parse_trigger_body(dialect, inner)
+}
+
+fn strip_catalog_trigger_header<'a>(dialect: &str, body: &'a str) -> Option<&'a str> {
+    let for_each_row = find_all_keywords(body, "FOR")
+        .into_iter()
+        .filter_map(|position| {
+            let rest = body[position + "FOR".len()..].trim_start();
+            if !starts_with_keyword(rest, "EACH") {
+                return None;
+            }
+            let rest = rest["EACH".len()..].trim_start();
+            starts_with_keyword(rest, "ROW").then_some(rest["ROW".len()..].trim_start())
+        })
+        .next()?;
+    if dialect == "db2" {
+        let mut rest = for_each_row;
+        if starts_with_keyword(rest, "MODE") {
+            let after_mode = rest["MODE".len()..].trim_start();
+            let (_, length) = head_word(after_mode);
+            rest = after_mode[length..].trim_start();
+        }
+        return Some(rest);
+    }
+    Some(for_each_row)
+}
+
+fn strip_outer_parentheses(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(end) = quoted_or_comment_end(trimmed, index) {
+            index = end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && index + 1 != bytes.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    (depth == 0).then(|| trimmed[1..trimmed.len() - 1].trim())
+}
+
 /// `AS $$...$$`·`AS $tag$...$tag$`·`AS '...'` 안의 몸체를 꺼낸다 —
 /// pg_get_functiondef·SHOW CREATE FUNCTION류 정의문은 몸체를 AS 뒤에
 /// 문자열로 담으므로, 그 껍질을 벗겨야 SQL 문장이 나온다.
@@ -1014,7 +1256,7 @@ fn extract_procedural_statements(body: &str, state: &mut ExtractionState) -> (Ve
                     in_declare = false;
                     rest = &rest[wlen..];
                 }
-                "DECLARE" | "IS" | "AS" => {
+                "DECLARE" | "DEFINE" | "IS" | "AS" => {
                     in_declare = true;
                     rest = &rest[wlen..];
                 }
@@ -4345,5 +4587,192 @@ mod tests {
         let (g, notes) = build(&doc);
         assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Calls));
         assert!(notes.iter().any(|n| n.contains("오버로드")));
+    }
+
+    #[test]
+    fn db2_sql_routine_전문에서_정적_dml을_추출한다() {
+        let mut routine = routine(
+            "touch_customer",
+            Some("sql"),
+            "CREATE PROCEDURE touch_customer(IN customer INTEGER) \
+             LANGUAGE SQL MODIFIES SQL DATA \
+             UPDATE customers SET name = 'touched' WHERE id = customer",
+        );
+        routine.kind = "procedure".into();
+        let mut doc = doc_with_routine(vec![routine], "");
+        doc.dialect = "db2".into();
+        let (graph, notes) = build(&doc);
+        assert!(
+            graph.edges().iter().any(|edge| {
+                edge.kind == EdgeKind::Writes
+                    && edge.from.as_str() == "public.touch_customer"
+                    && edge.to.as_str() == "public.customers"
+            }),
+            "edges: {:?}, notes: {:?}",
+            graph.edges(),
+            notes
+        );
+        assert!(notes.is_empty(), "notes: {notes:?}");
+    }
+
+    #[test]
+    fn db2_begin_atomic과_주석속_가짜_sql을_구분한다() {
+        let mut routine = routine(
+            "touch_customer",
+            Some("sql"),
+            "CREATE PROCEDURE touch_customer() LANGUAGE SQL \
+             BEGIN ATOMIC \
+               -- UPDATE ghost_table SET value = 1;\n\
+               UPDATE customers SET name = 'observed'; \
+             END",
+        );
+        routine.kind = "procedure".into();
+        let mut doc = doc_with_routine(vec![routine], "");
+        doc.dialect = "db2".into();
+        let (graph, notes) = build(&doc);
+        assert!(
+            graph.edges().iter().any(|edge| {
+                edge.kind == EdgeKind::Writes
+                    && edge.from.as_str() == "public.touch_customer"
+                    && edge.to.as_str() == "public.customers"
+            }),
+            "edges: {:?}, notes: {:?}",
+            graph.edges(),
+            notes
+        );
+        assert!(!graph
+            .vertices()
+            .any(|vertex| vertex.id.as_str().contains("ghost_table")));
+        assert!(notes.is_empty(), "notes: {notes:?}");
+    }
+
+    #[test]
+    fn informix_spl_routine_header와_body를_분리한다() {
+        let mut routine = routine(
+            "touch_customer",
+            Some("spl"),
+            "CREATE PROCEDURE touch_customer(customer INTEGER) \
+             RETURNING INTEGER; \
+             DEFINE marker INTEGER; \
+             UPDATE customers SET name = 'observed' WHERE id = customer; \
+             RETURN 1; \
+             END PROCEDURE",
+        );
+        routine.kind = "procedure".into();
+        let mut doc = doc_with_routine(vec![routine], "");
+        doc.dialect = "informix".into();
+        let (graph, notes) = build(&doc);
+        assert!(graph.edges().iter().any(|edge| {
+            edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.touch_customer"
+                && edge.to.as_str() == "public.customers"
+        }));
+        assert!(notes.is_empty(), "notes: {notes:?}");
+    }
+
+    #[test]
+    fn informix_trigger_wrapper의_static_dml이_writes가_된다() {
+        let mut doc =
+            doc_with_trigger("(UPDATE customers SET name = 'observed' WHERE id = NEW.customer_id)");
+        doc.dialect = "informix".into();
+        let (graph, notes) = build(&doc);
+        assert!(graph.edges().iter().any(|edge| {
+            edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "main.orders.trg_touch"
+                && edge.to.as_str() == "main.customers"
+        }));
+        assert!(notes.is_empty(), "notes: {notes:?}");
+    }
+
+    #[test]
+    fn db2_unrecognized_external_body는_추측하지_않고_미추출로_센다() {
+        let routine = routine(
+            "external_marker",
+            Some("c"),
+            "CREATE FUNCTION external_marker() LANGUAGE C EXTERNAL NAME 'x UPDATE ghost_table'",
+        );
+        let mut doc = doc_with_routine(vec![routine], "");
+        doc.dialect = "db2".into();
+        let (graph, notes) = build(&doc);
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.from.as_str() == "public.external_marker"));
+        assert!(notes.iter().any(|note| note.contains("language c")));
+    }
+
+    #[test]
+    fn db2_비sql_language는_body가_sql처럼_보여도_건너뛴다() {
+        let routine = routine(
+            "external_marker",
+            Some("c"),
+            "CREATE FUNCTION external_marker() LANGUAGE C UPDATE customers SET name = 'x'",
+        );
+        let mut doc = doc_with_routine(vec![routine], "");
+        doc.dialect = "db2".into();
+        let (graph, notes) = build(&doc);
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.from.as_str() == "public.external_marker"));
+        assert!(notes.iter().any(|note| note.contains("language c")));
+    }
+
+    #[test]
+    fn informix_반환형없는_procedure와_define뒤_dml을_추출한다() {
+        let mut routine = routine(
+            "touch_customer",
+            Some("spl"),
+            "CREATE PROCEDURE touch_customer(customer INTEGER) \
+             DEFINE marker INTEGER; \
+             UPDATE customers SET name = 'observed' WHERE id = customer; \
+             END PROCEDURE",
+        );
+        routine.kind = "procedure".into();
+        let mut doc = doc_with_routine(vec![routine], "");
+        doc.dialect = "informix".into();
+        let (graph, notes) = build(&doc);
+        assert!(graph.edges().iter().any(|edge| {
+            edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.touch_customer"
+                && edge.to.as_str() == "public.customers"
+        }));
+        assert!(notes.is_empty(), "notes: {notes:?}");
+    }
+
+    #[test]
+    fn informix_full_trigger_wrapper에서_action을_추출한다() {
+        let mut doc = doc_with_trigger(
+            "CREATE TRIGGER orders_touch INSERT ON orders \
+             REFERENCING NEW AS n FOR EACH ROW \
+             (-- UPDATE ghost_table SET value = 1;\n\
+              UPDATE customers SET name = 'observed' WHERE id = n.customer_id)",
+        );
+        doc.dialect = "informix".into();
+        let (graph, notes) = build(&doc);
+        assert!(graph.edges().iter().any(|edge| {
+            edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "main.orders.trg_touch"
+                && edge.to.as_str() == "main.customers"
+        }));
+        assert!(notes.is_empty(), "notes: {notes:?}");
+    }
+
+    #[test]
+    fn db2_full_trigger_wrapper에서_mode뒤_dml을_추출한다() {
+        let mut doc = doc_with_trigger(
+            "CREATE TRIGGER orders_touch AFTER INSERT ON orders \
+             REFERENCING NEW AS n FOR EACH ROW MODE DB2SQL \
+             -- UPDATE ghost_table SET value = 1;\n\
+             UPDATE customers SET name = 'observed' WHERE id = n.customer_id",
+        );
+        doc.dialect = "db2".into();
+        let (graph, notes) = build(&doc);
+        assert!(graph.edges().iter().any(|edge| {
+            edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "main.orders.trg_touch"
+                && edge.to.as_str() == "main.customers"
+        }));
+        assert!(notes.is_empty(), "notes: {notes:?}");
     }
 }

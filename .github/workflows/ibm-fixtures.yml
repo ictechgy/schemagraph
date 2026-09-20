@@ -1,0 +1,98 @@
+name: IBM database fixtures
+
+on:
+  workflow_dispatch:
+    inputs:
+      database:
+        description: IBM database fixture to run
+        required: true
+        default: all
+        type: choice
+        options: [all, db2, informix]
+  push:
+    paths:
+      - ".github/workflows/ibm-fixtures.yml"
+      - "Fixtures/db2/**"
+      - "Fixtures/informix/**"
+      - "Scripts/ApplySqlStatements.java"
+      - "Scripts/TestApplySqlStatements.java"
+      - "Scripts/verify-ibm-fixtures.py"
+      - "Scripts/verify-ibm-containers.py"
+      - "engine/**"
+      - "probe/**"
+  pull_request:
+    paths:
+      - ".github/workflows/ibm-fixtures.yml"
+      - "Fixtures/db2/**"
+      - "Fixtures/informix/**"
+      - "Scripts/ApplySqlStatements.java"
+      - "Scripts/TestApplySqlStatements.java"
+      - "Scripts/verify-ibm-fixtures.py"
+      - "Scripts/verify-ibm-containers.py"
+      - "engine/**"
+      - "probe/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Install engine build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libsqlite3-dev
+
+      - name: Build engine
+        run: cargo build --manifest-path engine/Cargo.toml --locked
+
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          gradle-version: "9.6.1"
+          cache-provider: basic
+
+      - name: Build JVM probe
+        run: gradle -p probe shadowJar --no-daemon --console=plain
+
+      - name: Download and verify IBM JDBC drivers
+        run: |
+          mkdir -p "$RUNNER_TEMP/ibm-drivers"
+          curl --fail --location --retry 3 \
+            https://repo.maven.apache.org/maven2/com/ibm/db2/jcc/12.1.5.0/jcc-12.1.5.0.jar \
+            --output "$RUNNER_TEMP/ibm-drivers/db2-jcc.jar"
+          curl --fail --location --retry 3 \
+            https://repo.maven.apache.org/maven2/com/ibm/informix/jdbc/15.0.1.4/jdbc-15.0.1.4.jar \
+            --output "$RUNNER_TEMP/ibm-drivers/informix-jdbc.jar"
+          echo "04150111a29370247d162c3f05b8e938bf1314f19a63ad9a5302d88dd478e8e8  $RUNNER_TEMP/ibm-drivers/db2-jcc.jar" | sha256sum --check
+          echo "152fe3380e414261266d7bde6bacae348c94b6db0cf16f969d1094368449cec7  $RUNNER_TEMP/ibm-drivers/informix-jdbc.jar" | sha256sum --check
+
+      - name: Run disposable IBM containers and fixture checks
+        run: |
+          python3 Scripts/verify-ibm-containers.py \
+            engine/target/debug/schemagraph \
+            probe/build/libs/schemagraph-probe-all.jar \
+            --database "${{ inputs.database || 'all' }}" \
+            --drivers-dir "$RUNNER_TEMP/ibm-drivers"

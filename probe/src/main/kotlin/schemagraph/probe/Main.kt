@@ -135,6 +135,8 @@ private fun dialectOf(url: String): String = when {
     else -> url.removePrefix("jdbc:").substringBefore(':').let {
         when (it) {
             "postgresql" -> "postgres"
+            "informix-sqli", "informix" -> "informix"
+            "db2" -> "db2"
             else -> it
         }
     }

@@ -23,6 +23,14 @@ private val SYSTEM_SCHEMAS = setOf(
     "dvsys", "dvf",
 )
 
+private val DB2_SYSTEM_SCHEMAS = setOf(
+    "sysibm", "syscat", "sysstat", "sysibmadm", "systools", "nullid", "sqlj",
+)
+
+private val INFORMIX_SYSTEM_SCHEMAS = setOf(
+    "sysmaster", "sysutils", "sysadmin", "sysuser", "syscdr", "syscdcv1",
+)
+
 private fun ResultSet.strOrNull(col: String): String? =
     try { getString(col) } catch (_: Exception) { null }
 
@@ -39,7 +47,12 @@ class Extractor(
      *  한정으로 억제한다(H2의 PUBLIC은 사용자 기본 스키마라 억제하면 안 된다). */
     private fun isSystem(schema: String): Boolean {
         val s = schema.lowercase()
-        return s in SYSTEM_SCHEMAS || (dialect == "oracle" && s == "public")
+        val dialectSystem = when (dialect) {
+            "db2" -> s in DB2_SYSTEM_SCHEMAS
+            "informix" -> s in INFORMIX_SYSTEM_SCHEMAS
+            else -> false
+        }
+        return s in SYSTEM_SCHEMAS || dialectSystem || (dialect == "oracle" && s == "public")
     }
 
     fun extract(): CatalogDocument {
@@ -151,9 +164,16 @@ class Extractor(
 
     /** 스키마 한정 객체 목록 — 카탈로그가 스키마인 드라이버는 catalog
      *  인자로, 나머지는 schemaPattern으로 긁는다. */
-    private fun rawObjectsOf(schema: String): List<RawObject> =
-        (if (schemaViaCatalog) readTables(schema, null) else readTables(null, schema))
+    private fun rawObjectsOf(schema: String): List<RawObject> = when (dialect) {
+        "db2" -> db2Objects(conn, schema, limitations).map {
+            RawObject(schema, null, schema, it.name, it.kind)
+        }
+        "informix" -> informixObjects(conn, schema, limitations).map {
+            RawObject(schema, null, schema, it.name, it.kind)
+        }
+        else -> (if (schemaViaCatalog) readTables(schema, null) else readTables(null, schema))
             .filter { it.schema == schema }
+    }
 
     // ---- 객체 수집: TABLE/VIEW 계열만 정점으로, 시스템 테이블은 버린다 ----
 
@@ -324,6 +344,25 @@ class Extractor(
         val routines = mutableListOf<Triple<String, String, RoutineDoc>>()
         val params = mutableMapOf<Pair<String, String>, String>()
         val sq = q(schema)
+
+        if (dialect == "db2") {
+            val specialized = db2Bodies(conn, schema, limitations)
+            return BodyHarvest(
+                specialized.views,
+                specialized.triggers,
+                specialized.routines,
+                specialized.routineParams,
+            )
+        }
+        if (dialect == "informix") {
+            val specialized = informixBodies(conn, schema, limitations)
+            return BodyHarvest(
+                specialized.views,
+                specialized.triggers,
+                specialized.routines,
+                specialized.routineParams,
+            )
+        }
 
         when (dialect) {
             "oracle" -> {
@@ -590,7 +629,8 @@ class Extractor(
             schema?.takeIf {
                 !isSystem(it) && (schemaFilter.isEmpty() || it in schemaFilter)
             }
-        if (dialect != "sqlite" && dialect != "sqlserver" && dialect != "oracle") {
+        if (dialect != "sqlite" && dialect != "sqlserver" && dialect != "oracle" &&
+            dialect != "db2" && dialect != "informix") {
             runCatching {
                 meta.getFunctions(null, null, null).use { rs ->
                     while (rs.next()) {
