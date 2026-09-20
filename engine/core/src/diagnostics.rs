@@ -35,6 +35,8 @@ pub struct ObjectAnalysis {
     pub scope: String,
     pub body_hash: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
+    /// 파일 생산자가 준 상대 경로다. 절대 경로나 연결 문자열은 넣지 않는다.
+    pub source: Option<String>,
 }
 
 /// 같은 간선의 서로 다른 SQL 출처를 원문 해시와 위치로 식별한다.

@@ -4,12 +4,15 @@
 //! 프로브(P2)도 같은 document를 뱉으므로 변환기는 경로를 모른다.
 
 pub mod codec;
+pub mod context;
+pub mod dependencies;
 pub mod diff;
 pub mod document;
 pub mod graph;
 pub mod mysql;
 pub mod ndjson;
 pub mod postgres;
+pub mod sql_files;
 pub mod sqlite;
 
 pub use document::CatalogDocument;
@@ -30,6 +33,19 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         // sqlite는 URL 형태가 다양하다(파일 경로까지) — 나머지는 sqlite로.
         sqlite::read(url).await
     }
+}
+
+/// 호출자가 추가 메타데이터 수집을 명시하도록 기본 read와 구분한다.
+pub async fn read_with_dependencies(url: &str) -> Result<CatalogDocument, SourceError> {
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        return postgres::read_with_dependencies(url, true).await;
+    }
+    let mut doc = read(url).await?;
+    doc.limitations.push("native catalog dependency collection is supported for PostgreSQL; use the JDBC or Go probe for Oracle and SQL Server".into());
+    if let Some(context) = &mut doc.context {
+        context.catalog_complete = false;
+    }
+    Ok(doc)
 }
 
 /// reader 실패. Connect(접속 자체 실패)와 Query(카탈로그 읽기 실패)를 구분해

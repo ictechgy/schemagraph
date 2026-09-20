@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ictechgy/schemagraph/blob/main/schemas/catalog-v2.schema.json",
+  "$comment": "Catalog document wire version 2. Structural validation only: codec validation enforces feature use, dependency/context semantics, duplicate identities, and producer/header rules beyond this shape. Unknown optional fields are intentionally accepted and reported by the codec. Version 2 requires producer and required_features, forbids reader, accepts query routines only with external-queries-v1, and rejects feature names outside the supported set. Regular routines may carry optional source metadata.",
+  "type": "object",
+  "required": ["version", "dialect", "producer", "required_features", "schemas", "limitations"],
+  "properties": {
+    "version": {"const": 2},
+    "dialect": {"type": "string"},
+    "producer": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {"name": {"type": "string", "minLength": 1}},
+      "additionalProperties": true
+    },
+    "required_features": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["catalog-dependencies-v1", "external-queries-v1", "package-members-v1", "usage-v1"]
+      }
+    },
+    "schemas": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/schema"}
+    },
+    "limitations": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "context": {
+      "anyOf": [
+        {"$ref": "#/$defs/context"},
+        {"type": "null"}
+      ]
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/dependency"}
+    }
+  },
+  "not": {"required": ["reader"]},
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "schemas": {
+            "contains": {
+              "properties": {
+                "routines": {
+                  "contains": {
+                    "required": ["kind"],
+                    "properties": {"kind": {"const": "query"}}
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "required_features": {
+            "contains": {"const": "external-queries-v1"}
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "context": {
+      "type": "object",
+      "required": ["source_id", "catalog_complete"],
+      "properties": {
+        "source_id": {"type": "string"},
+        "database": {"type": ["string", "null"]},
+        "schema_filter": {
+          "type": ["array", "null"],
+          "items": {"type": "string"}
+        },
+        "catalog_complete": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "object_ref": {
+      "type": "object",
+      "required": ["schema", "name"],
+      "properties": {
+        "schema": {"type": "string"},
+        "name": {"type": "string"},
+        "kind": {"type": ["string", "null"]},
+        "member": {"type": ["string", "null"]},
+        "signature": {"type": ["string", "null"]},
+        "database": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "dependency": {
+      "type": "object",
+      "required": ["source", "target", "catalog", "dependency_type"],
+      "properties": {
+        "source": {"$ref": "#/$defs/object_ref"},
+        "target": {"$ref": "#/$defs/object_ref"},
+        "catalog": {"type": "string"},
+        "dependency_type": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "schema": {
+      "type": "object",
+      "required": ["name", "objects", "routines"],
+      "properties": {
+        "name": {"type": "string"},
+        "objects": {"type": "array", "items": {"$ref": "#/$defs/object"}},
+        "routines": {"type": "array", "items": {"$ref": "#/$defs/routine"}}
+      },
+      "additionalProperties": true
+    },
+    "object": {
+      "type": "object",
+      "required": ["name", "kind", "columns", "constraints", "indexes", "triggers"],
+      "properties": {
+        "name": {"type": "string"},
+        "kind": {"type": "string"},
+        "columns": {"type": "array", "items": {"$ref": "#/$defs/column"}},
+        "constraints": {"type": "array", "items": {"$ref": "#/$defs/constraint"}},
+        "indexes": {"type": "array", "items": {"$ref": "#/$defs/index"}},
+        "triggers": {"type": "array", "items": {"$ref": "#/$defs/trigger"}},
+        "body": {"type": ["string", "null"]},
+        "usage": {"anyOf": [{"$ref": "#/$defs/usage"}, {"type": "null"}]}
+      },
+      "additionalProperties": true
+    },
+    "column": {
+      "type": "object",
+      "required": ["name", "data_type", "nullable", "ordinal", "pk_position"],
+      "properties": {
+        "name": {"type": "string"},
+        "data_type": {"type": "string"},
+        "nullable": {"type": "boolean"},
+        "default": {"type": ["string", "null"]},
+        "ordinal": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "pk_position": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+      },
+      "additionalProperties": true
+    },
+    "constraint": {
+      "type": "object",
+      "required": ["name", "kind", "columns"],
+      "properties": {
+        "name": {"type": "string"},
+        "kind": {"type": "string"},
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "referenced": {
+          "anyOf": [{"$ref": "#/$defs/referenced"}, {"type": "null"}]
+        }
+      },
+      "additionalProperties": true
+    },
+    "referenced": {
+      "type": "object",
+      "required": ["table", "columns"],
+      "properties": {
+        "schema": {"type": ["string", "null"]},
+        "table": {"type": "string"},
+        "columns": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": true
+    },
+    "index": {
+      "type": "object",
+      "required": ["name", "unique", "columns"],
+      "properties": {
+        "name": {"type": "string"},
+        "unique": {"type": "boolean"},
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "usage": {"anyOf": [{"$ref": "#/$defs/usage"}, {"type": "null"}]},
+        "definition_complete": {"type": ["boolean", "null"]},
+        "predicate": {"type": ["string", "null"]},
+        "has_predicate": {"type": ["boolean", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "trigger": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string"},
+        "body": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "routine": {
+      "type": "object",
+      "required": ["name", "kind"],
+      "properties": {
+        "name": {"type": "string"},
+        "kind": {"type": "string"},
+        "language": {"type": ["string", "null"]},
+        "body": {"type": ["string", "null"]},
+        "signature": {"type": ["string", "null"]},
+        "usage": {"anyOf": [{"$ref": "#/$defs/usage"}, {"type": "null"}]},
+        "member_of": {"type": ["string", "null"]},
+        "source": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "usage": {
+      "type": "object",
+      "required": ["reads", "writes"],
+      "properties": {
+        "since": {"type": ["string", "null"]},
+        "reads": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "writes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "total_ms": {"type": ["number", "null"]},
+        "self_ms": {"type": ["number", "null"]}
+      },
+      "additionalProperties": true
+    }
+  }
+}

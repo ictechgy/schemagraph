@@ -9,7 +9,10 @@ use schemagraph_core::{EdgeKind, Graph, Level, Usage, Vertex, VertexId, VertexKi
 
 mod retention;
 pub use retention::{RetentionPolicy, Suppression};
+pub mod budget;
 pub mod paths;
+pub mod review;
+pub mod schema_lint;
 
 /// 질의 대상을 못 찾았을 때. `notFound`에도 limitations를 싣는다 —
 /// 없는 것과 이 도구가 못 보는 것을 소비자가 구분해야 한다.
@@ -28,7 +31,10 @@ pub enum Resolve {
 /// 모호한 짧은 이름을 임의로 골라 잡으면 소비자가 엉뚱한 객체를 보게 된다.
 pub fn resolve(graph: &Graph, name: &str) -> Resolve {
     // 정규 id 그대로 입력된 경우가 먼저다.
-    let exact = VertexId::schema(name);
+    // 사용자가 건넨 canonical id는 이미 schema/object/member 구분자를
+    // 포함하므로 다시 schema 컴포넌트로 escape하면 안 된다. v1 graph의
+    // raw id도 from_raw로 그대로 읽어 compatibility를 유지한다.
+    let exact = VertexId::from_raw(name);
     if graph.vertex(&exact).is_some() {
         return Resolve::Found(exact);
     }

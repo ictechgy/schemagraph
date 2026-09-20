@@ -19,7 +19,9 @@ use sqlparser::dialect::{
     Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
 };
 
+mod cache;
 mod constant_sql;
+pub use cache::{BodyCache, BodyResult};
 mod scope;
 #[cfg(test)]
 mod scope_tests;
@@ -30,6 +32,15 @@ mod scope_tests;
 /// 호출자가 limitations를 그래프에 싣는다 — 여기서 직접 싣지 않는 이유는
 /// reader가 이미 싣은 한계와 순서를 섞지 않기 위해서다.
 pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<String>) {
+    enrich_with_cache(g, doc, None)
+}
+
+/// 현재 카탈로그에 유효한 몸체 결과만 재사용해 구조·통계 갱신을 보존한다.
+pub fn enrich_with_cache(
+    g: &mut Graph,
+    doc: &CatalogDocument,
+    mut cache: Option<&mut dyn BodyCache>,
+) -> (usize, Vec<String>) {
     let dialect = dialect_for(&doc.dialect);
     // Oracle의 미인용 식별자는 대문자로 접힌다 — 카탈로그는 ORDERS인데 몸체는
     // orders라 정확 일치가 없다. 대소문자 구분 방언(PG 등)에 켜면 다른
@@ -57,15 +68,34 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 if let Some(owner) =
                     resolve_object(g, &schema.name, &obj.name, kind, &obj.kind, false)
                 {
-                    notes.extend(scope::enrich_view(
+                    if !cache::reuse(
+                        &mut cache,
                         g,
-                        &catalog_index,
-                        &schema.name,
-                        obj,
                         &owner,
-                        dialect.as_deref(),
-                    ));
-                    enriched += usize::from(obj.body.is_some());
+                        obj.body.as_deref(),
+                        &mut notes,
+                        &mut enriched,
+                    ) {
+                        let note_start = notes.len();
+                        let enriched_start = enriched;
+                        notes.extend(scope::enrich_view(
+                            g,
+                            &catalog_index,
+                            &schema.name,
+                            obj,
+                            &owner,
+                            dialect.as_deref(),
+                        ));
+                        enriched += usize::from(obj.body.is_some());
+                        cache::save(
+                            &mut cache,
+                            g,
+                            &owner,
+                            obj.body.as_deref(),
+                            &notes[note_start..],
+                            enriched - enriched_start,
+                        );
+                    }
                 }
             }
             for trg in &obj.triggers {
@@ -99,7 +129,18 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                     );
                     continue;
                 };
+                if cache::reuse(
+                    &mut cache,
+                    g,
+                    &trigger_id,
+                    Some(body),
+                    &mut notes,
+                    &mut enriched,
+                ) {
+                    continue;
+                }
                 let note_start = notes.len();
+                let enriched_start = enriched;
                 let mut state = schemagraph_core::AnalysisState::Complete;
                 let parsed_body = match doc.dialect.as_str() {
                     "db2" => parse_db2_trigger_body(dialect.as_deref(), body),
@@ -132,33 +173,58 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                     "SG_BODY_PARTIAL",
                     &notes[note_start..],
                 );
+                cache::save(
+                    &mut cache,
+                    g,
+                    &trigger_id,
+                    Some(body),
+                    &notes[note_start..],
+                    enriched - enriched_start,
+                );
             }
         }
         for routine in &schema.routines {
-            // routine 정점 id는 graph.rs와 같은 규칙 — 시그니처가 있으면 괄호로
-            // 붙고, 같은 이름의 테이블/프로시저가 있으면 `id_name@kind`로 분리된다.
-            let id_name = match &routine.signature {
-                Some(sig) if !sig.is_empty() => format!("{}({})", routine.name, sig),
-                _ => routine.name.clone(),
-            };
             let (kind, suffix) = match routine.kind.as_str() {
                 "procedure" => (VertexKind::Procedure, "procedure"),
                 "package" => (VertexKind::Package, "package"),
+                "query" => (VertexKind::Query, "query"),
                 _ => (VertexKind::Function, "function"),
             };
             // 패키지 멤버는 schema.pkg.member 정점 — schema 직속이 아니다.
             let owner = match &routine.member_of {
-                Some(pkg) => resolve_member(g, &schema.name, pkg, &id_name, kind, suffix, ci),
-                None => resolve_object(g, &schema.name, &id_name, kind, suffix, ci),
+                Some(pkg) => resolve_routine_vertex(
+                    g,
+                    &schema.name,
+                    Some(pkg),
+                    &routine.name,
+                    routine.signature.as_deref(),
+                    kind,
+                    suffix,
+                    ci,
+                ),
+                None => resolve_routine_vertex(
+                    g,
+                    &schema.name,
+                    None,
+                    &routine.name,
+                    routine.signature.as_deref(),
+                    kind,
+                    suffix,
+                    ci,
+                ),
             };
             let Some(owner) = owner else {
                 notes.push(format!(
-                    "routine {}.{id_name}: 정점을 못 찾음 — 몸체 간선 생략",
-                    schema.name
+                    "routine {}.{}: 정점을 못 찾음 — 몸체 간선 생략",
+                    schema.name, routine.name
                 ));
                 continue;
             };
-            let Some(body) = routine.body.as_ref().filter(|b| !b.trim().is_empty()) else {
+            let Some(body) = routine
+                .body
+                .as_ref()
+                .filter(|b| routine.kind == "query" || !b.trim().is_empty())
+            else {
                 unavailable += 1;
                 record_body(
                     g,
@@ -170,7 +236,41 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 );
                 continue;
             };
+            if cache::reuse(&mut cache, g, &owner, Some(body), &mut notes, &mut enriched) {
+                continue;
+            }
             let note_start = notes.len();
+            let enriched_start = enriched;
+            if routine.kind == "query" && scope::is_select(dialect.as_deref(), body) {
+                let object = ObjectDoc {
+                    name: routine.name.clone(),
+                    kind: "query".into(),
+                    columns: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    triggers: vec![],
+                    body: Some(body.clone()),
+                    usage: None,
+                };
+                notes.extend(scope::enrich_view(
+                    g,
+                    &catalog_index,
+                    &schema.name,
+                    &object,
+                    &owner,
+                    dialect.as_deref(),
+                ));
+                enriched += 1;
+                cache::save(
+                    &mut cache,
+                    g,
+                    &owner,
+                    Some(body),
+                    &notes[note_start..],
+                    enriched - enriched_start,
+                );
+                continue;
+            }
             let mut state = schemagraph_core::AnalysisState::Complete;
             (|| {
                 if matches!(doc.dialect.as_str(), "db2" | "informix")
@@ -273,6 +373,37 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 "SG_BODY_PARTIAL",
                 &notes[note_start..],
             );
+            cache::save(
+                &mut cache,
+                g,
+                &owner,
+                Some(body),
+                &notes[note_start..],
+                enriched - enriched_start,
+            );
+        }
+    }
+    for schema in &doc.schemas {
+        for routine in schema
+            .routines
+            .iter()
+            .filter(|r| r.kind == "query" && r.source.is_some())
+        {
+            if let Some(id) = resolve_routine_vertex(
+                g,
+                &schema.name,
+                routine.member_of.as_deref(),
+                &routine.name,
+                routine.signature.as_deref(),
+                VertexKind::Query,
+                "query",
+                false,
+            ) {
+                if let Some(mut record) = g.analysis().get(&id).cloned() {
+                    record.source = routine.source.clone();
+                    g.set_analysis(id, record);
+                }
+            }
         }
     }
     if unavailable > 0 {
@@ -325,6 +456,7 @@ fn record_body(
     g.set_analysis(
         owner.clone(),
         ObjectAnalysis {
+            source: None,
             state,
             scope: "object-dependencies".into(),
             body_hash: hash,
@@ -2398,7 +2530,16 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger) {
             // count() 같은 호출이 "카탈로그에 없음" 노이즈를 만들지 않는다.
             Expr::Function(f) => {
                 let t = object_name_parts(&f.name);
-                if !t.1.is_empty() && !is_builtin_function(&t.1) && !parsed.calls.contains(&t) {
+                let quoted_name = f
+                    .name
+                    .0
+                    .last()
+                    .and_then(|part| part.as_ident())
+                    .is_some_and(|ident| ident.quote_style.is_some());
+                if !t.1.is_empty()
+                    && (quoted_name || !is_builtin_function(&t.1))
+                    && !parsed.calls.contains(&t)
+                {
                     parsed.calls.push(t);
                 }
             }
@@ -2574,6 +2715,25 @@ fn resolve_member(
     resolve_renamed(g, VertexId::member(schema, obj, name), kind, suffix, ci)
 }
 
+fn resolve_routine_vertex(
+    g: &Graph,
+    schema: &str,
+    package: Option<&str>,
+    name: &str,
+    signature: Option<&str>,
+    kind: VertexKind,
+    suffix: &str,
+    ci: bool,
+) -> Option<VertexId> {
+    resolve_renamed(
+        g,
+        VertexId::routine(schema, package, name, signature),
+        kind,
+        suffix,
+        ci,
+    )
+}
+
 /// 객체 레벨 정점(routine 등)을 같은 규칙으로 찾는다.
 fn resolve_object(
     g: &Graph,
@@ -2629,23 +2789,9 @@ fn vertex_hit(g: &Graph, id: &VertexId, ci: bool) -> Option<VertexId> {
 /// 먼저이고, 없으면 routine kind 정점의 표시 이름과 비교한다 — 호출자는
 /// 시그니처를 모르므로 이름이 유일할 때만 받아들인다(resolve()와 같은 철학).
 fn resolve_routine(g: &Graph, schema: &str, name: &str, ci: bool) -> RoutineHit {
-    let exact = VertexId::object(schema, name);
-    // 정확한 id가 routine kind일 때만 바로 받는다 — 같은 이름의 테이블이
-    // base id를 차지한 채 routine이 `name@function`으로 분리됐을 수 있어
-    // kind를 확인하지 않으면 calls 간선이 테이블을 가리킨다.
-    if g.vertex(&exact)
-        .map(|v| {
-            matches!(
-                v.kind,
-                schemagraph_core::VertexKind::Function
-                    | schemagraph_core::VertexKind::Procedure
-                    | schemagraph_core::VertexKind::Package
-            )
-        })
-        .unwrap_or(false)
-    {
-        return RoutineHit::One(exact);
-    }
+    // 정확한 base id가 있어도 같은 표시 이름의 시그니처 정점이 있으면
+    // 호출 인자 수를 모르는 이 경로에서 무인자 overload를 임의로 고르면 안
+    // 된다. 모든 routine 후보를 먼저 모아 하나일 때만 선택한다.
     let name_eq = |a: &str, b: &str| a == b || (ci && a.eq_ignore_ascii_case(b));
     let hits: Vec<VertexId> = g
         .vertices()
@@ -2834,21 +2980,20 @@ fn apply_call_edges(
 /// `schema.pkg.` 접두 안의 이름 스캔으로 찾는다. 오버로드가 여럿이면
 /// Ambiguous — resolve_routine과 같이 추측하지 않는다.
 fn resolve_pkg_member(g: &Graph, schema: &str, pkg: &str, name: &str, ci: bool) -> RoutineHit {
-    let base = VertexId::member(schema, pkg, name);
+    let base = VertexId::routine(schema, Some(pkg), name, None);
     if let Some(id) = resolve_renamed(g, base.clone(), VertexKind::Procedure, "procedure", ci)
         .or_else(|| resolve_renamed(g, base, VertexKind::Function, "function", ci))
     {
         return RoutineHit::One(id);
     }
-    let prefix = format!("{schema}.{pkg}.");
+    let package_id = VertexId::object(schema, pkg);
     let name_eq = |a: &str, b: &str| a == b || (ci && a.eq_ignore_ascii_case(b));
     let hits: Vec<VertexId> = g
         .vertices()
         .filter(|v| {
             name_eq(&v.name, name)
                 && matches!(v.kind, VertexKind::Procedure | VertexKind::Function)
-                && v.id.as_str().len() >= prefix.len()
-                && v.id.as_str()[..prefix.len()].eq_ignore_ascii_case(&prefix)
+                && v.id.parent().as_ref() == Some(&package_id)
         })
         .map(|v| v.id.clone())
         .collect();
@@ -2890,6 +3035,8 @@ mod tests {
 
     fn doc_with_view(body: &str) -> CatalogDocument {
         CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
             version: 1,
             dialect: "sqlite".into(),
             reader: "test".into(),
@@ -2919,6 +3066,8 @@ mod tests {
     /// (view 몸체 파싱 실패 notes가 섞이지 않도록).
     fn doc_with_trigger(body: &str) -> CatalogDocument {
         CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
             version: 1,
             dialect: "sqlite".into(),
             reader: "test".into(),
@@ -3008,6 +3157,8 @@ mod tests {
     #[test]
     fn oracle의_소문자_몸체가_대문자_정점으로_해석된다() {
         let doc = CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
             version: 1,
             dialect: "oracle".into(),
             reader: "test".into(),
@@ -3050,6 +3201,8 @@ mod tests {
     #[test]
     fn oracle의_미인용_식별자는_대문자_객체에만_붙는다() {
         let doc = CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
             version: 1,
             dialect: "oracle".into(),
             reader: "test".into(),
@@ -3147,6 +3300,8 @@ mod tests {
     /// routine이 달린 document — PG 방언의 EXECUTE FUNCTION trigger도 실험한다.
     fn doc_with_routine(routines: Vec<RoutineDoc>, trigger_body: &str) -> CatalogDocument {
         CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
             version: 1,
             dialect: "postgres".into(),
             reader: "test".into(),
@@ -3173,6 +3328,7 @@ mod tests {
 
     fn routine(name: &str, language: Option<&str>, body: &str) -> RoutineDoc {
         RoutineDoc {
+            source: None,
             name: name.into(),
             kind: "function".into(),
             language: language.map(|l| l.to_owned()),
@@ -4366,6 +4522,8 @@ mod tests {
             referenced: None,
         });
         let doc = CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
             version: 1,
             dialect: "postgres".into(),
             reader: "test".into(),

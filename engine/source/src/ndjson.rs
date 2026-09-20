@@ -79,9 +79,10 @@ pub fn document_from_reader(mut reader: impl std::io::BufRead) -> Result<Catalog
                     return Err("NDJSON has more than one document header".into());
                 }
                 version = crate::codec::wire_version(&record)?;
-                if record.get("schemas").is_some() {
+                if record.get("schemas").is_some() || record.get("dependencies").is_some() {
                     return Err(
-                        "NDJSON header cannot embed schemas; emit schema and data records".into(),
+                        "NDJSON header cannot embed schemas or dependencies; emit data records"
+                            .into(),
                     );
                 }
                 if let Some(features) = record.get("required_features").and_then(Value::as_array) {
@@ -137,6 +138,12 @@ pub fn document_from_reader(mut reader: impl std::io::BufRead) -> Result<Catalog
                     .get_mut("data")
                     .ok_or("NDJSON object/routine requires data")?
                     .take();
+                if version == 1
+                    && kind == "routine"
+                    && data.get("kind").and_then(Value::as_str) == Some("query")
+                {
+                    return Err("external query records require catalog v2".into());
+                }
                 let collection = if kind == "object" {
                     "objects"
                 } else {
@@ -164,7 +171,7 @@ pub fn document_from_reader(mut reader: impl std::io::BufRead) -> Result<Catalog
                 }
             }
             "limitations" => {
-                record_unknown_keys(&record, &["type", "data"], &mut extra_notes);
+                record_unknown_keys(&record, &["type", "data", "context"], &mut extra_notes);
                 let data = record
                     .get_mut("data")
                     .ok_or("NDJSON limitations trailer requires data")?
@@ -173,7 +180,38 @@ pub fn document_from_reader(mut reader: impl std::io::BufRead) -> Result<Catalog
                     .map_err(|error| format!("invalid NDJSON limitations: {error}"))?;
                 let catalog = doc.as_mut().ok_or("NDJSON document header is missing")?;
                 catalog.limitations.extend(items);
+                if let Some(context) = record.get_mut("context") {
+                    let mut wrapper = serde_json::json!({"version":1,"context":context.take()});
+                    unknown.extend(unknown_field_paths(&wrapper));
+                    let context: crate::document::CollectionContext =
+                        serde_json::from_value(wrapper["context"].take())
+                            .map_err(|e| format!("invalid NDJSON collection context: {e}"))?;
+                    if let Some(header) = &catalog.context {
+                        if header.source_id != context.source_id
+                            || header.database != context.database
+                            || header.schema_filter != context.schema_filter
+                        {
+                            return Err("NDJSON collection context identity or filters changed in the trailer".into());
+                        }
+                    }
+                    catalog.context = Some(context);
+                }
                 trailer_seen = true;
+            }
+            "dependency" => {
+                record_unknown_keys(&record, &["type", "data"], &mut extra_notes);
+                let data = record
+                    .get_mut("data")
+                    .ok_or("NDJSON dependency requires data")?
+                    .take();
+                let mut wrapper = serde_json::json!({"version":1,"dependencies":[data]});
+                unknown.extend(unknown_field_paths(&wrapper));
+                let dependency = serde_json::from_value(wrapper["dependencies"][0].take())
+                    .map_err(|e| format!("invalid dependency at NDJSON line {number}: {e}"))?;
+                doc.as_mut()
+                    .ok_or("NDJSON document header is missing")?
+                    .dependencies
+                    .push(dependency);
             }
             _ => {
                 return Err(format!(
@@ -183,6 +221,14 @@ pub fn document_from_reader(mut reader: impl std::io::BufRead) -> Result<Catalog
         }
     }
     let mut catalog = doc.ok_or("NDJSON document header is missing")?;
+    if !trailer_seen {
+        if let Some(context) = &mut catalog.context {
+            context.catalog_complete = false;
+            catalog.limitations.push(
+                "legacy NDJSON has no final trailer; catalog completeness is unverified".into(),
+            );
+        }
+    }
     if version == 2 {
         if !trailer_seen {
             return Err("catalog v2 NDJSON is incomplete: limitations trailer is missing".into());
@@ -221,7 +267,12 @@ pub fn document_to_ndjson(doc: &CatalogDocument) -> String {
 
 /// 협상 메타데이터만 바꾸고 레코드의 의미는 동일하게 유지하는 v1/v2 출력이다.
 pub fn document_to_ndjson_version(doc: &CatalogDocument, version: u32) -> Result<String, String> {
+    if version == 1 && crate::codec::document_features(doc).contains("external-queries-v1") {
+        return Err("external query records require document version 2".into());
+    }
     let metadata = CatalogDocument {
+        context: doc.context.clone(),
+        dependencies: Vec::new(),
         version: DOCUMENT_VERSION,
         dialect: doc.dialect.clone(),
         reader: doc.reader.clone(),
@@ -259,6 +310,12 @@ pub fn document_to_ndjson_version(doc: &CatalogDocument, version: u32) -> Result
             )?;
         }
     }
+    for dependency in &doc.dependencies {
+        append_record(
+            &mut output,
+            serde_json::json!({"type":"dependency","data":dependency}),
+        )?;
+    }
     append_record(
         &mut output,
         serde_json::json!({"type":"limitations", "data":doc.limitations}),
@@ -279,6 +336,8 @@ mod tests {
 
     fn sample_doc() -> CatalogDocument {
         CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
             version: DOCUMENT_VERSION,
             dialect: "sqlite".into(),
             reader: "probe-jdbc".into(),

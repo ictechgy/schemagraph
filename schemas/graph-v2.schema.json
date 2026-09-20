@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ictechgy/schemagraph/blob/main/schemas/graph-v2.schema.json",
+  "$comment": "Graph wire version 2. This schema validates shape and current labels; vertex/edge endpoint existence, level-kind consistency, origin endpoint matching, and analysis-state semantics remain codec checks. Query vertices, analysis source metadata, and schema_metadata are part of the graph contract. Unknown top-level optional fields remain accepted for forward-compatible additive output.",
+  "type": "object",
+  "required": ["version", "vertices", "edges"],
+  "properties": {
+    "version": {"const": 2},
+    "vertices": {"type": "array", "items": {"$ref": "#/$defs/vertex"}},
+    "edges": {"type": "array", "items": {"$ref": "#/$defs/edge"}},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "analysis": {"type": "array", "items": {"$ref": "#/$defs/analysis"}},
+    "origins": {"type": "array", "items": {"$ref": "#/$defs/origin"}},
+    "schema_metadata": {
+      "anyOf": [{"$ref": "#/$defs/schema_metadata"}, {"type": "null"}]
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "vertex": {
+      "type": "object",
+      "required": ["id", "kind", "level", "name", "schema"],
+      "properties": {
+        "id": {"type": "string"},
+        "kind": {
+          "type": "string",
+          "enum": [
+            "schema", "table", "view", "materialized-view", "sequence", "type",
+            "synonym", "column", "index", "constraint", "trigger", "function",
+            "procedure", "package", "query"
+          ]
+        },
+        "level": {"type": "string", "enum": ["schema", "object", "member"]},
+        "name": {"type": "string"},
+        "schema": {"type": "string"},
+        "usage": {"anyOf": [{"$ref": "#/$defs/usage"}, {"type": "null"}]}
+      },
+      "additionalProperties": true
+    },
+    "edge": {
+      "type": "object",
+      "required": ["from", "to", "kind"],
+      "properties": {
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+        "kind": {"$ref": "#/$defs/edge_kind"},
+        "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}}
+      },
+      "additionalProperties": true
+    },
+    "edge_kind": {
+      "type": "string",
+      "enum": [
+        "references", "reads", "writes", "calls", "fires", "uses-sequence",
+        "uses-type", "contains", "inferred", "derives-from", "depends-on"
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["layer", "detail"],
+      "properties": {
+        "layer": {
+          "type": "string",
+          "enum": ["catalog", "body-parse", "stats", "inferred"]
+        },
+        "detail": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "usage": {
+      "type": "object",
+      "required": ["reads", "writes"],
+      "properties": {
+        "since": {"type": ["string", "null"]},
+        "reads": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "writes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "total_ms": {"type": ["number", "null"]},
+        "self_ms": {"type": ["number", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "analysis": {
+      "type": "object",
+      "required": ["diagnostics", "id", "scope", "state"],
+      "properties": {
+        "body_hash": {"type": ["string", "null"]},
+        "diagnostics": {"type": "array", "items": {"$ref": "#/$defs/diagnostic"}},
+        "id": {"type": "string"},
+        "scope": {"type": "string"},
+        "state": {"type": "string", "enum": ["complete", "partial", "unsupported"]},
+        "source": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "diagnostic": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"type": "string"},
+        "location": {"anyOf": [{"$ref": "#/$defs/location"}, {"type": "null"}]},
+        "message": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "location": {
+      "type": "object",
+      "required": ["column", "end_column", "end_line", "line"],
+      "properties": {
+        "column": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "end_column": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "end_line": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "line": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+      },
+      "additionalProperties": true
+    },
+    "origin": {
+      "type": "object",
+      "required": ["body_hash", "from", "kind", "role", "to"],
+      "properties": {
+        "body_hash": {"type": "string"},
+        "from": {"type": "string"},
+        "kind": {"$ref": "#/$defs/edge_kind"},
+        "location": {"anyOf": [{"$ref": "#/$defs/location"}, {"type": "null"}]},
+        "role": {"type": "string"},
+        "to": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "schema_metadata": {
+      "type": "object",
+      "required": ["columns", "indexes", "foreign_keys"],
+      "properties": {
+        "columns": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/column_metadata"}
+        },
+        "indexes": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/index_metadata"}
+        },
+        "foreign_keys": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/foreign_key_metadata"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "column_metadata": {
+      "type": "object",
+      "required": ["data_type", "nullable", "ordinal"],
+      "properties": {
+        "data_type": {"type": "string"},
+        "nullable": {"type": "boolean"},
+        "ordinal": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "pk_position": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+      },
+      "additionalProperties": false
+    },
+    "index_metadata": {
+      "type": "object",
+      "required": ["table", "columns", "unique", "has_predicate", "complete"],
+      "properties": {
+        "table": {"type": "string"},
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "unique": {"type": "boolean"},
+        "has_predicate": {"type": "boolean"},
+        "complete": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "foreign_key_metadata": {
+      "type": "object",
+      "required": ["table", "columns", "target_columns", "complete"],
+      "properties": {
+        "table": {"type": "string"},
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "target_table": {"type": ["string", "null"]},
+        "target_columns": {"type": "array", "items": {"type": "string"}},
+        "complete": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

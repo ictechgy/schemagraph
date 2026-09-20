@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ictechgy/schemagraph/blob/main/schemas/catalog-v1.schema.json",
+  "$comment": "Catalog document wire version 1. Structural validation only: readers perform ordering, duplicate identity, foreign-key kind, and collection-context semantic checks. Unknown optional fields are intentionally accepted because the codec reports them as limitations. Version 1 requires reader, rejects query routines, and rejects the version 2 producer/required_features envelope; regular routines may carry optional source metadata.",
+  "type": "object",
+  "required": ["version", "dialect", "reader", "schemas", "limitations"],
+  "properties": {
+    "version": {"const": 1},
+    "dialect": {"type": "string"},
+    "reader": {"type": "string"},
+    "schemas": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/schema"}
+    },
+    "limitations": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "context": {
+      "anyOf": [
+        {"$ref": "#/$defs/context"},
+        {"type": "null"}
+      ]
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/dependency"}
+    }
+  },
+  "not": {"anyOf": [{"required": ["producer"]}, {"required": ["required_features"]}]},
+  "additionalProperties": true,
+  "$defs": {
+    "context": {
+      "type": "object",
+      "required": ["source_id", "catalog_complete"],
+      "properties": {
+        "source_id": {"type": "string"},
+        "database": {"type": ["string", "null"]},
+        "schema_filter": {
+          "type": ["array", "null"],
+          "items": {"type": "string"}
+        },
+        "catalog_complete": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "object_ref": {
+      "type": "object",
+      "required": ["schema", "name"],
+      "properties": {
+        "schema": {"type": "string"},
+        "name": {"type": "string"},
+        "kind": {"type": ["string", "null"]},
+        "member": {"type": ["string", "null"]},
+        "signature": {"type": ["string", "null"]},
+        "database": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "dependency": {
+      "type": "object",
+      "required": ["source", "target", "catalog", "dependency_type"],
+      "properties": {
+        "source": {"$ref": "#/$defs/object_ref"},
+        "target": {"$ref": "#/$defs/object_ref"},
+        "catalog": {"type": "string"},
+        "dependency_type": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "schema": {
+      "type": "object",
+      "required": ["name", "objects", "routines"],
+      "properties": {
+        "name": {"type": "string"},
+        "objects": {"type": "array", "items": {"$ref": "#/$defs/object"}},
+        "routines": {"type": "array", "items": {"$ref": "#/$defs/routine"}}
+      },
+      "additionalProperties": true
+    },
+    "object": {
+      "type": "object",
+      "required": ["name", "kind", "columns", "constraints", "indexes", "triggers"],
+      "properties": {
+        "name": {"type": "string"},
+        "kind": {"type": "string"},
+        "columns": {"type": "array", "items": {"$ref": "#/$defs/column"}},
+        "constraints": {"type": "array", "items": {"$ref": "#/$defs/constraint"}},
+        "indexes": {"type": "array", "items": {"$ref": "#/$defs/index"}},
+        "triggers": {"type": "array", "items": {"$ref": "#/$defs/trigger"}},
+        "body": {"type": ["string", "null"]},
+        "usage": {"anyOf": [{"$ref": "#/$defs/usage"}, {"type": "null"}]}
+      },
+      "additionalProperties": true
+    },
+    "column": {
+      "type": "object",
+      "required": ["name", "data_type", "nullable", "ordinal", "pk_position"],
+      "properties": {
+        "name": {"type": "string"},
+        "data_type": {"type": "string"},
+        "nullable": {"type": "boolean"},
+        "default": {"type": ["string", "null"]},
+        "ordinal": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "pk_position": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+      },
+      "additionalProperties": true
+    },
+    "constraint": {
+      "type": "object",
+      "required": ["name", "kind", "columns"],
+      "properties": {
+        "name": {"type": "string"},
+        "kind": {"type": "string"},
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "referenced": {
+          "anyOf": [{"$ref": "#/$defs/referenced"}, {"type": "null"}]
+        }
+      },
+      "additionalProperties": true
+    },
+    "referenced": {
+      "type": "object",
+      "required": ["table", "columns"],
+      "properties": {
+        "schema": {"type": ["string", "null"]},
+        "table": {"type": "string"},
+        "columns": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": true
+    },
+    "index": {
+      "type": "object",
+      "required": ["name", "unique", "columns"],
+      "properties": {
+        "name": {"type": "string"},
+        "unique": {"type": "boolean"},
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "usage": {"anyOf": [{"$ref": "#/$defs/usage"}, {"type": "null"}]},
+        "definition_complete": {"type": ["boolean", "null"]},
+        "predicate": {"type": ["string", "null"]},
+        "has_predicate": {"type": ["boolean", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "trigger": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string"},
+        "body": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "routine": {
+      "type": "object",
+      "required": ["name", "kind"],
+      "properties": {
+        "name": {"type": "string"},
+        "kind": {"type": "string"},
+        "language": {"type": ["string", "null"]},
+        "body": {"type": ["string", "null"]},
+        "signature": {"type": ["string", "null"]},
+        "usage": {"anyOf": [{"$ref": "#/$defs/usage"}, {"type": "null"}]},
+        "member_of": {"type": ["string", "null"]},
+        "source": {"type": ["string", "null"]}
+      },
+      "not": {"properties": {"kind": {"const": "query"}}},
+      "additionalProperties": true
+    },
+    "usage": {
+      "type": "object",
+      "required": ["reads", "writes"],
+      "properties": {
+        "since": {"type": ["string", "null"]},
+        "reads": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "writes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "total_ms": {"type": ["number", "null"]},
+        "self_ms": {"type": ["number", "null"]}
+      },
+      "additionalProperties": true
+    }
+  }
+}

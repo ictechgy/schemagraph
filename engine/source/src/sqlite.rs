@@ -23,6 +23,8 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         .map_err(|e| SourceError::Connect(format!("sqlite 접속 실패 ({path}): {e}")))?;
 
     let mut doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
         version: DOCUMENT_VERSION,
         dialect: "sqlite".to_owned(),
         reader: "native-sqlx".to_owned(),
@@ -36,6 +38,12 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
             .push(read_schema(&pool, &schema, &mut doc.limitations).await?);
     }
     doc.schemas.sort_by(|a, b| a.name.cmp(&b.name));
+    doc.context = Some(CollectionContext {
+        source_id: String::new(),
+        database: Some("main".into()),
+        schema_filter: None,
+        catalog_complete: doc.limitations.is_empty(),
+    });
     Ok(doc)
 }
 
@@ -273,16 +281,34 @@ async fn read_indexes(
         .fetch_all(pool)
         .await
         .map_err(SourceError::Query)?;
-        // cid < 0은 rowid·식 인덱스 키라 컬럼명이 없다 — 인덱스 정점만 만들고
-        // 컬럼 나열은 비워 둔다(파싱 P1에서 보강).
+        // key=0은 WITHOUT ROWID 보조 키라 인덱스 prefix가 아니다. key=1인
+        // 식/표현식 항목은 이름을 복원할 수 없으므로 definition을 불완전하게 둔다.
+        let mut definition_complete = true;
         let columns: Vec<String> = cols
             .iter()
             .filter_map(|c| {
+                if c.get::<i64, _>("key") == 0 {
+                    return None;
+                }
                 let cid: i64 = c.get("cid");
-                (cid >= 0).then(|| c.get::<String, _>("name"))
+                if cid < 0 {
+                    definition_complete = false;
+                    return None;
+                }
+                match c.get::<Option<String>, _>("name") {
+                    Some(name) => Some(name),
+                    None => {
+                        definition_complete = false;
+                        None
+                    }
+                }
             })
             .collect();
+        let partial = r.get::<i64, _>("partial") == 1;
         indexes.push(IndexDoc {
+            has_predicate: Some(partial),
+            definition_complete: Some(definition_complete),
+            predicate: None,
             name: idx_name,
             unique: r.get::<i64, _>("unique") == 1,
             columns,

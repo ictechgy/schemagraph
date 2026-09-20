@@ -53,6 +53,8 @@ pub struct AnalysisDoc {
     pub diagnostics: Vec<DiagnosticDoc>,
     pub id: String,
     pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub state: String,
 }
 
@@ -95,6 +97,7 @@ pub fn analysis_docs(graph: &Graph) -> Vec<AnalysisDoc> {
                 .collect(),
             id: id.as_str().to_owned(),
             scope: a.scope.clone(),
+            source: a.source.clone(),
             state: state_str(a.state).into(),
         })
         .collect()
@@ -135,6 +138,7 @@ pub(crate) fn restore(graph: &mut Graph, analyses: &[AnalysisDoc], origins: &[Or
             ObjectAnalysis {
                 state,
                 scope: a.scope.clone(),
+                source: a.source.clone(),
                 body_hash: a.body_hash.clone(),
                 diagnostics: a
                     .diagnostics
@@ -201,6 +205,7 @@ mod tests {
         graph.set_analysis(
             a.clone(),
             ObjectAnalysis {
+                source: None,
                 state: AnalysisState::Partial,
                 scope: "column-dependencies-and-lineage".into(),
                 body_hash: Some("sha256:test".into()),

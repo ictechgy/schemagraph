@@ -18,6 +18,7 @@ pub fn write_graph(writer: impl Write, graph: &Graph) -> serde_json::Result<()> 
         edges: Edges(&edges),
         limitations: graph.limitations(),
         origins: crate::diagnostics::origin_docs(graph),
+        schema_metadata: graph.schema_metadata().map(crate::schema_metadata::to_doc),
         version: GRAPH_VERSION,
         vertices: Vertices(graph),
     };
@@ -33,6 +34,8 @@ struct GraphView<'a> {
     limitations: &'a [String],
     #[serde(skip_serializing_if = "Vec::is_empty")]
     origins: Vec<crate::diagnostics::OriginDoc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_metadata: Option<crate::schema_metadata::SchemaMetadataDoc>,
     version: u32,
     vertices: Vertices<'a>,
 }

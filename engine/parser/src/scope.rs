@@ -104,11 +104,27 @@ pub(crate) fn body_hash(body: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
 }
 
+/// 단일 SELECT는 컬럼 해석기를 쓰고 DML·여러 문장은 기존 객체 의존성 추출기로 보낸다.
+pub(crate) fn is_select(dialect: Option<&dyn Dialect>, body: &str) -> bool {
+    let default = GenericDialect {};
+    sqlparser::parser::Parser::parse_sql(dialect.unwrap_or(&default), body)
+        .is_ok_and(|s| s.len() == 1 && matches!(s[0], Statement::Query(_)))
+}
+
 fn catalog_key(dialect: &str, value: &str) -> String {
     if dialect == "sqlite" {
         value.to_lowercase()
     } else {
         value.to_owned()
+    }
+}
+
+/// 컬럼 이름은 방언의 열 비교 규칙으로만 정규화한다. 테이블·스키마·테이블
+/// 별칭은 같은 규칙을 공유하지 않으므로 `name`을 그대로 사용해야 한다.
+fn column_key(dialect: &str, value: &str) -> String {
+    match dialect {
+        "sqlite" | "mysql" | "mariadb" => value.to_lowercase(),
+        _ => value.to_owned(),
     }
 }
 
@@ -126,6 +142,13 @@ fn name(dialect: &str, ident: &Ident) -> String {
     }
 }
 
+/// SQL 식별자의 컬럼 위치를 해석한다. 인용 여부에 따른 PostgreSQL·Oracle의
+/// 대소문자 의미는 `name`에 맡기고, MySQL/SQLite의 열 비교만 `column_key`로
+/// 접는다.
+fn column_name(dialect: &str, ident: &Ident) -> String {
+    column_key(dialect, &name(dialect, ident))
+}
+
 fn location(item: &impl Spanned) -> Option<SourceLocation> {
     let span = item.span();
     (span.start.line > 0 && span.end.line > 0).then_some(SourceLocation {
@@ -139,6 +162,11 @@ fn location(item: &impl Spanned) -> Option<SourceLocation> {
 impl Binder<'_, '_> {
     fn call(&mut self, function: &ObjectName, source: Option<SourceLocation>) {
         let parts = self.parts(function);
+        let quoted_name = function
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .is_some_and(|ident| ident.quote_style.is_some());
         let default = catalog_key(self.catalog.dialect, self.schema);
         let (schema, routine) = match parts.as_slice() {
             [routine] => (default.clone(), routine.clone()),
@@ -173,7 +201,10 @@ impl Binder<'_, '_> {
             .catalog
             .routines
             .contains(&(schema.clone(), routine.clone()));
+        // Quoted PostgreSQL identifiers are case-sensitive names, even when
+        // their folded spelling matches a builtin such as "SUM".
         if !known
+            && !quoted_name
             && super::is_builtin_function(&routine)
             && (parts.len() == 1
                 || matches!(schema.as_str(), "pg_catalog" | "SYS" | "SYSIBM" | "SYSFUN"))
@@ -385,13 +416,13 @@ impl Binder<'_, '_> {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                     let alias = match item {
                         SelectItem::ExprWithAlias { alias, .. } => {
-                            name(self.catalog.dialect, alias)
+                            column_name(self.catalog.dialect, alias)
                         }
                         _ => match expr {
-                            Expr::Identifier(id) => name(self.catalog.dialect, id),
+                            Expr::Identifier(id) => column_name(self.catalog.dialect, id),
                             Expr::CompoundIdentifier(ids) => ids
                                 .last()
-                                .map(|id| name(self.catalog.dialect, id))
+                                .map(|id| column_name(self.catalog.dialect, id))
                                 .unwrap_or_default(),
                             _ => expr.to_string(),
                         },
@@ -465,7 +496,10 @@ impl Binder<'_, '_> {
                 self.visit(expr, &scope, ctes, "grouping", &columns);
             }
         }
-        self.visit(&select.distinct, &scope, ctes, "distinct", &[]);
+        // PostgreSQL DISTINCT ON의 bare identifier도 ORDER BY와 같은 출력
+        // alias 우선 규칙을 따른다. 입력 relation을 먼저 보면 orders.id를
+        // 잘못 읽어 amount AS id의 의미가 오염된다.
+        self.visit(&select.distinct, &scope, ctes, "ordering", &columns);
         self.visit(&select.named_window, &scope, ctes, "window", &[]);
         self.visit(&select.cluster_by, &scope, ctes, "ordering", &[]);
         self.visit(&select.distribute_by, &scope, ctes, "ordering", &[]);
@@ -551,9 +585,10 @@ impl Binder<'_, '_> {
                 _ => None,
             };
             let keys = match constraint {
-                Some(JoinConstraint::Using(names)) => {
-                    names.iter().map(|n| self.parts(n).join(".")).collect()
-                }
+                Some(JoinConstraint::Using(names)) => names
+                    .iter()
+                    .map(|n| self.column_parts(n).join("."))
+                    .collect(),
                 Some(JoinConstraint::Natural) => group
                     .columns
                     .iter()
@@ -681,6 +716,14 @@ impl Binder<'_, '_> {
             .filter_map(|p| p.as_ident())
             .map(|id| name(self.catalog.dialect, id))
             .collect()
+    }
+
+    fn column_parts(&self, object: &ObjectName) -> Vec<String> {
+        let mut parts = self.parts(object);
+        if let Some(column) = parts.last_mut() {
+            *column = column_key(self.catalog.dialect, column);
+        }
+        parts
     }
 
     fn factor(&mut self, factor: &TableFactor, ctes: &Ctes, scope: Rc<Scope>) -> Relation {
@@ -837,7 +880,7 @@ impl Binder<'_, '_> {
                 .into_iter()
                 .collect::<Sources>();
                 Column {
-                    name: catalog_key(self.catalog.dialect, &column.name),
+                    name: column_key(self.catalog.dialect, &column.name),
                     unknown: sources.is_empty(),
                     sources,
                     location: None,
@@ -861,7 +904,7 @@ impl Binder<'_, '_> {
             );
         }
         for (column, alias) in relation.columns.iter_mut().zip(&alias.columns) {
-            column.name = name(self.catalog.dialect, &alias.name);
+            column.name = column_name(self.catalog.dialect, &alias.name);
         }
     }
 
@@ -874,7 +917,14 @@ impl Binder<'_, '_> {
     ) -> Sources {
         let parts: Vec<_> = ids
             .iter()
-            .map(|id| name(self.catalog.dialect, id))
+            .enumerate()
+            .map(|(index, id)| {
+                if index + 1 == ids.len() {
+                    column_name(self.catalog.dialect, id)
+                } else {
+                    name(self.catalog.dialect, id)
+                }
+            })
             .collect();
         let Some(column) = parts.last() else {
             return Sources::new();
@@ -1016,7 +1066,9 @@ impl Visitor for ExprVisitor<'_, '_, '_, '_> {
         let projected: Vec<_> = if root_expression && self.role == "ordering" && ids.len() == 1 {
             aliases
                 .iter()
-                .filter(|c| c.name == name(self.binder.catalog.dialect, &ids[0]) && !c.unknown)
+                .filter(|c| {
+                    c.name == column_name(self.binder.catalog.dialect, &ids[0]) && !c.unknown
+                })
                 .collect()
         } else {
             Vec::new()
@@ -1054,6 +1106,7 @@ pub(crate) fn enrich_view(
         graph.set_analysis(
             owner.clone(),
             ObjectAnalysis {
+                source: None,
                 state: AnalysisState::Unsupported,
                 scope: "column-dependencies-and-lineage".into(),
                 body_hash: None,
@@ -1228,6 +1281,7 @@ pub(crate) fn enrich_view(
     graph.set_analysis(
         owner.clone(),
         ObjectAnalysis {
+            source: None,
             state,
             scope: if object.columns.is_empty() {
                 "column-dependencies"

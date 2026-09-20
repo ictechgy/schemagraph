@@ -7,9 +7,14 @@
 //! `orders -> customers`는 "orders가 customers를 참조한다"는 뜻이다.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 mod diagnostics;
+mod merge;
+pub use merge::{merge_graphs, namespaced_id};
+mod schema_metadata;
 pub use diagnostics::{AnalysisState, Diagnostic, ObjectAnalysis, Origin, SourceLocation};
+pub use schema_metadata::{ColumnMetadata, ForeignKeyMetadata, IndexMetadata, SchemaMetadata};
 
 /// SQL 근거를 실제 간선에만 연결하기 위한 식별 키다.
 pub type OriginKey = (VertexId, VertexId, EdgeKind);
@@ -46,6 +51,8 @@ pub enum VertexKind {
     Function,
     Procedure,
     Package,
+    /// 파일에서 명시적으로 수집한 애플리케이션 SQL 사용처다.
+    Query,
 }
 
 impl VertexKind {
@@ -64,32 +71,88 @@ impl VertexKind {
 
 /// 정점의 정규 식별자. 표시 형태는 `schema.object[.member]`다.
 ///
-/// 마지막 `.` 기준으로 부모를 자르므로, 이름 자체에 `.`가 들어가면 부모
-/// 추적이 깨진다. reader가 그런 이름을 발견하면 `limitations`에 실어야 한다.
+/// 이름 컴포넌트의 구분자는 canonical escaping되어 마지막 `.`가 계층
+/// 구분자로만 남는다. `from_raw`로 읽은 graph v1의 legacy id는 원문 그대로
+/// 유지하므로 새 정점 생성자와 읽기 호환 경로를 구분한다.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct VertexId(String);
+pub struct VertexId(Arc<str>);
 
 impl VertexId {
+    /// 이름 컴포넌트에서 id 구분자로 쓰이는 문자를 percent-escape한다.
+    ///
+    /// 기존 단순 이름은 그대로 두어 `schema.table`과 `fn(integer)`의
+    /// canonical 표기를 유지하고, literal 구분자는 새 정점끼리 충돌하지
+    /// 않게 만든다. `%`도 먼저 escape하므로 이미 escape처럼 보이는 입력과
+    /// 실제 reserved 문자를 혼동하지 않는다.
+    fn component(name: &str) -> String {
+        let mut escaped = String::with_capacity(name.len());
+        for character in name.chars() {
+            let byte = character as u32;
+            if matches!(byte, 0x2e | 0x25 | 0x40 | 0x3a | 0x28 | 0x29) {
+                escaped.push('%');
+                escaped.push(char::from(b"0123456789ABCDEF"[(byte >> 4) as usize]));
+                escaped.push(char::from(b"0123456789ABCDEF"[(byte & 0x0f) as usize]));
+            } else {
+                escaped.push(character);
+            }
+        }
+        escaped
+    }
+
+    fn routine_component(name: &str, signature: Option<&str>) -> String {
+        let name = Self::component(name);
+        match signature.filter(|signature| !signature.is_empty()) {
+            Some(signature) => format!("{name}({})", Self::component(signature)),
+            None => name,
+        }
+    }
+
     /// 스키마 정점의 id.
     pub fn schema(name: &str) -> Self {
-        Self(name.to_owned())
+        Self(Arc::from(Self::component(name)))
     }
 
     /// 스키마 아래 객체의 id.
     pub fn object(schema: &str, name: &str) -> Self {
-        Self(format!("{schema}.{name}"))
+        Self(format!("{}.{}", Self::component(schema), Self::component(name)).into())
     }
 
     /// 객체 아래 멤버의 id.
     pub fn member(schema: &str, parent: &str, name: &str) -> Self {
-        Self(format!("{schema}.{parent}.{name}"))
+        Self(
+            format!(
+                "{}.{}.{}",
+                Self::component(schema),
+                Self::component(parent),
+                Self::component(name)
+            )
+            .into(),
+        )
+    }
+
+    /// 함수·프로시저·쿼리 routine의 canonical id를 만든다.
+    ///
+    /// signature 괄호는 wire id의 구분자로 유지하고, 이름·signature 내부의
+    /// reserved 문자는 각각 escape한다. package가 있으면 member와 같은
+    /// 세 단계 id가 된다.
+    pub fn routine(
+        schema: &str,
+        package: Option<&str>,
+        name: &str,
+        signature: Option<&str>,
+    ) -> Self {
+        let prefix = match package {
+            Some(package) => format!("{}.{}", Self::component(schema), Self::component(package)),
+            None => Self::component(schema),
+        };
+        Self(format!("{prefix}.{}", Self::routine_component(name, signature)).into())
     }
 
     /// 와이어에 실린 id 문자열을 그대로 복원한다. graph.json을 읽을 때만
     /// 쓴다 — 새 정점을 만들 때는 schema/object/member 생성자를 써야
     /// 형식이 보장된다.
     pub fn from_raw(id: &str) -> Self {
-        Self(id.to_owned())
+        Self(Arc::from(id))
     }
 
     /// 표시 문자열.
@@ -99,7 +162,7 @@ impl VertexId {
 
     /// 한 단계 위 조상의 id. 최상위(스키마)면 None.
     pub fn parent(&self) -> Option<VertexId> {
-        self.0.rfind('.').map(|i| Self(self.0[..i].to_owned()))
+        self.0.rfind('.').map(|i| Self(Arc::from(&self.0[..i])))
     }
 }
 
@@ -219,6 +282,8 @@ pub struct Graph {
     vertices: BTreeMap<VertexId, Vertex>,
     out_edges: BTreeMap<VertexId, Vec<Edge>>,
     in_edges: BTreeMap<VertexId, Vec<Edge>>,
+    /// 인접 차수가 큰 정점에서도 중복 간선을 선형 검색하지 않는다.
+    edge_slots: BTreeMap<OriginKey, (usize, usize)>,
     limitations: Vec<String>,
     /// 정점별 사용 통계 — 정점에 안 박고 따로 두는 이유: usage는 정점의
     /// 정체성이 아니라 관측 부속물이라, 없는 것(미수집)과 0(미사용 관측)을
@@ -226,11 +291,22 @@ pub struct Graph {
     usage: BTreeMap<VertexId, Usage>,
     analysis: BTreeMap<VertexId, ObjectAnalysis>,
     origins: BTreeMap<OriginKey, BTreeSet<Origin>>,
+    schema_metadata: Option<SchemaMetadata>,
 }
 
 impl Graph {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 메타데이터가 없는 구버전·투영 그래프를 성공한 빈 검사로 오인하지 않게 한다.
+    pub fn schema_metadata(&self) -> Option<&SchemaMetadata> {
+        self.schema_metadata.as_ref()
+    }
+
+    /// 전송 경계에서 확인한 카탈로그 사실을 그래프와 함께 유지한다.
+    pub fn set_schema_metadata(&mut self, metadata: SchemaMetadata) {
+        self.schema_metadata = Some(metadata);
     }
 
     /// 같은 분석 입력의 진단 순서와 중복이 출력 바이트를 바꾸지 않게 한다.
@@ -308,26 +384,36 @@ impl Graph {
     /// 컬럼 쌍이 여러 개인 FK가 간선 여러 개로 보이지 않게 한다.
     /// 병합은 in/out 양쪽 인덱스에 적용한다 — 한쪽만 합치면 질의 방향에 따라
     /// 보이는 근거가 달라진다.
-    pub fn add_edge(&mut self, edge: Edge) {
-        if let Some(existing) = self
-            .out_edges
-            .entry(edge.from.clone())
-            .or_default()
-            .iter_mut()
-            .find(|e| e.to == edge.to && e.kind == edge.kind)
-        {
-            existing.evidence.extend(edge.evidence.clone());
-            if let Some(in_entry) = self
-                .in_edges
-                .entry(edge.to.clone())
-                .or_default()
-                .iter_mut()
-                .find(|e| e.from == edge.from && e.kind == edge.kind)
-            {
-                in_entry.evidence.extend(edge.evidence);
-            }
+    pub fn add_edge(&mut self, mut edge: Edge) {
+        // 정점의 공유 문자열을 사용해 양방향 인덱스마다 id 본문을 복제하지 않는다.
+        if let Some(vertex) = self.vertex(&edge.from) {
+            edge.from = vertex.id.clone();
+        }
+        if let Some(vertex) = self.vertex(&edge.to) {
+            edge.to = vertex.id.clone();
+        }
+        let key = (edge.from.clone(), edge.to.clone(), edge.kind);
+        if let Some(&(out_slot, in_slot)) = self.edge_slots.get(&key) {
+            // 슬롯은 간선 추가 때만 만들어지고 기존 인접 리스트 순서는 바꾸지 않는다.
+            let outgoing = &mut self
+                .out_edges
+                .get_mut(&edge.from)
+                .expect("edge slot has outgoing adjacency")[out_slot];
+            outgoing.evidence.extend(edge.evidence);
+            outgoing
+                .evidence
+                .sort_by(|a, b| (a.layer, &a.detail).cmp(&(b.layer, &b.detail)));
+            self.in_edges
+                .get_mut(&edge.to)
+                .expect("edge slot has incoming adjacency")[in_slot]
+                .evidence = outgoing.evidence.clone();
             return;
         }
+        edge.evidence
+            .sort_by(|a, b| (a.layer, &a.detail).cmp(&(b.layer, &b.detail)));
+        let out_slot = self.outgoing(&edge.from).len();
+        let in_slot = self.incoming(&edge.to).len();
+        self.edge_slots.insert(key, (out_slot, in_slot));
         self.in_edges
             .entry(edge.to.clone())
             .or_default()
@@ -456,10 +542,27 @@ impl Graph {
     /// 조상 사슬에 그 레벨이 없으면 None.
     fn ancestor_at(&self, id: &VertexId, level: Level) -> Option<VertexId> {
         let mut current = Some(id.clone());
+        let mut seen = BTreeSet::new();
         while let Some(cid) = current {
+            if !seen.insert(cid.clone()) {
+                return None;
+            }
             match self.vertices.get(&cid) {
                 Some(v) if v.kind.level() == level => return Some(cid),
-                Some(_) => current = cid.parent(),
+                Some(_) => {
+                    let parents: BTreeSet<_> = self
+                        .incoming(&cid)
+                        .iter()
+                        .filter(|edge| edge.kind == EdgeKind::Contains)
+                        .map(|edge| edge.from.clone())
+                        .collect();
+                    // 실제 소유 관계가 없을 때만 graph v1의 문자열 부모 규칙을 쓴다.
+                    current = match parents.len() {
+                        0 => cid.parent(),
+                        1 => parents.into_iter().next(),
+                        _ => return None,
+                    };
+                }
                 // 부모 정점이 그래프에 없으면(비정상 입력) 사슬 종료.
                 None => return None,
             }
@@ -470,73 +573,152 @@ impl Graph {
     /// 의존성 간선만으로 계산한 강연결 요소(Tarjan). 크기 1짜리도 돌려주므로
     /// 순환 판정(크기>1 또는 자기 루프)은 호출자가 한다.
     pub fn strongly_connected(&self) -> Vec<Vec<VertexId>> {
-        struct Tarjan<'a> {
-            graph: &'a Graph,
-            index: BTreeMap<VertexId, usize>,
-            lowlink: BTreeMap<VertexId, usize>,
-            on_stack: BTreeSet<VertexId>,
-            stack: Vec<VertexId>,
-            next: usize,
-            components: Vec<Vec<VertexId>>,
+        struct Frame {
+            id: VertexId,
+            next_edge: usize,
         }
-        impl<'a> Tarjan<'a> {
-            fn visit(&mut self, id: VertexId) {
-                self.index.insert(id.clone(), self.next);
-                self.lowlink.insert(id.clone(), self.next);
-                self.next += 1;
-                self.stack.push(id.clone());
-                self.on_stack.insert(id.clone());
-                for edge in self.graph.outgoing(&id) {
-                    if !edge.kind.is_dependency() {
-                        continue;
+        let mut index: BTreeMap<VertexId, usize> = BTreeMap::new();
+        let mut lowlink: BTreeMap<VertexId, usize> = BTreeMap::new();
+        let mut on_stack: BTreeSet<VertexId> = BTreeSet::new();
+        let mut stack = Vec::new();
+        let mut frames = Vec::new();
+        let mut next = 0usize;
+        let mut components = Vec::new();
+        let ids: Vec<VertexId> = self.vertices().map(|v| v.id.clone()).collect();
+        for id in ids {
+            if index.contains_key(&id) {
+                continue;
+            }
+            index.insert(id.clone(), next);
+            lowlink.insert(id.clone(), next);
+            next += 1;
+            stack.push(id.clone());
+            on_stack.insert(id.clone());
+            frames.push(Frame { id, next_edge: 0 });
+
+            while !frames.is_empty() {
+                let next_id = {
+                    let frame = frames.last_mut().expect("nonempty DFS frame stack");
+                    let adjacency = self.outgoing(&frame.id);
+                    let mut found = None;
+                    while frame.next_edge < adjacency.len() {
+                        let edge = &adjacency[frame.next_edge];
+                        frame.next_edge += 1;
+                        if edge.kind.is_dependency() {
+                            found = Some(edge.to.clone());
+                            break;
+                        }
                     }
-                    if !self.index.contains_key(&edge.to) {
-                        self.visit(edge.to.clone());
-                        let low = self.lowlink[&id].min(self.lowlink[&edge.to]);
-                        self.lowlink.insert(id.clone(), low);
-                    } else if self.on_stack.contains(&edge.to) {
-                        let low = self.lowlink[&id].min(self.index[&edge.to]);
-                        self.lowlink.insert(id.clone(), low);
+                    found
+                };
+                if let Some(next_id) = next_id {
+                    if !index.contains_key(&next_id) {
+                        index.insert(next_id.clone(), next);
+                        lowlink.insert(next_id.clone(), next);
+                        next += 1;
+                        stack.push(next_id.clone());
+                        on_stack.insert(next_id.clone());
+                        frames.push(Frame {
+                            id: next_id,
+                            next_edge: 0,
+                        });
+                    } else if on_stack.contains(&next_id) {
+                        let current = &frames.last().expect("current DFS frame").id;
+                        let low = lowlink[current].min(index[&next_id]);
+                        lowlink.insert(current.clone(), low);
                     }
+                    continue;
                 }
-                if self.lowlink[&id] == self.index[&id] {
+
+                let finished = frames.pop().expect("nonempty DFS frame stack").id;
+                if let Some(parent) = frames.last() {
+                    let parent_id = parent.id.clone();
+                    let low = lowlink[&parent_id].min(lowlink[&finished]);
+                    lowlink.insert(parent_id, low);
+                }
+                if lowlink[&finished] == index[&finished] {
                     let mut component = Vec::new();
-                    while let Some(top) = self.stack.pop() {
-                        self.on_stack.remove(&top);
-                        let done = top == id;
+                    while let Some(top) = stack.pop() {
+                        on_stack.remove(&top);
+                        let done = top == finished;
                         component.push(top);
                         if done {
                             break;
                         }
                     }
                     component.sort();
-                    self.components.push(component);
+                    components.push(component);
                 }
             }
         }
-        let mut tarjan = Tarjan {
-            graph: self,
-            index: BTreeMap::new(),
-            lowlink: BTreeMap::new(),
-            on_stack: BTreeSet::new(),
-            stack: Vec::new(),
-            next: 0,
-            components: Vec::new(),
-        };
-        let ids: Vec<VertexId> = self.vertices().map(|v| v.id.clone()).collect();
-        for id in ids {
-            if !tarjan.index.contains_key(&id) {
-                tarjan.visit(id);
-            }
-        }
-        tarjan.components.sort();
-        tarjan.components
+        components.sort();
+        components
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_ids_escape_literal_separators_without_changing_simple_ids() {
+        assert_eq!(VertexId::object("s", "orders").as_str(), "s.orders");
+        assert_eq!(
+            VertexId::object("s.x%@()", "orders@x:y").as_str(),
+            "s%2Ex%25%40%28%29.orders%40x%3Ay"
+        );
+        assert_eq!(
+            VertexId::object("s", "orders.x").parent().unwrap().as_str(),
+            "s"
+        );
+        assert_eq!(
+            VertexId::routine("s", None, "fn", Some("integer")).as_str(),
+            "s.fn(integer)"
+        );
+        assert_ne!(
+            VertexId::routine("s", None, "fn(integer)", None),
+            VertexId::routine("s", None, "fn", Some("integer"))
+        );
+        assert_eq!(
+            VertexId::routine("s", Some("pkg.x"), "fn", Some("a)b")).as_str(),
+            "s.pkg%2Ex.fn(a%29b)"
+        );
+    }
+
+    #[test]
+    fn raw_v1_ids_remain_readable_as_unescaped_ids() {
+        let raw = VertexId::from_raw("s.literal.name");
+        assert_eq!(raw.as_str(), "s.literal.name");
+        assert_eq!(raw.parent().unwrap().as_str(), "s.literal");
+    }
+
+    #[test]
+    fn projection_follows_escaped_dotted_object_parents() {
+        let mut graph = Graph::new();
+        let schema = VertexId::schema("s");
+        let object = VertexId::object("s", "a.b");
+        let column = VertexId::member("s", "a.b", "c.d");
+        graph.add_vertex(Vertex {
+            id: schema.clone(),
+            kind: VertexKind::Schema,
+            name: "s".into(),
+            schema: "s".into(),
+        });
+        graph.add_vertex(Vertex {
+            id: object.clone(),
+            kind: VertexKind::Table,
+            name: "a.b".into(),
+            schema: "s".into(),
+        });
+        graph.add_vertex(Vertex {
+            id: column,
+            kind: VertexKind::Column,
+            name: "c.d".into(),
+            schema: "s".into(),
+        });
+        let projected = graph.project(Level::Object);
+        assert!(projected.vertex(&object).is_some());
+    }
 
     fn table(schema: &str, name: &str) -> Vertex {
         Vertex {
@@ -643,6 +825,58 @@ mod tests {
         assert!(!sccs
             .iter()
             .any(|c| c.len() > 1 && c.contains(&VertexId::schema("s"))));
+    }
+
+    #[test]
+    fn scc는_큰_chain과_cycle에서도_stack을_쓰지_않는다() {
+        const COUNT: usize = 30_000;
+        let chain_ids: Vec<_> = (0..COUNT)
+            .map(|index| VertexId::object("chain", &format!("v{index}")))
+            .collect();
+        let mut chain = Graph::new();
+        for id in &chain_ids {
+            chain.add_vertex(Vertex {
+                id: id.clone(),
+                kind: VertexKind::Table,
+                name: id.as_str().to_owned(),
+                schema: "chain".into(),
+            });
+        }
+        for pair in chain_ids.windows(2) {
+            chain.add_edge(Edge {
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                kind: EdgeKind::References,
+                evidence: vec![],
+            });
+        }
+        let chain_sccs = chain.strongly_connected();
+        assert_eq!(chain_sccs.len(), COUNT);
+        assert!(chain_sccs.iter().all(|component| component.len() == 1));
+
+        let cycle_ids: Vec<_> = (0..COUNT)
+            .map(|index| VertexId::object("cycle", &format!("v{index}")))
+            .collect();
+        let mut cycle = Graph::new();
+        for id in &cycle_ids {
+            cycle.add_vertex(Vertex {
+                id: id.clone(),
+                kind: VertexKind::Table,
+                name: id.as_str().to_owned(),
+                schema: "cycle".into(),
+            });
+        }
+        for index in 0..COUNT {
+            cycle.add_edge(Edge {
+                from: cycle_ids[index].clone(),
+                to: cycle_ids[(index + 1) % COUNT].clone(),
+                kind: EdgeKind::References,
+                evidence: vec![],
+            });
+        }
+        let cycle_sccs = cycle.strongly_connected();
+        assert_eq!(cycle_sccs.len(), 1);
+        assert_eq!(cycle_sccs[0].len(), COUNT);
     }
 
     #[test]

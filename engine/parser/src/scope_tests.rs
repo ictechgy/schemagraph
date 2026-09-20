@@ -36,6 +36,8 @@ fn scan(sql: &str, outputs: &[&str]) -> Graph {
     view.kind = "view".into();
     view.body = Some(sql.into());
     let doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
         version: 1,
         dialect: "postgres".into(),
         reader: "fixture".into(),

@@ -42,6 +42,8 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         .map_err(|e| SourceError::Connect(format!("mysql 접속 실패: {e}")))?;
 
     let mut doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
         version: DOCUMENT_VERSION,
         dialect: "mysql".to_owned(),
         reader: "native-sqlx".to_owned(),
@@ -49,11 +51,18 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         limitations: Vec::new(),
     };
 
+    let mut catalog_complete = true;
     for schema in schema_list(&pool, scope_db.as_deref()).await? {
         doc.schemas
-            .push(read_schema(&pool, &schema, &mut doc.limitations).await?);
+            .push(read_schema(&pool, &schema, &mut doc.limitations, &mut catalog_complete).await?);
     }
     doc.schemas.sort_by(|a, b| a.name.cmp(&b.name));
+    doc.context = Some(CollectionContext {
+        source_id: String::new(),
+        database: scope_db.clone(),
+        schema_filter: scope_db.map(|name| vec![name]),
+        catalog_complete,
+    });
     Ok(doc)
 }
 
@@ -78,7 +87,9 @@ async fn read_schema(
     pool: &MySqlPool,
     schema: &str,
     limitations: &mut Vec<String>,
+    catalog_complete: &mut bool,
 ) -> Result<SchemaDoc, SourceError> {
+    let metadata_start = limitations.len();
     let mut objects = read_objects(pool, schema).await?;
     let mut expr_index_cols = 0usize;
     for obj in &mut objects {
@@ -95,6 +106,7 @@ async fn read_schema(
         ));
     }
     let mut routines = read_routines(pool, schema, limitations).await?;
+    *catalog_complete &= limitations.len() == metadata_start;
     attach_usage(pool, schema, &mut objects, limitations).await;
     sort_all(&mut objects, &mut routines);
     Ok(SchemaDoc {
@@ -398,24 +410,30 @@ async fn read_indexes(
     .await
     .map_err(SourceError::Query)?;
 
-    let mut by_name: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
+    let mut by_name: BTreeMap<String, (bool, Vec<String>, bool)> = BTreeMap::new();
     let mut expr_cols = 0usize;
     for r in &rows {
         let name: String = r.get("name");
         let entry = by_name
             .entry(name)
-            .or_insert_with(|| (r.get::<i64, _>("non_unique") == 0, Vec::new()));
+            .or_insert_with(|| (r.get::<i64, _>("non_unique") == 0, Vec::new(), true));
         match r.get::<Option<String>, _>("col") {
             // MySQL 8 functional 인덱스는 column_name이 NULL이다 — 식을
             // 컬럼으로 위장하지 않고 개수만 센다.
             Some(col) => entry.1.push(col),
-            None => expr_cols += 1,
+            None => {
+                entry.2 = false;
+                expr_cols += 1;
+            }
         }
     }
     Ok((
         by_name
             .into_iter()
-            .map(|(name, (unique, columns))| IndexDoc {
+            .map(|(name, (unique, columns, complete))| IndexDoc {
+                has_predicate: None,
+                definition_complete: Some(complete),
+                predicate: None,
                 name,
                 unique,
                 columns,
@@ -493,6 +511,7 @@ async fn read_routines(
             ));
         }
         routines.push(RoutineDoc {
+            source: None,
             name,
             kind: if raw_type == "PROCEDURE" {
                 "procedure"

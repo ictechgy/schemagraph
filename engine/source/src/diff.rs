@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use schemagraph_core::VertexId;
 use serde::Serialize;
 
 use crate::document::{
@@ -25,6 +26,21 @@ pub struct DocumentDiff {
     /// 델타 자체의 한계 + 방언 불일치 경고. 입력 문서의 limitations는
     /// 스캔 시점의 관측 한계라 델타로 섞지 않는다.
     pub limitations: Vec<String>,
+    #[serde(skip_serializing_if = "DependencyDelta::is_empty")]
+    pub dependencies: DependencyDelta,
+}
+
+/// 새 카탈로그 증거의 추가·제거도 스냅샷 diff에서 누락하지 않는다.
+#[derive(Debug, Serialize)]
+pub struct DependencyDelta {
+    pub added: Vec<crate::document::CatalogDependency>,
+    pub removed: Vec<crate::document::CatalogDependency>,
+}
+
+impl DependencyDelta {
+    fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -162,14 +178,41 @@ fn collect<T: Clone>(
 /// routine의 graph 정규 id — document_to_graph와 같은 규칙이어야 diff
 /// 산출물의 id가 그래프 id와 통한다.
 fn routine_id(schema: &str, r: &RoutineDoc) -> String {
-    let name = match &r.member_of {
-        Some(parent) => format!("{parent}.{}", r.name),
-        None => r.name.clone(),
-    };
-    match &r.signature {
-        Some(sig) if !sig.is_empty() => format!("{schema}.{name}({sig})"),
-        _ => format!("{schema}.{name}"),
+    VertexId::routine(
+        schema,
+        r.member_of.as_deref(),
+        &r.name,
+        r.signature.as_deref(),
+    )
+    .as_str()
+    .to_owned()
+}
+
+/// 같은 이름의 테이블·함수·프로시저를 reader가 실제로 분리한 id로 비교한다.
+fn routine_map(doc: &CatalogDocument) -> BTreeMap<String, &RoutineDoc> {
+    use schemagraph_core::{VertexId, VertexKind};
+    let graph = crate::graph::document_to_graph(doc);
+    let mut result = BTreeMap::new();
+    for schema in &doc.schemas {
+        for routine in &schema.routines {
+            let base = routine_id(&schema.name, routine);
+            let (kind, suffix) = match routine.kind.as_str() {
+                "procedure" => (VertexKind::Procedure, "procedure"),
+                "package" => (VertexKind::Package, "package"),
+                "query" => (VertexKind::Query, "query"),
+                _ => (VertexKind::Function, "function"),
+            };
+            let renamed = format!("{base}@{suffix}");
+            let id = [&base, &renamed].into_iter().find(|id| {
+                graph
+                    .vertex(&VertexId::from_raw(id))
+                    .is_some_and(|v| v.kind == kind)
+            });
+            // 중복·충돌로 reader가 만들지 못한 정점은 입력 id를 유지한다. 분석 단계가 미해결로 보고한다.
+            result.insert(id.unwrap_or(&base).clone(), routine);
+        }
     }
+    result
 }
 
 fn routine_change(new_id: &str, old: &RoutineDoc, new: &RoutineDoc) -> Option<RoutineChange> {
@@ -234,7 +277,7 @@ pub fn diff_documents(old: &CatalogDocument, new: &CatalogDocument) -> DocumentD
         .flat_map(|s| {
             s.objects
                 .iter()
-                .map(move |o| (format!("{}.{}", s.name, o.name), o))
+                .map(move |o| (VertexId::object(&s.name, &o.name).as_str().to_owned(), o))
         })
         .collect();
     let new_objects: BTreeMap<String, _> = new
@@ -243,7 +286,7 @@ pub fn diff_documents(old: &CatalogDocument, new: &CatalogDocument) -> DocumentD
         .flat_map(|s| {
             s.objects
                 .iter()
-                .map(move |o| (format!("{}.{}", s.name, o.name), o))
+                .map(move |o| (VertexId::object(&s.name, &o.name).as_str().to_owned(), o))
         })
         .collect();
 
@@ -270,16 +313,8 @@ pub fn diff_documents(old: &CatalogDocument, new: &CatalogDocument) -> DocumentD
         }
     }
 
-    let old_routines: BTreeMap<String, _> = old
-        .schemas
-        .iter()
-        .flat_map(|s| s.routines.iter().map(move |r| (routine_id(&s.name, r), r)))
-        .collect();
-    let new_routines: BTreeMap<String, _> = new
-        .schemas
-        .iter()
-        .flat_map(|s| s.routines.iter().map(move |r| (routine_id(&s.name, r), r)))
-        .collect();
+    let old_routines = routine_map(old);
+    let new_routines = routine_map(new);
 
     for (id, nr) in &new_routines {
         match old_routines.get(id) {
@@ -303,9 +338,29 @@ pub fn diff_documents(old: &CatalogDocument, new: &CatalogDocument) -> DocumentD
         }
     }
 
+    let old_dependencies: std::collections::BTreeSet<_> =
+        old.dependencies.iter().cloned().collect();
+    let new_dependencies: std::collections::BTreeSet<_> =
+        new.dependencies.iter().cloned().collect();
+    let dependencies = DependencyDelta {
+        added: new_dependencies
+            .difference(&old_dependencies)
+            .cloned()
+            .collect(),
+        removed: old_dependencies
+            .difference(&new_dependencies)
+            .cloned()
+            .collect(),
+    };
     let summary = DiffSummary {
-        added: schemas.added.len() + objects.added.len() + routines.added.len(),
-        removed: schemas.removed.len() + objects.removed.len() + routines.removed.len(),
+        added: schemas.added.len()
+            + objects.added.len()
+            + routines.added.len()
+            + dependencies.added.len(),
+        removed: schemas.removed.len()
+            + objects.removed.len()
+            + routines.removed.len()
+            + dependencies.removed.len(),
         changed: objects.changed.len() + routines.changed.len(),
     };
 
@@ -317,6 +372,7 @@ pub fn diff_documents(old: &CatalogDocument, new: &CatalogDocument) -> DocumentD
         objects,
         routines,
         limitations,
+        dependencies,
     }
 }
 
@@ -373,6 +429,8 @@ mod tests {
 
     fn doc(objects: Vec<ObjectDoc>, routines: Vec<RoutineDoc>) -> CatalogDocument {
         CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
             version: 1,
             dialect: "sqlite".into(),
             reader: "test".into(),
@@ -439,6 +497,7 @@ mod tests {
     #[test]
     fn routine은_시그니처_id로_대응한다() {
         let r = |body: &str| RoutineDoc {
+            source: None,
             name: "f".into(),
             kind: "function".into(),
             language: Some("sql".into()),
@@ -470,6 +529,9 @@ mod tests {
     fn index_usage만_바뀌면_document_diff에서_제외한다() {
         let mut old_table = table("t", vec![]);
         old_table.indexes = vec![IndexDoc {
+            has_predicate: None,
+            definition_complete: None,
+            predicate: None,
             name: "t_idx".into(),
             unique: true,
             columns: vec!["id".into()],
@@ -504,6 +566,7 @@ mod tests {
     #[test]
     fn routine_member_of_이동은_graph_id_add_remove로_보고한다() {
         let routine = |member_of: &str| RoutineDoc {
+            source: None,
             name: "touch".into(),
             kind: "procedure".into(),
             language: Some("plsql".into()),
@@ -523,6 +586,7 @@ mod tests {
     #[test]
     fn 같은_이름의_다른_패키지_멤버는_동일_문서에서_충돌하지_않는다() {
         let routine = |parent: &str, name: &str| RoutineDoc {
+            source: None,
             name: name.into(),
             kind: "procedure".into(),
             language: Some("plsql".into()),
