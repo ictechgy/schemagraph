@@ -30,11 +30,18 @@ pub fn resolve_reference(
             return None;
         }
     }
+    let schema_id = VertexId::schema(&reference.schema);
     let mut candidates: Vec<_> = graph
-        .vertices()
+        .outgoing(&schema_id)
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Contains)
+        .filter_map(|edge| graph.vertex(&edge.to))
         .filter(|v| {
             v.schema == reference.schema
                 && v.name == reference.name
+                // 카탈로그 object 이름은 schema 직속이다. 같은 이름의 패키지
+                // 멤버나 부모 미수집 fallback 정점을 대신 고르지 않는다.
+                && v.id.parent().as_ref() == Some(&schema_id)
                 && kind_matches(v.kind, reference.kind.as_deref())
         })
         .collect();

@@ -117,6 +117,28 @@ fn document() -> CatalogDocument {
     }
 }
 
+#[test]
+fn catalog_object_reference_never_substitutes_a_same_named_package_member() {
+    let mut doc = document();
+    doc.schemas[0].routines = vec![
+        serde_json::from_value(json!({"name":"pkg","kind":"package"})).unwrap(),
+        serde_json::from_value(json!({"name":"target","kind":"function","member_of":"pkg"}))
+            .unwrap(),
+    ];
+    let target = reference("app", "target", Some("function"));
+    let package_only = graph::document_to_graph(&doc);
+    assert!(
+        schemagraph_source::dependencies::resolve_reference(&package_only, &doc, &target).is_none()
+    );
+    doc.schemas[0]
+        .routines
+        .push(serde_json::from_value(json!({"name":"target","kind":"function"})).unwrap());
+    let with_global = graph::document_to_graph(&doc);
+    let resolved =
+        schemagraph_source::dependencies::resolve_reference(&with_global, &doc, &target).unwrap();
+    assert_eq!(resolved.as_str(), "app.target");
+}
+
 fn dependency_document() -> CatalogDocument {
     let mut doc = document();
     let source = reference("app", "consumer", Some("table"));
