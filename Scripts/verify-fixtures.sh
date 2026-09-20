@@ -193,6 +193,7 @@ if [ -n "$pg_url" ]; then
     fi
 
     "$BIN" scan "$pg_url" -o "$tmp/graph-pg.json"
+    python3 Scripts/verify-dynamic-sql.py "$tmp/graph-pg.json" postgres
 
     if [ -f "$PGFIX/basic.graph.golden.json" ]; then
         # usage 값(시각·카운트)은 환경 의존 — 정규화 후 비교한다.
@@ -575,6 +576,7 @@ EOF
             [ -n "${BASH_REMATCH[4]:-}" ] && probe_pg_args+=(--password "${BASH_REMATCH[4]}")
             "$JAVABIN" -jar "$JAR" "${probe_pg_args[@]}" -o "$tmp/probe-pg-doc.json"
             "$BIN" scan --document "$tmp/probe-pg-doc.json" -o "$tmp/probe-pg-graph.json"
+            python3 Scripts/verify-dynamic-sql.py "$tmp/probe-pg-graph.json" postgres
             python3 - "$tmp/probe-pg-graph.json" <<'EOF'
 import json, sys
 g = json.load(open(sys.argv[1]))
@@ -717,6 +719,7 @@ EOF
         "$JAVABIN" -jar "$JAR" --url "$mssql_jdbc" \
             --user "$ms_user" --password "$ms_pass" -o "$tmp/probe-ms-doc.json"
         "$BIN" scan --document "$tmp/probe-ms-doc.json" -o "$tmp/probe-ms-graph.json"
+        python3 Scripts/verify-dynamic-sql.py "$tmp/probe-ms-graph.json" sqlserver
         python3 - "$tmp/probe-ms-graph.json" <<'EOF'
 import json, sys
 g = json.load(open(sys.argv[1]))
@@ -835,6 +838,7 @@ EOF
             --user "$oracle_user" --password "$oracle_pass" \
             --driver "$OJAR" -o "$tmp/probe-or-doc.json"
         "$BIN" scan --document "$tmp/probe-or-doc.json" -o "$tmp/probe-or-graph.json"
+        python3 Scripts/verify-dynamic-sql.py "$tmp/probe-or-graph.json" oracle
         python3 - "$tmp/probe-or-graph.json" <<'EOF'
 import json, sys
 g = json.load(open(sys.argv[1]))

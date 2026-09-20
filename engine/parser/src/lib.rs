@@ -697,9 +697,7 @@ fn starts_with_keyword(s: &str, kw: &str) -> bool {
         })
 }
 
-/// BEGIN..END 안쪽을 꺼낸다. 단어 경계가 아닌 BEGIN/END는 무시한다 —
-/// 문자열 리터럴 안의 BEGIN까지 정확히 거르지는 못하지만, 못 벗기면
-/// 파싱 실패로 limitations에 남는다(조용히 틀리지 않는다).
+/// BEGIN..END 안쪽을 꺼낸다. 인용·주석 안의 키워드는 블록 경계가 아니다.
 fn extract_trigger_inner(body: &str) -> Option<&str> {
     // 대문자 사본을 만들지 않는다 — to_uppercase는 비ASCII에서 바이트
     // 오프셋을 바꿔 슬라이스를 틀어뜨린다. 원문에서 case-insensitive로 찾는다.
@@ -713,15 +711,26 @@ fn extract_trigger_inner(body: &str) -> Option<&str> {
     (!inner.is_empty()).then_some(inner)
 }
 
-/// 원문에서 대소문자 무관·단어 경계인 키워드의 모든 위치를 돌린다.
+/// 인용·주석 바깥의 키워드만 찾는다 — 문자열에 든 SQL은 실행 문맥에서만 푼다.
 fn find_all_keywords(s: &str, kw: &str) -> Vec<usize> {
     let bytes = s.as_bytes();
-    (0..=bytes.len().saturating_sub(kw.len()))
-        .filter(|&i| {
-            bytes[i..i + kw.len()].eq_ignore_ascii_case(kw.as_bytes())
-                && word_boundary(s, i, kw.len())
-        })
-        .collect()
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = quoted_or_comment_end(s, i) {
+            i = end;
+            continue;
+        }
+        if bytes
+            .get(i..i + kw.len())
+            .is_some_and(|word| word.eq_ignore_ascii_case(kw.as_bytes()))
+            && word_boundary(s, i, kw.len())
+        {
+            found.push(i);
+        }
+        i += 1;
+    }
+    found
 }
 
 /// 위치 i부터 len 바이트가 독립 단어인지 — 식별자 문자로 붙어 있으면
@@ -952,15 +961,11 @@ fn split_top_level(s: &str) -> Vec<&str> {
     let mut start = 0usize;
     let mut i = 0usize;
     while i < n {
+        if let Some(end) = quoted_or_comment_end(s, i) {
+            i = end;
+            continue;
+        }
         i = match b[i] {
-            b'\'' => skip_string(s, i),
-            b'"' | b'`' => skip_quoted_ident(s, i),
-            b'-' if b.get(i + 1) == Some(&b'-') => skip_line_comment(s, i),
-            b'/' if b.get(i + 1) == Some(&b'*') => skip_block_comment(s, i),
-            b'$' => dollar_quote_end(s, i).unwrap_or(i + 1),
-            b'q' | b'Q' if b.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(b[i - 1])) => {
-                q_quote_end(s, i).unwrap_or(i + 1)
-            }
             b';' => {
                 parts.push(&s[start..i]);
                 i += 1;
@@ -984,15 +989,11 @@ fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
     let mut depth = 0i32;
     let mut i = 0usize;
     while i < n {
+        if let Some(end) = quoted_or_comment_end(s, i) {
+            i = end;
+            continue;
+        }
         i = match b[i] {
-            b'\'' => skip_string(s, i),
-            b'"' | b'`' => skip_quoted_ident(s, i),
-            b'-' if b.get(i + 1) == Some(&b'-') => skip_line_comment(s, i),
-            b'/' if b.get(i + 1) == Some(&b'*') => skip_block_comment(s, i),
-            b'$' => dollar_quote_end(s, i).unwrap_or(i + 1),
-            b'q' | b'Q' if b.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(b[i - 1])) => {
-                q_quote_end(s, i).unwrap_or(i + 1)
-            }
             b'(' => {
                 depth += 1;
                 i + 1
@@ -1016,6 +1017,29 @@ fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
     None
 }
 
+/// 같은 인용 규칙을 문장 분할과 키워드 탐색에 적용해 경계 해석이 어긋나지 않게 한다.
+fn quoted_or_comment_end(s: &str, i: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    match bytes[i] {
+        b'\'' => Some(skip_string(s, i)),
+        b'"' | b'`' | b'[' => Some(skip_quoted_ident(s, i)),
+        b'-' if bytes.get(i + 1) == Some(&b'-') => Some(skip_line_comment(s, i)),
+        b'/' if bytes.get(i + 1) == Some(&b'*') => Some(skip_block_comment(s, i)),
+        b'$' => dollar_quote_end(s, i),
+        b'e' | b'E'
+            if bytes.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(bytes[i - 1])) =>
+        {
+            Some(skip_escape_string(s, i + 1))
+        }
+        b'q' | b'Q'
+            if bytes.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(bytes[i - 1])) =>
+        {
+            q_quote_end(s, i)
+        }
+        _ => None,
+    }
+}
+
 /// i의 여는 ' 다음에 오는 닫는 ' 다음 위치 — ''는 이스케이프다.
 fn skip_string(s: &str, i: usize) -> usize {
     let b = s.as_bytes();
@@ -1034,10 +1058,25 @@ fn skip_string(s: &str, i: usize) -> usize {
     b.len()
 }
 
-/// "ident"·`ident` 인용 식별자의 끝 다음 위치 — ""·``는 이스케이프다.
+/// PG E-string의 역슬래시는 다음 문자를 이스케이프하므로 닫는 따옴표와 구분한다.
+fn skip_escape_string(s: &str, i: usize) -> usize {
+    let bytes = s.as_bytes();
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j = (j + 2).min(bytes.len()),
+            b'\'' if bytes.get(j + 1) == Some(&b'\'') => j += 2,
+            b'\'' => return j + 1,
+            _ => j += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// 인용 식별자의 끝 다음 위치 — ""·``·]]는 이스케이프다.
 fn skip_quoted_ident(s: &str, i: usize) -> usize {
     let b = s.as_bytes();
-    let q = b[i];
+    let q = if b[i] == b'[' { b']' } else { b[i] };
     let mut j = i + 1;
     while j < b.len() {
         if b[j] == q {
@@ -1097,24 +1136,20 @@ fn dollar_quote_end(s: &str, i: usize) -> Option<usize> {
 /// Oracle `q'구분자...구분자'`의 끝 다음 위치 — 괄호 구분자는 대칭,
 /// 나머지는 같은 문자가 닫는다.
 fn q_quote_end(s: &str, i: usize) -> Option<usize> {
-    let b = s.as_bytes();
-    let open = *b.get(i + 2)?;
+    let open = s.get(i + 2..)?.chars().next()?;
     let close = match open {
-        b'[' => b']',
-        b'(' => b')',
-        b'{' => b'}',
-        b'<' => b'>',
-        c if !c.is_ascii_whitespace() => c,
+        '[' => ']',
+        '(' => ')',
+        '{' => '}',
+        '<' => '>',
+        c if !c.is_whitespace() && c != '\'' => c,
         _ => return None,
     };
-    let mut j = i + 3;
-    while j + 1 < b.len() {
-        if b[j] == close && b[j + 1] == b'\'' {
-            return Some(j + 2);
-        }
-        j += 1;
-    }
-    None
+    let start = i + 2 + open.len_utf8();
+    let delimiter = format!("{close}'");
+    s[start..]
+        .find(&delimiter)
+        .map(|offset| start + offset + delimiter.len())
 }
 
 /// 공백과 주석(`--…`, `/*…*/`)을 건너뛴다 — 조각 선두·중간의 주석이
@@ -1203,15 +1238,17 @@ fn strip_condition<'a>(
 }
 
 /// T-SQL `EXEC <routine> <args>` — EXECUTE와 달리 기본이 routine 호출이다.
-/// 문자열 리터럴·`@변수`·`EXEC('SQL')` 꼴은 동적 실행이라 미추출로 센다
-/// (리터럴만 복구한다).
+/// 괄호로 감싼 문자열 실행은 전체가 리터럴일 때만 복구한다.
 fn strip_exec_call(rest: &str, kwlen: usize, stmts: &mut Vec<String>, unextracted: &mut usize) {
-    let tail = rest[kwlen..].trim_start();
-    if tail.starts_with('\'') {
-        if let Some(inner) = unquote_sql_string(tail) {
-            stmts.push(inner.into_owned());
-            return;
-        }
+    let tail = skip_ws_comments(&rest[kwlen..]);
+    if tail.starts_with('(')
+        || tail.starts_with('\'')
+        || tail.starts_with("N'")
+        || tail.starts_with("n'")
+        || sql_string_literal(tail).is_some()
+    {
+        push_dynamic_sql(tail, false, stmts, unextracted);
+        return;
     }
     let len = dotted_name_len(tail);
     if len > 0 && !tail[..len].starts_with('(') {
@@ -1222,7 +1259,7 @@ fn strip_exec_call(rest: &str, kwlen: usize, stmts: &mut Vec<String>, unextracte
 }
 
 /// `FOR <var> IN <질의|범위|EXECUTE> LOOP` — IN 뒤가 질의면 문장으로 살리고,
-/// EXECUTE면 동적 SQL로 미추출, 숫자 범위는 의존이 없어 넘긴다.
+/// EXECUTE도 문자열이 확정되면 복구한다. 숫자 범위는 의존이 없어 넘긴다.
 fn strip_for<'a>(
     rest: &'a str,
     kwlen: usize,
@@ -1241,7 +1278,7 @@ fn strip_for<'a>(
     };
     let inner = after_in[..loop_pos].trim();
     if starts_with_keyword(inner, "EXECUTE") {
-        *unextracted += 1;
+        strip_execute(inner, "EXECUTE".len(), stmts, unextracted);
     } else if is_query_text(inner) {
         stmts.push(inner.to_owned());
     }
@@ -1272,7 +1309,7 @@ fn strip_return<'a>(
     if starts_with_keyword(tail, "QUERY") {
         tail = tail["QUERY".len()..].trim_start();
         if starts_with_keyword(tail, "EXECUTE") {
-            *unextracted += 1;
+            strip_execute(tail, "EXECUTE".len(), stmts, unextracted);
         } else if !tail.is_empty() {
             stmts.push(tail.to_owned());
         }
@@ -1298,9 +1335,12 @@ fn strip_open<'a>(
     if let Some(p) = find_top_level(tail, "FOR", true) {
         let inner = tail[p + "FOR".len()..].trim();
         if starts_with_keyword(inner, "EXECUTE") {
-            *unextracted += 1;
+            strip_execute(inner, "EXECUTE".len(), stmts, unextracted);
         } else if is_query_text(inner) {
             stmts.push(inner.to_owned());
+        } else {
+            // Oracle OPEN .. FOR는 EXECUTE 없이 문자열을 직접 받는다.
+            push_dynamic_sql(inner, true, stmts, unextracted);
         }
     }
     ""
@@ -1310,15 +1350,9 @@ fn strip_open<'a>(
 /// 동적 SQL)은 미추출로 센다. `EXECUTE FUNCTION/PROCEDURE f()`는 CALL로
 /// 재작성한다 — 인자는 이름 해석에 필요 없어 버린다.
 fn strip_execute(rest: &str, kwlen: usize, stmts: &mut Vec<String>, unextracted: &mut usize) {
-    let mut tail = rest[kwlen..].trim_start();
+    let mut tail = skip_ws_comments(&rest[kwlen..]);
     if starts_with_keyword(tail, "IMMEDIATE") {
-        tail = tail["IMMEDIATE".len()..].trim_start();
-    }
-    if tail.starts_with('\'') {
-        if let Some(inner) = unquote_sql_string(tail) {
-            stmts.push(inner.into_owned());
-            return;
-        }
+        tail = skip_ws_comments(&tail["IMMEDIATE".len()..]);
     }
     for kw in ["FUNCTION", "PROCEDURE"] {
         if starts_with_keyword(tail, kw) {
@@ -1330,7 +1364,108 @@ fn strip_execute(rest: &str, kwlen: usize, stmts: &mut Vec<String>, unextracted:
             }
         }
     }
-    *unextracted += 1;
+    push_dynamic_sql(tail, true, stmts, unextracted);
+}
+
+/// 리터럴 한 개와 소비하지 않은 꼬리를 함께 돌려 연결식을 놓치지 않는다.
+fn sql_string_literal(rest: &str) -> Option<(std::borrow::Cow<'_, str>, &str)> {
+    if rest.starts_with('\'') {
+        return Some((unquote_sql_string(rest)?, &rest[skip_string(rest, 0)..]));
+    }
+    if rest.starts_with("N'") || rest.starts_with("n'") {
+        return Some((
+            unquote_sql_string(&rest[1..])?,
+            &rest[skip_string(rest, 1)..],
+        ));
+    }
+    if rest.starts_with('$') {
+        return Some((undollar_quote(rest)?, &rest[dollar_quote_end(rest, 0)?..]));
+    }
+    if rest.starts_with("q'") || rest.starts_with("Q'") {
+        let end = q_quote_end(rest, 0)?;
+        let delimiter_len = rest.get(2..)?.chars().next()?.len_utf8();
+        let inner = rest.get(2 + delimiter_len..end - delimiter_len - 1)?;
+        return Some((std::borrow::Cow::Borrowed(inner), &rest[end..]));
+    }
+    None
+}
+
+/// 괄호는 리터럴을 감싸는 경우만 허용한다. 연산·변수·함수 평가는 추측하지 않는다.
+fn dynamic_sql_literal(rest: &str) -> Option<(std::borrow::Cow<'_, str>, &str)> {
+    let mut tail = skip_ws_comments(rest);
+    let mut parentheses = 0;
+    while let Some(inner) = tail.strip_prefix('(') {
+        parentheses += 1;
+        tail = skip_ws_comments(inner);
+    }
+    let (sql, remaining) = sql_string_literal(tail)?;
+    tail = skip_ws_comments(remaining);
+    for _ in 0..parentheses {
+        tail = skip_ws_comments(tail.strip_prefix(')')?);
+    }
+    Some((sql, tail))
+}
+
+/// SQL 본문이 끝났는지 확인한 뒤에만 간선 후보로 넘긴다. AT 같은 원격 실행
+/// 꼬리는 로컬 객체로 오귀속하지 않고 미추출로 남긴다.
+fn push_dynamic_sql(
+    tail: &str,
+    allow_bindings: bool,
+    stmts: &mut Vec<String>,
+    unextracted: &mut usize,
+) {
+    let Some((sql, remaining)) = dynamic_sql_literal(tail) else {
+        *unextracted += 1;
+        return;
+    };
+    if !remaining.is_empty() && !(allow_bindings && dynamic_binding_head(remaining).is_some()) {
+        *unextracted += 1;
+        return;
+    }
+    stmts.push(sql.into_owned());
+    collect_dynamic_bindings(remaining, stmts, unextracted);
+}
+
+/// INTO 대상·USING 인자는 SQL 문자열 밖의 식이다. 함수 호출이 있으면
+/// 의존성이 생기므로 버리지 않고 별도 SELECT로 파싱한다.
+fn dynamic_binding_head(mut rest: &str) -> Option<&str> {
+    if starts_with_keyword(rest, "RETURNING") {
+        rest = skip_ws_comments(&rest["RETURNING".len()..]);
+    }
+    if starts_with_keyword(rest, "BULK") {
+        rest = skip_ws_comments(&rest["BULK".len()..]);
+        if !starts_with_keyword(rest, "COLLECT") {
+            return None;
+        }
+        rest = skip_ws_comments(&rest["COLLECT".len()..]);
+    }
+    for keyword in ["INTO", "USING"] {
+        if starts_with_keyword(rest, keyword) {
+            let mut tail = skip_ws_comments(&rest[keyword.len()..]);
+            if keyword == "INTO" && starts_with_keyword(tail, "STRICT") {
+                tail = skip_ws_comments(&tail["STRICT".len()..]);
+            }
+            return Some(tail);
+        }
+    }
+    None
+}
+
+/// 바인딩 절의 복잡한 식을 SQL 파서로 넘겨, 해석 실패도 기존 미추출 집계에 싣는다.
+fn collect_dynamic_bindings(mut rest: &str, stmts: &mut Vec<String>, unextracted: &mut usize) {
+    while !rest.is_empty() {
+        let Some(expressions) = dynamic_binding_head(rest) else {
+            *unextracted += 1;
+            return;
+        };
+        let end = ["INTO", "USING", "RETURNING", "BULK"]
+            .iter()
+            .filter_map(|keyword| find_top_level(expressions, keyword, true))
+            .min()
+            .unwrap_or(expressions.len());
+        stmts.push(format!("SELECT {}", expressions[..end].trim()));
+        rest = skip_ws_comments(&expressions[end..]);
+    }
 }
 
 /// `EXIT/CONTINUE WHEN <cond>`·`ASSERT <cond>`의 꼬리 조건 — `(`가
@@ -2649,6 +2784,254 @@ mod tests {
             notes.iter().any(|n| n.contains("미추출")),
             "notes: {notes:?}"
         );
+    }
+
+    #[test]
+    fn dynamic_sql_does_not_treat_a_literal_prefix_as_the_complete_command() {
+        for command in [
+            "EXECUTE 'DELETE FROM customers' || suffix",
+            "EXECUTE 'DELETE FROM customers' || '_archive'",
+            "EXECUTE ('DELETE FROM customers' || suffix)",
+        ] {
+            let doc = doc_with_routine(
+                vec![routine(
+                    "dynamic_cleanup",
+                    Some("plpgsql"),
+                    &format!("BEGIN {command}; UPDATE orders SET customer_id = 1; END"),
+                )],
+                "",
+            );
+            let (graph, notes) = build(&doc);
+            let targets: BTreeSet<_> = graph
+                .edges()
+                .iter()
+                .filter(|edge| edge.from.as_str() == "public.dynamic_cleanup")
+                .map(|edge| (edge.kind, edge.to.as_str()))
+                .collect();
+            assert_eq!(
+                targets,
+                BTreeSet::from([(EdgeKind::Writes, "public.orders")])
+            );
+            assert!(
+                notes.iter().any(|note| note.contains("1건 미추출")),
+                "{notes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_sql_recovers_complete_quoted_commands_across_dialects() {
+        for (dialect, language, command) in [
+            (
+                "postgres",
+                "plpgsql",
+                "EXECUTE $sql$UPDATE customers SET name = 'BEGIN; END'$sql$",
+            ),
+            (
+                "postgres",
+                "plpgsql",
+                "EXECUTE (('UPDATE customers SET name = ''한글'''))",
+            ),
+            (
+                "oracle",
+                "plsql",
+                "EXECUTE IMMEDIATE q'[UPDATE customers SET name = 'BEGIN; END']'",
+            ),
+            (
+                "oracle",
+                "plsql",
+                "EXECUTE IMMEDIATE q'!UPDATE customers SET name = '한글'!'",
+            ),
+            (
+                "oracle",
+                "plsql",
+                "EXECUTE IMMEDIATE q'한UPDATE customers SET name = 'BEGIN; END'한'",
+            ),
+            (
+                "sqlserver",
+                "sql",
+                "EXEC(N'UPDATE customers SET name = ''BEGIN; END''')",
+            ),
+            (
+                "sqlserver",
+                "sql",
+                "EXECUTE(N'UPDATE customers SET name = ''한글''')",
+            ),
+        ] {
+            let mut doc = doc_with_routine(
+                vec![routine(
+                    "dynamic_touch",
+                    Some(language),
+                    &format!("BEGIN {command}; END"),
+                )],
+                "",
+            );
+            doc.dialect = dialect.into();
+            let (graph, notes) = build(&doc);
+            assert!(notes.is_empty(), "{dialect}: {command}: {notes:?}");
+            assert!(
+                graph
+                    .edges()
+                    .iter()
+                    .any(|edge| edge.kind == EdgeKind::Writes
+                        && edge.from.as_str() == "public.dynamic_touch"
+                        && edge.to.as_str() == "public.customers"),
+                "{dialect}: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_sql_recovers_cursor_loop_and_return_queries_with_binding_calls() {
+        for command in [
+            "RETURN QUERY EXECUTE $q$SELECT id FROM customers WHERE id = $1$q$ USING customer_key()",
+            "FOR row IN EXECUTE 'SELECT id FROM customers WHERE id = $1' USING customer_key() LOOP NULL; END LOOP",
+            "OPEN cur FOR EXECUTE 'SELECT id FROM customers WHERE id = $1' USING customer_key()",
+            "EXECUTE 'SELECT id FROM customers WHERE id = $1' INTO STRICT found_id USING customer_key()",
+        ] {
+            let doc = doc_with_routine(
+                vec![
+                    routine("customer_key", Some("sql"), "SELECT 1"),
+                    routine("dynamic_read", Some("plpgsql"), &format!("BEGIN {command}; END")),
+                ],
+                "",
+            );
+            let (graph, notes) = build(&doc);
+            assert!(notes.is_empty(), "{command}: {notes:?}");
+            for (kind, target) in [(EdgeKind::Reads, "public.customers"), (EdgeKind::Calls, "public.customer_key")] {
+                assert!(graph.edges().iter().any(|edge| edge.kind == kind
+                    && edge.from.as_str() == "public.dynamic_read"
+                    && edge.to.as_str() == target), "{command}: missing {target}");
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_sql_does_not_resolve_remote_execution_as_local_dependencies() {
+        let mut doc = doc_with_routine(
+            vec![routine("remote_read", Some("sql"),
+                "BEGIN EXEC(N'SELECT id FROM customers') AT linked_db; UPDATE orders SET customer_id = 1; END")],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (graph, notes) = build(&doc);
+        assert!(
+            notes.iter().any(|note| note.contains("미추출")),
+            "{notes:?}"
+        );
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.from.as_str() == "public.remote_read"
+                && edge.to.as_str() == "public.customers"));
+        assert!(graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.remote_read"
+                && edge.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn dynamic_sql_keywords_inside_data_or_comments_are_not_executed() {
+        let doc = doc_with_routine(
+            vec![
+                routine("touch_customer", Some("sql"), "SELECT 1"),
+                routine(
+                    "message",
+                    Some("sql"),
+                    "SELECT 'EXECUTE FUNCTION touch_customer(); BEGIN' AS message /* END */",
+                ),
+            ],
+            "",
+        );
+        let (graph, notes) = build(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.from.as_str() == "public.message"));
+    }
+
+    #[test]
+    fn dynamic_sql_handles_short_and_empty_bodies_without_panicking() {
+        for body in ["x", ";", " "] {
+            let doc = doc_with_routine(vec![routine("short_body", Some("plpgsql"), body)], "");
+            let (graph, notes) = build(&doc);
+            if body == "x" {
+                assert!(
+                    notes.iter().any(|note| note.contains("1건 미추출")),
+                    "{notes:?}"
+                );
+            }
+            assert!(!graph
+                .edges()
+                .iter()
+                .any(|edge| edge.from.as_str() == "public.short_body"));
+        }
+    }
+
+    #[test]
+    fn dynamic_sql_quote_boundaries_preserve_data_and_quoted_identifiers() {
+        for (dialect, body) in [
+            (
+                "postgres",
+                "SELECT E'escaped \\' EXECUTE FUNCTION touch_customer(); BEGIN'",
+            ),
+            (
+                "postgres",
+                "SELECT $q$EXECUTE FUNCTION touch_customer(); BEGIN$q$",
+            ),
+            ("sqlserver", "SELECT id AS [BEGIN] FROM orders"),
+        ] {
+            let mut doc = doc_with_routine(
+                vec![
+                    routine("touch_customer", Some("sql"), "SELECT 1"),
+                    routine("message", Some("sql"), body),
+                ],
+                "",
+            );
+            doc.dialect = dialect.into();
+            let (graph, notes) = build(&doc);
+            assert!(notes.is_empty(), "{body}: {notes:?}");
+            assert!(
+                !graph
+                    .edges()
+                    .iter()
+                    .any(|edge| edge.from.as_str() == "public.message"
+                        && edge.kind == EdgeKind::Calls)
+            );
+            if dialect == "sqlserver" {
+                assert!(graph
+                    .edges()
+                    .iter()
+                    .any(|edge| edge.from.as_str() == "public.message"
+                        && edge.to.as_str() == "public.orders"));
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_sql_incomplete_literals_do_not_become_routine_calls() {
+        for command in [
+            "EXEC(N'SELECT id FROM customers'",
+            "EXEC N'SELECT id FROM customers",
+        ] {
+            let mut doc = doc_with_routine(
+                vec![
+                    routine("N", Some("sql"), "SELECT 1"),
+                    routine("broken", Some("sql"), command),
+                ],
+                "",
+            );
+            doc.dialect = "sqlserver".into();
+            let (graph, notes) = build(&doc);
+            assert!(!notes.is_empty(), "{command}");
+            assert!(!graph
+                .edges()
+                .iter()
+                .any(|edge| edge.from.as_str() == "public.broken"));
+        }
     }
 
     #[test]

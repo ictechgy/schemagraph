@@ -117,3 +117,22 @@ BEGIN
     RETURN (SELECT COUNT(*) FROM orders);
 END;
 GO
+
+-- EXEC와 EXECUTE의 괄호·N 리터럴을 모두 검증한다.
+CREATE PROCEDURE dynamic_touch AS
+BEGIN
+    EXEC(N'UPDATE customers SET name = N''BEGIN; END'' WHERE id = 1');
+    EXECUTE(N'SELECT id FROM orders');
+END;
+GO
+
+-- 실행할 이름에 변수가 섞이면 리터럴 접두부를 완성된 SQL로 보지 않는다.
+CREATE PROCEDURE dynamic_cleanup @suffix NVARCHAR(32) AS
+BEGIN
+    EXEC(N'DELETE FROM customers' + @suffix);
+END;
+GO
+
+EXEC dynamic_touch;
+EXEC dynamic_cleanup N'';
+GO

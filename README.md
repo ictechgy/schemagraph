@@ -168,8 +168,13 @@ views, functions, procedures, and packages can be.
   Live scans can differ as catalog contents and usage statistics change.
 - **Body coverage:** views and triggers yield table and column dependencies.
   SQL routines, PL/pgSQL, PL/SQL, and T-SQL have body parsing or statement
-  extraction support, including Oracle package members. Dynamic SQL and
-  nested column scopes can leave gaps, which are reported.
+  extraction support, including Oracle package members. Supported dynamic
+  SQL forms include complete PostgreSQL dollar-quoted commands, Oracle
+  q-quoted commands, and T-SQL `EXEC(N'…')` / `EXECUTE(N'…')`. Cursor, loop,
+  and return-query forms also recover literal commands and binding calls.
+  Concatenated or variable-built commands remain limitations; a literal
+  prefix is never treated as the full command. Nested column scopes can
+  also leave reported gaps.
 
 ### Usage evidence
 

@@ -4,6 +4,17 @@
 
 ## 지금 상태
 
+- 2026-09-20: **동적 SQL 리터럴 복구와 오탐 방지 보강**.
+  PostgreSQL dollar-quote·Oracle q-quote·T-SQL 괄호/N 리터럴을 복구하고,
+  FOR/OPEN/RETURN QUERY EXECUTE와 Oracle OPEN FOR에서도 같은 경로를 쓴다.
+  INTO·USING 바인딩의 함수 호출도 간선으로 수집한다. 문자열 뒤에 연결식이나
+  원격 실행 꼬리가 있으면 앞부분만 완성된 SQL로 읽지 않고 미추출로 보고한다.
+  키워드 탐색·문장 분할의 인용/주석 처리를 통일해 문자열 속 가짜 EXECUTE
+  호출·BEGIN/END를 무시하고, 짧은 몸체의 범위 밖 슬라이스 패닉도 고쳤다.
+  새 회귀 테스트를 포함한 Rust 96개 테스트와 전체 DB fixture(건너뜀 0)가
+  통과했다. PG·Oracle·SQL Server fixture는 새 구문을 실제로 실행하며,
+  `Scripts/verify-dynamic-sql.py`가 필요한 간선과 생기면 안 되는 간선을 함께
+  확인한다. 문자열 연결식 계산·format 평가·변수 값 추적은 계속 미지원이다.
 - 2026-09-20: **GitHub Actions CI 추가** —
   [워크플로](.github/workflows/ci.yml) ·
   [실행 기록](https://github.com/ictechgy/schemagraph/actions/workflows/ci.yml).
@@ -300,7 +311,7 @@
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 88개 테스트
+cd engine && cargo build && cargo test        # 빌드 + 96개 테스트
 Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + JDBC probe 양방향 검증
 # PG는 initdb로, MySQL·MariaDB·MSSQL·Oracle은 docker로 자동 프로비전한다.
 #   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh      (폐기용 DB만!)
@@ -316,8 +327,9 @@ Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + 
 ## 다음 할 일
 
 1. routine 파싱 잔여 — T-SQL `TRY/CATCH`·`EXEC`·`WHILE`·커서는 복구됐고
-   남은 건 추출기가 못 가르는 드물고 동적인 구문뿐. 패키지 멤버 귀속은
-   완료 — 남은 것은 멤버 경계가 모호한 경우의 추가 정밀도뿐이다.
+   완전한 문자열 리터럴의 동적 SQL도 복구한다. 남은 것은 문자열 연결식·
+   format 평가·변수 값 추적과 드문 절차형 구문이다. 패키지 멤버 귀속은
+   완료됐고, 멤버 경계가 모호한 경우의 추가 정밀도는 남아 있다.
 2. Go 프로브 확장 — Oracle·SQL Server를 커버. pure-Go 드라이버가 있는
    방언(pgwire·mysql·sqlite)으로 수요별 확장.
 3. document v2 — additive 필드 너머의 협상(변경·제거 필드의 버전 계약).

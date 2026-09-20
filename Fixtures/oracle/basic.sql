@@ -107,3 +107,23 @@ CREATE OR REPLACE PACKAGE BODY order_ops AS
     END refresh;
 END order_ops;
 /
+
+-- q-quote의 SQL 본문과 OPEN FOR 문자열은 원문 그대로 엔진에 전달한다.
+CREATE OR REPLACE PROCEDURE dynamic_touch AS
+    cur SYS_REFCURSOR;
+BEGIN
+    EXECUTE IMMEDIATE q'[UPDATE customers SET name = 'BEGIN; END' WHERE id = :1]' USING 1;
+    OPEN cur FOR q'한SELECT id FROM orders WHERE id = :1한' USING 1;
+    CLOSE cur;
+END;
+/
+CREATE OR REPLACE PROCEDURE dynamic_cleanup(suffix IN VARCHAR2) AS
+BEGIN
+    EXECUTE IMMEDIATE 'DELETE FROM customers' || suffix;
+END;
+/
+BEGIN
+    dynamic_touch;
+    dynamic_cleanup('');
+END;
+/

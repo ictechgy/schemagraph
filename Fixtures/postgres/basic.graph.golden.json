@@ -18,6 +18,26 @@
     {
       "from": "public",
       "kind": "contains",
+      "to": "public.dynamic_cleanup(suffix text)"
+    },
+    {
+      "from": "public",
+      "kind": "contains",
+      "to": "public.dynamic_key"
+    },
+    {
+      "from": "public",
+      "kind": "contains",
+      "to": "public.dynamic_rows"
+    },
+    {
+      "from": "public",
+      "kind": "contains",
+      "to": "public.dynamic_touch"
+    },
+    {
+      "from": "public",
+      "kind": "contains",
       "to": "public.loop_self"
     },
     {
@@ -158,6 +178,61 @@
       "from": "public.customers",
       "kind": "contains",
       "to": "public.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_rows Reads public.customers",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_rows",
+      "kind": "reads",
+      "to": "public.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_rows calls public.dynamic_key",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_rows",
+      "kind": "calls",
+      "to": "public.dynamic_key"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_rows Reads public.orders",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_rows",
+      "kind": "reads",
+      "to": "public.orders"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_touch Writes public.customers",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_touch",
+      "kind": "writes",
+      "to": "public.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_touch Reads public.orders",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_touch",
+      "kind": "reads",
+      "to": "public.orders"
     },
     {
       "evidence": [
@@ -493,7 +568,8 @@
   ],
   "limitations": [
     "track_functions=none \u2014 routine usage \ubbf8\uc218\uc9d1(\ud568\uc218 \ud1b5\uacc4 \ube44\ud65c\uc131)",
-    "\uba64\ubc84 id \ucda9\ub3cc: public.products.products_sku_key\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 public.products.products_sku_key@index\ub85c \ubd84\ub9ac"
+    "\uba64\ubc84 id \ucda9\ub3cc: public.products.products_sku_key\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 public.products.products_sku_key@index\ub85c \ubd84\ub9ac",
+    "routine public.dynamic_cleanup(suffix text): \ubab8\uccb4 \ubb38\uc7a5 1\uac74 \ubbf8\ucd94\ucd9c(\ub3d9\uc801 SQL\u00b7\ube44SQL \uad6c\ubb38) \u2014 \ubab8\uccb4 \uac04\uc120 \ubd88\uc644\uc804"
   ],
   "version": 1,
   "vertices": [
@@ -615,6 +691,34 @@
       "kind": "column",
       "level": "member",
       "name": "name",
+      "schema": "public"
+    },
+    {
+      "id": "public.dynamic_cleanup(suffix text)",
+      "kind": "function",
+      "level": "object",
+      "name": "dynamic_cleanup",
+      "schema": "public"
+    },
+    {
+      "id": "public.dynamic_key",
+      "kind": "function",
+      "level": "object",
+      "name": "dynamic_key",
+      "schema": "public"
+    },
+    {
+      "id": "public.dynamic_rows",
+      "kind": "function",
+      "level": "object",
+      "name": "dynamic_rows",
+      "schema": "public"
+    },
+    {
+      "id": "public.dynamic_touch",
+      "kind": "function",
+      "level": "object",
+      "name": "dynamic_touch",
       "schema": "public"
     },
     {

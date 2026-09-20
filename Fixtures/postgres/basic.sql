@@ -78,3 +78,41 @@ FOR EACH ROW EXECUTE FUNCTION trg_orders_touch_fn();
 CREATE VIEW order_totals AS
 SELECT o.id AS order_id, c.name AS customer_name, o.total
 FROM orders o JOIN customers c ON c.id = o.customer_id;
+
+-- 문자열 전체가 확정된 동적 SQL만 복구한다. 본문 안의 BEGIN/END는 데이터다.
+CREATE FUNCTION dynamic_key() RETURNS integer AS $$ SELECT 1; $$ LANGUAGE sql;
+
+CREATE FUNCTION dynamic_touch() RETURNS void AS $body$
+BEGIN
+    EXECUTE $sql$UPDATE customers SET name = 'BEGIN; END' WHERE id = 1$sql$;
+    EXECUTE $sql$SELECT id FROM orders$sql$;
+END;
+$body$ LANGUAGE plpgsql;
+
+CREATE FUNCTION dynamic_rows() RETURNS SETOF integer AS $body$
+DECLARE
+    row_value record;
+    cur refcursor;
+    found_id integer;
+BEGIN
+    EXECUTE 'SELECT count(*) FROM customers' INTO STRICT found_id;
+    FOR row_value IN EXECUTE $sql$SELECT id FROM customers$sql$ LOOP
+        RETURN NEXT row_value.id;
+    END LOOP;
+    OPEN cur FOR EXECUTE $sql$SELECT id FROM orders$sql$;
+    CLOSE cur;
+    RETURN QUERY EXECUTE $sql$SELECT id FROM orders WHERE id = $1$sql$ USING dynamic_key();
+END;
+$body$ LANGUAGE plpgsql;
+
+-- suffix가 바뀌면 다른 테이블을 가리킨다. customers 삭제 간선을 추측하면 안 된다.
+CREATE FUNCTION dynamic_cleanup(suffix text) RETURNS void AS $body$
+BEGIN
+    EXECUTE 'DELETE FROM customers' || suffix;
+END;
+$body$ LANGUAGE plpgsql;
+
+-- 빈 fixture에서 실제 실행해 DB가 이 구문을 받아들이는지도 검증한다.
+SELECT dynamic_touch();
+SELECT * FROM dynamic_rows();
+SELECT dynamic_cleanup('');

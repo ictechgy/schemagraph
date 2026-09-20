@@ -238,8 +238,16 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
   버전을 올린다. 버전 불일치는 거부하고, 같은 버전 안의 미지 필드는 받되
   무시된 경로를 `limitations`에 신고한다(`unknown_field_paths`).
 - **routine 몸체 파싱 커버리지** — `sql`·`plpgsql`·`plsql`은 문장 추출로
-  파싱됨(P5). 남은 것: T-SQL 전용 구문(TRY/CATCH, CURSOR 루프 등)과
-  Oracle 패키지 멤버별 귀속, 기타 언어는 limitation 유지.
+  파싱됨(P5). T-SQL의 TRY/CATCH·EXEC·WHILE·커서와 Oracle 패키지 멤버
+  귀속도 지원한다(P6). 동적 SQL은 전체 문자열이 보이는 경우에만 복구한다:
+  PG dollar-quote, Oracle q-quote, T-SQL 괄호·N 리터럴과 FOR/OPEN/RETURN
+  QUERY EXECUTE 경로. INTO·USING 식의 함수 호출도 수집한다. 문자열 뒤에
+  연결식·연산이나 원격 실행 꼬리(AT)가 있으면 접두부를 완성된 SQL로 보지
+  않고 미추출로 보고한다. 상수 연결식 계산·format 평가·변수 값 추적·나머지
+  언어는 미지원이며 limitation을 유지한다. 문법 기준은
+  [PostgreSQL EXECUTE](https://www.postgresql.org/docs/16/plpgsql-statements.html#PLPGSQL-STATEMENTS-EXECUTING-DYN),
+  [Oracle EXECUTE IMMEDIATE](https://docs.oracle.com/en/database/oracle/oracle-database/19/lnpls/EXECUTE-IMMEDIATE-statement.html),
+  [SQL Server EXECUTE](https://learn.microsoft.com/en-us/sql/t-sql/language-elements/execute-transact-sql?view=sql-server-ver16)다.
 - **프로브 전송 방식** — 파일·stdout에 NDJSON 형식이 더해짐(P5). 프로브 측
   진짜 스트리밍(수확과 동시에 행 출력)은 아직 — 현재는 문서를 만든 뒤
   직렬화만 행 단위다. 수요가 생기면 Extractor를 행 방출로 고친다.
