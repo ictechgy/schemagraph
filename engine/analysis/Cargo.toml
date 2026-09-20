@@ -10,4 +10,4 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-schemagraph-core = { path = "../core", version = "0.2.0" }
+schemagraph-core = { path = "../core", version = "0.3.0" }

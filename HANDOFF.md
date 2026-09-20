@@ -4,6 +4,17 @@
 
 ## 지금 상태
 
+- 2026-09-20: **추가 확장 3건 진행 중** (`feature/scaling-db2-informix-maven`).
+  사용자가 대형 DB 성능·메모리 개선, DB2·Informix 특화 수집, JDBC 프로브의
+  Maven 배포를 모두 승인했다. Rust는 입력 원문·NDJSON Value·출력 그래프의
+  중복 보관을 줄이고, Go는 수집 단계부터 NDJSON을 순차 방출하도록 변경 중이다.
+  `Scripts/benchmark-catalog.py`가 실제 컬럼·PK·FK·인덱스가 있는 1천·1만 객체로
+  시간·프로세스별 최고 RSS·출력 해시를 기록한다. 기준 버전은 crates.io의 0.2.0.
+  JVM DB2·Informix 카탈로그 및 fixture 구현과 Maven Central용 패키징은 병행 중이다.
+  실제 DB fixture 검증 전에는 새 DB 지원을 검증 완료로 표시하지 않는다.
+  사용자에게 Maven namespace/게시 설정 유무와 사용할 DB 환경을 질문한 상태다.
+  토큰·서명키·기존 인증 파일은 읽지 않았다. 현재 로컬 Docker는 ARM64·4GB다.
+
 - 2026-09-20: **v0.2.0 배포·설치 검증 완료** —
   [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.2.0) ·
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.2.0) ·

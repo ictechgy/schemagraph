@@ -38,7 +38,7 @@ jobs:
       - name: Install native fixture tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes pkg-config libsqlite3-dev sqlite3 postgresql-16
+          sudo apt-get install --yes pkg-config libsqlite3-dev sqlite3 postgresql-16 maven
           echo /usr/lib/postgresql/16/bin >> "$GITHUB_PATH"
 
       - name: Set up Rust
@@ -96,8 +96,11 @@ jobs:
           gradle-version: "9.6.1"
           cache-provider: basic
 
-      - name: Build the JDBC probe
-        run: gradle -p probe shadowJar --no-daemon --console=plain
+      - name: Build and test the JDBC probe
+        run: gradle -p probe check shadowJar --no-daemon --console=plain
+
+      - name: Verify local Maven publication and consumers
+        run: Scripts/verify-probe-maven.sh
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0

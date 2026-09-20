@@ -525,7 +525,11 @@ for j in "$(command -v java 2>/dev/null || true)" \
     fi
 done
 
-JAR="probe/build/libs/schemagraph-probe-all.jar"
+JAR="${SG_PROBE_JAR:-probe/build/libs/schemagraph-probe-all.jar}"
+if [ -n "${SG_PROBE_JAR:-}" ] && [ ! -f "$JAR" ]; then
+    echo "error: SG_PROBE_JAR does not point to an existing probe jar" >&2
+    exit 1
+fi
 if [ -n "$JAVABIN" ] && [ ! -f "$JAR" ] && command -v gradle >/dev/null; then
     JAVA_HOME="$(cd "$(dirname "$JAVABIN")/.." && pwd)" \
         gradle -p probe shadowJar --console=plain -q \
