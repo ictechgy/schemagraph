@@ -4,7 +4,18 @@
 
 ## 지금 상태
 
-- 2026-09-20: **v0.1.0 배포 검증 완료, crates.io 인증 대기** (`f55b837`).
+- 2026-09-20: **v0.1.0 crates.io 배포 완료** —
+  [CLI 패키지](https://crates.io/crates/schemagraph-cli/0.1.0) ·
+  [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.1.0).
+  `schemagraph-core`·`schemagraph-analysis`·`schemagraph-source`·
+  `schemagraph-export`·`schemagraph-parser`·`schemagraph-cli` 6개를 게시했다.
+  모든 게시 아카이브의 체크섬과 소스 커밋 `7907634`를 확인했고, `v0.1.0`
+  태그도 그 커밋을 가리킨다. 로컬 스냅샷이 아닌 레지스트리에서
+  `cargo install schemagraph-cli --version 0.1.0 --locked`로 별도 경로에
+  설치한 뒤 버전·스킬 문서·SQLite 골든·document 왕복·query·impact를 검증했다.
+  첫 인증 실패는 재로그인으로 해결했고, 마지막 CLI의 신규 크레이트 등록
+  속도 제한은 서버가 안내한 시각 이후 재시도해 해결했다.
+- 2026-09-20: **v0.1.0 패키징 수정과 배포 검증 완료** (`f55b837`).
   CLI의 `include_str!`가 크레이트 밖의 스킬 파일을 읽던 패키징 결함을 수정했다.
   원본 `skills/schemagraph/SKILL.md`와 패키지용 `engine/cli/SKILL.md`는 같은
   내용을 유지해야 한다. 6개 크레이트가 영어 README를 상속하며 각 패키지에
@@ -12,11 +23,8 @@
   Rust 빌드·테스트·fmt, JDBC shadowJar, 전체 DB fixture(건너뜀 0), 6개
   크레이트의 격리 패키지 빌드와 `cargo publish --workspace --dry-run --locked`가
   통과했다. **Cargo 1.96에서는 workspace dry-run이 임시 레지스트리로 미게시
-  형제 의존성을 검증할 수 있다.** 실제 게시 요청은 첫 크레이트에서
-  `403 authentication failed`로 거절됐으며 게시된 크레이트는 없다.
-  로컬 `cargo login`으로 인증을 갱신한 뒤 아래 게시 명령을 재실행하고,
-  레지스트리 설치 검증·GitHub 릴리스를 마무리한다. 배포 준비 커밋은 개발
-  브랜치에만 올리고 `main`과 버전 태그는 실제 게시 성공 후 갱신한다.
+  형제 의존성을 검증할 수 있다.** 배포 준비는 개발 브랜치에서 진행하고,
+  실제 게시와 레지스트리 설치 검증이 끝난 뒤 `main`에 반영했다.
 - 2026-09-20: **공개 GitHub 저장소 생성** —
   [ictechgy/schemagraph](https://github.com/ictechgy/schemagraph).
   공개 기본 브랜치는 `main`, 개발 브랜치는 `feature/p0-engine`이다.
@@ -27,7 +35,7 @@
   문서 링크·셸/TOML 예제·번역 간 명령 일치, 기존 CLI의 SQLite 예제와 골든
   일치, 오프라인 Cargo 메타데이터 로딩을 확인했다. 런타임 코드는 변경하지
   않았으며 전체 DB fixture 검증은 아래 P6 실행 기록을 기준으로 한다.
-  crates.io 게시는 아직 하지 않았다.
+  이 단계에서는 GitHub 공개까지만 진행했다.
 - 2026-09-19: **P0 완료** (`651fb12`). `engine/` Rust 워크스페이스에 core·source·
   analysis·export·cli 크레이트. SQLite 네이티브 reader가 카탈로그를 읽어
   그래프를 만들고, `scan`/`graph`/`query`/`cycles`가 동작한다.
@@ -294,18 +302,12 @@ Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + 
 
 ## 다음 할 일
 
-1. crates.io 인증 갱신 후 실게시 — 6개 크레이트 전체 검증은 끝났으며,
-   첫 업로드가 인증 실패로 거절돼 아직 미게시 상태다. `cargo login` 후
-   `cargo publish --manifest-path engine/Cargo.toml --workspace --locked`로
-   의존 순서대로 게시한다. 이어서 `cargo install schemagraph-cli --version
-   0.1.0 --locked`로 레지스트리 설치를 검증하고 `main`·`v0.1.0` 릴리스를
-   갱신한다. GitHub 저장소 URL과 게시용 README·LICENSE는 준비됐다.
-2. routine 파싱 잔여 — T-SQL `TRY/CATCH`·`EXEC`·`WHILE`·커서는 복구됐고
+1. routine 파싱 잔여 — T-SQL `TRY/CATCH`·`EXEC`·`WHILE`·커서는 복구됐고
    남은 건 추출기가 못 가르는 드물고 동적인 구문뿐. 패키지 멤버 귀속은
    완료 — 남은 것은 멤버 경계가 모호한 경우의 추가 정밀도뿐이다.
-3. Go 프로브 확장 — Oracle·SQL Server를 커버. pure-Go 드라이버가 있는
+2. Go 프로브 확장 — Oracle·SQL Server를 커버. pure-Go 드라이버가 있는
    방언(pgwire·mysql·sqlite)으로 수요별 확장.
-4. document v2 — additive 필드 너머의 협상(변경·제거 필드의 버전 계약).
+3. document v2 — additive 필드 너머의 협상(변경·제거 필드의 버전 계약).
 
 ## 미결
 
