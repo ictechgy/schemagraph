@@ -133,38 +133,122 @@ for coordinate in {
 print(f"validated publication: {os.environ['GROUP_ID']}:{artifact}:{version}")
 PY
 
-cat >"$consumer_dir/settings.gradle.kts" <<EOF
-rootProject.name = "probe-maven-consumer"
-EOF
-cat >"$consumer_dir/build.gradle.kts" <<EOF
-plugins {
-    application
-}
+export CONSUMER_DIR="$consumer_dir" REPO_DIR="$repo_dir" GROUP_ID ARTIFACT_ID VERSION
+python3 - <<'PY'
+import os
+import pathlib
+import xml.etree.ElementTree as ET
 
-repositories {
-    maven { url = uri("$repo_dir") }
+consumer = pathlib.Path(os.environ["CONSUMER_DIR"])
+repo_uri = pathlib.Path(os.environ["REPO_DIR"]).resolve().as_uri()
+group = os.environ["GROUP_ID"]
+artifact = os.environ["ARTIFACT_ID"]
+version = os.environ["VERSION"]
+jdbc_url = "jdbc:h2:mem:probe_maven_consumer;INIT=CREATE TABLE items(id INT PRIMARY KEY)"
+
+(consumer / "settings.gradle.kts").write_text(
+    'rootProject.name = "probe-maven-consumer"\n', encoding="utf-8"
+)
+(consumer / "build.gradle.kts").write_text(
+    f'''plugins {{ application }}
+
+repositories {{
+    maven {{ url = uri("{repo_uri}") }}
     mavenCentral()
-}
+}}
 
-dependencies {
-    implementation("$GROUP_ID:$ARTIFACT_ID:$VERSION")
-}
+dependencies {{ implementation("{group}:{artifact}:{version}") }}
 
-application {
-    mainClass.set("schemagraph.probe.MainKt")
-}
+application {{ mainClass.set("schemagraph.probe.MainKt") }}
 
-tasks.named<JavaExec>("run") {
-    args("--url", "jdbc:h2:mem:probe_maven_consumer", "-o", "$consumer_dir/catalog.json")
-}
-EOF
+tasks.named<JavaExec>("run") {{
+    args("--url", "{jdbc_url}", "-o", "{(consumer / 'gradle-catalog.json').as_posix()}")
+}}
+''', encoding="utf-8"
+)
+
+project = ET.Element("project", {
+    "xmlns": "http://maven.apache.org/POM/4.0.0",
+    "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+    "xsi:schemaLocation": "http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd",
+})
+
+def add(parent, tag, value=None):
+    child = ET.SubElement(parent, tag)
+    if value is not None:
+        child.text = value
+    return child
+
+add(project, "modelVersion", "4.0.0")
+add(project, "groupId", "local.consumer")
+add(project, "artifactId", "probe-maven-consumer")
+add(project, "version", "1.0.0")
+repositories = add(project, "repositories")
+repository = add(repositories, "repository")
+add(repository, "id", "local-publication")
+add(repository, "url", repo_uri)
+central = add(repositories, "repository")
+add(central, "id", "central")
+add(central, "url", "https://repo.maven.apache.org/maven2")
+dependencies = add(project, "dependencies")
+dependency = add(dependencies, "dependency")
+add(dependency, "groupId", group)
+add(dependency, "artifactId", artifact)
+add(dependency, "version", version)
+build = add(project, "build")
+plugins = add(build, "plugins")
+plugin = add(plugins, "plugin")
+add(plugin, "groupId", "org.codehaus.mojo")
+add(plugin, "artifactId", "exec-maven-plugin")
+add(plugin, "version", "3.5.0")
+configuration = add(plugin, "configuration")
+add(configuration, "mainClass", "schemagraph.probe.MainKt")
+add(configuration, "classpathScope", "runtime")
+arguments = add(configuration, "arguments")
+for value in ("--url", jdbc_url, "-o", str(consumer / "maven-catalog.json")):
+    add(arguments, "argument", value)
+tree = ET.ElementTree(project)
+ET.indent(tree, space="  ")
+tree.write(consumer / "pom.xml", encoding="utf-8", xml_declaration=True)
+PY
 
 gradle -p "$consumer_dir" run --console=plain
-test -s "$consumer_dir/catalog.json"
-echo "external Maven repository consumer and probe CLI succeeded"
 
-if command -v mvn >/dev/null 2>&1; then
-    echo "Maven CLI detected: $(mvn -version | head -1)"
-else
-    echo "note: Maven CLI is unavailable; Gradle Maven-repository consumer verification was used" >&2
+maven_bin=""
+if [[ -n ${MAVEN_HOME:-} && -x "$MAVEN_HOME/bin/mvn" ]]; then
+    maven_bin="$MAVEN_HOME/bin/mvn"
+elif command -v mvn >/dev/null 2>&1; then
+    maven_bin=$(command -v mvn)
 fi
+if [[ -n "$maven_bin" ]]; then
+    "$maven_bin" -B -q -f "$consumer_dir/pom.xml" \
+        -Dmaven.repo.local="$consumer_dir/m2" exec:java
+    echo "external Maven CLI consumer and probe CLI succeeded"
+    export CATALOG_PATHS="$consumer_dir/gradle-catalog.json:$consumer_dir/maven-catalog.json"
+else
+    echo "note: Maven CLI is unavailable; Gradle Maven-repository consumer was used" >&2
+    export CATALOG_PATHS="$consumer_dir/gradle-catalog.json"
+fi
+
+export CATALOG_PATHS
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+for raw in os.environ["CATALOG_PATHS"].split(":"):
+    path = Path(raw)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise SystemExit(f"error: packaged CLI did not produce a catalog: {path}")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("version") != 1 or document.get("dialect") != "h2":
+        raise SystemExit(f"error: unexpected catalog header in {path}: {document}")
+    tables = [obj for schema in document.get("schemas", []) for obj in schema.get("objects", [])
+              if obj.get("name", "").casefold() == "items"]
+    if len(tables) != 1:
+        raise SystemExit(f"error: items table missing from {path}")
+    columns = [col for col in tables[0].get("columns", []) if col.get("name", "").casefold() == "id"]
+    if len(columns) != 1 or columns[0].get("pk_position") != 1:
+        raise SystemExit(f"error: items.id primary-key metadata missing from {path}")
+print("external consumers contain version, dialect, items, id, and primary-key metadata")
+PY
