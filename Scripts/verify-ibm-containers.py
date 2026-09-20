@@ -151,7 +151,8 @@ def main() -> int:
             image(DB2_IMAGE)
             name = f"sg-ibm-db2-{run_id}"
             containers.append(name)
-            password = secrets.token_urlsafe(18)
+            # 옵션처럼 시작하는 값도 안전하게 전달되는지 실DB 검증에서 항상 확인한다.
+            password = "-" + secrets.token_urlsafe(18)
             SECRET_VALUES.append(password)
             docker(["run", "-d", "--name", name, "--platform", "linux/amd64", "--privileged",
                     "--memory", args.memory, "--shm-size=256m",
@@ -166,7 +167,7 @@ def main() -> int:
             run([sys.executable, str(VERIFY), str(args.engine), str(args.probe_jar),
                  "--database", "db2", "--require-all", "--java", args.java,
                  "--output-dir", str(args.output_dir.resolve() / f"db2-{run_id}"),
-                 "--db2-url", db2_url, "--db2-user", "db2inst1", "--db2-password", password,
+                 "--db2-url", db2_url, "--db2-user", "db2inst1", f"--db2-password={password}",
                  "--db2-jdbc", str(db2_driver), "--db2-schema", "SGFIX"],
                 "Db2 fixture verification", timeout=900)
             cleanup(name, run_id)
@@ -185,7 +186,7 @@ def main() -> int:
                     INFORMIX_IMAGE], "start Informix container", timeout=120)
             print("Informix fixture container started; waiting for the database", flush=True)
             wait_informix(name)
-            password = secrets.token_urlsafe(18)
+            password = "-" + secrets.token_urlsafe(18)
             SECRET_VALUES.append(password)
             docker(["exec", "-i", "-u", "0", name, "chpasswd"], "set ephemeral Informix credentials",
                    input_text=f"informix:{password}\n")
@@ -197,7 +198,7 @@ def main() -> int:
                  "--database", "informix", "--require-all", "--java", args.java,
                  "--output-dir", str(args.output_dir.resolve() / f"informix-{run_id}"),
                  "--informix-url", informix_url, "--informix-user", "informix",
-                 "--informix-password", password, "--informix-jdbc", str(informix_driver)],
+                 f"--informix-password={password}", "--informix-jdbc", str(informix_driver)],
                 "Informix fixture verification", timeout=900)
             cleanup(name, run_id)
             containers.remove(name)

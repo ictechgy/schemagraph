@@ -4,68 +4,50 @@
 
 ## 지금 상태
 
-- 2026-09-21: **v0.4.0 로컬 통합 완료, 공개 CI·배포 검증 단계**.
-  구현 커밋: `b0ac6c0`(라이브러리), `f851ad7`(CLI), `b87cc47`(프로브).
-  Rust **233개 테스트**, Go test/vet·CGO 없는 빌드, JVM check/shadowJar,
-  JSON Schema·SQLite CLI/MCP/HTML/캐시/merge 검증, 6개 crate의 격리 package 빌드가 통과했다.
-  실제 native/Go/JDBC SQLite와 PostgreSQL의 카탈로그 의존성·부분/식/보조 인덱스
-  및 v1/v2 JSON/NDJSON 검증도 통과했다. MSSQL JDBC 4조합과 Go v2에서
-  카탈로그 8행·depends-on 8개를 직접 확인했다. Oracle 신규 카탈로그 검증은
-  기존 전체 fixture에서 DB가 살아 있을 때 실행하도록 연결했고 CI에서 실행할 예정이다.
-  Docker 4GiB VM에 다른 프로젝트 컨테이너가 있어 이를 종료하지 않고 GitHub CI를 사용한다.
-  - 최종 core 합성 측정: 구축 833.435→35.632ms, 조회100회 201.421→199.237ms,
-    peak RSS 32.09→27.70MiB. 캐시는 짧은 SQL500개에서122→158ms(warm)로느리고,
-    1000값 IN조건 SQL500개에서297→194ms로빨랐다. 캐시는기본비활성이며 측정한
-    한계를 PERFORMANCE.md에 명시했다. 임시결과 `/tmp/schemagraph-analysis-{short,long}/results.json`.
-  - 남은 작업: 최종 문서/워크플로 커밋·feature push와 draft PR,
-    전체7DB+IBM2DB와 Linux/macOS 사전빌드 CI 확인. MySQL/MariaDB golden은
-    새 graph v2 기준 실출력을 아티팩트로 받아 실제 차이 검토 후 갱신해야 한다.
-    이후 main 반영·v0.4.0 tag·Rust/Maven/바이너리 공개 배포·소비자 검증.
-    아직 v0.4.0은 게시하지 않았고 v0.3.0은 그대로 공개되어 있다.
+- 2026-09-21: **v0.4.0 경쟁 조사 후속 구현·공개 배포 완료**.
+  [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.0) ·
+  [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.4.0) ·
+  [Maven Central](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.4.0) ·
+  [공개 Maven 저장소](https://ictechgy.github.io/schemagraph/maven/).
+  릴리스 소스와 태그는 `f48bd1c389944ba5d40bfd1c4e85f77a19ac9f94`다.
+  [구현 PR #1](https://github.com/ictechgy/schemagraph/pull/1)을 병합했으며,
+  배포한 6개 crate의 레지스트리 체크섬·로컬 게시 바이트·내장 소스 커밋 일치를 확인했다.
+  - **분석**: 컬럼 스코프/값 계보, 객체별 complete/partial/unsupported 진단,
+    원문 해시·위치, `explain`·`path`, 보존 루트·이유/만료가 있는 억제,
+    이전 그래프에서 제거 대상을 추적하는 `review`, FK index/PK prefix `lint`.
+  - **수집·인터페이스**: 수집 맥락과 선택적 PG/SQL Server/Oracle 카탈로그 근거,
+    SQL 파일 query 정점, source namespace `merge`, offline HTML, 고정 그래프 MCP,
+    query/impact/review 탐색 예산과 선택적 몸체 분석 캐시를 추가했다.
+    graph v2를 쓰고 기존 v1 읽기를 유지한다. 새 ID는 예약 문자를 escape하며
+    일반 `schema.table`과 `fn(integer)`는 유지한다. 사용법은 [ANALYSIS.md](ANALYSIS.md).
+  - **검증**: [235개 Rust 테스트·일반 DB 통합 CI](https://github.com/ictechgy/schemagraph/actions/runs/35524666271),
+    [Db2·Informix 실DB](https://github.com/ictechgy/schemagraph/actions/runs/35523949136),
+    Go test/vet·CGO 없는 빌드, JVM 및 Maven/Gradle 소비자, 6개 격리 패키지,
+    JSON Schema, 실제 브라우저 검색·선택 검사를 통과했다. 기존 9개 DB fixture와
+    PG/SQL Server/Oracle JDBC·Go의 catalog-dependencies v1/v2 JSON/NDJSON를 확인했다.
+    네이티브 golden은 기존 정점·간선이 유지되는지 검토한 뒤 새 계보/메타데이터를 반영했다.
+  - **배포 검증**: [Linux x86_64·macOS arm64 바이너리 및 standalone JAR](https://github.com/ictechgy/schemagraph/actions/runs/35524772437),
+    [Pages Maven](https://github.com/ictechgy/schemagraph/actions/runs/35524666269),
+    [Central 게시](https://github.com/ictechgy/schemagraph/actions/runs/35524781356)가 완료됐다.
+    Central deployment `1e328452-2e5c-467f-afbf-0cc7eaa8c3c7`의 PUBLISHED와 실제 공개 파일을 확인했다.
+    5개 payload의 체크섬·PGP 서명·Pages 바이트, all JAR의 GitHub 바이트가 일치한다.
+    별도 crates.io 설치와 공개 macOS 압축파일에서 CLI 회귀를, Central만 사용하는
+    별도 Java 소비자에서 H2 테이블·컬럼·PK를, standalone JAR에서 SQLite FK를 검증했다.
+    서명키 지문은 기존 `0A98034C6F045509D1EE58EE329F94DC51434A1B`이며 비밀키 백업은 건드리지 않았다.
+  - **성능·한계**: [PERFORMANCE.md](PERFORMANCE.md)에 재현 절차와 측정을 남겼다.
+    3만 간선 합성 구축은 833→36ms, peak RSS는 32.09→27.70MiB였다.
+    짧은 SQL 500개는 캐시가 느리고(122→158ms), 긴 IN 조건에서는 빨랐다(297→194ms).
+    캐시는 기본 비활성이다. 미지원 SQL·불완전 수집·모호한 외부 참조는 계속 명시하며,
+    CLI/MCP는 동기식이라 진행 중 요청의 협력적 취소는 라이브러리 API에만 있다.
+    이번 범위는 기존 9개 DB 강화다. 신규 warehouse는 수요를 확인한 뒤의 후속 항목이다.
+  - **CI 후속**: 임시 비밀번호가 하이픈으로 시작할 때 argparse가 오독하던
+    검증기 호출을 [PR #2](https://github.com/ictechgy/schemagraph/pull/2)에서 고쳤다.
+    [하이픈 비밀번호를 강제한 Db2·Informix 실DB 검사](https://github.com/ictechgy/schemagraph/actions/runs/35525936427)도 통과했다.
+    `--option=value`로 전달하고 비밀번호에 하이픈 접두를 넣어 해당 경계를 항상 검사한다.
+    이 변경은 fixture 실행기만 수정하며 공개 v0.4.0 런타임 바이트는 그대로 유지한다.
+    검증 요약·체크섬·서명·소비자·브라우저 기록 13개는 저장소 밖
+    `~/Library/Application Support/schemagraph/verification/v0.4.0-20260921`에 보관했다.
 
-- 2026-09-21: **경쟁 조사 후속 통합 진행 중 — 아직 배포하지 않음**.
-  브랜치 `feature/competitive-roadmap`, 다음 버전 `0.4.0`으로 Cargo·Gradle·배포 기본값을 올렸다.
-  이전 `0.3.0` 산출물을 덮어쓰지 않는다. 현재 변경은 대부분 미커밋 상태다.
-  - 구현 연결: `review`(이전 그래프의 삭제 대상 추적), 카탈로그 context/dependencies,
-    실제 ID로 FK/메타데이터 정규화, `lint`, `scan --sql-dir`, HTML, MCP stdio,
-    query/impact/review 탐색 예산, `scan --cache-dir`, source namespace `merge`.
-    예약 문자 ID escaping·typed routine ID·graph v1 읽기 호환을 추가했다.
-  - 마지막 전체 Rust 검사: **230개 통과**. Go test/vet 및 JVM check/shadowJar도 통과.
-    실제 SQLite `verify-competitive.py`와 JSON Schema 검증 통과 보고를 받았고,
-    최종 소스에서 다시 직접 실행해야 한다. 이후 review signature 누락 회귀 수정과
-    DB index partial 플래그 보강이 진행 중이므로 위 검사를 최종 검증으로 쓰지 않는다.
-  - root가 SQLite golden을 검토: 정점/기존 간선 유지, JOIN 키 reads 2개와 컬럼
-    derives-from 3개 및 graph v2 analysis/origins/schema_metadata만 추가됨을 확인해 갱신.
-    PostgreSQL/MySQL/MariaDB golden과 전체 실DB·IBM fixture 검증은 아직 남았다.
-  - 3만 간선 합성 core 측정(3회): 구축 중앙값 833.435→35.979ms,
-    조회 100회 201.421→200.247ms, peak RSS 32.09→27.73MiB.
-    비교 기준 `a3fd72d`, Arc ID/edge slot 변경 시점. 이후 ID escaping 변경이 있어
-    최종 측정 재실행 후 PERFORMANCE.md에 기록해야 한다. harness `Scripts/benchmark-core.rs`.
-  - 외부 검증 드라이버는 `/tmp/schemagraph-competitive-drivers/`의
-    `mysql-connector-j.jar`·`ojdbc8.jar`; CI와 동일한 SHA256 검증 완료.
-    테스트 로그는 `/tmp/schemagraph-competitive-{tests,build,jvm}.log`.
-    서명키/비밀파일은 읽거나 바꾸지 않았다.
-  - 남은 필수: actual PG/MSSQL/Oracle optional catalogs, 기존 전체9DB fixture,
-    schema/CLI/HTML/MCP 최종검증, cache/performance 재현, 패키징·CI·Linux/macOS binary,
-    최종 문서/버전 정합성·feature commit/push·검증 후 0.4.0 공개 배포.
-
-- 2026-09-20: **경쟁 조사 후속 개선 구현 시작** (`feature/competitive-roadmap`).
-  사용자가 [경쟁 조사](COMPETITIVE-ANALYSIS.md)의 권장 작업을 순서대로 진행하도록
-  승인했다. 진행 순서는 (1) 컬럼 스코프·진단·보존 루트, (2) 경로·변경 검토·
-  카탈로그 근거·규칙, (3) 배포/CI·SQL 파일·MCP/HTML·실행 예산/증분 분석이다.
-  신규 데이터웨어하우스는 보고서의 수요 조건에 따라 사용자 선호를 질문했다.
-  완료 조건은 기존 출력 호환, 결정적 결과, 필요한/금지된 간선, 실제 DB fixture다.
-  v0.3.0은 공개되어 있으며 새 기능은 아직 배포하지 않았다. 최근 로컬 빌드·검증
-  산출물은 정리했으므로 필요한 빌드를 다시 생성한다. 서명키 백업은 건드리지 않는다.
-  - 진행: graph v2의 객체별 분석 상태·원문 해시/위치(기존 v1 읽기 유지),
-    스코프 기반 view 컬럼 해석·값 계보, `dead` retain/이유 있는 예외/만료,
-    `diagnostics`·`explain`·`path`와 경로 탐색 예산을 구현했다.
-    Rust 173개 테스트가 통과했다. 실제 DB 전체 검증·문서 계약 갱신은 아직 남았다.
-    `scope.rs`는 재귀 CTE·SEMI/ANTI/APPLY·wildcard modifier를 보수적으로 partial 처리한다.
-  - 현재 작업: catalog diff+impact `review`, 수집 범위/카탈로그 의존성 계약,
-    기존 9종의 수집 깊이 강화. 이후 배포 바이너리/CI·외부 SQL·MCP/HTML·
-    조회 예산/증분 분석·식별자 호환을 이어간다. 신규 DB 선호 응답은 아직 없으며
-    수요 조건이 있는 신규 warehouse는 추가하지 않고 기존 DB 강화 기본안으로 진행한다.
 - 2026-09-20: **Maven Central v0.3.0 게시·설치 검증 완료**.
   [`io.github.ictechgy:schemagraph-probe:0.3.0`](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.3.0)을
   Central에 추가 게시했다. 소비자는 `mavenCentral()`만 사용하면 된다.
