@@ -4,6 +4,7 @@ target/
 
 # Kotlin/JVM (probe-jdbc)
 .gradle/
+.kotlin/
 build/
 out/
 
@@ -14,6 +15,10 @@ probe-go/schemagraph-probe-go
 .idea/
 *.iml
 .vscode/
+
+# 로컬 도구 설정과 중첩 작업 디렉터리
+/.serena/
+/sanddab/
 
 # OS
 .DS_Store
