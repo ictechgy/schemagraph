@@ -1,9 +1,10 @@
 # Catalog document protocol
 
 The catalog document is the probe-to-engine wire format. It carries a
-deterministic catalog snapshot and the limitations observed while collecting
-it. The engine normalizes both wire versions into the same internal v1
-`CatalogDocument`; graph format and graph version remain unchanged.
+deterministic catalog snapshot, collection context, catalog dependency facts,
+and the limitations observed while collecting it. The engine normalizes both
+wire versions into the same internal `CatalogDocument`; the graph wire format
+is version 2.
 
 ## Versions and compatibility
 
@@ -24,6 +25,10 @@ The known required features are:
 
 - `package-members-v1` — routine records use `member_of` for package members.
 - `usage-v1` — objects, indexes, or routines carry `usage` evidence.
+- `catalog-dependencies-v1` — `dependencies` carries DB-reported references,
+  including an optional target database.
+- `external-queries-v1` — `query` routines came from declared application SQL
+  files and carry a relative `source` path.
 
 A v2 producer must declare every feature used by its records. An unknown
 required feature is rejected; the engine never silently downgrades or ignores
@@ -75,7 +80,19 @@ The remaining record fields are unchanged between versions. A schema has
 `name`, `objects`, and `routines`. Object, column, constraint, referenced,
 index, trigger, routine, and usage fields are the v1 internal document fields;
 optional values such as `body`, `default`, `since`, `total_ms`, `self_ms`, and
-`member_of` are omitted when absent.
+`member_of` are omitted when absent. Index records may also carry
+`definition_complete`, `predicate`, and `has_predicate`; these describe what
+the catalog actually exposed and are not inferred by the engine. Routine
+`source`, when present, is a relative path only. SQL bodies remain ordinary
+document inputs for parser analysis and are not copied into `graph.schema_metadata`.
+The structural column/index/FK facts are projected into graph v2's optional
+`schema_metadata` maps and retain their string vertex IDs for codec validation.
+
+`context` identifies a collection with `source_id`, optional `database` and
+`schema_filter`, and `catalog_complete`. `dependencies` carries source and
+target object references, catalog name, and dependency type. These fields are
+structural input to document comparison and source-aware merge; a consumer must
+not infer a cross-database target when zero or multiple collected sources match.
 
 To emit a document from a live scan, use the CLI option that writes the raw
 catalog alongside the graph:
@@ -111,6 +128,11 @@ follow it. The header's `limitations` is normally empty because a streaming
 producer does not know its final limitations yet; the reader combines header
 and trailer limitations. Version 1 legacy NDJSON may omit the trailer.
 
+The v2 trailer is part of the completeness contract: EOF before that trailer is
+an incomplete document, even if all preceding schema records were valid. A
+trailer context may finalize `catalog_complete`, but its source/database/schema
+identity must match the header.
+
 ```text
 {"type":"document","version":2,"dialect":"postgres","producer":{"name":"probe-jdbc"},"required_features":["usage-v1"],"limitations":[]}
 {"type":"schema","name":"public"}
@@ -125,9 +147,16 @@ optional fields on recognized records are reported in `limitations`.
 ## Normalization and graph compatibility
 
 JSON v1, JSON v2, NDJSON v1, and NDJSON v2 that describe the same catalog
-normalize to the same internal v1 document. Consequently, building a graph
-from v1 or v2 has no semantic delta, and a document diff reports no change
-caused only by the wire-version metadata. The graph itself remains version 1.
+normalize to the same internal document. Consequently, building a graph from
+v1 or v2 has no semantic delta, and a document diff reports no change caused
+only by wire-version metadata. The graph output is graph v2 and may include
+object analysis records, body origins, query vertices, and analysis `source`.
+
+Graph analysis states are scoped claims: `complete` means the recorded analysis
+scope completed, while `partial` and `unsupported` mean an empty result cannot
+prove the absence of a dependency. Query and impact reports expose `truncated`,
+`depth`, and any traversal budget reasons; consumers must preserve those flags
+when forwarding results.
 
 Use the engine's document reader for compatibility checks rather than
 rewriting fields in a producer. In particular, do not remove an unknown

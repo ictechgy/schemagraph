@@ -8,6 +8,8 @@ use serde_json::{json, Value};
 
 fn sample_document() -> CatalogDocument {
     CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
         version: DOCUMENT_VERSION,
         dialect: "sqlite".into(),
         reader: "fixture-reader".into(),
@@ -26,6 +28,9 @@ fn sample_document() -> CatalogDocument {
                 }],
                 constraints: vec![],
                 indexes: vec![IndexDoc {
+                    has_predicate: None,
+                    definition_complete: None,
+                    predicate: None,
                     name: "items_idx".into(),
                     unique: true,
                     columns: vec!["id".into()],
@@ -42,6 +47,7 @@ fn sample_document() -> CatalogDocument {
                 usage: None,
             }],
             routines: vec![RoutineDoc {
+                source: None,
                 name: "member".into(),
                 kind: "procedure".into(),
                 language: None,

@@ -21,6 +21,49 @@ pub struct CatalogDocument {
     pub schemas: Vec<SchemaDoc>,
     /// 스캔 중 실측한 한계. 모든 응답에 그대로 실어야 한다.
     pub limitations: Vec<String>,
+    /// 비교 대상과 수집 범위를 명시한다. URL이나 인증정보는 저장하지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<CollectionContext>,
+    /// DB가 제공한 참조 사실. 읽기/쓰기 판정은 프로브가 하지 않는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<CatalogDependency>,
+}
+
+/// 동일한 수집 범위인지 확인하지 않고 객체 누락을 DROP으로 해석하지 않게 한다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectionContext {
+    pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    /// None은 사용자 스키마 전체, Some은 명시적으로 선택한 스키마다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_filter: Option<Vec<String>>,
+    /// 수집기가 카탈로그 참조를 모두 읽었는지 선언한다. 미상은 성공이 아니다.
+    pub catalog_complete: bool,
+}
+
+/// DB 식별자와 이름을 보존하고 엔진이 실제 reader 정점으로 해석하게 한다.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CatalogObjectRef {
+    pub schema: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+}
+
+/// 프로브가 간선을 추론하지 않고 원래 카탈로그의 참조 행을 전송한다.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CatalogDependency {
+    pub source: CatalogObjectRef,
+    pub target: CatalogObjectRef,
+    pub catalog: String,
+    pub dependency_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,6 +138,14 @@ pub struct IndexDoc {
     /// 인덱스 사용 통계(pg_stat_user_indexes, sys.schema_unused_indexes 등).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageDoc>,
+    /// 기존 생산자의 누락은 unknown이다. 식·부분 인덱스를 무필터 키로 추정하지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
+    /// 부분 인덱스 여부만 공개하는 카탈로그에서도 SQL을 추측하지 않고 옮긴다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_predicate: Option<bool>,
 }
 
 /// 사용 통계 — DB가 리셋 이후 관측한 작업량. 통계는 "since 이후만 유효"라는
@@ -149,6 +200,9 @@ pub struct RoutineDoc {
     /// `schema.package.member` 정점이 되고 패키지→멤버 contains 간선이 생긴다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub member_of: Option<String>,
+    /// 외부 SQL 생산자가 지정한 상대 소스 경로다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// 역직렬화로 읽은 문서에서 serde가 조용히 무시한 필드를 찾는다.
@@ -173,6 +227,9 @@ pub fn unknown_field_paths(doc: &serde_json::Value) -> Vec<String> {
             "triggers" => TRIGGER_KEYS,
             "usage" => USAGE_KEYS,
             "producer" => &["name"],
+            "context" => &["source_id", "database", "schema_filter", "catalog_complete"],
+            "dependencies" => &["source", "target", "catalog", "dependency_type"],
+            "source" | "target" => &["schema", "name", "kind", "member", "signature", "database"],
             _ => return None,
         })
     }
@@ -216,7 +273,15 @@ pub fn unknown_field_paths(doc: &serde_json::Value) -> Vec<String> {
     out.into_iter().collect()
 }
 
-const DOC_KEYS: &[&str] = &["version", "dialect", "reader", "schemas", "limitations"];
+const DOC_KEYS: &[&str] = &[
+    "version",
+    "dialect",
+    "reader",
+    "schemas",
+    "limitations",
+    "context",
+    "dependencies",
+];
 const DOC_V2_KEYS: &[&str] = &[
     "version",
     "dialect",
@@ -224,6 +289,8 @@ const DOC_V2_KEYS: &[&str] = &[
     "required_features",
     "schemas",
     "limitations",
+    "context",
+    "dependencies",
 ];
 const SCHEMA_KEYS: &[&str] = &["name", "objects", "routines"];
 const OBJECT_KEYS: &[&str] = &[
@@ -246,7 +313,15 @@ const COLUMN_KEYS: &[&str] = &[
 ];
 const CONSTRAINT_KEYS: &[&str] = &["name", "kind", "columns", "referenced"];
 const REFERENCED_KEYS: &[&str] = &["schema", "table", "columns"];
-const INDEX_KEYS: &[&str] = &["name", "unique", "columns", "usage"];
+const INDEX_KEYS: &[&str] = &[
+    "name",
+    "unique",
+    "columns",
+    "usage",
+    "definition_complete",
+    "predicate",
+    "has_predicate",
+];
 const TRIGGER_KEYS: &[&str] = &["name", "body"];
 const ROUTINE_KEYS: &[&str] = &[
     "name",
@@ -256,6 +331,7 @@ const ROUTINE_KEYS: &[&str] = &[
     "signature",
     "usage",
     "member_of",
+    "source",
 ];
 const USAGE_KEYS: &[&str] = &["since", "reads", "writes", "total_ms", "self_ms"];
 

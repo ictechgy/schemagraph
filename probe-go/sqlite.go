@@ -61,6 +61,9 @@ func (h *harvester) streamSQLite(stream *ndjsonStreamWriter) error {
 		if err := stream.schema(h.sqliteSchema(schema)); err != nil {
 			return err
 		}
+		if err := h.streamDependencies(stream, schema); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -114,6 +117,7 @@ func (h *harvester) sqliteObjects(schema string) []sqliteObject {
 		return nil
 	})
 	if inlineConstraints {
+		h.catalogIncomplete = true
 		h.limitations = append(h.limitations,
 			"inline UNIQUE/CHECK constraints are not exposed by the catalog; inline DDL constraint parsing is unsupported")
 	}
@@ -210,8 +214,9 @@ func (h *harvester) sqliteConstraints(schema, table string) []ConstraintDoc {
 // 없으므로 정점은 보존하되 컬럼 목록에서는 제외한다.
 func (h *harvester) sqliteIndexes(schema, table string) []IndexDoc {
 	type indexRow struct {
-		name   string
-		unique bool
+		name    string
+		unique  bool
+		partial bool
 	}
 	indexes := []indexRow{}
 	listQuery := fmt.Sprintf("PRAGMA %s.index_list(%s)", sqliteQuoteIdent(schema), sqliteQuoteIdent(table))
@@ -222,27 +227,34 @@ func (h *harvester) sqliteIndexes(schema, table string) []IndexDoc {
 		}
 		name := sqliteString(v, "name")
 		if name != "" {
-			indexes = append(indexes, indexRow{name: name, unique: sqliteInt(v, "unique") == 1})
+			indexes = append(indexes, indexRow{name: name, unique: sqliteInt(v, "unique") == 1, partial: sqliteInt(v, "partial") == 1})
 		}
 		return nil
 	})
 	out := make([]IndexDoc, 0, len(indexes))
 	for _, index := range indexes {
 		columns := []string{}
+		complete := true
+		notesBefore := len(h.limitations)
 		query := fmt.Sprintf("PRAGMA %s.index_xinfo(%s)", sqliteQuoteIdent(schema), sqliteQuoteIdent(index.name))
 		h.bestEffort("sqlite index columns", query, func(rows *sql.Rows) error {
 			v, err := sqliteRow(rows)
 			if err != nil {
 				return err
 			}
-			if sqliteInt(v, "cid") >= 0 {
+			if sqliteInt(v, "key") == 0 {
+				return nil
+			}
+			if sqliteInt(v, "cid") >= 0 && sqliteString(v, "name") != "" {
 				if name := sqliteString(v, "name"); name != "" {
 					columns = append(columns, name)
 				}
+			} else {
+				complete = false
 			}
 			return nil
 		})
-		out = append(out, IndexDoc{Name: index.name, Unique: index.unique, Columns: columns})
+		out = append(out, IndexDoc{Name: index.name, Unique: index.unique, Columns: columns, DefinitionComplete: boolValue(complete && len(columns) > 0 && len(h.limitations) == notesBefore), HasPredicate: boolValue(index.partial)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
@@ -265,6 +277,7 @@ func (h *harvester) sqliteTriggers(schema string, objects []ObjectDoc) {
 		table := sqliteString(v, "tbl_name")
 		obj := byName[table]
 		if obj == nil {
+			h.catalogIncomplete = true
 			h.limitations = append(h.limitations, fmt.Sprintf("trigger %s.%s targets %s, which is missing from the scanned catalog", schema, sqliteString(v, "name"), table))
 			return nil
 		}

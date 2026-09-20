@@ -10,6 +10,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-schemagraph-core = { path = "../core", version = "0.3.0" }
-schemagraph-source = { path = "../source", version = "0.3.0" }
+schemagraph-core = { path = "../core", version = "0.4.0" }
+schemagraph-source = { path = "../source", version = "0.4.0" }
 sqlparser = { version = "0.58", features = ["visitor"] }
+sha2 = "0.10.9"
+
+[dev-dependencies]
+serde_json = "1"

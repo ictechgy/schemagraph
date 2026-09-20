@@ -117,6 +117,8 @@ fn kind_label(kind: EdgeKind) -> &'static str {
         // 아래 둘은 호출자가 걸러서 여기 오지 않는다.
         EdgeKind::Contains => "contains",
         EdgeKind::Inferred => "inferred",
+        EdgeKind::DerivesFrom => "derives-from",
+        EdgeKind::DependsOn => "depends-on",
     }
 }
 

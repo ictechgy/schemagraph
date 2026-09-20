@@ -45,6 +45,9 @@ func (h *harvester) streamPostgres(stream *ndjsonStreamWriter) error {
 		if err := stream.schema(h.postgresSchema(schema)); err != nil {
 			return err
 		}
+		if err := h.streamDependencies(stream, schema); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -63,6 +66,7 @@ func (h *harvester) postgresSchemas() []string {
 		WHERE nspname NOT LIKE 'pg\_%' AND nspname <> 'information_schema'
 		ORDER BY nspname`)
 	if err != nil {
+		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("schemas unavailable — %s", oneLine(err.Error())))
 		return []string{}
 	}
@@ -71,6 +75,7 @@ func (h *harvester) postgresSchemas() []string {
 	for rows.Next() {
 		var schema string
 		if err := rows.Scan(&schema); err != nil {
+			h.catalogIncomplete = true
 			h.limitations = append(h.limitations, fmt.Sprintf("schema row read failed — %s", oneLine(err.Error())))
 			break
 		}
@@ -79,6 +84,7 @@ func (h *harvester) postgresSchemas() []string {
 		}
 	}
 	if err := rows.Err(); err != nil {
+		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("schemas unavailable — %s", oneLine(err.Error())))
 	}
 	return out
@@ -234,12 +240,13 @@ func (h *harvester) postgresIndexes(schema, table string) []IndexDoc {
 	byName := map[string]*IndexDoc{}
 	order := []string{}
 	h.pgRows("indexes", `
-		SELECT cls.relname, idx.indisunique, attr.attname, index_cols.ord
+		SELECT cls.relname, idx.indisunique, attr.attname, index_cols.ord,
+		       idx.indisvalid AND idx.indisready, pg_get_expr(idx.indpred, idx.indrelid)
 		FROM pg_index idx
 		JOIN pg_class cls ON cls.oid = idx.indexrelid
 		JOIN pg_class tbl ON tbl.oid = idx.indrelid
 		JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
-		JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS index_cols(attnum, ord) ON true
+		JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS index_cols(attnum, ord) ON index_cols.ord <= idx.indnkeyatts
 		LEFT JOIN pg_attribute attr ON attr.attrelid = tbl.oid AND attr.attnum = index_cols.attnum
 		WHERE ns.nspname = $1 AND tbl.relname = $2 AND NOT idx.indisprimary
 		ORDER BY cls.relname, index_cols.ord`, []any{schema, table}, func(rows *sql.Rows) error {
@@ -247,17 +254,21 @@ func (h *harvester) postgresIndexes(schema, table string) []IndexDoc {
 		var unique bool
 		var column sql.NullString
 		var ordinal int
-		if err := rows.Scan(&name, &unique, &column, &ordinal); err != nil {
+		var ready bool
+		var predicate sql.NullString
+		if err := rows.Scan(&name, &unique, &column, &ordinal, &ready, &predicate); err != nil {
 			return err
 		}
 		idx := byName[name]
 		if idx == nil {
-			idx = &IndexDoc{Name: name, Unique: unique, Columns: []string{}}
+			idx = &IndexDoc{Name: name, Unique: unique, Columns: []string{}, DefinitionComplete: boolValue(ready), HasPredicate: boolValue(predicate.Valid), Predicate: ns(predicate)}
 			byName[name] = idx
 			order = append(order, name)
 		}
 		if column.Valid {
 			idx.Columns = append(idx.Columns, column.String)
+		} else {
+			idx.DefinitionComplete = boolValue(false)
 		}
 		return nil
 	})
@@ -443,17 +454,20 @@ func (h *harvester) postgresRoutineUsage(schema string, routines []RoutineDoc) {
 func (h *harvester) pgRows(label, query string, args []any, scan func(*sql.Rows) error) {
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
+		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("%s unavailable — %s", label, oneLine(err.Error())))
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
 		if err := scan(rows); err != nil {
+			h.catalogIncomplete = true
 			h.limitations = append(h.limitations, fmt.Sprintf("%s row read failed — %s", label, oneLine(err.Error())))
 			return
 		}
 	}
 	if err := rows.Err(); err != nil {
+		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("%s unavailable — %s", label, oneLine(err.Error())))
 	}
 }

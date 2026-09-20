@@ -10,19 +10,21 @@
 
 ## 이 도구가 파는 것
 
-기존 범용 DB 툴(SchemaSpy·SchemaCrawler·tbls·Azimutt·DBeaver)은 스키마를 읽어
-다이어그램과 문서에서 멈춘다. schemagraph는 스키마를 의존성 그래프로 만들고,
-그 위에 **판정 질의**를 얹는다.
+schemagraph는 여러 DB의 카탈로그와 SQL 의존성을 재현 가능한 그래프 파일로 만들고,
+변경 영향과 분석 한계를 로컬에서 질의하는 개발자·에이전트용 도구다.
+SchemaCrawler·tbls·Azimutt 등에도 의존성·lint·탐색 기능이 있다. 기능의 독점성을
+주장하지 않고 해석 범위·근거·실DB 검증으로 분석 품질을 설명한다.
+비교 근거와 후속 개발 제안은 [COMPETITIVE-ANALYSIS.md](COMPETITIVE-ANALYSIS.md)에 있다.
 
 - "이 컬럼/테이블을 바꾸거나 지우면 뭐가 깨지는가" — `impact`
 - "순환 의존이 있는가" — `cycles` (FK 순환 = 삭제 순서·배치 데드락 분석)
 - "아무도 쓰지 않는 객체가 있는가" — `dead` (사용 통계를 증거로 첨부)
 - "팀 규칙을 어기는 의존이 있는가" — `rules`
 
-차별점 두 개:
+집중하는 특성 두 개:
 
 1. **간선의 깊이.** 선언된 FK만이 아니라 view/routine/trigger의 SQL 몸체를 파싱해
-   `reads`·`writes`·`calls` 간선을 만든다. 기존 범용 툴이 전부 멈추는 지점이다.
+   `reads`·`writes`·`calls` 간선을 만든다. 방언별 실제 수집·해석 범위를 명시한다.
 2. **판정 계약.** 출력은 사람용 문서가 아니라 코딩 에이전트가 소비하는 결정적 JSON이다.
    그래프 사실과 판정을 분리한다("도달 불가"라고 말할 뿐 "지워도 된다"고는 말하지 않는다).
 
@@ -45,6 +47,8 @@
 - **object**: `table`, `view`, `materialized-view`, `sequence`, `type`, `synonym`
 - **member**: `column`(1급 정점 — impact 질의의 핵심), `index`, `constraint`, `trigger`
 - **executable**: `function`, `procedure`, `package`(Oracle 계열)
+- **query**: `--sql-dir`로 명시한 애플리케이션 SQL 파일. DB routine이라고
+  주장하지 않고 보존 루트로 취급한다.
 
 정점 id는 `schema`, `schema.object`, `schema.object.member` 형식이다.
 이름이 kind를 넘나들며 충돌할 수 있다(MySQL의 FK 자동 인덱스는 컬럼
@@ -67,6 +71,20 @@ id가 다른 kind에 점유됐으면 나중 정점은 `name@kind`로 분리된�
 - `inferred` — 선언 FK가 없을 때 이름 규칙으로 추정한 간선(Azimutt식).
   `confidence`를 낮게 매기고, 선언된 간선과 같은 필드에 섞지 않는다.
   추정 간선은 판정이 아니라 탐색 보조다.
+
+그래프 v2의 `analysis`는 객체별 파싱 범위·`complete`/`partial`/`unsupported`
+상태·진단·몸체 해시를 보존한다. 외부 SQL query 정점은 분석 `source`에
+상대 파일 경로를 싣고, 절대 경로나 원문 SQL은 그래프에 복사하지 않는다.
+`origins`는 실제 간선의 `(from,to,kind)`에만 연결된 몸체 해시·role·원문 위치다.
+출력 소비자는 정점·간선·origin endpoint가 실제 그래프에 있는지 확인해야 하며,
+없는 정점을 복구하거나 간선을 추론해서는 안 된다.
+
+카탈로그 reader가 제공한 컬럼·인덱스·FK 사실은 core의 `SchemaMetadata`로
+보존하고 graph v2의 선택적 `schema_metadata` maps로 내보낸다. maps의 키와
+값은 실제 graph 정점 ID를 가리키며, export codec은 kind·parent·table 관계를
+검증해 유령 metadata를 거부한다. 인덱스의 ordered prefix, predicate 유무,
+완전성, FK 컬럼 대응은 `lint`가 이 메타데이터로 검사한다. metadata가 없거나
+불완전하면 `confirmed` 판정을 내리지 않고 `unverified`와 limitation을 보고한다.
 
 ## 어댑터 등급 — "JDBC 전부"가 성립하는 방식
 
@@ -92,7 +110,8 @@ id가 다른 kind에 점유됐으면 나중 정점은 `name@kind`로 분리된�
 
 ```
 schemagraph scan <jdbc-url> [-o graph.json]   # 카탈로그+몸체 파싱 → 그래프 산출물
-schemagraph graph --format mermaid|json|dot [--level schema|object|column]
+schemagraph scan <jdbc-url> --sql-dir queries --query-schema app  # 외부 SQL query root 추가
+schemagraph graph --format mermaid|json|dot|html [--level schema|object|column]
 schemagraph query <객체> [--depth N]           # 누가 쓰나·무엇을 쓰나 (JSON, 에이전트용)
 schemagraph impact <객체>                      # 바꾸면/지우면 뭐가 깨지나 — query의 역방향 전이 클로저
 schemagraph cycles [--level object|column]     # FK 순환 — 삭제 순서·데드락 분석
@@ -100,6 +119,9 @@ schemagraph dead                               # 도달 불가/무사용 후보 
 schemagraph rules                              # 레이어·규칙 검사
 schemagraph stats                              # 수집된 사용 통계 열람 (그래프 위의 질의)
 schemagraph diff <old.json> <new.json>         # 마이그레이션 전후 델타
+schemagraph merge <catalog-a.json> <catalog-b.json>  # source namespace를 보존해 병합
+schemagraph lint                                # FK ordered-prefix와 구조화 진단 검사
+schemagraph serve --graph graph.json            # 고정 그래프를 읽기 전용 MCP stdio로 제공
 schemagraph skill                              # 에이전트 스킬 설치 (계열 전통)
 ```
 
@@ -125,6 +147,15 @@ DB에는 `main()`이 없다. 다른 객체가 참조하지 않는 테이블이 �
   나머지 관계가 사라진다.
 - **값이 없는 선택 필드는 키가 빠진다.**
 - **억제된 판정은 그렇다고 표시한다** — 실제로 보고되었을 정점에만.
+- **분석 상태의 의미를 좁게 읽는다.** `complete`는 기록된 분석 범위가
+  완료됐다는 뜻이지 실행 시점 SQL 전체가 안전하다는 뜻이 아니다. `partial`이나
+  `unsupported`에서는 빈 간선 목록을 부재의 증명으로 읽지 않는다.
+- **`truncated`는 결과 제한과 탐색 중단을 구분한다.** 결과 개수만 잘린 경우에도
+  `truncated`를 싣고, depth·visited·examined edge 예산으로 탐색을 끝낸 경우에는
+  `truncationReasons`와 `complete=false`를 함께 보고한다.
+- **HTML은 오프라인 산출물이다.** `graph --format html`은 외부 asset·network를
+  사용하지 않고, 첫 화면에는 전체 그래프를 그리지 않는다. 선택된 정점의 직접
+  이웃만 제한해 표시하며 이름·근거·origin은 DOM `textContent`로 출력한다.
 
 ## 모듈 레이아웃
 
@@ -221,6 +252,16 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
 각 단계의 완료 조건은 실제 DB fixture로 양방향 검증하는 스크립트다
 (계열의 verify-fixtures 전통 — 도구가 실제로 발견한 결함이 단위 테스트를 통과한 뒤
 드러난 전과가 있다).
+
+- **P6 로컬 통합 경로**: `--sql-dir`는 수집된 단일 schema에 상대 SQL 파일을
+  `query_<hex-relative-path>` routine으로 추가한다. 파일 원문은 parser 입력으로만
+  쓰고, query는 애플리케이션 사용 root라는 사실만 보존한다. `--cache-dir`는
+  실행 파일 fingerprint·graph version·몸체를 제외한 전체 카탈로그 구조·context·
+  dependencies를 namespace로 삼고, 몸체별 parser 효과만 checksum된 private entry로
+  저장한다. cache 오류는 분석 실패가 아니라 stderr 경고와 miss다.
+  `merge`는 각 document의 명시적 `context.source_id`를 `source::id` namespace로
+  보존하고, 외부 dependency 대상이 하나로 결정될 때만 `depends-on`을 만든다.
+  여러 후보·미수집 대상은 간선을 만들지 않고 limitation으로 남긴다.
 
 ## 경쟁 대비 위치
 

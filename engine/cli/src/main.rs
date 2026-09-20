@@ -15,11 +15,17 @@ use serde::Deserialize;
 use std::io::{BufReader, BufWriter, Seek, Write};
 use std::path::PathBuf;
 
+mod cache;
+mod mcp;
+mod merge;
+mod policy;
+mod review;
+
 #[derive(Parser)]
 #[command(
     name = "schemagraph",
     version,
-    about = "Build a dependency graph of a database schema and run judgment queries on it"
+    about = "Build a database dependency graph and inspect dependencies, evidence, and changes"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -47,8 +53,26 @@ enum Command {
         /// Add name-heuristic `inferred` edges (opt-in — never a dependency basis).
         #[arg(long)]
         inferred: bool,
+        /// Logical source label for comparing snapshots; never a connection URL.
+        #[arg(long)]
+        source_id: Option<String>,
+        /// Restrict the collected document to these schemas.
+        #[arg(long, value_delimiter = ',')]
+        schema: Vec<String>,
+        /// Also collect native DB dependency catalog facts when supported.
+        #[arg(long)]
+        catalog_dependencies: bool,
+        /// Add declared application SQL uses from a directory of .sql files.
+        #[arg(long)]
+        sql_dir: Option<PathBuf>,
+        /// Default schema for application SQL (required when several are collected).
+        #[arg(long, requires = "sql_dir")]
+        query_schema: Option<String>,
+        /// Reuse SQL body analysis from this local directory (catalog and usage stay fresh).
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
     },
-    /// Render the graph as mermaid/json/dot.
+    /// Render the graph as Mermaid, JSON, DOT, or offline HTML.
     Graph {
         /// Input graph.json produced by `scan`.
         #[arg(short, long, default_value = "graph.json")]
@@ -56,8 +80,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = GraphFormat::Json)]
         format: GraphFormat,
         /// Aggregation level (column = member level).
-        #[arg(long, value_enum, default_value_t = LevelArg::Object)]
-        level: LevelArg,
+        #[arg(long, value_enum)]
+        level: Option<LevelArg>,
     },
     /// Who depends on this object / what does it depend on (agent JSON).
     Query {
@@ -70,6 +94,12 @@ enum Command {
         /// Max neighbors per direction before `truncated` is reported.
         #[arg(long, default_value_t = 256)]
         max: usize,
+        /// Max vertices visited by each directional traversal.
+        #[arg(long, default_value_t = 100_000)]
+        max_visited: usize,
+        /// Max dependency edges examined by each directional traversal.
+        #[arg(long, default_value_t = 1_000_000)]
+        max_examined_edges: usize,
     },
     /// What breaks if this object is changed or dropped (reverse transitive closure).
     Impact {
@@ -80,6 +110,12 @@ enum Command {
         /// Max impacted objects before `truncated` is reported.
         #[arg(long, default_value_t = 1024)]
         max: usize,
+        /// Max vertices visited by the reverse traversal.
+        #[arg(long, default_value_t = 100_000)]
+        max_visited: usize,
+        /// Max dependency edges examined by the reverse traversal.
+        #[arg(long, default_value_t = 1_000_000)]
+        max_examined_edges: usize,
     },
     /// Dead-object candidates: consumers nothing in the database references.
     Dead {
@@ -91,6 +127,46 @@ enum Command {
         /// Exit 1 when any candidate is reported (for CI).
         #[arg(long)]
         strict: bool,
+        /// Optional TOML policy; schemagraph.toml is loaded when present.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Preserve matching entry points and their transitive dependencies.
+        #[arg(long, value_delimiter = ',')]
+        retain: Vec<String>,
+        /// Reproducible date used to evaluate expiring suppressions.
+        #[arg(long)]
+        as_of: Option<String>,
+    },
+    /// Report structured per-object analysis coverage and diagnostic codes.
+    Diagnostics {
+        name: Option<String>,
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+    },
+    /// Explain incident edges using their catalog or SQL provenance.
+    Explain {
+        name: String,
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        #[arg(long, default_value_t = 1024)]
+        max: usize,
+    },
+    /// Find shortest dependency paths (use --reverse for impact direction).
+    Path {
+        from: String,
+        to: String,
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        max_paths: usize,
+        #[arg(long, default_value_t = 32)]
+        depth: u32,
+        #[arg(long, default_value_t = 100_000)]
+        max_visited: usize,
+        #[arg(long, default_value_t = 1_000_000)]
+        max_edges: usize,
+        #[arg(long)]
+        reverse: bool,
     },
     /// Report dependency cycles (delete ordering / deadlock analysis).
     Cycles {
@@ -117,6 +193,49 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
+    /// Review catalog changes and trace their dependents in the previous snapshot.
+    Review {
+        before: PathBuf,
+        after: PathBuf,
+        #[arg(long)]
+        strict: bool,
+        #[arg(long)]
+        require_complete: bool,
+        #[arg(long, default_value_t = 256)]
+        max_changes: usize,
+        #[arg(long, default_value_t = 1024)]
+        max_impacted: usize,
+        /// Maximum vertices per changed object's impact traversal.
+        #[arg(long, default_value_t = 100_000)]
+        max_visited: usize,
+        /// Maximum examined edges per changed object's impact traversal.
+        #[arg(long, default_value_t = 1_000_000)]
+        max_examined_edges: usize,
+        #[arg(long,value_enum,default_value_t=ReviewFormat::Json)]
+        format: ReviewFormat,
+    },
+    /// Serve read-only MCP tools over one preloaded graph (stdio JSON-RPC).
+    Serve {
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+    },
+    /// Merge catalog documents under their explicit source-id namespaces.
+    Merge {
+        #[arg(required = true, num_args = 2..)]
+        documents: Vec<PathBuf>,
+        #[arg(short, long, default_value = "graph.json")]
+        output: String,
+    },
+    /// Report schema facts and unresolved SQL references from the graph.
+    Lint {
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        #[arg(long, default_value_t = 256)]
+        max: usize,
+        /// Exit 1 for confirmed findings, or 2 when coverage is incomplete.
+        #[arg(long)]
+        strict: bool,
+    },
     /// Print the agent skill document for consuming this tool's output.
     Skill,
     /// Describe catalog versions and features so producers can choose a compatible format.
@@ -139,6 +258,13 @@ enum GraphFormat {
     Mermaid,
     Json,
     Dot,
+    Html,
+}
+
+#[derive(Clone, ValueEnum)]
+enum ReviewFormat {
+    Json,
+    Markdown,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -181,14 +307,26 @@ async fn run(cli: Cli) -> Result<i32> {
             document_version,
             document,
             inferred,
+            source_id,
+            schema,
+            catalog_dependencies,
+            sql_dir,
+            query_schema,
+            cache_dir,
         } => {
             scan(
                 url.as_deref(),
                 document.as_deref(),
                 &output,
                 emit_document.as_deref(),
-                document_version.unwrap_or(1),
+                document_version.unwrap_or(if sql_dir.is_some() { 2 } else { 1 }),
                 inferred,
+                source_id.as_deref(),
+                &schema,
+                catalog_dependencies,
+                sql_dir.as_deref(),
+                query_schema.as_deref(),
+                cache_dir.as_deref(),
             )
             .await
         }
@@ -196,15 +334,56 @@ async fn run(cli: Cli) -> Result<i32> {
             graph,
             format,
             level,
-        } => render_graph(&graph, format, level.level()),
+        } => render_graph(&graph, format, level.map(|level| level.level())),
         Command::Query {
             name,
             graph,
             depth,
             max,
-        } => query(&name, &graph, depth, max),
-        Command::Impact { name, graph, max } => impact(&name, &graph, max),
-        Command::Dead { graph, max, strict } => dead(&graph, max, strict),
+            max_visited,
+            max_examined_edges,
+        } => query(&name, &graph, depth, max, max_visited, max_examined_edges),
+        Command::Impact {
+            name,
+            graph,
+            max,
+            max_visited,
+            max_examined_edges,
+        } => impact(&name, &graph, max, max_visited, max_examined_edges),
+        Command::Dead {
+            graph,
+            max,
+            strict,
+            config,
+            retain,
+            as_of,
+        } => {
+            let policy = policy::load(config.as_deref(), &retain, as_of.as_deref())?;
+            dead(&graph, max, strict, &policy)
+        }
+        Command::Diagnostics { graph, name } => diagnostics(&graph, name.as_deref()),
+        Command::Explain { graph, name, max } => explain(&graph, &name, max),
+        Command::Path {
+            graph,
+            from,
+            to,
+            max_paths,
+            depth,
+            max_visited,
+            max_edges,
+            reverse,
+        } => path_report(
+            &graph,
+            &from,
+            &to,
+            analysis::paths::SearchOptions {
+                max_paths,
+                max_depth: depth,
+                max_visited,
+                max_edges,
+                reverse,
+            },
+        ),
         Command::Cycles {
             graph,
             level,
@@ -212,6 +391,53 @@ async fn run(cli: Cli) -> Result<i32> {
         } => cycles(&graph, level.level(), strict),
         Command::Stats { graph } => stats(&graph),
         Command::Diff { old, new, strict } => diff(&old, &new, strict),
+        Command::Review {
+            before,
+            after,
+            strict,
+            require_complete,
+            max_changes,
+            max_impacted,
+            max_visited,
+            max_examined_edges,
+            format,
+        } => review::run(
+            &before,
+            &after,
+            strict,
+            require_complete,
+            max_changes,
+            max_impacted,
+            analysis::budget::Budget {
+                max_visited,
+                max_examined_edges,
+            },
+            matches!(format, ReviewFormat::Markdown),
+        ),
+        Command::Serve { graph } => {
+            let graph = load_graph(&graph)?;
+            mcp::serve(&graph, std::io::stdin().lock(), std::io::stdout().lock())?;
+            Ok(0)
+        }
+        Command::Merge { documents, output } => {
+            write_graph_output(&output, &merge::run(&documents)?)?;
+            Ok(0)
+        }
+        Command::Lint { graph, max, strict } => {
+            let graph = load_graph(&graph)?;
+            let report = analysis::schema_lint::lint(&graph, max);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&export::lint::to_value(&report))?
+            );
+            Ok(if strict && !report.complete {
+                2
+            } else if strict && report.confirmed_count > 0 {
+                1
+            } else {
+                0
+            })
+        }
         Command::Skill => {
             // 패키지 밖의 파일은 cargo install에서 사라지므로 사본을 포함한다.
             // 원본 skills/schemagraph/SKILL.md를 고치면 cli/SKILL.md도 갱신한다.
@@ -243,15 +469,38 @@ async fn scan(
     emit_document: Option<&std::path::Path>,
     document_version: u32,
     inferred: bool,
+    source_id: Option<&str>,
+    schemas: &[String],
+    catalog_dependencies: bool,
+    sql_dir: Option<&std::path::Path>,
+    query_schema: Option<&str>,
+    cache_dir: Option<&std::path::Path>,
 ) -> Result<i32> {
-    let doc = match (url, document) {
-        (Some(url), None) => source::read(url).await.context(
-            "database scan failed; check the connection settings and catalog permissions",
-        )?,
+    if let Some(id) = source_id {
+        source::context::validate_source_id(id).map_err(|e| anyhow!(e))?;
+    }
+    let mut doc = match (url, document) {
+        (Some(url), None) => if catalog_dependencies {
+            source::read_with_dependencies(url).await
+        } else {
+            source::read(url).await
+        }
+        .context("database scan failed; check the connection settings and catalog permissions")?,
         (None, Some(path)) => load_document(path)?,
         (None, None) => bail!("URL 또는 --document 중 하나는 필요하다"),
         (Some(_), Some(_)) => bail!("URL과 --document는 같이 쓸 수 없다 — 둘 중 하나만"),
     };
+    source::context::annotate(&mut doc, source_id, schemas).map_err(|e| anyhow!(e))?;
+    if let Some(directory) = sql_dir {
+        let schema = match query_schema {
+            Some(schema) => schema.to_owned(),
+            None if doc.schemas.len() == 1 => doc.schemas[0].name.clone(),
+            None => {
+                bail!("--query-schema is required when the catalog contains multiple or no schemas")
+            }
+        };
+        source::sql_files::attach(&mut doc, directory, &schema).map_err(|e| anyhow!(e))?;
+    }
     if let Some(path) = emit_document {
         let value = source::codec::document_to_value(&doc, document_version)
             .map_err(|error| anyhow!(error))?;
@@ -259,24 +508,54 @@ async fn scan(
         std::fs::write(path, format!("{json}\n"))
             .with_context(|| format!("catalog document 쓰기 실패: {}", path.display()))?;
     }
-    let mut graph = source::graph::document_to_graph(&doc);
+    let mut cache = cache_dir
+        .map(|directory| cache::DiskBodyCache::new(directory, &doc))
+        .transpose()
+        .context("could not prepare SQL analysis cache; check directory permissions")?;
+    let graph = analyze_document_with_cache(
+        &doc,
+        inferred,
+        cache
+            .as_mut()
+            .map(|cache| cache as &mut dyn schemagraph_parser::BodyCache),
+    );
+    if let Some(cache) = &cache {
+        let stats = cache.stats();
+        eprintln!(
+            "schemagraph cache: hits={} misses={} writes={} warnings={}",
+            stats.hits, stats.misses, stats.writes, stats.warnings
+        );
+    }
+    // 그래프는 원문을 소유하지 않으므로 출력 전에 큰 카탈로그를 해제한다.
+    drop(doc);
+    write_graph_output(output, &graph)?;
+    Ok(0)
+}
+
+fn analyze_document(doc: &source::CatalogDocument, inferred: bool) -> Graph {
+    analyze_document_with_cache(doc, inferred, None)
+}
+
+fn analyze_document_with_cache(
+    doc: &source::CatalogDocument,
+    inferred: bool,
+    cache: Option<&mut dyn schemagraph_parser::BodyCache>,
+) -> Graph {
+    let mut graph = source::graph::document_to_graph(doc);
     // 몸체 파싱은 엔진의 일 — reader는 원문만 옮기고 의미는 여기서 해석한다.
-    let (_enriched, notes) = schemagraph_parser::enrich_from_document(&mut graph, &doc);
+    let (_enriched, notes) = schemagraph_parser::enrich_with_cache(&mut graph, doc, cache);
     for note in notes {
         graph.add_limitation(note);
     }
     if inferred {
         // 이름 규칙 추정은 opt-in — 카탈로그·몸체 증거와 섞이지 않게
         // 별도 패스로 돌리고 한계도 그대로 limitations에 싣는다.
-        let (_n, inotes) = schemagraph_parser::enrich_inferred(&mut graph, &doc);
+        let (_n, inotes) = schemagraph_parser::enrich_inferred(&mut graph, doc);
         for note in inotes {
             graph.add_limitation(note);
         }
     }
-    // 그래프가 몸체 원문을 소유하지 않으므로 출력 전에 카탈로그를 해제한다.
-    drop(doc);
-    write_graph_output(output, &graph)?;
-    Ok(0)
+    graph
 }
 
 /// 프로브가 만든 catalog document를 읽는다. 단일 JSON과 NDJSON(행 단위)을
@@ -298,7 +577,7 @@ fn load_document(path: &std::path::Path) -> Result<source::CatalogDocument> {
 fn load_graph(path: &std::path::Path) -> Result<Graph> {
     let doc: GraphDoc = serde_json::from_reader(open_reader(path)?)
         .with_context(|| format!("graph.json 파싱 실패: {}", path.display()))?;
-    if doc.version != export::GRAPH_VERSION {
+    if !matches!(doc.version, 1 | export::GRAPH_VERSION) {
         bail!(
             "graph.json 버전 {}는 이 바이너리({})와 다르다 — 다시 scan해라",
             doc.version,
@@ -308,14 +587,22 @@ fn load_graph(path: &std::path::Path) -> Result<Graph> {
     Ok(export::graph_from_doc(&doc))
 }
 
-fn render_graph(path: &std::path::Path, format: GraphFormat, level: Level) -> Result<i32> {
+fn render_graph(path: &std::path::Path, format: GraphFormat, level: Option<Level>) -> Result<i32> {
     let graph = load_graph(path)?;
-    let projected = graph.project(level);
+    let projected = if matches!(&format, GraphFormat::Html) && level.is_none() {
+        graph
+    } else {
+        graph.project(level.unwrap_or(Level::Object))
+    };
     let out = match format {
         GraphFormat::Mermaid => export::mermaid::to_mermaid(&projected),
         GraphFormat::Dot => to_dot(&projected),
         GraphFormat::Json => {
             write_graph_output("-", &projected)?;
+            return Ok(0);
+        }
+        GraphFormat::Html => {
+            export::html::write_html(std::io::stdout().lock(), &projected)?;
             return Ok(0);
         }
     };
@@ -341,15 +628,42 @@ fn to_dot(g: &Graph) -> String {
     out
 }
 
-fn query(name: &str, path: &std::path::Path, depth: u32, max: usize) -> Result<i32> {
+fn query(
+    name: &str,
+    path: &std::path::Path,
+    depth: u32,
+    max: usize,
+    max_visited: usize,
+    max_examined_edges: usize,
+) -> Result<i32> {
     let graph = load_graph(path)?;
     match analysis::resolve(&graph, name) {
         Resolve::Found(id) => {
-            let report = analysis::query(&graph, &id, depth, max);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&export::query_to_value(&report))?
+            let budget = analysis::budget::Budget {
+                max_visited,
+                max_examined_edges,
+            };
+            let dependents = analysis::budget::walk(&graph, &id, depth, max, true, budget, None);
+            let dependencies = analysis::budget::walk(&graph, &id, depth, max, false, budget, None);
+            let mut self_edges: Vec<_> = graph
+                .outgoing(&id)
+                .iter()
+                .filter(|edge| edge.to == id && edge.kind.is_dependency())
+                .map(|edge| edge.kind)
+                .collect();
+            self_edges.sort();
+            self_edges.dedup();
+            let value = export::budgeted_query_to_value(
+                graph
+                    .vertex(&id)
+                    .expect("resolve verified the query subject"),
+                &dependents,
+                &dependencies,
+                depth,
+                &self_edges,
+                graph.limitations(),
             );
+            println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(0)
         }
         Resolve::NotFound { candidates } => {
@@ -361,15 +675,36 @@ fn query(name: &str, path: &std::path::Path, depth: u32, max: usize) -> Result<i
 }
 
 /// impact — query와 같은 resolve 경로를 타고, 결과만 역방향 클로저로 다르다.
-fn impact(name: &str, path: &std::path::Path, max: usize) -> Result<i32> {
+fn impact(
+    name: &str,
+    path: &std::path::Path,
+    max: usize,
+    max_visited: usize,
+    max_examined_edges: usize,
+) -> Result<i32> {
     let graph = load_graph(path)?;
     match analysis::resolve(&graph, name) {
         Resolve::Found(id) => {
-            let report = analysis::impact(&graph, &id, max);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&export::impact_to_value(&report))?
+            let report = analysis::budget::walk(
+                &graph,
+                &id,
+                u32::MAX,
+                max,
+                true,
+                analysis::budget::Budget {
+                    max_visited,
+                    max_examined_edges,
+                },
+                None,
             );
+            let value = export::budgeted_impact_to_value(
+                graph
+                    .vertex(&id)
+                    .expect("resolve verified the impact subject"),
+                &report,
+                graph.limitations(),
+            );
+            println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(0)
         }
         Resolve::NotFound { candidates } => {
@@ -380,18 +715,105 @@ fn impact(name: &str, path: &std::path::Path, max: usize) -> Result<i32> {
     }
 }
 
-fn dead(path: &std::path::Path, max: usize, strict: bool) -> Result<i32> {
+fn dead(
+    path: &std::path::Path,
+    max: usize,
+    strict: bool,
+    policy: &analysis::RetentionPolicy,
+) -> Result<i32> {
     let graph = load_graph(path)?;
-    let report = analysis::dead(&graph, max);
+    let report = analysis::dead_with_policy(&graph, max, policy);
     println!(
         "{}",
         serde_json::to_string_pretty(&export::dead_to_value(&report))?
     );
-    Ok(if strict && !report.candidates.is_empty() {
+    Ok(if strict && report.unsuppressed_count > 0 {
         1
     } else {
         0
     })
+}
+
+fn diagnostics(path: &std::path::Path, name: Option<&str>) -> Result<i32> {
+    let graph = load_graph(path)?;
+    let id = match name.map(|name| (name, analysis::resolve(&graph, name))) {
+        Some((_, Resolve::Found(id))) => Some(id),
+        Some((name, Resolve::NotFound { candidates })) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&export::not_found_value(
+                    name,
+                    &candidates,
+                    graph.limitations()
+                ))?
+            );
+            return Ok(1);
+        }
+        None => None,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&export::diagnostics::report(&graph, id.as_ref()))?
+    );
+    Ok(0)
+}
+
+fn explain(path: &std::path::Path, name: &str, max: usize) -> Result<i32> {
+    let graph = load_graph(path)?;
+    match analysis::resolve(&graph, name) {
+        Resolve::Found(id) => {
+            let report = analysis::paths::explain(&graph, &id, max)
+                .expect("resolve verified the subject exists");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&export::explain::explanation_value(&report, &graph))?
+            );
+            Ok(0)
+        }
+        Resolve::NotFound { candidates } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&export::not_found_value(
+                    name,
+                    &candidates,
+                    graph.limitations()
+                ))?
+            );
+            Ok(1)
+        }
+    }
+}
+
+fn path_report(
+    path: &std::path::Path,
+    from: &str,
+    to: &str,
+    options: analysis::paths::SearchOptions,
+) -> Result<i32> {
+    let graph = load_graph(path)?;
+    let mut endpoints = Vec::new();
+    for name in [from, to] {
+        match analysis::resolve(&graph, name) {
+            Resolve::Found(id) => endpoints.push(id),
+            Resolve::NotFound { candidates } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&export::not_found_value(
+                        name,
+                        &candidates,
+                        graph.limitations()
+                    ))?
+                );
+                return Ok(1);
+            }
+        }
+    }
+    let report = analysis::paths::paths(&graph, &endpoints[0], &endpoints[1], options, None);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&export::explain::path_value(&report))?
+    );
+    Ok(0)
 }
 
 fn stats(path: &std::path::Path) -> Result<i32> {

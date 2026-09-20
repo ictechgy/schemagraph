@@ -10,7 +10,12 @@ use crate::document::{unknown_field_paths, CatalogDocument, DOCUMENT_VERSION};
 /// 새 생산자가 명시적으로 선택할 수 있는 전송 버전. 기본 출력은 v1을 유지한다.
 pub const LATEST_DOCUMENT_VERSION: u32 = 2;
 /// 의미를 모르는 필수 기능을 조용히 무시하지 않도록 명시한 소비자 능력이다.
-pub const SUPPORTED_FEATURES: &[&str] = &["package-members-v1", "usage-v1"];
+pub const SUPPORTED_FEATURES: &[&str] = &[
+    "catalog-dependencies-v1",
+    "external-queries-v1",
+    "package-members-v1",
+    "usage-v1",
+];
 
 /// 범위를 먼저 검사해 큰 버전 정수가 u32로 잘려 구버전으로 오인되지 않게 한다.
 pub fn wire_version(value: &Value) -> Result<u32, String> {
@@ -50,6 +55,9 @@ pub fn document_from_value(value: Value) -> Result<CatalogDocument, String> {
 /// NDJSON은 헤더와 본문을 따로 읽으므로 필드 변환과 최종 진단 집계를 분리한다.
 pub(crate) fn decode_document(mut value: Value) -> Result<CatalogDocument, String> {
     let version = wire_version(&value)?;
+    if version == 1 && required_features(&value).contains("external-queries-v1") {
+        return Err("external query records require catalog v2 and external-queries-v1".into());
+    }
     if version == 2 {
         validate_v2(&value)?;
         let reader = value["producer"]["name"].clone();
@@ -68,6 +76,14 @@ pub(crate) fn finish_document(
     mut doc: CatalogDocument,
     unknown: BTreeSet<String>,
 ) -> CatalogDocument {
+    doc.dependencies.sort();
+    doc.dependencies.dedup();
+    if let Some(context) = &mut doc.context {
+        if let Some(filter) = &mut context.schema_filter {
+            filter.sort();
+            filter.dedup();
+        }
+    }
     if !unknown.is_empty() {
         doc.limitations.push(format!(
             "ignored catalog fields: {}",
@@ -173,6 +189,13 @@ fn validate_v2(value: &Value) -> Result<(), String> {
 /// 기능을 쓰는 레코드만 확인해 미지 필드의 내용을 알려진 의미로 오인하지 않는다.
 fn required_features(value: &Value) -> BTreeSet<&'static str> {
     let mut features = BTreeSet::new();
+    if value
+        .get("dependencies")
+        .and_then(Value::as_array)
+        .is_some_and(|d| !d.is_empty())
+    {
+        features.insert("catalog-dependencies-v1");
+    }
     let schemas = value
         .get("schemas")
         .and_then(Value::as_array)
@@ -201,6 +224,9 @@ fn required_features(value: &Value) -> BTreeSet<&'static str> {
             .into_iter()
             .flatten()
         {
+            if routine.get("kind").and_then(Value::as_str) == Some("query") {
+                features.insert("external-queries-v1");
+            }
             add_usage_feature(routine, &mut features);
             if routine.get("member_of").is_some_and(|v| !v.is_null()) {
                 features.insert("package-members-v1");
@@ -219,7 +245,13 @@ fn add_usage_feature(value: &Value, features: &mut BTreeSet<&'static str>) {
 /// 스트리밍 헤더를 만들 때 본문 전체를 JSON으로 복제하지 않고 기능만 찾는다.
 pub(crate) fn document_features(doc: &CatalogDocument) -> BTreeSet<&'static str> {
     let mut features = BTreeSet::new();
+    if !doc.dependencies.is_empty() {
+        features.insert("catalog-dependencies-v1");
+    }
     for schema in &doc.schemas {
+        if schema.routines.iter().any(|r| r.kind == "query") {
+            features.insert("external-queries-v1");
+        }
         if schema.objects.iter().any(|object| {
             object.usage.is_some() || object.indexes.iter().any(|index| index.usage.is_some())
         }) || schema
@@ -242,6 +274,9 @@ pub(crate) fn document_features(doc: &CatalogDocument) -> BTreeSet<&'static str>
 
 /// 출력 버전 선택은 그래프 의미를 바꾸지 않고 전송 메타데이터만 변환한다.
 pub fn document_to_value(doc: &CatalogDocument, version: u32) -> Result<Value, String> {
+    if version == 1 && document_features(doc).contains("external-queries-v1") {
+        return Err("external query records require document version 2".into());
+    }
     if ![1, 2].contains(&version) {
         return Err(format!(
             "unsupported output catalog version {version}; choose 1 or 2"

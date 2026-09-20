@@ -10,14 +10,16 @@ schemagraph는 데이터베이스 스키마의 의존성 그래프를 만들어 
 **그래프가 산출물이고, 분석은 그 위의 질의입니다.** 한 번 스캔한 뒤에는 DB에
 다시 접속하지 않고 의존성 조회, 영향 추적, 순환 탐지, 아키텍처 규칙 검사,
 스냅샷 비교를 수행할 수 있습니다. 스크립트와 코딩 에이전트를 위한 결정적
-JSON을 출력하며, Mermaid와 Graphviz DOT 다이어그램도 지원합니다.
+JSON을 출력하며, Mermaid·Graphviz DOT와 오프라인 HTML 탐색기도 지원합니다.
+컬럼 계보·진단·경로·보존 정책·변경 검토의 상세 사용법은 영어 정본인
+[분석 가이드](ANALYSIS.md), 설치와 CI 예제는 [설치 안내](INSTALLATION.md)를 참고하세요.
 
 ## 빠른 시작
 
 Rust와 Cargo로 CLI를 설치합니다.
 
 ```sh
-cargo install schemagraph-cli --version 0.3.0 --locked
+cargo install schemagraph-cli --version 0.4.0 --locked
 ```
 
 ### 소스에서 빌드
@@ -82,11 +84,18 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 | --- | --- |
 | `scan <url>` | 카탈로그를 수집해 의존성 그래프를 만듭니다. |
 | `scan --document <path>` | JSON 또는 NDJSON catalog document에서 그래프를 만듭니다. |
-| `graph --format mermaid\|json\|dot` | 그래프를 렌더링합니다. `--level schema\|object\|column`으로 단위를 선택합니다. |
+| `graph --format mermaid\|json\|dot\|html` | 그래프를 렌더링합니다. `--level schema\|object\|column`으로 단위를 선택합니다. |
 | `query <name> --depth N` | 의존 대상과 의존자를 근거 간선과 함께 조회합니다. |
 | `impact <name>` | 변경의 영향을 받을 수 있는 의존자를 추적합니다. |
 | `cycles` | 의존성 순환과 자기루프를 보고합니다. |
-| `dead` | DB 그래프 안에 남은 의존자가 없는 뷰·루틴 후보를 보고합니다. |
+| `dead` | 보존 루트·예외를 적용해 도달할 수 없는 뷰·루틴 후보를 보고합니다. |
+| `diagnostics` | SQL 분석 상태와 위치가 있는 미해결·미지원 진단을 보고합니다. |
+| `explain <name>` | 이웃 간선과 카탈로그·SQL 근거를 보여줍니다. |
+| `path <from> <to>` | 탐색 예산 안에서 최단 의존 경로를 찾습니다. |
+| `review <before> <after>` | 카탈로그 변경과 의존자 영향·비교 가능 여부를 함께 보고합니다. |
+| `lint` | FK 인덱스 prefix와 미해결·모호한 참조 사실을 검사합니다. |
+| `merge <documents>…` | source ID별로 구분한 DB 카탈로그를 통합합니다. |
+| `serve` | 미리 읽은 그래프 하나를 조회하는 MCP 도구를 제공합니다. |
 | `stats` | 수집된 사용 통계와 수집 범위를 보여줍니다. |
 | `rules --config <path>` | TOML 규칙으로 의존 간선을 검사합니다. |
 | `diff <old> <new>` | 그래프 스냅샷 두 개 또는 JSON/NDJSON catalog document 두 개를 비교합니다. |
@@ -165,15 +174,17 @@ schemagraph scan --document catalog.json -o graph.json
 
 ## 결과 읽기
 
-보고서는 그래프에 수집된 의존성을 설명합니다. 애플리케이션 쿼리는 그래프에
-없으므로 `dead` 후보는 **삭제 권고가 아닙니다**. 테이블은 `dead` 후보에 포함되지
+보고서는 그래프에 수집된 의존성을 설명합니다. 애플리케이션 쿼리는 `--sql-dir`로
+수집한 경우에만 포함되며, 다른 외부 사용처는 `--retain`으로 선언할 수 있습니다.
+`dead` 후보는 **삭제 권고가 아닙니다**. 테이블은 `dead` 후보에 포함되지
 않으며, 뷰·물리화된 뷰·함수·프로시저·패키지가 후보가 될 수 있습니다.
 
 - **근거와 한계:** 관측된 수집·파싱 누락은 `limitations`에 실립니다. 미지원
   루틴 언어, 해석하지 못한 참조, 모호한 이름은 보고하되 가짜 대상 정점을 만들지
   않습니다.
 - **부분 결과:** `query`, `impact`, `dead`는 결과 제한으로 잘리면 `truncated`를
-  보고합니다. 완전한 결과로 해석하기 전에 `limitations`와 함께 확인해야 합니다.
+  보고합니다. 탐색 예산이 있는 질의는 `complete`, 방문·검사 간선 수,
+  `truncationReasons`도 보고하므로 `limitations`와 함께 확인해야 합니다.
 - **출력의 일관성:** 같은 입력 문서는 같은 그래프를 만듭니다. 실제 DB를 다시
   스캔하면 카탈로그와 사용 통계의 변화에 따라 출력이 달라질 수 있습니다.
 - **본문 분석 범위:** 뷰·트리거에서 테이블·컬럼 의존성을 추출합니다. SQL 루틴,
@@ -264,8 +275,9 @@ DB 통합 검증을 수행합니다. 외부 MySQL·Oracle JDBC jar은 `SG_MYSQL_
 스크립트를 시작하기 전에 CLI를 빌드하고 검증이 끝날 때까지 바이너리를
 교체하지 마세요.
 
-P0–P6와 v0.2 로드맵을 구현했습니다. v0.3에는 카탈로그 메모리 개선,
-Db2 LUW·Informix JDBC 특화 수집, JDBC 프로브의 Maven 배포를 추가했습니다.
+[경쟁 조사](COMPETITIVE-ANALYSIS.md) 후속으로 컬럼 스코프·계보, 근거 진단,
+변경 검토, 보존 루트, 카탈로그 의존성, SQL 파일 수집, MCP·HTML,
+탐색 예산과 선택적 몸체 분석 캐시를 추가했습니다.
 실행 시점 값에 의존하는 SQL은 명시적인 한계로 남습니다. 배포와 검증 상태는
 [HANDOFF.md](HANDOFF.md)에 기록합니다.
 

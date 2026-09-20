@@ -13,6 +13,14 @@ use crate::SourceError;
 
 /// `postgres://…` URL로 접속해 카탈로그를 읽는다.
 pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
+    read_with_dependencies(url, false).await
+}
+
+/// 선택적 의존 카탈로그 조회 실패는 일반 스키마 수집을 숨기지 않고 한계로 보고한다.
+pub async fn read_with_dependencies(
+    url: &str,
+    include_dependencies: bool,
+) -> Result<CatalogDocument, SourceError> {
     let options = PgConnectOptions::from_str(url)
         .map_err(|e| SourceError::Connect(format!("postgres URL 해석 실패: {e}")))?;
     let pool = PgPoolOptions::new()
@@ -20,11 +28,14 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
             Box::pin(async move {
                 // 읽기 전용 세션 고정 — sqlite reader의 read_only(true)와 같은 의도.
                 sqlx::Executor::execute(
-                    conn,
+                    &mut *conn,
                     "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
                 )
-                .await
-                .map(|_| ())
+                .await?;
+                // 서버가 렌더링하는 뷰 이름을 한정해 수집 세션의 search_path 영향을 없앤다.
+                sqlx::Executor::execute(conn, "SET search_path = pg_catalog")
+                    .await
+                    .map(|_| ())
             })
         })
         .connect_with(options)
@@ -32,6 +43,8 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         .map_err(|e| SourceError::Connect(format!("postgres 접속 실패: {e}")))?;
 
     let mut doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
         version: DOCUMENT_VERSION,
         dialect: "postgres".to_owned(),
         reader: "native-sqlx".to_owned(),
@@ -39,12 +52,72 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         limitations: Vec::new(),
     };
 
+    let mut catalog_complete = true;
     for schema in schema_list(&pool).await? {
         doc.schemas
-            .push(read_schema(&pool, &schema, &mut doc.limitations).await?);
+            .push(read_schema(&pool, &schema, &mut doc.limitations, &mut catalog_complete).await?);
     }
     doc.schemas.sort_by(|a, b| a.name.cmp(&b.name));
+    let database = sqlx::query_scalar::<_, String>("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .map_err(SourceError::Query)?;
+    doc.context = Some(CollectionContext {
+        source_id: String::new(),
+        database: Some(database),
+        schema_filter: None,
+        catalog_complete,
+    });
+    if include_dependencies {
+        for schema in &doc.schemas {
+            match read_dependencies(&pool, &schema.name).await {
+                Ok(rows) => doc.dependencies.extend(rows),
+                Err(error) => {
+                    doc.limitations.push(format!(
+                        "pg_depend metadata unavailable for {}: {error}",
+                        schema.name
+                    ));
+                    if let Some(context) = &mut doc.context {
+                        context.catalog_complete = false;
+                    }
+                }
+            }
+        }
+        doc.dependencies.sort();
+        doc.dependencies.dedup();
+    }
     Ok(doc)
+}
+
+async fn read_dependencies(
+    pool: &PgPool,
+    schema: &str,
+) -> Result<Vec<CatalogDependency>, sqlx::Error> {
+    let query = include_str!("sql/catalog-postgres.sql").replace(":schema", "$1");
+    let rows = sqlx::query(&query).bind(schema).fetch_all(pool).await?;
+    Ok(rows
+        .iter()
+        .map(|row| CatalogDependency {
+            source: CatalogObjectRef {
+                schema: row.get("source_schema"),
+                name: row.get("source_name"),
+                kind: row.get("source_kind"),
+                signature: row.get("source_signature"),
+                member: None,
+                database: None,
+            },
+            target: CatalogObjectRef {
+                schema: row.get("target_schema"),
+                name: row.get("target_name"),
+                kind: row.get("target_kind"),
+                signature: row.get("target_signature"),
+                member: row.get("target_member"),
+                database: row.get("target_database"),
+            },
+            catalog: "pg_depend".into(),
+            dependency_type: row.get("dependency_type"),
+        })
+        .collect())
 }
 
 /// 사용자 스키마 목록 — pg_%(시스템)과 information_schema는 제외한다.
@@ -64,7 +137,9 @@ async fn read_schema(
     pool: &PgPool,
     schema: &str,
     limitations: &mut Vec<String>,
+    catalog_complete: &mut bool,
 ) -> Result<SchemaDoc, SourceError> {
+    let metadata_start = limitations.len();
     let mut objects = read_objects(pool, schema).await?;
     for obj in &mut objects {
         obj.columns = read_columns(pool, schema, &obj.name).await?;
@@ -73,6 +148,7 @@ async fn read_schema(
         obj.triggers = read_triggers(pool, schema, &obj.name).await?;
     }
     let mut routines = read_routines(pool, schema, limitations).await?;
+    *catalog_complete &= limitations.len() == metadata_start;
     attach_usage(pool, schema, &mut objects, &mut routines, limitations).await;
     sort_all(&mut objects, &mut routines);
     Ok(SchemaDoc {
@@ -425,15 +501,17 @@ async fn read_indexes(
 ) -> Result<Vec<IndexDoc>, SourceError> {
     let rows = sqlx::query(
         "SELECT cls.relname AS index_name, idx.indisunique, \
-                array_remove(array_agg(a.attname ORDER BY u.ord), NULL) AS cols \
+                array_remove(array_agg(a.attname ORDER BY u.ord), NULL) AS cols, \
+                (idx.indisvalid AND idx.indisready AND bool_and(a.attname IS NOT NULL)) AS definition_complete, \
+                pg_get_expr(idx.indpred, idx.indrelid) AS predicate \
          FROM pg_index idx \
          JOIN pg_class cls ON cls.oid = idx.indexrelid \
          JOIN pg_class tbl ON tbl.oid = idx.indrelid \
          JOIN pg_namespace n ON n.oid = tbl.relnamespace \
-         JOIN unnest(idx.indkey) WITH ORDINALITY u(attnum, ord) ON true \
+         JOIN unnest(idx.indkey) WITH ORDINALITY u(attnum, ord) ON u.ord <= idx.indnkeyatts \
          LEFT JOIN pg_attribute a ON a.attrelid = tbl.oid AND a.attnum = u.attnum \
          WHERE n.nspname = $1 AND tbl.relname = $2 AND NOT idx.indisprimary \
-         GROUP BY cls.relname, idx.indisunique",
+         GROUP BY cls.relname, idx.indisunique, idx.indrelid, idx.indpred, idx.indisvalid, idx.indisready",
     )
     .bind(schema)
     .bind(table)
@@ -443,6 +521,9 @@ async fn read_indexes(
     Ok(rows
         .iter()
         .map(|r| IndexDoc {
+            has_predicate: None,
+            definition_complete: Some(r.get("definition_complete")),
+            predicate: r.get("predicate"),
             name: r.get("index_name"),
             unique: r.get("indisunique"),
             // indkey=0(식 인덱스)은 attname이 NULL이라 array_remove로 뺐다.
@@ -488,7 +569,7 @@ async fn read_routines(
     let rows = sqlx::query(
         "SELECT p.proname, l.lanname, p.prokind::text AS prokind, \
                 pg_get_function_identity_arguments(p.oid) AS sig, \
-                pg_get_functiondef(p.oid) AS def \
+                CASE WHEN p.prokind IN ('f','p') THEN pg_get_functiondef(p.oid) ELSE NULL END AS def \
          FROM pg_proc p \
          JOIN pg_namespace n ON n.oid = p.pronamespace \
          JOIN pg_language l ON l.oid = p.prolang \
@@ -512,6 +593,7 @@ async fn read_routines(
             }
         };
         routines.push(RoutineDoc {
+            source: None,
             name: r.get("proname"),
             kind: kind.to_owned(),
             language: Some(r.get("lanname")),

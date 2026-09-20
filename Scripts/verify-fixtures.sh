@@ -23,6 +23,14 @@ trap 'rm -rf "$tmp"' EXIT
 
 # 프로브는 한 번 빌드해 전 DB/전송 버전 조합에서 같은 바이너리를 사용한다.
 GO_PROBE=""
+
+# CI 실패 뒤에도 실제 그래프를 검토할 수 있게 알려진 fixture 출력만 보관한다.
+record_fixture_graph() {
+    if [ -n "${SG_FIXTURE_ARTIFACTS:-}" ]; then
+        mkdir -p "$SG_FIXTURE_ARTIFACTS"
+        cp "$2" "$SG_FIXTURE_ARTIFACTS/$1.graph.json"
+    fi
+}
 if command -v go >/dev/null 2>&1; then
     GO_PROBE="$tmp/schemagraph-probe-go"
     (cd probe-go && CGO_ENABLED=0 go build -o "$GO_PROBE" .)
@@ -60,6 +68,7 @@ EOF
 sqlite3 "$tmp/basic.db" < "$FIX/basic.sql"
 
 "$BIN" scan "sqlite:$tmp/basic.db" -o "$tmp/graph.json" --emit-document "$tmp/sqlite-document.json"
+record_fixture_graph sqlite "$tmp/graph.json"
 python3 Scripts/verify-document-versions.py "$BIN" "$tmp/sqlite-document.json" "$tmp/protocol-sqlite"
 verify_go_versions "sqlite:$tmp/basic.db" "$tmp/graph.json" sqlite
 
@@ -218,6 +227,7 @@ if [ -n "$pg_url" ]; then
     fi
 
     "$BIN" scan "$pg_url" -o "$tmp/graph-pg.json" --emit-document "$tmp/pg-document.json"
+    record_fixture_graph postgres "$tmp/graph-pg.json"
     python3 Scripts/verify-dynamic-sql.py "$tmp/graph-pg.json" postgres
     python3 Scripts/verify-document-versions.py "$BIN" "$tmp/pg-document.json" "$tmp/protocol-pg"
     verify_go_versions "$pg_url" "$tmp/graph-pg.json" postgres
@@ -332,6 +342,7 @@ if [ -n "$my_url" ]; then
     fi
 
     "$BIN" scan "$my_url" -o "$tmp/graph-my.json"
+    record_fixture_graph mysql "$tmp/graph-my.json"
     verify_go_versions "$my_url" "$tmp/graph-my.json" mysql
 
     if [ -f "$MYFIX/basic.graph.golden.json" ]; then
@@ -463,6 +474,7 @@ if [ -n "$maria_url" ]; then
     fi
 
     "$BIN" scan "$maria_url" -o "$tmp/graph-maria.json"
+    record_fixture_graph mariadb "$tmp/graph-maria.json"
     verify_go_versions "$maria_url" "$tmp/graph-maria.json" mariadb-on
 
     # 골든은 MariaDB 전용이다 — MySQL과 구조는 같아도 시그니처 표기
@@ -823,6 +835,13 @@ EOF
         echo "주의: MSSQL을 찾지 못해 probe-MSSQL 검증 건너뜀 (SG_MSSQL_URL 또는 docker)" >&2
     fi
 
+    if [ -n "$mssql_jdbc" ]; then
+        python3 Scripts/verify-catalog-dependencies.py \
+            --engine "$BIN" --go-probe "$tmp/schemagraph-probe-go" --jdbc-jar "$JAR" \
+            --skip-sqlite --skip-postgres \
+            --mssql-jdbc "$mssql_jdbc" --mssql-user "$ms_user" --mssql-password "$ms_pass"
+    fi
+
     # MSSQL도 여기서 끝 — Oracle(2GB+)과 동시 기동하지 않게 소유 컨테이너를 내린다.
     if [ -n "$mssql_container" ]; then
         docker rm -f "$mssql_container" >/dev/null 2>&1 || true
@@ -966,6 +985,12 @@ EOF
     else
         [ -n "$OJAR" ] && [ -f "$OJAR" ] && \
             echo "주의: Oracle을 찾지 못해 probe-Oracle 검증 건너뜀 (SG_ORACLE_URL 또는 docker)" >&2
+    fi
+    if [ -n "$oracle_jdbc" ]; then
+        python3 Scripts/verify-catalog-dependencies.py \
+            --engine "$BIN" --go-probe "$tmp/schemagraph-probe-go" --jdbc-jar "$JAR" \
+            --oracle-jar "$OJAR" --skip-sqlite --skip-postgres \
+            --oracle-jdbc "$oracle_jdbc" --oracle-user "$oracle_user" --oracle-password "$oracle_pass"
     fi
 else
     echo "주의: java/probe jar이 없어 probe 검증 건너뜀 (brew openjdk 또는 gradle shadowJar)" >&2

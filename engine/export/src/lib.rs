@@ -6,17 +6,24 @@
 //! (AGENTS.md "JSON 출력은 결정적이어야 합니다").
 
 use schemagraph_analysis::{
-    CyclesReport, DeadReason, DeadReport, EdgeKey, GraphDiff, ImpactReport, QueryReport,
-    RulesReport,
+    budget::BudgetedReport, CyclesReport, DeadReason, DeadReport, EdgeKey, GraphDiff, ImpactReport,
+    QueryReport, RulesReport,
 };
 use schemagraph_core::{Edge, EdgeKind, EvidenceLayer, Graph, Level, Vertex, VertexKind};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
+pub mod diagnostics;
+pub mod explain;
+pub mod html;
+pub mod lint;
 pub mod mermaid;
+pub mod review;
+pub mod schema_metadata;
 pub mod stream;
 
 /// graph.json의 와이어 버전. 형식이 깨지는 변경은 올린다.
-pub const GRAPH_VERSION: u32 = 1;
+pub const GRAPH_VERSION: u32 = 2;
 
 // ---------- kind 문자열 (와이어 계약) ----------
 
@@ -36,6 +43,7 @@ fn vertex_kind_str(kind: VertexKind) -> &'static str {
         VertexKind::Function => "function",
         VertexKind::Procedure => "procedure",
         VertexKind::Package => "package",
+        VertexKind::Query => "query",
     }
 }
 
@@ -55,6 +63,7 @@ fn vertex_kind_parse(s: &str) -> Option<VertexKind> {
         "function" => VertexKind::Function,
         "procedure" => VertexKind::Procedure,
         "package" => VertexKind::Package,
+        "query" => VertexKind::Query,
         _ => return None,
     })
 }
@@ -79,6 +88,8 @@ pub fn edge_kind_str(kind: EdgeKind) -> &'static str {
         EdgeKind::UsesType => "uses-type",
         EdgeKind::Contains => "contains",
         EdgeKind::Inferred => "inferred",
+        EdgeKind::DerivesFrom => "derives-from",
+        EdgeKind::DependsOn => "depends-on",
     }
 }
 
@@ -94,6 +105,8 @@ pub fn edge_kind_parse(s: &str) -> Option<EdgeKind> {
         "uses-type" => EdgeKind::UsesType,
         "contains" => EdgeKind::Contains,
         "inferred" => EdgeKind::Inferred,
+        "derives-from" => EdgeKind::DerivesFrom,
+        "depends-on" => EdgeKind::DependsOn,
         _ => return None,
     })
 }
@@ -126,6 +139,12 @@ pub struct GraphDoc {
     pub edges: Vec<EdgeDoc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limitations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analysis: Vec<diagnostics::AnalysisDoc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origins: Vec<diagnostics::OriginDoc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_metadata: Option<schema_metadata::SchemaMetadataDoc>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -218,6 +237,9 @@ pub fn graph_to_doc(g: &Graph) -> GraphDoc {
         vertices,
         edges,
         limitations: g.limitations().to_vec(),
+        analysis: diagnostics::analysis_docs(g),
+        origins: diagnostics::origin_docs(g),
+        schema_metadata: g.schema_metadata().map(schema_metadata::to_doc),
     }
 }
 
@@ -231,6 +253,7 @@ pub fn graph_from_doc(doc: &GraphDoc) -> Graph {
     }
     let mut dropped_v = 0usize;
     let mut dropped_e = 0usize;
+    let mut dangling_e = 0usize;
     for v in &doc.vertices {
         match vertex_kind_parse(&v.kind) {
             Some(kind) => {
@@ -262,9 +285,15 @@ pub fn graph_from_doc(doc: &GraphDoc) -> Graph {
             dropped_e += 1;
             continue;
         };
+        let from = schemagraph_core::VertexId::from_raw(&e.from);
+        let to = schemagraph_core::VertexId::from_raw(&e.to);
+        if g.vertex(&from).is_none() || g.vertex(&to).is_none() {
+            dangling_e += 1;
+            continue;
+        }
         g.add_edge(Edge {
-            from: schemagraph_core::VertexId::from_raw(&e.from),
-            to: schemagraph_core::VertexId::from_raw(&e.to),
+            from,
+            to,
             kind,
             evidence: e
                 .evidence
@@ -287,6 +316,18 @@ pub fn graph_from_doc(doc: &GraphDoc) -> Graph {
         g.add_limitation(format!(
             "graph.json의 간선 {dropped_e}개가 알 수 없는 kind라 버림 (버전 불일치?)"
         ));
+    }
+    if dangling_e > 0 {
+        g.add_limitation(format!(
+            "graph.json의 간선 {dangling_e}개가 존재하지 않는 정점을 가리켜 버림"
+        ));
+    }
+    diagnostics::restore(&mut g, &doc.analysis, &doc.origins);
+    if let Some(metadata) = &doc.schema_metadata {
+        match schema_metadata::from_doc(metadata, &g) {
+            Ok(metadata) => g.set_schema_metadata(metadata),
+            Err(error) => g.add_limitation(format!("invalid schema metadata: {error}")),
+        }
     }
     g
 }
@@ -372,10 +413,76 @@ pub fn impact_to_value(report: &ImpactReport) -> serde_json::Value {
     })
 }
 
+/// 예산 적용 질의의 방향별 탐색 수치를 기록한다. 기존 `max` 결과 제한과
+/// 탐색 예산 소진을 소비자가 구분할 수 있도록 합계와 상세를 함께 싣는다.
+pub fn budgeted_query_to_value(
+    subject: &schemagraph_core::Vertex,
+    dependents: &BudgetedReport,
+    dependencies: &BudgetedReport,
+    depth: u32,
+    self_edges: &[EdgeKind],
+    limitations: &[String],
+) -> serde_json::Value {
+    let mut reasons: BTreeSet<&str> = BTreeSet::new();
+    reasons.extend(dependents.truncation_reasons.iter().map(String::as_str));
+    reasons.extend(dependencies.truncation_reasons.iter().map(String::as_str));
+    let mut value = serde_json::json!({
+        "dependencies": neighbors_value(&dependencies.neighbors),
+        "dependents": neighbors_value(&dependents.neighbors),
+        "depth": depth,
+        "limitations": limitations,
+        "subject": subject_value(subject),
+        "truncated": !reasons.is_empty(),
+        "complete": dependents.complete && dependencies.complete,
+        "visited": dependents.visited + dependencies.visited,
+        "examinedEdges": dependents.examined_edges + dependencies.examined_edges,
+        "truncationReasons": reasons.into_iter().collect::<Vec<_>>(),
+        "traversals": {
+            "dependents": budgeted_traversal_value(dependents),
+            "dependencies": budgeted_traversal_value(dependencies),
+        },
+    });
+    if !self_edges.is_empty() {
+        value["selfEdges"] = serde_json::json!(self_edges
+            .iter()
+            .map(|kind| edge_kind_str(*kind))
+            .collect::<Vec<_>>());
+    }
+    value
+}
+
+/// 예산 적용 impact 보고를 기존 impact JSON 계약과 탐색 수치로 표현한다.
+pub fn budgeted_impact_to_value(
+    subject: &schemagraph_core::Vertex,
+    report: &BudgetedReport,
+    limitations: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "impacted": neighbors_value(&report.neighbors),
+        "limitations": limitations,
+        "subject": subject_value(subject),
+        "truncated": !report.truncation_reasons.is_empty(),
+        "complete": report.complete,
+        "visited": report.visited,
+        "examinedEdges": report.examined_edges,
+        "truncationReasons": report.truncation_reasons,
+    })
+}
+
+fn budgeted_traversal_value(report: &BudgetedReport) -> serde_json::Value {
+    serde_json::json!({
+        "visited": report.visited,
+        "examinedEdges": report.examined_edges,
+        "truncationReasons": report.truncation_reasons,
+        "complete": report.complete,
+        "rootFound": report.root_found,
+    })
+}
+
 /// DeadReport → JSON Value. usage는 미수집(None)이면 키가 빠진다 —
 /// 0 관측은 usage가 있는 채로 reads=0/writes=0이다.
 pub fn dead_to_value(report: &DeadReport) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "candidates": report.candidates.iter().map(|c| {
             let mut v = serde_json::json!({
                 "id": c.vertex.id.as_str(),
@@ -396,11 +503,25 @@ pub fn dead_to_value(report: &DeadReport) -> serde_json::Value {
                 })
                 .unwrap_or(serde_json::Value::Null);
             }
+            if let Some(reason) = &c.suppression {
+                v["suppressed"] = serde_json::json!(true);
+                v["suppressionReason"] = serde_json::json!(reason);
+            }
             v
         }).collect::<Vec<_>>(),
         "limitations": report.limitations,
         "truncated": report.truncated,
-    })
+        "totalCandidates": report.total_candidates,
+        "unsuppressedCount": report.unsuppressed_count,
+    });
+    if !report.retained.is_empty() {
+        value["retained"] = serde_json::json!(report
+            .retained
+            .iter()
+            .map(|(id, reason)| serde_json::json!({"id":id.as_str(),"reason":reason}))
+            .collect::<Vec<_>>());
+    }
+    value
 }
 
 /// 그래프에 싣린 사용 통계를 그대로 보고한다 — 목록엔 관측된 정점만 나오고,
@@ -588,6 +709,26 @@ mod tests {
         let g2 = graph_from_doc(&doc2);
         assert_eq!(g.vertices().count(), g2.vertices().count());
         assert_eq!(g.edges().len(), g2.edges().len());
+    }
+
+    #[test]
+    fn 존재하지_않는_정점을_가리키는_간선은_복원하지_않는다() {
+        let mut doc = graph_to_doc(&sample());
+        doc.edges.push(EdgeDoc {
+            from: "main.a".into(),
+            to: "main.missing".into(),
+            kind: "references".into(),
+            evidence: vec![],
+        });
+        let graph = graph_from_doc(&doc);
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.to.as_str() == "main.missing"));
+        assert!(graph
+            .limitations()
+            .iter()
+            .any(|note| note.contains("존재하지 않는 정점")));
     }
 
     #[test]

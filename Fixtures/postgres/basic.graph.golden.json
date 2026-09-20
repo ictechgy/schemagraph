@@ -1,4 +1,93 @@
 {
+  "analysis": [
+    {
+      "body_hash": "sha256:f421f9b4be822a8575efa3f5722cf4c5c3ad14b74cf536d272cf0158ee05c8a5",
+      "diagnostics": [
+        {
+          "code": "SG_BODY_PARTIAL",
+          "message": "routine public.dynamic_branch(flag boolean): \ubab8\uccb4 \ubb38\uc7a5 1\uac74 \ubbf8\ucd94\ucd9c(\ub3d9\uc801 SQL\u00b7\ube44SQL \uad6c\ubb38) \u2014 \ubab8\uccb4 \uac04\uc120 \ubd88\uc644\uc804"
+        }
+      ],
+      "id": "public.dynamic_branch(flag boolean)",
+      "scope": "object-dependencies",
+      "state": "partial"
+    },
+    {
+      "body_hash": "sha256:a6226176ac159dd1cc7703492d9ee514d02cd14ce7a0798f6fa7747be89f4e3e",
+      "diagnostics": [
+        {
+          "code": "SG_BODY_PARTIAL",
+          "message": "routine public.dynamic_cleanup(suffix text): \ubab8\uccb4 \ubb38\uc7a5 1\uac74 \ubbf8\ucd94\ucd9c(\ub3d9\uc801 SQL\u00b7\ube44SQL \uad6c\ubb38) \u2014 \ubab8\uccb4 \uac04\uc120 \ubd88\uc644\uc804"
+        }
+      ],
+      "id": "public.dynamic_cleanup(suffix text)",
+      "scope": "object-dependencies",
+      "state": "partial"
+    },
+    {
+      "body_hash": "sha256:22967b6ab1d50fc5bc2500f42b201eb2e6b4d6fa8b39ccc3ecef71c89cfaa721",
+      "diagnostics": [],
+      "id": "public.dynamic_concat",
+      "scope": "object-dependencies",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:af484b3a32efd869d402c10f4d29586398161d3b9eaa0225b65485a06c68a1d6",
+      "diagnostics": [],
+      "id": "public.dynamic_format",
+      "scope": "object-dependencies",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:240b5f1981adee075214e481a1a1f18cd73aafe21c41fdacf16a31a9d7c5a801",
+      "diagnostics": [],
+      "id": "public.dynamic_key",
+      "scope": "object-dependencies",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:0cb61b89285e42518410b756fc4bf5556b284a030ea0672a27275948e9f40ee1",
+      "diagnostics": [],
+      "id": "public.dynamic_reassign",
+      "scope": "object-dependencies",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:08521847aca6900694920d7288de6ae5859720128fc8875e2077070b133f41d8",
+      "diagnostics": [],
+      "id": "public.dynamic_rows",
+      "scope": "object-dependencies",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:b451276c8627a8d661bb12fa77952e3857c35a728876ee859a1f574889e43892",
+      "diagnostics": [],
+      "id": "public.dynamic_touch",
+      "scope": "object-dependencies",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "diagnostics": [],
+      "id": "public.order_totals",
+      "scope": "column-dependencies-and-lineage",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:b118383d2046f740246cdbc9ec56288fbe59925c0f64cd414804e2244e5a3ae3",
+      "diagnostics": [],
+      "id": "public.orders.trg_orders_touch",
+      "scope": "object-dependencies",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:12909e6692f033cd47f2f33cb5e4c84666734b982b2f6bc6cecb3b0cbc38755d",
+      "diagnostics": [],
+      "id": "public.trg_orders_touch_fn",
+      "scope": "object-dependencies",
+      "state": "complete"
+    }
+  ],
   "edges": [
     {
       "from": "public",
@@ -417,6 +506,17 @@
     {
       "evidence": [
         {
+          "detail": "view public.order_totals reads public.customers.id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.order_totals",
+      "kind": "reads",
+      "to": "public.customers.id"
+    },
+    {
+      "evidence": [
+        {
           "detail": "view public.order_totals reads public.customers.name",
           "layer": "body-parse"
         }
@@ -454,6 +554,17 @@
     {
       "evidence": [
         {
+          "detail": "view public.order_totals reads public.orders.customer_id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.order_totals",
+      "kind": "reads",
+      "to": "public.orders.customer_id"
+    },
+    {
+      "evidence": [
+        {
           "detail": "view public.order_totals reads public.orders.id",
           "layer": "body-parse"
         }
@@ -471,6 +582,39 @@
       ],
       "from": "public.order_totals",
       "kind": "reads",
+      "to": "public.orders.total"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.order_totals.customer_name derives its value from public.customers.name",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.order_totals.customer_name",
+      "kind": "derives-from",
+      "to": "public.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.order_totals.order_id derives its value from public.orders.id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.order_totals.order_id",
+      "kind": "derives-from",
+      "to": "public.orders.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.order_totals.total derives its value from public.orders.total",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.order_totals.total",
+      "kind": "derives-from",
       "to": "public.orders.total"
     },
     {
@@ -625,7 +769,439 @@
     "routine public.dynamic_branch(flag boolean): \ubab8\uccb4 \ubb38\uc7a5 1\uac74 \ubbf8\ucd94\ucd9c(\ub3d9\uc801 SQL\u00b7\ube44SQL \uad6c\ubb38) \u2014 \ubab8\uccb4 \uac04\uc120 \ubd88\uc644\uc804",
     "routine public.dynamic_cleanup(suffix text): \ubab8\uccb4 \ubb38\uc7a5 1\uac74 \ubbf8\ucd94\ucd9c(\ub3d9\uc801 SQL\u00b7\ube44SQL \uad6c\ubb38) \u2014 \ubab8\uccb4 \uac04\uc120 \ubd88\uc644\uc804"
   ],
-  "version": 1,
+  "origins": [
+    {
+      "body_hash": "sha256:22967b6ab1d50fc5bc2500f42b201eb2e6b4d6fa8b39ccc3ecef71c89cfaa721",
+      "from": "public.dynamic_concat",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "public.customers"
+    },
+    {
+      "body_hash": "sha256:af484b3a32efd869d402c10f4d29586398161d3b9eaa0225b65485a06c68a1d6",
+      "from": "public.dynamic_format",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "public.customers"
+    },
+    {
+      "body_hash": "sha256:0cb61b89285e42518410b756fc4bf5556b284a030ea0672a27275948e9f40ee1",
+      "from": "public.dynamic_reassign",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "public.orders"
+    },
+    {
+      "body_hash": "sha256:08521847aca6900694920d7288de6ae5859720128fc8875e2077070b133f41d8",
+      "from": "public.dynamic_rows",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "public.customers"
+    },
+    {
+      "body_hash": "sha256:08521847aca6900694920d7288de6ae5859720128fc8875e2077070b133f41d8",
+      "from": "public.dynamic_rows",
+      "kind": "calls",
+      "role": "body-dependency",
+      "to": "public.dynamic_key"
+    },
+    {
+      "body_hash": "sha256:08521847aca6900694920d7288de6ae5859720128fc8875e2077070b133f41d8",
+      "from": "public.dynamic_rows",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "public.orders"
+    },
+    {
+      "body_hash": "sha256:b451276c8627a8d661bb12fa77952e3857c35a728876ee859a1f574889e43892",
+      "from": "public.dynamic_touch",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "public.customers"
+    },
+    {
+      "body_hash": "sha256:b451276c8627a8d661bb12fa77952e3857c35a728876ee859a1f574889e43892",
+      "from": "public.dynamic_touch",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "public.orders"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "from": "public.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 11,
+        "end_column": 29,
+        "end_line": 5,
+        "line": 5
+      },
+      "role": "relation",
+      "to": "public.customers"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "from": "public.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 35,
+        "end_column": 39,
+        "end_line": 5,
+        "line": 5
+      },
+      "role": "join",
+      "to": "public.customers.id"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "from": "public.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 5,
+        "end_column": 11,
+        "end_line": 2,
+        "line": 2
+      },
+      "role": "projection",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "from": "public.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 10,
+        "end_column": 25,
+        "end_line": 4,
+        "line": 4
+      },
+      "role": "relation",
+      "to": "public.orders"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "from": "public.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 42,
+        "end_column": 55,
+        "end_line": 5,
+        "line": 5
+      },
+      "role": "join",
+      "to": "public.orders.customer_id"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "from": "public.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 9,
+        "end_column": 13,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "projection",
+      "to": "public.orders.id"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "from": "public.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 5,
+        "end_column": 12,
+        "end_line": 3,
+        "line": 3
+      },
+      "role": "projection",
+      "to": "public.orders.total"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "from": "public.order_totals.customer_name",
+      "kind": "derives-from",
+      "location": {
+        "column": 5,
+        "end_column": 11,
+        "end_line": 2,
+        "line": 2
+      },
+      "role": "value",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "from": "public.order_totals.order_id",
+      "kind": "derives-from",
+      "location": {
+        "column": 9,
+        "end_column": 13,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "value",
+      "to": "public.orders.id"
+    },
+    {
+      "body_hash": "sha256:2ed3bf530c75c884b4bcd77c132b553bda7b7878ade62967a2303ff8f03e6c3d",
+      "from": "public.order_totals.total",
+      "kind": "derives-from",
+      "location": {
+        "column": 5,
+        "end_column": 12,
+        "end_line": 3,
+        "line": 3
+      },
+      "role": "value",
+      "to": "public.orders.total"
+    },
+    {
+      "body_hash": "sha256:b118383d2046f740246cdbc9ec56288fbe59925c0f64cd414804e2244e5a3ae3",
+      "from": "public.orders.trg_orders_touch",
+      "kind": "calls",
+      "role": "body-dependency",
+      "to": "public.trg_orders_touch_fn"
+    },
+    {
+      "body_hash": "sha256:12909e6692f033cd47f2f33cb5e4c84666734b982b2f6bc6cecb3b0cbc38755d",
+      "from": "public.trg_orders_touch_fn",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "public.customers"
+    }
+  ],
+  "schema_metadata": {
+    "columns": {
+      "public.a.b_id": {
+        "data_type": "integer",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "public.a.id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "public.b.a_id": {
+        "data_type": "integer",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "public.b.id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "public.customers.id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "public.customers.name": {
+        "data_type": "text",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "public.loop_self.id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "public.loop_self.parent_id": {
+        "data_type": "integer",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "public.order_items.id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "public.order_items.order_id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "public.order_items.product_id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 3,
+        "pk_position": 0
+      },
+      "public.order_totals.customer_name": {
+        "data_type": "text",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "public.order_totals.order_id": {
+        "data_type": "integer",
+        "nullable": true,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "public.order_totals.total": {
+        "data_type": "numeric",
+        "nullable": true,
+        "ordinal": 3,
+        "pk_position": 0
+      },
+      "public.orders.customer_id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "public.orders.id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "public.orders.total": {
+        "data_type": "numeric",
+        "nullable": false,
+        "ordinal": 3,
+        "pk_position": 0
+      },
+      "public.products.id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "public.products.sku": {
+        "data_type": "text",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "public.standalone.id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "public.standalone.note": {
+        "data_type": "text",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "public.tickets.id": {
+        "data_type": "integer",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "public.tickets.note": {
+        "data_type": "text",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      }
+    },
+    "foreign_keys": {
+      "public.a.a_b_fk": {
+        "columns": [
+          "public.a.b_id"
+        ],
+        "complete": true,
+        "table": "public.a",
+        "target_columns": [
+          "public.b.id"
+        ],
+        "target_table": "public.b"
+      },
+      "public.b.b_a_fk": {
+        "columns": [
+          "public.b.a_id"
+        ],
+        "complete": true,
+        "table": "public.b",
+        "target_columns": [
+          "public.a.id"
+        ],
+        "target_table": "public.a"
+      },
+      "public.loop_self.loop_self_parent_id_fkey": {
+        "columns": [
+          "public.loop_self.parent_id"
+        ],
+        "complete": true,
+        "table": "public.loop_self",
+        "target_columns": [
+          "public.loop_self.id"
+        ],
+        "target_table": "public.loop_self"
+      },
+      "public.order_items.order_items_order_id_fkey": {
+        "columns": [
+          "public.order_items.order_id"
+        ],
+        "complete": true,
+        "table": "public.order_items",
+        "target_columns": [
+          "public.orders.id"
+        ],
+        "target_table": "public.orders"
+      },
+      "public.order_items.order_items_product_id_fkey": {
+        "columns": [
+          "public.order_items.product_id"
+        ],
+        "complete": true,
+        "table": "public.order_items",
+        "target_columns": [
+          "public.products.id"
+        ],
+        "target_table": "public.products"
+      },
+      "public.orders.orders_customer_id_fkey": {
+        "columns": [
+          "public.orders.customer_id"
+        ],
+        "complete": true,
+        "table": "public.orders",
+        "target_columns": [
+          "public.customers.id"
+        ],
+        "target_table": "public.customers"
+      }
+    },
+    "indexes": {
+      "public.orders.idx_orders_customer": {
+        "columns": [
+          "public.orders.customer_id"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "public.orders",
+        "unique": false
+      },
+      "public.products.products_sku_key@index": {
+        "columns": [
+          "public.products.sku"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "public.products",
+        "unique": true
+      }
+    }
+  },
+  "version": 2,
   "vertices": [
     {
       "id": "public",

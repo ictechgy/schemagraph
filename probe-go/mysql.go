@@ -42,6 +42,9 @@ func (h *harvester) streamMySQL(stream *ndjsonStreamWriter) error {
 		if err := stream.schema(h.mysqlSchema(schema)); err != nil {
 			return err
 		}
+		if err := h.streamDependencies(stream, schema); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -246,7 +249,7 @@ func (h *harvester) mysqlIndexes(schema, table string) []IndexDoc {
 		}
 		idx := byName[name]
 		if idx == nil {
-			idx = &IndexDoc{Name: name, Unique: nonUnique == 0, Columns: []string{}}
+			idx = &IndexDoc{Name: name, Unique: nonUnique == 0, Columns: []string{}, DefinitionComplete: boolValue(true), HasPredicate: boolValue(false)}
 			byName[name] = idx
 			order = append(order, name)
 		}
@@ -254,6 +257,7 @@ func (h *harvester) mysqlIndexes(schema, table string) []IndexDoc {
 			idx.Columns = append(idx.Columns, column.String)
 		} else {
 			expressionColumns++
+			idx.DefinitionComplete = boolValue(false)
 		}
 		return nil
 	})
@@ -442,17 +446,20 @@ func (h *harvester) mysqlObjectUsage(schema string, objects []ObjectDoc) {
 func (h *harvester) mysqlRows(label, query string, args []any, scan func(*sql.Rows) error) {
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
+		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("%s unavailable — %s", label, oneLine(err.Error())))
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
 		if err := scan(rows); err != nil {
+			h.catalogIncomplete = true
 			h.limitations = append(h.limitations, fmt.Sprintf("%s row read failed — %s", label, oneLine(err.Error())))
 			return
 		}
 	}
 	if err := rows.Err(); err != nil {
+		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("%s unavailable — %s", label, oneLine(err.Error())))
 	}
 }

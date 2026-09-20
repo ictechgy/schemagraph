@@ -5,7 +5,8 @@
 //! 추측으로 간선을 만들지 않는다.
 
 use schemagraph_core::{
-    Edge, EdgeKind, Evidence, EvidenceLayer, Graph, Usage, Vertex, VertexId, VertexKind,
+    ColumnMetadata, Edge, EdgeKind, Evidence, EvidenceLayer, ForeignKeyMetadata, Graph,
+    IndexMetadata, SchemaMetadata, Usage, Vertex, VertexId, VertexKind,
 };
 
 use crate::document::*;
@@ -19,7 +20,153 @@ pub fn document_to_graph(doc: &CatalogDocument) -> Graph {
     for schema in &doc.schemas {
         build_schema(&mut g, schema);
     }
+    for schema in &doc.schemas {
+        add_foreign_key_edges(&mut g, schema);
+    }
+    attach_schema_metadata(&mut g, doc);
+    crate::dependencies::apply(&mut g, doc);
     g
+}
+
+/// 새 reader가 명시한 메타데이터만 실제 graph 정점으로 정규화한다.
+fn attach_schema_metadata(graph: &mut Graph, doc: &CatalogDocument) {
+    if doc.context.is_none()
+        && !doc.schemas.iter().any(|schema| {
+            schema
+                .objects
+                .iter()
+                .flat_map(|object| &object.indexes)
+                .any(|index| index.definition_complete.is_some() || index.predicate.is_some())
+                || schema
+                    .objects
+                    .iter()
+                    .any(|object| object.columns.iter().any(|column| column.pk_position > 0))
+        })
+    {
+        return;
+    }
+    let mut metadata = SchemaMetadata::default();
+    for schema in &doc.schemas {
+        for object in &schema.objects {
+            let table = VertexId::object(&schema.name, &object.name);
+            for column in &object.columns {
+                if let Some(id) = member_id(graph, &table, &column.name, VertexKind::Column) {
+                    metadata.columns.insert(
+                        id,
+                        ColumnMetadata {
+                            data_type: column.data_type.clone(),
+                            nullable: column.nullable,
+                            ordinal: column.ordinal,
+                            pk_position: column.pk_position,
+                        },
+                    );
+                }
+            }
+            for index in &object.indexes {
+                let Some(index_id) = member_id(graph, &table, &index.name, VertexKind::Index)
+                else {
+                    continue;
+                };
+                let columns = index
+                    .columns
+                    .iter()
+                    .filter_map(|name| member_id(graph, &table, name, VertexKind::Column))
+                    .collect::<Vec<_>>();
+                let complete = index.definition_complete == Some(true)
+                    && columns.len() == index.columns.len()
+                    && columns.iter().all(|column| {
+                        graph
+                            .vertex(column)
+                            .is_some_and(|vertex| vertex.kind == VertexKind::Column)
+                    });
+                metadata.indexes.insert(
+                    index_id,
+                    IndexMetadata {
+                        table: table.clone(),
+                        columns,
+                        unique: index.unique,
+                        has_predicate: index.has_predicate == Some(true)
+                            || index.predicate.is_some(),
+                        complete,
+                    },
+                );
+            }
+            for constraint in object
+                .constraints
+                .iter()
+                .filter(|constraint| constraint.kind == "fk")
+            {
+                let Some(constraint_id) =
+                    member_id(graph, &table, &constraint.name, VertexKind::Constraint)
+                else {
+                    continue;
+                };
+                let columns = constraint
+                    .columns
+                    .iter()
+                    .filter_map(|name| member_id(graph, &table, name, VertexKind::Column))
+                    .collect::<Vec<_>>();
+                let (target_table, target_columns) = match &constraint.referenced {
+                    Some(reference) => {
+                        let target_schema = reference.schema.as_deref().unwrap_or(&schema.name);
+                        let table_id = VertexId::object(target_schema, &reference.table);
+                        let target_columns = reference
+                            .columns
+                            .iter()
+                            .filter_map(|name| {
+                                member_id(graph, &table_id, name, VertexKind::Column)
+                            })
+                            .collect::<Vec<_>>();
+                        (graph.vertex(&table_id).map(|_| table_id), target_columns)
+                    }
+                    None => (None, Vec::new()),
+                };
+                let complete = doc
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| context.catalog_complete)
+                    && !columns.is_empty()
+                    && columns.len() == constraint.columns.len()
+                    && columns.iter().all(|column| {
+                        graph
+                            .vertex(column)
+                            .is_some_and(|vertex| vertex.kind == VertexKind::Column)
+                    })
+                    && target_table.is_some()
+                    && target_columns.len()
+                        == constraint
+                            .referenced
+                            .as_ref()
+                            .map_or(0, |reference| reference.columns.len())
+                    && target_columns.iter().all(|column| {
+                        graph
+                            .vertex(column)
+                            .is_some_and(|vertex| vertex.kind == VertexKind::Column)
+                    });
+                metadata.foreign_keys.insert(
+                    constraint_id,
+                    ForeignKeyMetadata {
+                        table: table.clone(),
+                        columns,
+                        target_table,
+                        target_columns,
+                        complete,
+                    },
+                );
+            }
+        }
+    }
+    graph.set_schema_metadata(metadata);
+}
+
+fn member_id(graph: &Graph, table: &VertexId, name: &str, kind: VertexKind) -> Option<VertexId> {
+    graph
+        .outgoing(table)
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Contains)
+        .filter_map(|edge| graph.vertex(&edge.to))
+        .find(|vertex| vertex.name == name && vertex.kind == kind)
+        .map(|vertex| vertex.id.clone())
 }
 
 fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
@@ -41,12 +188,6 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
             "synonym" => VertexKind::Synonym,
             _ => VertexKind::Table,
         };
-        if obj.name.contains('.') {
-            g.add_limitation(format!(
-                "객체 이름에 '.'이 있어 정점 id가 깨짐: {}.{}",
-                schema.name, obj.name
-            ));
-        }
         g.add_vertex(Vertex {
             id: obj_id.clone(),
             kind,
@@ -78,9 +219,6 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
                 &con.name,
                 VertexKind::Constraint,
             );
-            if con.kind == "fk" {
-                build_fk_edges(g, schema, obj, con, &obj_id);
-            }
         }
 
         for idx in &obj.indexes {
@@ -133,19 +271,15 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
         let kind = match routine.kind.as_str() {
             "procedure" => VertexKind::Procedure,
             "package" => VertexKind::Package,
+            "query" => VertexKind::Query,
             _ => VertexKind::Function,
-        };
-        // signature는 오버로드 구분자 — 비어 있지 않을 때만 정점 id에 붙인다.
-        // (PG의 인자 없는 함수는 시그니처가 빈 문자열이라 "fn()"가 되면 안 된다)
-        let id_name = match &routine.signature {
-            Some(sig) if !sig.is_empty() => format!("{}({})", routine.name, sig),
-            _ => routine.name.clone(),
         };
         // 함수와 프로시저는 같은 이름을 공유할 수 있다(MySQL) — member와
         // 같은 규칙으로 충돌을 분리해 나중 정점이 조용히 드랍되지 않게 한다.
         let suffix = match kind {
             VertexKind::Procedure => "procedure",
             VertexKind::Package => "package",
+            VertexKind::Query => "query",
             _ => "function",
         };
         if let Some(pkg) = &routine.member_of {
@@ -153,7 +287,12 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
             // 스키마 직속 contains 대신 패키지→멤버 contains를 만든다.
             let Some(mem_id) = resolve_collision(
                 g,
-                VertexId::member(&schema.name, pkg, &id_name),
+                VertexId::routine(
+                    &schema.name,
+                    Some(pkg),
+                    &routine.name,
+                    routine.signature.as_deref(),
+                ),
                 &routine.name,
                 kind,
                 suffix,
@@ -177,9 +316,9 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
                 None => {
                     g.add_edge(contains(&schema_id, &mem_id));
                     g.add_limitation(format!(
-                        "{}.{pkg}.{id_name}: 부모 패키지 정점이 카탈로그에 없음 \
+                        "{}.{pkg}.{}: 부모 패키지 정점이 카탈로그에 없음 \
                          — 스키마 직속으로 둠",
-                        schema.name
+                        schema.name, routine.name
                     ));
                 }
             }
@@ -187,7 +326,12 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
         }
         let Some(rt_id) = resolve_collision(
             g,
-            VertexId::object(&schema.name, &id_name),
+            VertexId::routine(
+                &schema.name,
+                None,
+                &routine.name,
+                routine.signature.as_deref(),
+            ),
             &routine.name,
             kind,
             suffix,
@@ -223,6 +367,19 @@ fn find_package(g: &Graph, schema: &str, pkg: &str) -> Option<VertexId> {
 }
 
 /// fk 제약 하나를 object 레벨 + column 레벨 간선으로 푼다.
+fn add_foreign_key_edges(g: &mut Graph, schema: &SchemaDoc) {
+    for object in &schema.objects {
+        let object_id = VertexId::object(&schema.name, &object.name);
+        for constraint in object
+            .constraints
+            .iter()
+            .filter(|constraint| constraint.kind == "fk")
+        {
+            build_fk_edges(g, schema, object, constraint, &object_id);
+        }
+    }
+}
+
 fn build_fk_edges(
     g: &mut Graph,
     schema: &SchemaDoc,
@@ -242,6 +399,13 @@ fn build_fk_edges(
         .clone()
         .unwrap_or_else(|| schema.name.clone());
     let target_id = VertexId::object(&target_schema, &referenced.table);
+    if g.vertex(&target_id).is_none() {
+        g.add_limitation(format!(
+            "foreign key {}.{} -> {} could not be resolved to a collected table; no edge inferred",
+            schema.name, obj.name, target_id
+        ));
+        return;
+    }
 
     g.add_edge(Edge {
         from: obj_id.clone(),
@@ -268,9 +432,15 @@ fn build_fk_edges(
             // 만들지 않는다 — object 간선은 이미 있다.
             continue;
         }
+        let Some(local_id) = member_id(g, obj_id, local, VertexKind::Column) else {
+            continue;
+        };
+        let Some(remote_id) = member_id(g, &target_id, remote, VertexKind::Column) else {
+            continue;
+        };
         g.add_edge(Edge {
-            from: VertexId::member(&schema.name, &obj.name, local),
-            to: VertexId::member(&target_schema, &referenced.table, remote),
+            from: local_id,
+            to: remote_id,
             kind: EdgeKind::References,
             evidence: vec![Evidence {
                 layer: EvidenceLayer::Catalog,
@@ -384,6 +554,8 @@ mod tests {
 
     fn doc_with_fk() -> CatalogDocument {
         CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
             version: 1,
             dialect: "sqlite".into(),
             reader: "test".into(),
@@ -469,6 +641,71 @@ mod tests {
     }
 
     #[test]
+    fn 수집되지_않은_fk_대상에는_유령_간선을_만들지_않는다() {
+        let mut doc = doc_with_fk();
+        doc.schemas[0].objects[1].constraints[0]
+            .referenced
+            .as_mut()
+            .unwrap()
+            .table = "missing_customers".into();
+        let graph = document_to_graph(&doc);
+        assert!(graph
+            .vertex(&VertexId::object("main", "missing_customers"))
+            .is_none());
+        assert!(!graph.edges().iter().any(|edge| {
+            edge.from.as_str() == "main.orders" && edge.to.as_str() == "main.missing_customers"
+        }));
+        assert!(graph
+            .limitations()
+            .iter()
+            .any(|note| note.contains("no edge inferred")));
+    }
+
+    #[test]
+    fn 명시된_schema_metadata는_실제_컬럼_index_fk_id를_가리킨다() {
+        let mut doc = doc_with_fk();
+        doc.context = Some(CollectionContext {
+            source_id: "test".into(),
+            database: None,
+            schema_filter: None,
+            catalog_complete: true,
+        });
+        doc.schemas[0].objects[1].indexes.push(IndexDoc {
+            has_predicate: None,
+            definition_complete: Some(true),
+            predicate: None,
+            name: "orders_customer_idx".into(),
+            unique: false,
+            columns: vec!["customer_id".into()],
+            usage: None,
+        });
+        let graph = document_to_graph(&doc);
+        let metadata = graph.schema_metadata().expect("schema metadata");
+        assert!(metadata
+            .columns
+            .contains_key(&VertexId::member("main", "orders", "customer_id")));
+        assert_eq!(
+            metadata.columns[&VertexId::member("main", "customers", "id")].pk_position,
+            1
+        );
+        let index_id = VertexId::member("main", "orders", "orders_customer_idx");
+        assert_eq!(
+            metadata.indexes[&index_id].columns,
+            vec![VertexId::member("main", "orders", "customer_id")]
+        );
+        let fk_id = VertexId::member("main", "orders", "orders_fk_0");
+        assert!(metadata.foreign_keys[&fk_id].complete);
+        doc.context.as_mut().unwrap().catalog_complete = false;
+        assert!(
+            !document_to_graph(&doc)
+                .schema_metadata()
+                .unwrap()
+                .foreign_keys[&fk_id]
+                .complete
+        );
+    }
+
+    #[test]
     fn document의_usage는_정점에_매핑되고_없음과_0은_다르다() {
         let mut doc = doc_with_fk();
         // orders: 0 관측(usage가 있는 채로 0) — 미수집과 구분해야 한다.
@@ -481,6 +718,9 @@ mod tests {
         });
         // customers의 인덱스에도 usage를 둔다(인덱스는 멤버 레벨 정점).
         doc.schemas[0].objects[0].indexes.push(IndexDoc {
+            has_predicate: None,
+            definition_complete: None,
+            predicate: None,
             name: "idx_id".into(),
             columns: vec!["id".into()],
             unique: true,
@@ -509,6 +749,9 @@ mod tests {
         let mut doc = doc_with_fk();
         // MySQL의 FK 자동 인덱스는 컬럼 이름을 그대로 쓴다 — 컬럼과 충돌.
         doc.schemas[0].objects[1].indexes.push(IndexDoc {
+            has_predicate: None,
+            definition_complete: None,
+            predicate: None,
             name: "customer_id".into(),
             columns: vec!["customer_id".into()],
             unique: false,
@@ -522,6 +765,9 @@ mod tests {
         });
         // 제약과도 충돌하는 인덱스 — fk 제약과 같은 이름.
         doc.schemas[0].objects[1].indexes.push(IndexDoc {
+            has_predicate: None,
+            definition_complete: None,
+            predicate: None,
             name: "orders_fk_0".into(),
             columns: vec!["customer_id".into()],
             unique: false,
@@ -533,14 +779,14 @@ mod tests {
         assert!(g
             .vertex(&VertexId::member("main", "orders", "customer_id"))
             .is_some());
-        let idx_id = VertexId::member("main", "orders", "customer_id@index");
+        let idx_id = VertexId::from_raw("main.orders.customer_id@index");
         let idx = g.vertex(&idx_id).expect("분리된 index 정점");
         assert_eq!(idx.kind, VertexKind::Index);
         // usage도 분리된 정점에 붙는다.
         assert_eq!(g.usage(&idx_id).map(|u| u.reads), Some(4));
         // 제약 이름과 충돌한 인덱스도 분리된다.
         assert_eq!(
-            g.vertex(&VertexId::member("main", "orders", "orders_fk_0@index"))
+            g.vertex(&VertexId::from_raw("main.orders.orders_fk_0@index"))
                 .map(|v| v.kind),
             Some(VertexKind::Index)
         );
@@ -554,6 +800,7 @@ mod tests {
         // 테이블과 같은 이름의 함수 — MySQL에선 함수/프로시저가 이름을 공유할 수 있다.
         doc.schemas[0].routines = vec![
             RoutineDoc {
+                source: None,
                 name: "orders".into(), // 테이블 orders와 충돌
                 kind: "function".into(),
                 language: Some("sql".into()),
@@ -569,6 +816,7 @@ mod tests {
                 member_of: None,
             },
             RoutineDoc {
+                source: None,
                 name: "helper".into(),
                 kind: "procedure".into(),
                 language: Some("sql".into()),
@@ -616,6 +864,7 @@ mod tests {
         let mut doc = doc_with_fk();
         doc.schemas[0].routines = vec![
             RoutineDoc {
+                source: None,
                 name: "aaa_touch".into(), // zzz_ops보다 정렬이 빠르다
                 kind: "procedure".into(),
                 language: Some("plsql".into()),
@@ -625,6 +874,7 @@ mod tests {
                 member_of: Some("zzz_ops".into()),
             },
             RoutineDoc {
+                source: None,
                 name: "zzz_ops".into(),
                 kind: "package".into(),
                 language: Some("plsql".into()),

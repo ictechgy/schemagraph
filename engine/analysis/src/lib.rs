@@ -7,6 +7,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use schemagraph_core::{EdgeKind, Graph, Level, Usage, Vertex, VertexId, VertexKind};
 
+mod retention;
+pub use retention::{RetentionPolicy, Suppression};
+pub mod budget;
+pub mod paths;
+pub mod review;
+pub mod schema_lint;
+
 /// 질의 대상을 못 찾았을 때. `notFound`에도 limitations를 싣는다 —
 /// 없는 것과 이 도구가 못 보는 것을 소비자가 구분해야 한다.
 #[derive(Debug)]
@@ -24,7 +31,10 @@ pub enum Resolve {
 /// 모호한 짧은 이름을 임의로 골라 잡으면 소비자가 엉뚱한 객체를 보게 된다.
 pub fn resolve(graph: &Graph, name: &str) -> Resolve {
     // 정규 id 그대로 입력된 경우가 먼저다.
-    let exact = VertexId::schema(name);
+    // 사용자가 건넨 canonical id는 이미 schema/object/member 구분자를
+    // 포함하므로 다시 schema 컴포넌트로 escape하면 안 된다. v1 graph의
+    // raw id도 from_raw로 그대로 읽어 compatibility를 유지한다.
+    let exact = VertexId::from_raw(name);
     if graph.vertex(&exact).is_some() {
         return Resolve::Found(exact);
     }
@@ -151,6 +161,8 @@ pub struct DeadCandidate {
     /// 사용 통계 증거 — 있다고 후보가 확정되지는 않는다(통계는 since 이후만
     /// 유효하고 애플리케이션 조회는 그래프에 없다). None = 미수집, 0 = 관측된 0.
     pub usage: Option<Usage>,
+    /// 실제 후보에 적용된 명시적 예외 사유다.
+    pub suppression: Option<String>,
 }
 
 /// `dead` 보고.
@@ -160,6 +172,10 @@ pub struct DeadReport {
     pub candidates: Vec<DeadCandidate>,
     pub truncated: bool,
     pub limitations: Vec<String>,
+    /// 사용자가 선언한 루트와 그 의존 대상이다. 후보와 구분한다.
+    pub retained: Vec<(VertexId, String)>,
+    pub total_candidates: usize,
+    pub unsuppressed_count: usize,
 }
 
 /// 존재 가치가 "다른 객체가 호출/조회해줘야" 생기는 kind들.
@@ -181,12 +197,25 @@ fn is_consumer_kind(kind: VertexKind) -> bool {
 /// 애플리케이션 쿼리는 그래프에 없으므로 "후보"는 "DB 내부 참조 없음"의
 /// 뜻이지 "삭제 가능"의 뜻이 아니다. 이 계약은 출력 limitations에도 실린다.
 pub fn dead(graph: &Graph, max_candidates: usize) -> DeadReport {
+    dead_with_policy(graph, max_candidates, &RetentionPolicy::default())
+}
+
+/// 루트에서 도달하는 객체를 살려두면서 기존의 DB 내부 참조 부재 후보를 계산한다.
+pub fn dead_with_policy(
+    graph: &Graph,
+    max_candidates: usize,
+    policy: &RetentionPolicy,
+) -> DeadReport {
+    let protected = retention::retained(graph, policy);
     let mut dead_set: BTreeSet<VertexId> = BTreeSet::new();
     let mut reasons: BTreeMap<VertexId, DeadReason> = BTreeMap::new();
     loop {
         let mut changed = false;
         for v in graph.vertices() {
-            if !is_consumer_kind(v.kind) || dead_set.contains(&v.id) {
+            if !is_consumer_kind(v.kind)
+                || dead_set.contains(&v.id)
+                || protected.contains_key(&v.id)
+            {
                 continue;
             }
             let dependents: Vec<&VertexId> = graph
@@ -219,13 +248,20 @@ pub fn dead(graph: &Graph, max_candidates: usize) -> DeadReport {
                 vertex: v.clone(),
                 reason: reasons[id],
                 usage: graph.usage(id).cloned(),
+                suppression: retention::suppression(id, policy),
             })
         })
         .collect();
     candidates.sort_by(|a, b| a.vertex.id.as_str().cmp(b.vertex.id.as_str()));
+    let total_candidates = candidates.len();
+    let unsuppressed_count = candidates
+        .iter()
+        .filter(|c| c.suppression.is_none())
+        .count();
     let truncated = candidates.len() > max_candidates;
     candidates.truncate(max_candidates);
     let mut limitations = graph.limitations().to_vec();
+    limitations.extend(retention::policy_notes(graph, policy));
     limitations.push(
         "application queries are not in the graph — candidates mean no \
          in-database dependents, not safe to delete"
@@ -235,6 +271,9 @@ pub fn dead(graph: &Graph, max_candidates: usize) -> DeadReport {
         candidates,
         truncated,
         limitations,
+        retained: protected.into_iter().collect(),
+        total_candidates,
+        unsuppressed_count,
     }
 }
 

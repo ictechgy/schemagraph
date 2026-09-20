@@ -30,16 +30,22 @@ func (s *ndjsonStreamWriter) flush() error {
 }
 
 func (s *ndjsonStreamWriter) header(dialect, reader string, version int, features []string) error {
+	return s.headerWithContext(dialect, reader, version, features, nil)
+}
+
+func (s *ndjsonStreamWriter) headerWithContext(dialect, reader string, version int, features []string, context *CollectionContext) error {
 	if version == 1 {
 		return s.line(ndjsonDocumentV1{
 			Type: "document", Version: version, Dialect: dialect,
 			Reader: reader, Limitations: []string{},
+			Context: context,
 		})
 	}
 	return s.line(ndjsonDocumentV2{
 		Type: "document", Version: version, Dialect: dialect,
 		Producer: documentProducer{Name: reader}, RequiredFeatures: features,
 		Limitations: []string{},
+		Context:     context,
 	})
 }
 
@@ -65,10 +71,18 @@ func (s *ndjsonStreamWriter) schema(schema SchemaDoc) error {
 }
 
 func (s *ndjsonStreamWriter) limitations(limitations []string) error {
+	return s.footer(limitations, nil)
+}
+
+func (s *ndjsonStreamWriter) footer(limitations []string, context *CollectionContext) error {
 	if limitations == nil {
 		limitations = []string{}
 	}
-	return s.line(map[string]any{"type": "limitations", "data": limitations})
+	record := map[string]any{"type": "limitations", "data": limitations}
+	if context != nil {
+		record["context"] = context
+	}
+	return s.line(record)
 }
 
 // streamNDJSON은 adapter가 schema 하나를 만든 즉시 방출한다. header에는
@@ -79,7 +93,7 @@ func (h *harvester) streamNDJSON(w io.Writer, version int) error {
 	}
 	features := h.streamFeatures()
 	stream := newNDJSONStreamWriter(w)
-	if err := stream.header(h.dialect, "probe-go", version, features); err != nil {
+	if err := stream.headerWithContext(h.dialect, "probe-go", version, features, h.collectionContext(false)); err != nil {
 		return err
 	}
 	switch h.dialect {
@@ -104,7 +118,7 @@ func (h *harvester) streamNDJSON(w io.Writer, version int) error {
 			return err
 		}
 	}
-	if err := stream.limitations(sortedDistinct(h.limitations)); err != nil {
+	if err := stream.footer(sortedDistinct(h.limitations), h.collectionContext(true)); err != nil {
 		return err
 	}
 	return stream.flush()
@@ -121,6 +135,9 @@ func (h *harvester) streamFeatures() []string {
 		members = true
 	}
 	features := make([]string, 0, 2)
+	if h.catalogDependencies {
+		features = append(features, "catalog-dependencies-v1")
+	}
 	if members {
 		features = append(features, "package-members-v1")
 	}
@@ -217,6 +234,9 @@ func (h *harvester) streamOracle(stream *ndjsonStreamWriter) error {
 		document := h.oracleSchema(schema)
 		objects += len(document.Objects)
 		if err := stream.schema(document); err != nil {
+			return err
+		}
+		if err := h.streamDependencies(stream, schema); err != nil {
 			return err
 		}
 	}

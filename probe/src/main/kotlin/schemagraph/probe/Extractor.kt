@@ -39,9 +39,33 @@ class Extractor(
     private val conn: Connection,
     private val dialect: String,
     private val schemaFilter: List<String>,
+    private val catalogDependencies: Boolean = false,
+    private val sourceId: String = "",
 ) {
     private val limitations = mutableListOf<String>()
     private val meta: DatabaseMetaData = conn.metaData
+    private var sessionComplete = true
+
+    /** 원문 렌더링에 수집 세션의 기본 스키마가 섞이지 않게 한다. */
+    private fun prepareSession() {
+        runCatching { conn.isReadOnly = true }.onFailure {
+            limitations += "read-only session hint was unavailable; only catalog queries were issued"
+        }
+        if (dialect == "postgres") {
+            runCatching { conn.createStatement().use { it.execute("SET search_path = pg_catalog") } }
+                .onFailure {
+                    sessionComplete = false
+                    limitations += "PostgreSQL definition namespace could not be pinned; object resolution may be incomplete"
+                }
+        }
+    }
+
+    private fun collectionContext(complete: Boolean) = CollectionContext(
+        sourceId = sourceId,
+        database = runCatching { conn.catalog }.getOrNull(),
+        schemaFilter = schemaFilter.distinct().sorted().takeIf { it.isNotEmpty() },
+        catalogComplete = complete && sessionComplete,
+    )
 
     /** 시스템 스키마 억제 — Oracle의 PUBLIC은 수만 시노님 슈도스키마라 방언
      *  한정으로 억제한다(H2의 PUBLIC은 사용자 기본 스키마라 억제하면 안 된다). */
@@ -58,11 +82,14 @@ class Extractor(
     fun extract(): CatalogDocument {
         // 읽기 전용 힌트 — sqlite-jdbc처럼 연결 후 변경을 거부하는 드라이버는
         // 건너뛴다(프로브는 어차피 SELECT만 친다).
-        runCatching { conn.isReadOnly = true }
+        prepareSession()
         val usage = collectUsage()
+        val metadataStart = limitations.size
         val schemas = mutableListOf<SchemaDoc>()
+        val dependencies = mutableListOf<CatalogDependency>()
         for (schema in candidateSchemas()) {
             extractSchema(schema, usage)?.let { schemas += it }
+            if (catalogDependencies) dependencies += collectCatalogDependencies(conn, dialect, schema, limitations)
         }
         if (schemas.none { it.objects.isNotEmpty() }) {
             limitations += "JDBC 메타데이터가 테이블/뷰를 하나도 주지 않았다 — 드라이버 커버리지를 확인해라"
@@ -73,6 +100,8 @@ class Extractor(
             reader = "probe-jdbc",
             schemas = schemas,
             limitations = limitations.distinct().sorted(),
+            context = collectionContext(limitations.size == metadataStart),
+            dependencies = dependencies.distinct().sortedBy { lineMapper.writeValueAsString(it) },
         )
     }
 
@@ -84,27 +113,35 @@ class Extractor(
      * 싣는다 — 스트리밍은 마지막까지 무슨 한계가 나올지 모르기 때문이다.
      */
     fun extractStreaming(documentVersion: Int = 1, emit: (String) -> Unit) {
-        runCatching { conn.isReadOnly = true }
+        prepareSession()
         fun rec(type: String, vararg fields: Pair<String, Any?>) {
             val node = lineMapper.createObjectNode()
             node.put("type", type)
             for ((k, v) in fields) node.set<JsonNode>(k, lineMapper.valueToTree(v))
             emit(lineMapper.writeValueAsString(node))
         }
-        emit(lineMapper.writeValueAsString(streamingHeader(documentVersion, dialect)))
+        val header = streamingHeader(documentVersion, dialect, catalogDependencies)
+        header.set<JsonNode>("context", lineMapper.valueToTree(collectionContext(false)))
+        emit(lineMapper.writeValueAsString(header))
         val usage = collectUsage()
+        val metadataStart = limitations.size
         var sawObjects = false
         for (schema in candidateSchemas()) {
-            val sd = extractSchema(schema, usage) ?: continue
-            sawObjects = sawObjects || sd.objects.isNotEmpty()
-            rec("schema", "name" to sd.name)
-            for (obj in sd.objects) rec("object", "schema" to sd.name, "data" to obj)
-            for (rt in sd.routines) rec("routine", "schema" to sd.name, "data" to rt)
+            val sd = extractSchema(schema, usage)
+            if (sd != null) {
+                sawObjects = sawObjects || sd.objects.isNotEmpty()
+                rec("schema", "name" to sd.name)
+                for (obj in sd.objects) rec("object", "schema" to sd.name, "data" to obj)
+                for (rt in sd.routines) rec("routine", "schema" to sd.name, "data" to rt)
+            }
+            if (catalogDependencies) {
+                for (dependency in collectCatalogDependencies(conn, dialect, schema, limitations).distinct().sortedBy { lineMapper.writeValueAsString(it) }) rec("dependency", "data" to dependency)
+            }
         }
         if (!sawObjects) {
             limitations += "JDBC 메타데이터가 테이블/뷰를 하나도 주지 않았다 — 드라이버 커버리지를 확인해라"
         }
-        rec("limitations", "data" to limitations.distinct().sorted())
+        rec("limitations", "data" to limitations.distinct().sorted(), "context" to collectionContext(limitations.size == metadataStart))
     }
 
     /** 스키마 하나분의 수확 — 스트리밍 방출의 버퍼 단위. 내용이 없는
@@ -298,7 +335,15 @@ class Extractor(
         return out.sortedBy { it.name } to pkPos
     }
 
-    private fun indexesOf(obj: RawObject): List<IndexDoc> = runCatching {
+    private fun indexesOf(obj: RawObject): List<IndexDoc> {
+        if (dialect == "postgres" || dialect == "sqlite") {
+            try {
+                return catalogIndexes(conn, dialect, obj.schema, obj.name).orEmpty()
+            } catch (error: Exception) {
+                limitations += "${obj.schema}.${obj.name}: index definition catalog unavailable; falling back to JDBC metadata with unknown definition completeness"
+            }
+        }
+        return runCatching {
         meta.getIndexInfo(obj.catalog, obj.schemaName, obj.name, false, false).use { rs ->
             val groups = linkedMapOf<String, Pair<Boolean, MutableList<Pair<Int, String>>>>()
             while (rs.next()) {
@@ -315,6 +360,7 @@ class Extractor(
     }.getOrElse {
         limitations += "${obj.schema}.${obj.name}: getIndexInfo 실패 — ${it.message}"
         emptyList()
+    }
     }
 
     private fun discoveredSchemas(): List<String> = runCatching {

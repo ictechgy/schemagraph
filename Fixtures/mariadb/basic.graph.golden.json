@@ -1,4 +1,34 @@
 {
+  "analysis": [
+    {
+      "body_hash": "sha256:630fd271349d330682bcddd9d3b6971a555bca1801f3fe94ecfc89775701d875",
+      "diagnostics": [],
+      "id": "sgfix.order_count",
+      "scope": "object-dependencies",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "diagnostics": [],
+      "id": "sgfix.order_totals",
+      "scope": "column-dependencies-and-lineage",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
+      "diagnostics": [],
+      "id": "sgfix.orders.trg_orders_touch",
+      "scope": "object-dependencies",
+      "state": "complete"
+    },
+    {
+      "body_hash": "sha256:eb48c5efdd2dd49021f5d1eb4388119216d71301d9b753e8bcf064b7dad5a945",
+      "diagnostics": [],
+      "id": "sgfix.touch_customer(int%2811%29)",
+      "scope": "object-dependencies",
+      "state": "complete"
+    }
+  ],
   "edges": [
     {
       "from": "sgfix",
@@ -58,7 +88,7 @@
     {
       "from": "sgfix",
       "kind": "contains",
-      "to": "sgfix.touch_customer(int(11))"
+      "to": "sgfix.touch_customer(int%2811%29)"
     },
     {
       "from": "sgfix.a",
@@ -325,6 +355,17 @@
     {
       "evidence": [
         {
+          "detail": "view sgfix.order_totals reads sgfix.customers.id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "to": "sgfix.customers.id"
+    },
+    {
+      "evidence": [
+        {
           "detail": "view sgfix.order_totals reads sgfix.customers.name",
           "layer": "body-parse"
         }
@@ -362,6 +403,17 @@
     {
       "evidence": [
         {
+          "detail": "view sgfix.order_totals reads sgfix.orders.customer_id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "to": "sgfix.orders.customer_id"
+    },
+    {
+      "evidence": [
+        {
           "detail": "view sgfix.order_totals reads sgfix.orders.id",
           "layer": "body-parse"
         }
@@ -379,6 +431,39 @@
       ],
       "from": "sgfix.order_totals",
       "kind": "reads",
+      "to": "sgfix.orders.total"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.order_totals.customer_name derives its value from sgfix.customers.name",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_totals.customer_name",
+      "kind": "derives-from",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.order_totals.order_id derives its value from sgfix.orders.id",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_totals.order_id",
+      "kind": "derives-from",
+      "to": "sgfix.orders.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.order_totals.total derives its value from sgfix.orders.total",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.order_totals.total",
+      "kind": "derives-from",
       "to": "sgfix.orders.total"
     },
     {
@@ -529,11 +614,11 @@
     {
       "evidence": [
         {
-          "detail": "sgfix.touch_customer(int(11)) Writes sgfix.customers",
+          "detail": "sgfix.touch_customer(int%2811%29) Writes sgfix.customers",
           "layer": "body-parse"
         }
       ],
-      "from": "sgfix.touch_customer(int(11))",
+      "from": "sgfix.touch_customer(int%2811%29)",
       "kind": "writes",
       "to": "sgfix.customers"
     }
@@ -547,7 +632,442 @@
     "\uba64\ubc84 id \ucda9\ub3cc: sgfix.products.sku\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 constraint \uc815\uc810\uc740 sgfix.products.sku@constraint\ub85c \ubd84\ub9ac",
     "\uba64\ubc84 id \ucda9\ub3cc: sgfix.products.sku\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.products.sku@index\ub85c \ubd84\ub9ac"
   ],
-  "version": 1,
+  "origins": [
+    {
+      "body_hash": "sha256:630fd271349d330682bcddd9d3b6971a555bca1801f3fe94ecfc89775701d875",
+      "from": "sgfix.order_count",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "sgfix.orders"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 116,
+        "end_column": 139,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "relation",
+      "to": "sgfix.customers"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 143,
+        "end_column": 151,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "join",
+      "to": "sgfix.customers.id"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 31,
+        "end_column": 41,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "projection",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 90,
+        "end_column": 110,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "relation",
+      "to": "sgfix.orders"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 154,
+        "end_column": 171,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "join",
+      "to": "sgfix.orders.customer_id"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 8,
+        "end_column": 16,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "projection",
+      "to": "sgfix.orders.id"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "from": "sgfix.order_totals",
+      "kind": "reads",
+      "location": {
+        "column": 61,
+        "end_column": 72,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "projection",
+      "to": "sgfix.orders.total"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "from": "sgfix.order_totals.customer_name",
+      "kind": "derives-from",
+      "location": {
+        "column": 31,
+        "end_column": 41,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "value",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "from": "sgfix.order_totals.order_id",
+      "kind": "derives-from",
+      "location": {
+        "column": 8,
+        "end_column": 16,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "value",
+      "to": "sgfix.orders.id"
+    },
+    {
+      "body_hash": "sha256:b53ea1a42562d4a705c55c1f21ebe217e76db792c418f0925aaa7cf05be6b6e6",
+      "from": "sgfix.order_totals.total",
+      "kind": "derives-from",
+      "location": {
+        "column": 61,
+        "end_column": 72,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "value",
+      "to": "sgfix.orders.total"
+    },
+    {
+      "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "sgfix.customers"
+    },
+    {
+      "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "sgfix.orders.customer_id"
+    },
+    {
+      "body_hash": "sha256:eb48c5efdd2dd49021f5d1eb4388119216d71301d9b753e8bcf064b7dad5a945",
+      "from": "sgfix.touch_customer(int%2811%29)",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "sgfix.customers"
+    }
+  ],
+  "schema_metadata": {
+    "columns": {
+      "sgfix.a.b_id": {
+        "data_type": "int",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "sgfix.a.id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "sgfix.b.a_id": {
+        "data_type": "int",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "sgfix.b.id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "sgfix.customers.id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "sgfix.customers.name": {
+        "data_type": "varchar",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "sgfix.loop_self.id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "sgfix.loop_self.parent_id": {
+        "data_type": "int",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "sgfix.order_items.id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "sgfix.order_items.order_id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "sgfix.order_items.product_id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 3,
+        "pk_position": 0
+      },
+      "sgfix.order_totals.customer_name": {
+        "data_type": "varchar",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "sgfix.order_totals.order_id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 0
+      },
+      "sgfix.order_totals.total": {
+        "data_type": "decimal",
+        "nullable": false,
+        "ordinal": 3,
+        "pk_position": 0
+      },
+      "sgfix.orders.customer_id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "sgfix.orders.id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "sgfix.orders.total": {
+        "data_type": "decimal",
+        "nullable": false,
+        "ordinal": 3,
+        "pk_position": 0
+      },
+      "sgfix.products.id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "sgfix.products.sku": {
+        "data_type": "varchar",
+        "nullable": false,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "sgfix.standalone.id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "sgfix.standalone.note": {
+        "data_type": "varchar",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      },
+      "sgfix.tickets.id": {
+        "data_type": "int",
+        "nullable": false,
+        "ordinal": 1,
+        "pk_position": 1
+      },
+      "sgfix.tickets.note": {
+        "data_type": "varchar",
+        "nullable": true,
+        "ordinal": 2,
+        "pk_position": 0
+      }
+    },
+    "foreign_keys": {
+      "sgfix.a.a_b_fk": {
+        "columns": [
+          "sgfix.a.b_id"
+        ],
+        "complete": true,
+        "table": "sgfix.a",
+        "target_columns": [
+          "sgfix.b.id"
+        ],
+        "target_table": "sgfix.b"
+      },
+      "sgfix.b.b_a_fk": {
+        "columns": [
+          "sgfix.b.a_id"
+        ],
+        "complete": true,
+        "table": "sgfix.b",
+        "target_columns": [
+          "sgfix.a.id"
+        ],
+        "target_table": "sgfix.a"
+      },
+      "sgfix.loop_self.loop_self_ibfk_1": {
+        "columns": [
+          "sgfix.loop_self.parent_id"
+        ],
+        "complete": true,
+        "table": "sgfix.loop_self",
+        "target_columns": [
+          "sgfix.loop_self.id"
+        ],
+        "target_table": "sgfix.loop_self"
+      },
+      "sgfix.order_items.order_items_ibfk_1": {
+        "columns": [
+          "sgfix.order_items.order_id"
+        ],
+        "complete": true,
+        "table": "sgfix.order_items",
+        "target_columns": [
+          "sgfix.orders.id"
+        ],
+        "target_table": "sgfix.orders"
+      },
+      "sgfix.order_items.order_items_ibfk_2": {
+        "columns": [
+          "sgfix.order_items.product_id"
+        ],
+        "complete": true,
+        "table": "sgfix.order_items",
+        "target_columns": [
+          "sgfix.products.id"
+        ],
+        "target_table": "sgfix.products"
+      },
+      "sgfix.orders.orders_customer_fk": {
+        "columns": [
+          "sgfix.orders.customer_id"
+        ],
+        "complete": true,
+        "table": "sgfix.orders",
+        "target_columns": [
+          "sgfix.customers.id"
+        ],
+        "target_table": "sgfix.customers"
+      }
+    },
+    "indexes": {
+      "sgfix.a.a_b_fk@index": {
+        "columns": [
+          "sgfix.a.b_id"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "sgfix.a",
+        "unique": false
+      },
+      "sgfix.b.b_a_fk@index": {
+        "columns": [
+          "sgfix.b.a_id"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "sgfix.b",
+        "unique": false
+      },
+      "sgfix.loop_self.parent_id@index": {
+        "columns": [
+          "sgfix.loop_self.parent_id"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "sgfix.loop_self",
+        "unique": false
+      },
+      "sgfix.order_items.order_id@index": {
+        "columns": [
+          "sgfix.order_items.order_id"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "sgfix.order_items",
+        "unique": false
+      },
+      "sgfix.order_items.product_id@index": {
+        "columns": [
+          "sgfix.order_items.product_id"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "sgfix.order_items",
+        "unique": false
+      },
+      "sgfix.orders.idx_orders_customer": {
+        "columns": [
+          "sgfix.orders.customer_id"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "sgfix.orders",
+        "unique": false
+      },
+      "sgfix.products.sku@index": {
+        "columns": [
+          "sgfix.products.sku"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "sgfix.products",
+        "unique": true
+      }
+    }
+  },
+  "version": 2,
   "vertices": [
     {
       "id": "sgfix",
@@ -1043,7 +1563,7 @@
       "schema": "sgfix"
     },
     {
-      "id": "sgfix.touch_customer(int(11))",
+      "id": "sgfix.touch_customer(int%2811%29)",
       "kind": "procedure",
       "level": "object",
       "name": "touch_customer",
