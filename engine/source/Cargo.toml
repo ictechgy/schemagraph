@@ -4,6 +4,7 @@ description = "Catalog document types and database readers for schemagraph"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 

@@ -4,6 +4,17 @@
 
 ## 지금 상태
 
+- 2026-09-20: **공개 GitHub 저장소 생성** —
+  [ictechgy/schemagraph](https://github.com/ictechgy/schemagraph).
+  공개 기본 브랜치는 `main`, 개발 브랜치는 `feature/p0-engine`이다.
+  Cargo 워크스페이스와 6개 크레이트에 `repository` URL을 반영했다.
+  `README.md`를 영어 정본으로 퇴고하고 `README.ko.md`를 한국어 참고 번역으로
+  추가했다. SQL Server 드라이버 번들·NDJSON 메모리 사용 설명도 구현에 맞췄다.
+  `.serena/`·중첩 `sanddab/`·Kotlin 캐시는 `.gitignore`로 제외한다.
+  문서 링크·셸/TOML 예제·번역 간 명령 일치, 기존 CLI의 SQLite 예제와 골든
+  일치, 오프라인 Cargo 메타데이터 로딩을 확인했다. 런타임 코드는 변경하지
+  않았으며 전체 DB fixture 검증은 아래 P6 실행 기록을 기준으로 한다.
+  crates.io 게시는 아직 하지 않았다.
 - 2026-09-19: **P0 완료** (`651fb12`). `engine/` Rust 워크스페이스에 core·source·
   analysis·export·cli 크레이트. SQLite 네이티브 reader가 카탈로그를 읽어
   그래프를 만들고, `scan`/`graph`/`query`/`cycles`가 동작한다.
@@ -274,8 +285,7 @@ Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + 
    확인). 메타데이터·LICENSE·path 버전은 준비됐고 `schemagraph-core`
    dry-run 통과. 미게시 형제는 dry-run 해석이 불가하므로 의존 순서
    (core → source → parser/analysis → export → cli)대로 실게시해야 한다.
-   원격 git 저장소도 아직 없다 — 저장소 URL이 생기면 `repository` 필드를
-   채운다.
+   GitHub 공개 저장소와 `repository` 필드는 준비됐다.
 2. routine 파싱 잔여 — T-SQL `TRY/CATCH`·`EXEC`·`WHILE`·커서는 복구됐고
    남은 건 추출기가 못 가르는 드물고 동적인 구문뿐. 패키지 멤버 귀속은
    완료 — 남은 것은 멤버 경계가 모호한 경우의 추가 정밀도뿐이다.
