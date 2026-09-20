@@ -121,6 +121,8 @@ button:hover, button:focus-visible { text-decoration: underline; }
 .result { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
 .result-meta, .edge-meta, .tag { color: var(--muted); font-size: 13px; }
 .tag { display: inline-block; margin-right: 6px; padding: 2px 6px; border: 1px solid var(--line); border-radius: 4px; }
+.tag, .edge-meta, #selected-id, .result button { overflow-wrap: anywhere; }
+@media (max-width: 600px) { .search-row { flex-direction: column; align-items: stretch; } .result { flex-wrap: wrap; } }
 .partial { color: var(--warn); }
 .detail-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 20px; align-items: baseline; }
 .edge-list { display: grid; gap: 10px; }
@@ -172,6 +174,8 @@ const HTML_SUFFIX: &str = r##"</script>
   "use strict";
 
   const graph = JSON.parse(document.getElementById("graph-data").textContent);
+  for (const key of ["analysis", "origins", "limitations"]) graph[key] ??= [];
+  const analysisById = new Map(graph.analysis.map((record) => [record.id, record]));
   const MAX_RESULTS = 30;
   const MAX_NEIGHBORS = 100;
   const vertices = new Map(graph.vertices.map((vertex) => [vertex.id, vertex]));
@@ -220,7 +224,7 @@ const HTML_SUFFIX: &str = r##"</script>
       return;
     }
     const matches = graph.vertices.filter((vertex) =>
-      [vertex.id, vertex.name, vertex.schema, vertex.kind].some((value) =>
+      [vertex.id, vertex.name, vertex.schema, vertex.kind, analysisById.get(vertex.id)?.source || ""].some((value) =>
         value.toLocaleLowerCase().includes(query)
       )
     );
@@ -242,7 +246,7 @@ const HTML_SUFFIX: &str = r##"</script>
       row.className = "result";
       const button = document.createElement("button");
       button.type = "button";
-      button.textContent = vertex.name || vertex.id;
+      button.textContent = analysisById.get(vertex.id)?.source || vertex.name || vertex.id;
       button.title = vertex.id;
       button.addEventListener("click", () => selectVertex(vertex.id));
       row.appendChild(button);
@@ -267,7 +271,7 @@ const HTML_SUFFIX: &str = r##"</script>
 
   function renderAnalysis(id) {
     analysis.replaceChildren();
-    const record = graph.analysis.find((item) => item.id === id);
+    const record = analysisById.get(id);
     if (!record) {
       const empty = document.createElement("p");
       empty.className = "muted";
@@ -280,6 +284,7 @@ const HTML_SUFFIX: &str = r##"</script>
     appendText(heading, record.state, `tag state-${record.state}`);
     appendText(heading, `scope: ${record.scope}`, "tag");
     if (record.body_hash) appendText(heading, `body hash: ${record.body_hash}`, "tag");
+    if (record.source) appendText(heading, `source: ${record.source}`, "tag");
     analysis.appendChild(heading);
     if (record.diagnostics.length === 0) return;
     const list = document.createElement("ul");
