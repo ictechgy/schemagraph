@@ -4,9 +4,8 @@
 //! 권위는 엔진 한 곳에 있다(DESIGN.md "파싱은 단일 소스"). 파싱 실패는
 //! 숨기지 않고 limitation으로 실측해 돌려준다.
 //!
-//! 정직한 범위(P1): 테이블 참조는 visitor가 서브쿼리·CTE까지 전부 읽지만,
-//! 컬럼 참조는 최상위 select의 별칭 맵으로만 해석한다 — 서브쿼리 스코프를
-//! 섞으면 오귀속되므로, 그 존재는 limitation으로 보고한다.
+//! 뷰는 스키마·스코프별로 컬럼을 해석하고, 절차형 몸체는 지원하는 SQL 문장을
+//! 추출한다. 값의 계보와 조건절의 읽기 의존성을 구분하고 미해석은 진단한다.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
@@ -14,14 +13,16 @@ use std::ops::ControlFlow;
 use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId, VertexKind};
 use schemagraph_source::document::{CatalogDocument, ObjectDoc};
 use sqlparser::ast::{
-    visit_expressions, visit_relations, Expr, JoinConstraint, JoinOperator, ObjectName, Query,
-    SelectItem, SetExpr, Statement, TableFactor, TableObject,
+    visit_expressions, visit_relations, Expr, ObjectName, Statement, TableFactor, TableObject,
 };
 use sqlparser::dialect::{
     Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
 };
 
 mod constant_sql;
+mod scope;
+#[cfg(test)]
+mod scope_tests;
 
 /// document의 몸체들을 파싱해 그래프에 간선을 보강한다.
 ///
@@ -40,29 +41,34 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
             .iter()
             .flat_map(|schema| &schema.routines)
             .any(|routine| routine.name.eq_ignore_ascii_case("format"));
+    let catalog_index = scope::CatalogIndex::new(doc);
     let mut enriched = 0usize;
+    let mut unavailable = 0usize;
     let mut notes: Vec<String> = Vec::new();
 
     for schema in &doc.schemas {
         for obj in &schema.objects {
-            if let Some(body) = obj.body.as_ref().filter(|b| !b.trim().is_empty()) {
-                let owner = VertexId::object(&schema.name, &obj.name);
-                match obj.kind.as_str() {
-                    "view" => match parse_view(dialect.as_deref(), body) {
-                        Ok(parsed) => {
-                            apply_view(g, &schema.name, &owner, &parsed, &mut notes, ci);
-                            enriched += 1;
-                        }
-                        Err(msg) => notes.push(format!(
-                            "view {}.{} 몸체 파싱 실패: {msg}",
-                            schema.name, obj.name
-                        )),
-                    },
-                    _ => {}
+            if matches!(obj.kind.as_str(), "view" | "materialized-view") {
+                let kind = if obj.kind == "view" {
+                    VertexKind::View
+                } else {
+                    VertexKind::MaterializedView
+                };
+                if let Some(owner) =
+                    resolve_object(g, &schema.name, &obj.name, kind, &obj.kind, false)
+                {
+                    notes.extend(scope::enrich_view(
+                        g,
+                        &catalog_index,
+                        &schema.name,
+                        obj,
+                        &owner,
+                        dialect.as_deref(),
+                    ));
+                    enriched += usize::from(obj.body.is_some());
                 }
             }
             for trg in &obj.triggers {
-                let Some(body) = &trg.body else { continue };
                 // document_to_graph가 멤버 이름 충돌을 `name@kind`로 분리한다 —
                 // 같은 규칙으로 실제 정점 id를 찾고, 못 찾으면 유령 간선 대신
                 // notes로 남긴다.
@@ -81,6 +87,20 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                     ));
                     continue;
                 };
+                let Some(body) = trg.body.as_ref().filter(|b| !b.trim().is_empty()) else {
+                    unavailable += 1;
+                    record_body(
+                        g,
+                        &trigger_id,
+                        None,
+                        schemagraph_core::AnalysisState::Unsupported,
+                        "SG_BODY_UNAVAILABLE",
+                        &["trigger definition was not collected".into()],
+                    );
+                    continue;
+                };
+                let note_start = notes.len();
+                let mut state = schemagraph_core::AnalysisState::Complete;
                 let parsed_body = match doc.dialect.as_str() {
                     "db2" => parse_db2_trigger_body(dialect.as_deref(), body),
                     "informix" => parse_informix_trigger_body(dialect.as_deref(), body),
@@ -99,14 +119,22 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                         );
                         enriched += 1;
                     }
-                    Err(msg) => notes.push(format!("trigger {trigger_id} 몸체 파싱 실패: {msg}")),
+                    Err(msg) => {
+                        state = schemagraph_core::AnalysisState::Unsupported;
+                        notes.push(format!("trigger {trigger_id} body parse failed: {msg}"));
+                    }
                 }
+                record_body(
+                    g,
+                    &trigger_id,
+                    Some(body),
+                    state,
+                    "SG_BODY_PARTIAL",
+                    &notes[note_start..],
+                );
             }
         }
         for routine in &schema.routines {
-            let Some(body) = routine.body.as_ref().filter(|b| !b.trim().is_empty()) else {
-                continue;
-            };
             // routine 정점 id는 graph.rs와 같은 규칙 — 시그니처가 있으면 괄호로
             // 붙고, 같은 이름의 테이블/프로시저가 있으면 `id_name@kind`로 분리된다.
             let id_name = match &routine.signature {
@@ -130,97 +158,186 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 ));
                 continue;
             };
-            if matches!(doc.dialect.as_str(), "db2" | "informix")
-                && catalog_routine_language_allowed(&doc.dialect, routine.language.as_deref())
-            {
-                let (parsed, unextracted) = parse_catalog_routine_body(&doc.dialect, body);
-                apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
-                if unextracted > 0 {
-                    notes.push(format!(
+            let Some(body) = routine.body.as_ref().filter(|b| !b.trim().is_empty()) else {
+                unavailable += 1;
+                record_body(
+                    g,
+                    &owner,
+                    None,
+                    schemagraph_core::AnalysisState::Unsupported,
+                    "SG_BODY_UNAVAILABLE",
+                    &["routine definition was not collected".into()],
+                );
+                continue;
+            };
+            let note_start = notes.len();
+            let mut state = schemagraph_core::AnalysisState::Complete;
+            (|| {
+                if matches!(doc.dialect.as_str(), "db2" | "informix")
+                    && catalog_routine_language_allowed(&doc.dialect, routine.language.as_deref())
+                {
+                    let (parsed, unextracted) = parse_catalog_routine_body(&doc.dialect, body);
+                    apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                    if unextracted > 0 {
+                        notes.push(format!(
                         "routine {owner}: body statement(s) {unextracted} could not be extracted"
                     ));
+                    }
+                    enriched += 1;
+                    return;
                 }
-                enriched += 1;
-                continue;
-            }
-            if matches!(doc.dialect.as_str(), "db2" | "informix") {
-                let language = routine.language.as_deref().unwrap_or("unknown");
-                notes.push(format!(
+                if matches!(doc.dialect.as_str(), "db2" | "informix") {
+                    state = schemagraph_core::AnalysisState::Unsupported;
+                    let language = routine.language.as_deref().unwrap_or("unknown");
+                    notes.push(format!(
                     "routine {owner}: language {language} is unsupported for {0} catalog parsing — body edges omitted",
                     doc.dialect
                 ));
-                continue;
-            }
-            match routine.language.as_deref() {
-                // SQL 언어 함수는 몸체가 그대로 SQL이라 파싱 가능 — 나머지
-                // 언어는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
-                Some("sql") | None => match parse_routine_body(dialect.as_deref(), body) {
-                    Ok(parsed) => {
-                        apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
-                        enriched += 1;
-                    }
-                    Err(msg) => {
-                        // 도매 파싱이 실패한 몸체 — T-SQL의 DECLARE/IF/TRY
-                        // 같은 절차형 구문이 섞이면 sqlparser가 문장 목록째
-                        // 거부한다. 문장 추출로 부분 복구해 파싱된 문장의
-                        // 간선만 취하고, 미추출은 limitation으로 센다.
+                    return;
+                }
+                match routine.language.as_deref() {
+                    // SQL 언어 함수는 몸체가 그대로 SQL이라 파싱 가능 — 나머지
+                    // 언어는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
+                    Some("sql") | None => match parse_routine_body(dialect.as_deref(), body) {
+                        Ok(parsed) => {
+                            apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                            enriched += 1;
+                        }
+                        Err(msg) => {
+                            // 도매 파싱이 실패한 몸체 — T-SQL의 DECLARE/IF/TRY
+                            // 같은 절차형 구문이 섞이면 sqlparser가 문장 목록째
+                            // 거부한다. 문장 추출로 부분 복구해 파싱된 문장의
+                            // 간선만 취하고, 미추출은 limitation으로 센다.
+                            let (parsed, unextracted) = parse_procedural_body(
+                                dialect.as_deref(),
+                                body,
+                                constant_sql::dialect(&doc.dialect),
+                                format_shadowed,
+                            );
+                            if parsed.has_edges() || unextracted > 0 {
+                                if parsed.has_edges() {
+                                    apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                                }
+                                // 미추출 0건은 완전 복구 — 한계가 아니므로 조용히 둔다.
+                                if unextracted > 0 {
+                                    notes.push(format!(
+                                        "routine {owner}: 몸체 문장 {unextracted}건 미추출\
+                                     (절차형 구문) — 몸체 간선 불완전 ({msg})"
+                                    ));
+                                }
+                                enriched += 1;
+                            } else {
+                                state = schemagraph_core::AnalysisState::Unsupported;
+                                notes.push(format!("routine {owner} body parse failed: {msg}"));
+                            }
+                        }
+                    },
+                    // plpgsql·plsql은 문장 단위 추출기로 SQL 문장만 꺼내 파싱한다.
+                    // 꺼내지 못한 문장(동적 SQL 등)은 수를 세어 limitation으로 남긴다.
+                    Some("plpgsql" | "plsql" | "pl/sql") => {
                         let (parsed, unextracted) = parse_procedural_body(
                             dialect.as_deref(),
                             body,
                             constant_sql::dialect(&doc.dialect),
                             format_shadowed,
                         );
-                        if parsed.has_edges() || unextracted > 0 {
-                            if parsed.has_edges() {
-                                apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
-                            }
-                            // 미추출 0건은 완전 복구 — 한계가 아니므로 조용히 둔다.
-                            if unextracted > 0 {
-                                notes.push(format!(
-                                    "routine {owner}: 몸체 문장 {unextracted}건 미추출\
-                                     (절차형 구문) — 몸체 간선 불완전 ({msg})"
-                                ));
-                            }
-                            enriched += 1;
-                        } else {
-                            notes.push(format!("routine {owner} 몸체 파싱 실패: {msg}"));
-                        }
-                    }
-                },
-                // plpgsql·plsql은 문장 단위 추출기로 SQL 문장만 꺼내 파싱한다.
-                // 꺼내지 못한 문장(동적 SQL 등)은 수를 세어 limitation으로 남긴다.
-                Some("plpgsql" | "plsql" | "pl/sql") => {
-                    let (parsed, unextracted) = parse_procedural_body(
-                        dialect.as_deref(),
-                        body,
-                        constant_sql::dialect(&doc.dialect),
-                        format_shadowed,
-                    );
-                    apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
-                    // 멤버가 member_of로 나오는 문서에서 패키지 몸체는 스펙이라
-                    // 실행 간선이 거의 없다 — 패키지 정점에 간선이 붙는다는 건
-                    // 멤버 몸체가 통째로 실린 옛 형식이라는 뜻이라 그때만 알린다.
-                    if routine.kind == "package" && parsed.has_edges() {
-                        notes.push(format!(
-                            "routine {owner}: 패키지 몸체 간선은 패키지 정점에 귀속 \
+                        apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                        // 멤버가 member_of로 나오는 문서에서 패키지 몸체는 스펙이라
+                        // 실행 간선이 거의 없다 — 패키지 정점에 간선이 붙는다는 건
+                        // 멤버 몸체가 통째로 실린 옛 형식이라는 뜻이라 그때만 알린다.
+                        if routine.kind == "package" && parsed.has_edges() {
+                            notes.push(format!(
+                                "routine {owner}: 패키지 몸체 간선은 패키지 정점에 귀속 \
                              — 멤버 구분은 문서의 member_of를 쓴다"
-                        ));
-                    }
-                    if unextracted > 0 {
-                        notes.push(format!(
-                            "routine {owner}: 몸체 문장 {unextracted}건 미추출\
+                            ));
+                        }
+                        if unextracted > 0 {
+                            notes.push(format!(
+                                "routine {owner}: 몸체 문장 {unextracted}건 미추출\
                              (동적 SQL·비SQL 구문) — 몸체 간선 불완전"
-                        ));
+                            ));
+                        }
+                        enriched += 1;
                     }
-                    enriched += 1;
+                    Some(lang) => {
+                        state = schemagraph_core::AnalysisState::Unsupported;
+                        notes.push(format!("routine {owner}: language {lang} is unsupported; body dependencies omitted"));
+                    }
                 }
-                Some(lang) => notes.push(format!(
-                    "routine {owner}: 언어 {lang}의 몸체 파싱 미지원 — 몸체 간선 없음"
-                )),
-            }
+            })();
+            record_body(
+                g,
+                &owner,
+                Some(body),
+                state,
+                "SG_BODY_PARTIAL",
+                &notes[note_start..],
+            );
         }
     }
+    if unavailable > 0 {
+        g.add_limitation(format!("{unavailable} routine/trigger definitions were not collected; see structured analysis diagnostics"));
+    }
     (enriched, notes)
+}
+
+/// 절차형 추출기의 범위를 명시하고, 재작성 전 원문 해시만 근거로 보존한다.
+fn record_body(
+    g: &mut Graph,
+    owner: &VertexId,
+    body: Option<&str>,
+    mut state: schemagraph_core::AnalysisState,
+    code: &str,
+    notes: &[String],
+) {
+    use schemagraph_core::{AnalysisState, Diagnostic, ObjectAnalysis, Origin};
+    if state == AnalysisState::Complete && !notes.is_empty() {
+        state = AnalysisState::Partial;
+    }
+    let code = if state == AnalysisState::Unsupported && code == "SG_BODY_PARTIAL" {
+        "SG_BODY_UNSUPPORTED"
+    } else {
+        code
+    };
+    let hash = body.map(scope::body_hash);
+    let keys: Vec<_> = g
+        .outgoing(owner)
+        .iter()
+        .filter(|e| {
+            e.evidence
+                .iter()
+                .any(|ev| ev.layer == EvidenceLayer::BodyParse)
+        })
+        .map(|e| (e.from.clone(), e.to.clone(), e.kind))
+        .collect();
+    if let Some(hash) = &hash {
+        for key in keys {
+            g.add_origin(
+                key,
+                Origin {
+                    body_hash: hash.clone(),
+                    role: "body-dependency".into(),
+                    location: None,
+                },
+            );
+        }
+    }
+    g.set_analysis(
+        owner.clone(),
+        ObjectAnalysis {
+            state,
+            scope: "object-dependencies".into(),
+            body_hash: hash,
+            diagnostics: notes
+                .iter()
+                .map(|message| Diagnostic {
+                    code: code.into(),
+                    message: message.clone(),
+                    location: None,
+                })
+                .collect(),
+        },
+    );
 }
 
 /// `--inferred` opt-in 이름 규칙 추정 — 선언된 FK가 없는 `xxx_id` 컬럼을
@@ -318,46 +435,6 @@ fn dialect_for(dialect: &str) -> Option<Box<dyn Dialect>> {
     })
 }
 
-/// 파싱 결과.
-struct ParsedView {
-    /// (스키마?, 테이블) — visitor가 서브쿼리·CTE까지 다 읽은 관계 대상.
-    tables: Vec<(Option<String>, String)>,
-    /// (스키마?, 테이블, 컬럼) — 최상위 별칭 맵으로 해석된 것만.
-    columns: Vec<(Option<String>, String, String)>,
-    /// database qualifier가 있어 catalog identity로 귀속할 수 없는 관계.
-    ignored_relations: BTreeSet<String>,
-    /// CTE나 서브쿼리가 있어 컬럼 해석이 불완전한 경우.
-    has_nested_scope: bool,
-}
-
-/// `CREATE VIEW v AS SELECT ...` 또는 벌어진 SELECT를 파싱한다.
-fn parse_view(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedView, String> {
-    let default = GenericDialect {};
-    let dialect = dialect.unwrap_or(&default);
-    let statements =
-        sqlparser::parser::Parser::parse_sql(dialect, body).map_err(|e| e.to_string())?;
-    let mut parsed = ParsedView {
-        tables: Vec::new(),
-        columns: Vec::new(),
-        ignored_relations: BTreeSet::new(),
-        has_nested_scope: false,
-    };
-    for stmt in &statements {
-        let query = match stmt {
-            Statement::CreateView { query, .. } => Some(&**query),
-            Statement::Query(q) => Some(&**q),
-            _ => None,
-        };
-        if let Some(q) = query {
-            collect_query(q, &mut parsed);
-        }
-    }
-    if parsed.tables.is_empty() && parsed.ignored_relations.is_empty() {
-        return Err("몸체에서 테이블 참조를 찾지 못함".to_owned());
-    }
-    Ok(parsed)
-}
-
 /// ObjectName → (스키마?, 테이블). 부분이 셋 이상이면 마지막 둘을 쓰고
 /// 나머지는 버린다 — 카탈로그를 넘나드는 참조는 DB마다 의미가 다르다.
 fn object_name_parts(name: &ObjectName) -> (Option<String>, String) {
@@ -401,211 +478,6 @@ fn relation_name_key(name: &ObjectName) -> String {
         .filter_map(|part| part.as_ident().map(|ident| ident.value.clone()))
         .collect::<Vec<_>>()
         .join(".")
-}
-
-/// 테이블 관계 전부(visitor) + 최상위 select의 컬럼 참조를 모은다.
-fn collect_query(query: &Query, parsed: &mut ParsedView) {
-    if query.with.is_some() {
-        parsed.has_nested_scope = true;
-    }
-    let _ = visit_relations(query, |name| {
-        if let Some((schema, table)) = relation_name_parts(name) {
-            parsed.tables.push((schema, table));
-        } else {
-            parsed.ignored_relations.insert(relation_name_key(name));
-        }
-        ControlFlow::<()>::Continue(())
-    });
-
-    // 컬럼 참조는 최상위 select 스코프만 — 서브쿼리 별칭과 섞이면 오귀속된다.
-    if let SetExpr::Select(select) = &*query.body {
-        let mut aliases: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
-        for twj in &select.from {
-            fill_twj(twj, &mut aliases, parsed);
-        }
-        for item in &select.projection {
-            let expr = match item {
-                SelectItem::UnnamedExpr(e) => Some(e),
-                SelectItem::ExprWithAlias { expr, .. } => Some(expr),
-                _ => None,
-            };
-            if let Some(e) = expr {
-                collect_expr_columns(e, &aliases, parsed);
-            }
-        }
-        if let Some(sel) = &select.selection {
-            collect_expr_columns(sel, &aliases, parsed);
-        }
-        // FROM 안에 서브쿼리(Derived)가 있으면 컬럼 해석이 불완전하다고 표시.
-        for twj in &select.from {
-            if is_derived(&twj.relation) || twj.joins.iter().any(|j| is_derived(&j.relation)) {
-                parsed.has_nested_scope = true;
-            }
-        }
-    }
-}
-
-fn is_derived(factor: &TableFactor) -> bool {
-    matches!(factor, TableFactor::Derived { .. })
-}
-
-/// TableWithJoins 하나의 별칭을 순서대로 채우고, 조인 ON 식의 컬럼 참조를
-/// 모은다. ON은 자기 왼쪽의 테이블만 참조할 수 있으므로 문서 순서대로
-/// 채우면서 모으는 게 맞다.
-fn fill_twj(
-    twj: &sqlparser::ast::TableWithJoins,
-    aliases: &mut BTreeMap<String, (Option<String>, String)>,
-    parsed: &mut ParsedView,
-) {
-    fill_alias(&twj.relation, aliases, parsed);
-    for join in &twj.joins {
-        fill_alias(&join.relation, aliases, parsed);
-        if let Some(on) = join_on(&join.join_operator) {
-            collect_expr_columns(on, aliases, parsed);
-        }
-    }
-}
-
-/// 테이블 인자에서 별칭 → (스키마?, 테이블)을 채운다.
-///
-/// NestedJoin((a JOIN b ON ...))은 괄호일 뿐 스코프를 새로 열지 않는다 —
-/// PG의 pg_get_viewdef가 FROM 절 전체를 괄호로 감싸 출력하므로 재귀가
-/// 없으면 그쪽 view의 컬럼 해석이 전부 비게 된다.
-fn fill_alias(
-    factor: &TableFactor,
-    aliases: &mut BTreeMap<String, (Option<String>, String)>,
-    parsed: &mut ParsedView,
-) {
-    match factor {
-        TableFactor::Table { name, alias, .. } => {
-            let Some((schema, table)) = relation_name_parts(name) else {
-                return;
-            };
-            let key = alias
-                .as_ref()
-                .map(|a| a.name.value.clone())
-                .unwrap_or_else(|| table.clone());
-            aliases.insert(key, (schema, table));
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => fill_twj(table_with_joins, aliases, parsed),
-        _ => {}
-    }
-}
-
-/// join operator에서 ON 조건식만 꺼낸다.
-fn join_on(op: &JoinOperator) -> Option<&Expr> {
-    let constraint = match op {
-        JoinOperator::Inner(c)
-        | JoinOperator::LeftOuter(c)
-        | JoinOperator::RightOuter(c)
-        | JoinOperator::FullOuter(c)
-        | JoinOperator::Semi(c)
-        | JoinOperator::LeftSemi(c)
-        | JoinOperator::RightSemi(c)
-        | JoinOperator::Anti(c)
-        | JoinOperator::LeftAnti(c)
-        | JoinOperator::RightAnti(c) => c,
-        _ => return None,
-    };
-    match constraint {
-        JoinConstraint::On(e) => Some(e),
-        _ => None,
-    }
-}
-
-/// 식 안의 `별칭.컬럼` 식별자를 수집해 별칭 맵으로 해석한다. 별칭에 없는
-/// 두 파트 식별자와 한 파트 식별자는 어느 테이블의 것인지 모른다 —
-/// 추측하지 않고 버린다.
-fn collect_expr_columns(
-    expr: &Expr,
-    aliases: &BTreeMap<String, (Option<String>, String)>,
-    parsed: &mut ParsedView,
-) {
-    let _ = visit_expressions(expr, |e| {
-        match e {
-            Expr::CompoundIdentifier(parts) => {
-                if parts.len() == 2 {
-                    let qual = &parts[0].value;
-                    let col = &parts[1].value;
-                    if let Some((schema, table)) = aliases.get(qual) {
-                        parsed
-                            .columns
-                            .push((schema.clone(), table.clone(), col.clone()));
-                    }
-                }
-            }
-            // 식 안의 서브쿼리는 별칭 스코프가 달라 컬럼 해석이 불완전하다.
-            Expr::Subquery(_)
-            | Expr::InSubquery { .. }
-            | Expr::Exists { .. }
-            | Expr::AnyOp { .. }
-            | Expr::AllOp { .. } => parsed.has_nested_scope = true,
-            _ => {}
-        }
-        ControlFlow::<()>::Continue(())
-    });
-}
-
-/// 파싱 결과를 그래프 간선으로 반영한다. 대상 정점이 그래프에 있을 때만
-/// 간선을 만든다 — 없는 객체를 가리키는 간선은 유령 정점을 만들고, 추측으로
-/// 만들지 않는 것이 원칙이다(못 본 대상은 limitations로 남긴다).
-fn apply_view(
-    g: &mut Graph,
-    schema: &str,
-    owner: &VertexId,
-    parsed: &ParsedView,
-    notes: &mut Vec<String>,
-    ci: bool,
-) {
-    if parsed.has_nested_scope {
-        notes.push(format!(
-            "view {owner}: 서브쿼리/CTE의 컬럼 참조는 미해석 — reads 간선이 부분적일 수 있음"
-        ));
-    }
-    note_ignored_relations(owner, &parsed.ignored_relations, notes);
-
-    let mut made = std::collections::BTreeSet::new();
-    for (ref_schema, table) in &parsed.tables {
-        let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-        let Some(target) = vertex_hit(g, &VertexId::object(&target_schema, table), ci) else {
-            notes.push(format!(
-                "view {owner}가 참조하는 {target_schema}.{table}이 카탈로그에 없음 \
-                 (다른 스키마이거나 미수집)"
-            ));
-            continue;
-        };
-        if made.insert(target.clone()) {
-            g.add_edge(Edge {
-                from: owner.clone(),
-                to: target.clone(),
-                kind: EdgeKind::Reads,
-                evidence: vec![Evidence {
-                    layer: EvidenceLayer::BodyParse,
-                    detail: format!("view {owner} reads {target}"),
-                }],
-            });
-        }
-    }
-    for (ref_schema, table, column) in &parsed.columns {
-        let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-        let Some(target) = vertex_hit(g, &VertexId::member(&target_schema, table, column), ci)
-        else {
-            // 컬럼 정점이 없으면(함수 반환값·계산 컬럼 등) 조용히 넘긴다 —
-            // object 레벨 간선이 이미 있고, 없는 컬럼을 추측으로 만들지 않는다.
-            continue;
-        };
-        g.add_edge(Edge {
-            from: owner.clone(),
-            to: target,
-            kind: EdgeKind::Reads,
-            evidence: vec![Evidence {
-                layer: EvidenceLayer::BodyParse,
-                detail: format!("view {owner} reads {target_schema}.{table}.{column}"),
-            }],
-        });
-    }
 }
 
 /// trigger 본문 파싱 결과.
@@ -3115,16 +2987,20 @@ mod tests {
         let mut g = schemagraph_source::graph::document_to_graph(&doc);
         let (_n, notes) = enrich_from_document(&mut g, &doc);
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("파싱 실패"));
+        assert!(notes[0].contains("parse failed"));
     }
 
     #[test]
-    fn 서브쿼리가_있으면_불완전_표시를_남긴다() {
+    fn 서브쿼리의_비한정_컬럼을_해당_스코프에서_해석한다() {
         let doc = doc_with_view(
             "CREATE VIEW order_totals AS SELECT o.id FROM orders o WHERE o.customer_id IN (SELECT id FROM customers)",
         );
-        let (_g, notes) = build(&doc);
-        assert!(notes.iter().any(|n| n.contains("미해석")));
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(g
+            .edges()
+            .iter()
+            .any(|e| e.kind == EdgeKind::Reads && e.to.as_str() == "main.customers.id"));
     }
 
     /// Oracle은 카탈로그가 대문자(미인용 식별자 접힘)인데 몸체는 소문자로
@@ -3172,7 +3048,7 @@ mod tests {
     /// 대소문자만 다른 두 객체가 공존하고 몸체가 둘 중 어느 철자도 정확히
     /// 쓰지 않으면 ci는 어느 쪽인지 모른다 — 추측 간선 대신 miss를 남긴다.
     #[test]
-    fn oracle의_대소문자_충돌은_추측하지_않는다() {
+    fn oracle의_미인용_식별자는_대문자_객체에만_붙는다() {
         let doc = CatalogDocument {
             version: 1,
             dialect: "oracle".into(),
@@ -3198,11 +3074,14 @@ mod tests {
             }],
         };
         let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "SGFIX.V"
+            && e.to.as_str() == "SGFIX.ORDERS"));
         assert!(!g
             .edges()
             .iter()
-            .any(|e| e.kind == EdgeKind::Reads && e.from.as_str() == "SGFIX.V"));
-        assert!(notes.iter().any(|n| n.contains("Orders")));
+            .any(|e| e.kind == EdgeKind::Reads && e.to.as_str() == "SGFIX.orders"));
     }
 
     #[test]
@@ -3262,7 +3141,7 @@ mod tests {
     fn trigger_파싱_실패는_notes로_보고된다() {
         let doc = doc_with_trigger("CREATE TRIGGER t BEGIN ((( 깨짐; END");
         let (_g, notes) = build(&doc);
-        assert!(notes.iter().any(|n| n.contains("파싱 실패")));
+        assert!(notes.iter().any(|n| n.contains("parse failed")));
     }
 
     /// routine이 달린 document — PG 방언의 EXECUTE FUNCTION trigger도 실험한다.
@@ -3434,7 +3313,7 @@ mod tests {
         assert!(
             !notes
                 .iter()
-                .any(|n| n.contains("sync_orders") && n.contains("파싱 실패")),
+                .any(|n| n.contains("sync_orders") && n.contains("parse failed")),
             "notes: {notes:?}"
         );
     }
@@ -3531,7 +3410,7 @@ mod tests {
         assert!(
             notes
                 .iter()
-                .any(|n| n.contains("noop") && n.contains("파싱 실패")),
+                .any(|n| n.contains("noop") && n.contains("parse failed")),
             "notes: {notes:?}"
         );
     }
@@ -4861,7 +4740,7 @@ mod tests {
         assert!(!graph.edges().iter().any(|edge| {
             edge.kind == EdgeKind::Writes && edge.from.as_str() == "informix.orders.trg_touch"
         }));
-        assert!(notes.iter().any(|note| note.contains("파싱 실패")));
+        assert!(notes.iter().any(|note| note.contains("parse failed")));
     }
 
     #[test]

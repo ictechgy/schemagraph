@@ -12,6 +12,15 @@
   완료 조건은 기존 출력 호환, 결정적 결과, 필요한/금지된 간선, 실제 DB fixture다.
   v0.3.0은 공개되어 있으며 새 기능은 아직 배포하지 않았다. 최근 로컬 빌드·검증
   산출물은 정리했으므로 필요한 빌드를 다시 생성한다. 서명키 백업은 건드리지 않는다.
+  - 진행: graph v2의 객체별 분석 상태·원문 해시/위치(기존 v1 읽기 유지),
+    스코프 기반 view 컬럼 해석·값 계보, `dead` retain/이유 있는 예외/만료,
+    `diagnostics`·`explain`·`path`와 경로 탐색 예산을 구현했다.
+    Rust 173개 테스트가 통과했다. 실제 DB 전체 검증·문서 계약 갱신은 아직 남았다.
+    `scope.rs`는 재귀 CTE·SEMI/ANTI/APPLY·wildcard modifier를 보수적으로 partial 처리한다.
+  - 현재 작업: catalog diff+impact `review`, 수집 범위/카탈로그 의존성 계약,
+    기존 9종의 수집 깊이 강화. 이후 배포 바이너리/CI·외부 SQL·MCP/HTML·
+    조회 예산/증분 분석·식별자 호환을 이어간다. 신규 DB 선호 응답은 아직 없으며
+    수요 조건이 있는 신규 warehouse는 추가하지 않고 기존 DB 강화 기본안으로 진행한다.
 - 2026-09-20: **Maven Central v0.3.0 게시·설치 검증 완료**.
   [`io.github.ictechgy:schemagraph-probe:0.3.0`](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.3.0)을
   Central에 추가 게시했다. 소비자는 `mavenCentral()`만 사용하면 된다.

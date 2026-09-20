@@ -12,11 +12,13 @@ use schemagraph_analysis::{
 use schemagraph_core::{Edge, EdgeKind, EvidenceLayer, Graph, Level, Vertex, VertexKind};
 use serde::{Deserialize, Serialize};
 
+pub mod diagnostics;
+pub mod explain;
 pub mod mermaid;
 pub mod stream;
 
 /// graph.json의 와이어 버전. 형식이 깨지는 변경은 올린다.
-pub const GRAPH_VERSION: u32 = 1;
+pub const GRAPH_VERSION: u32 = 2;
 
 // ---------- kind 문자열 (와이어 계약) ----------
 
@@ -79,6 +81,8 @@ pub fn edge_kind_str(kind: EdgeKind) -> &'static str {
         EdgeKind::UsesType => "uses-type",
         EdgeKind::Contains => "contains",
         EdgeKind::Inferred => "inferred",
+        EdgeKind::DerivesFrom => "derives-from",
+        EdgeKind::DependsOn => "depends-on",
     }
 }
 
@@ -94,6 +98,8 @@ pub fn edge_kind_parse(s: &str) -> Option<EdgeKind> {
         "uses-type" => EdgeKind::UsesType,
         "contains" => EdgeKind::Contains,
         "inferred" => EdgeKind::Inferred,
+        "derives-from" => EdgeKind::DerivesFrom,
+        "depends-on" => EdgeKind::DependsOn,
         _ => return None,
     })
 }
@@ -126,6 +132,10 @@ pub struct GraphDoc {
     pub edges: Vec<EdgeDoc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limitations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analysis: Vec<diagnostics::AnalysisDoc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origins: Vec<diagnostics::OriginDoc>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -218,6 +228,8 @@ pub fn graph_to_doc(g: &Graph) -> GraphDoc {
         vertices,
         edges,
         limitations: g.limitations().to_vec(),
+        analysis: diagnostics::analysis_docs(g),
+        origins: diagnostics::origin_docs(g),
     }
 }
 
@@ -288,6 +300,7 @@ pub fn graph_from_doc(doc: &GraphDoc) -> Graph {
             "graph.json의 간선 {dropped_e}개가 알 수 없는 kind라 버림 (버전 불일치?)"
         ));
     }
+    diagnostics::restore(&mut g, &doc.analysis, &doc.origins);
     g
 }
 
@@ -375,7 +388,7 @@ pub fn impact_to_value(report: &ImpactReport) -> serde_json::Value {
 /// DeadReport → JSON Value. usage는 미수집(None)이면 키가 빠진다 —
 /// 0 관측은 usage가 있는 채로 reads=0/writes=0이다.
 pub fn dead_to_value(report: &DeadReport) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "candidates": report.candidates.iter().map(|c| {
             let mut v = serde_json::json!({
                 "id": c.vertex.id.as_str(),
@@ -396,11 +409,25 @@ pub fn dead_to_value(report: &DeadReport) -> serde_json::Value {
                 })
                 .unwrap_or(serde_json::Value::Null);
             }
+            if let Some(reason) = &c.suppression {
+                v["suppressed"] = serde_json::json!(true);
+                v["suppressionReason"] = serde_json::json!(reason);
+            }
             v
         }).collect::<Vec<_>>(),
         "limitations": report.limitations,
         "truncated": report.truncated,
-    })
+        "totalCandidates": report.total_candidates,
+        "unsuppressedCount": report.unsuppressed_count,
+    });
+    if !report.retained.is_empty() {
+        value["retained"] = serde_json::json!(report
+            .retained
+            .iter()
+            .map(|(id, reason)| serde_json::json!({"id":id.as_str(),"reason":reason}))
+            .collect::<Vec<_>>());
+    }
+    value
 }
 
 /// 그래프에 싣린 사용 통계를 그대로 보고한다 — 목록엔 관측된 정점만 나오고,

@@ -8,6 +8,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod diagnostics;
+pub use diagnostics::{AnalysisState, Diagnostic, ObjectAnalysis, Origin, SourceLocation};
+
+/// SQL 근거를 실제 간선에만 연결하기 위한 식별 키다.
+pub type OriginKey = (VertexId, VertexId, EdgeKind);
+
 /// 질의와 출력의 집계 단위.
 ///
 /// CLI의 `column` 레벨은 `Member`로 매핑한다. 컬럼이 의존성을 가지는 사실상
@@ -125,6 +131,10 @@ pub enum EdgeKind {
     Contains,
     /// 선언되지 않은 관계의 이름 규칙 추정. 탐색 보조이지 판정 근거가 아니다.
     Inferred,
+    /// 출력 컬럼 값의 유래. 조건절에서 읽은 컬럼과 구별한다.
+    DerivesFrom,
+    /// DB가 보고했으나 읽기·쓰기 등으로 분류할 수 없는 의존성.
+    DependsOn,
 }
 
 impl EdgeKind {
@@ -204,7 +214,7 @@ pub struct Vertex {
 ///
 /// 모든 컬렉션은 BTreeMap/BTreeSet이라 반복 순서가 결정적이다.
 /// `limitations`는 이 그래프를 만들면서 실측된 분석 한계다.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Graph {
     vertices: BTreeMap<VertexId, Vertex>,
     out_edges: BTreeMap<VertexId, Vec<Edge>>,
@@ -214,11 +224,52 @@ pub struct Graph {
     /// 정체성이 아니라 관측 부속물이라, 없는 것(미수집)과 0(미사용 관측)을
     /// Option으로 구분해야 한다.
     usage: BTreeMap<VertexId, Usage>,
+    analysis: BTreeMap<VertexId, ObjectAnalysis>,
+    origins: BTreeMap<OriginKey, BTreeSet<Origin>>,
 }
 
 impl Graph {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 같은 분석 입력의 진단 순서와 중복이 출력 바이트를 바꾸지 않게 한다.
+    pub fn set_analysis(&mut self, id: VertexId, mut analysis: ObjectAnalysis) {
+        if !self.vertices.contains_key(&id) {
+            self.add_limitation(format!(
+                "analysis target {id} does not exist; annotation omitted"
+            ));
+            return;
+        }
+        analysis.diagnostics.sort();
+        analysis.diagnostics.dedup();
+        self.analysis.insert(id, analysis);
+    }
+
+    /// 객체가 아예 분석되지 않은 경우와 성공한 빈 결과를 구별한다.
+    pub fn analysis(&self) -> &BTreeMap<VertexId, ObjectAnalysis> {
+        &self.analysis
+    }
+
+    /// 존재하는 간선에만 원문 근거를 연결해 유령 참조를 막는다.
+    pub fn add_origin(&mut self, key: OriginKey, origin: Origin) {
+        if self
+            .outgoing(&key.0)
+            .iter()
+            .any(|e| e.to == key.1 && e.kind == key.2)
+        {
+            self.origins.entry(key).or_default().insert(origin);
+        } else {
+            self.add_limitation(format!(
+                "origin edge {} -> {} does not exist; annotation omitted",
+                key.0, key.1
+            ));
+        }
+    }
+
+    /// 근거를 별도로 보관해 인접 리스트마다 원문 위치를 복제하지 않는다.
+    pub fn origins(&self) -> &BTreeMap<OriginKey, BTreeSet<Origin>> {
+        &self.origins
     }
 
     /// 이 그래프의 분석 한계(실측). 소비자가 "없는 것"과 "못 본 것"을
@@ -377,6 +428,27 @@ impl Graph {
             }
         }
         projected.limitations = self.limitations.clone();
+        for (id, analysis) in &self.analysis {
+            if projected.vertex(id).is_some() {
+                projected.set_analysis(id.clone(), analysis.clone());
+            }
+        }
+        for ((from, to, kind), origins) in &self.origins {
+            let (Some(from), Some(to)) =
+                (self.ancestor_at(from, level), self.ancestor_at(to, level))
+            else {
+                continue;
+            };
+            if projected
+                .outgoing(&from)
+                .iter()
+                .any(|e| e.to == to && e.kind == *kind)
+            {
+                for origin in origins {
+                    projected.add_origin((from.clone(), to.clone(), *kind), origin.clone());
+                }
+            }
+        }
         projected
     }
 

@@ -15,6 +15,8 @@ use serde::Deserialize;
 use std::io::{BufReader, BufWriter, Seek, Write};
 use std::path::PathBuf;
 
+mod policy;
+
 #[derive(Parser)]
 #[command(
     name = "schemagraph",
@@ -91,6 +93,46 @@ enum Command {
         /// Exit 1 when any candidate is reported (for CI).
         #[arg(long)]
         strict: bool,
+        /// Optional TOML policy; schemagraph.toml is loaded when present.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Preserve matching entry points and their transitive dependencies.
+        #[arg(long, value_delimiter = ',')]
+        retain: Vec<String>,
+        /// Reproducible date used to evaluate expiring suppressions.
+        #[arg(long)]
+        as_of: Option<String>,
+    },
+    /// Report structured per-object analysis coverage and diagnostic codes.
+    Diagnostics {
+        name: Option<String>,
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+    },
+    /// Explain incident edges using their catalog or SQL provenance.
+    Explain {
+        name: String,
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        #[arg(long, default_value_t = 1024)]
+        max: usize,
+    },
+    /// Find shortest dependency paths (use --reverse for impact direction).
+    Path {
+        from: String,
+        to: String,
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        max_paths: usize,
+        #[arg(long, default_value_t = 32)]
+        depth: u32,
+        #[arg(long, default_value_t = 100_000)]
+        max_visited: usize,
+        #[arg(long, default_value_t = 1_000_000)]
+        max_edges: usize,
+        #[arg(long)]
+        reverse: bool,
     },
     /// Report dependency cycles (delete ordering / deadlock analysis).
     Cycles {
@@ -204,7 +246,40 @@ async fn run(cli: Cli) -> Result<i32> {
             max,
         } => query(&name, &graph, depth, max),
         Command::Impact { name, graph, max } => impact(&name, &graph, max),
-        Command::Dead { graph, max, strict } => dead(&graph, max, strict),
+        Command::Dead {
+            graph,
+            max,
+            strict,
+            config,
+            retain,
+            as_of,
+        } => {
+            let policy = policy::load(config.as_deref(), &retain, as_of.as_deref())?;
+            dead(&graph, max, strict, &policy)
+        }
+        Command::Diagnostics { graph, name } => diagnostics(&graph, name.as_deref()),
+        Command::Explain { graph, name, max } => explain(&graph, &name, max),
+        Command::Path {
+            graph,
+            from,
+            to,
+            max_paths,
+            depth,
+            max_visited,
+            max_edges,
+            reverse,
+        } => path_report(
+            &graph,
+            &from,
+            &to,
+            analysis::paths::SearchOptions {
+                max_paths,
+                max_depth: depth,
+                max_visited,
+                max_edges,
+                reverse,
+            },
+        ),
         Command::Cycles {
             graph,
             level,
@@ -298,7 +373,7 @@ fn load_document(path: &std::path::Path) -> Result<source::CatalogDocument> {
 fn load_graph(path: &std::path::Path) -> Result<Graph> {
     let doc: GraphDoc = serde_json::from_reader(open_reader(path)?)
         .with_context(|| format!("graph.json 파싱 실패: {}", path.display()))?;
-    if doc.version != export::GRAPH_VERSION {
+    if !matches!(doc.version, 1 | export::GRAPH_VERSION) {
         bail!(
             "graph.json 버전 {}는 이 바이너리({})와 다르다 — 다시 scan해라",
             doc.version,
@@ -380,18 +455,105 @@ fn impact(name: &str, path: &std::path::Path, max: usize) -> Result<i32> {
     }
 }
 
-fn dead(path: &std::path::Path, max: usize, strict: bool) -> Result<i32> {
+fn dead(
+    path: &std::path::Path,
+    max: usize,
+    strict: bool,
+    policy: &analysis::RetentionPolicy,
+) -> Result<i32> {
     let graph = load_graph(path)?;
-    let report = analysis::dead(&graph, max);
+    let report = analysis::dead_with_policy(&graph, max, policy);
     println!(
         "{}",
         serde_json::to_string_pretty(&export::dead_to_value(&report))?
     );
-    Ok(if strict && !report.candidates.is_empty() {
+    Ok(if strict && report.unsuppressed_count > 0 {
         1
     } else {
         0
     })
+}
+
+fn diagnostics(path: &std::path::Path, name: Option<&str>) -> Result<i32> {
+    let graph = load_graph(path)?;
+    let id = match name.map(|name| (name, analysis::resolve(&graph, name))) {
+        Some((_, Resolve::Found(id))) => Some(id),
+        Some((name, Resolve::NotFound { candidates })) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&export::not_found_value(
+                    name,
+                    &candidates,
+                    graph.limitations()
+                ))?
+            );
+            return Ok(1);
+        }
+        None => None,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&export::diagnostics::report(&graph, id.as_ref()))?
+    );
+    Ok(0)
+}
+
+fn explain(path: &std::path::Path, name: &str, max: usize) -> Result<i32> {
+    let graph = load_graph(path)?;
+    match analysis::resolve(&graph, name) {
+        Resolve::Found(id) => {
+            let report = analysis::paths::explain(&graph, &id, max)
+                .expect("resolve verified the subject exists");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&export::explain::explanation_value(&report, &graph))?
+            );
+            Ok(0)
+        }
+        Resolve::NotFound { candidates } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&export::not_found_value(
+                    name,
+                    &candidates,
+                    graph.limitations()
+                ))?
+            );
+            Ok(1)
+        }
+    }
+}
+
+fn path_report(
+    path: &std::path::Path,
+    from: &str,
+    to: &str,
+    options: analysis::paths::SearchOptions,
+) -> Result<i32> {
+    let graph = load_graph(path)?;
+    let mut endpoints = Vec::new();
+    for name in [from, to] {
+        match analysis::resolve(&graph, name) {
+            Resolve::Found(id) => endpoints.push(id),
+            Resolve::NotFound { candidates } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&export::not_found_value(
+                        name,
+                        &candidates,
+                        graph.limitations()
+                    ))?
+                );
+                return Ok(1);
+            }
+        }
+    }
+    let report = analysis::paths::paths(&graph, &endpoints[0], &endpoints[1], options, None);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&export::explain::path_value(&report))?
+    );
+    Ok(0)
 }
 
 fn stats(path: &std::path::Path) -> Result<i32> {

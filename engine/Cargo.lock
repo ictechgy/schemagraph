@@ -1116,6 +1116,7 @@ version = "0.3.0"
 dependencies = [
  "schemagraph-core",
  "schemagraph-source",
+ "sha2",
  "sqlparser",
 ]
 

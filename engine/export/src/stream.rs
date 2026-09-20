@@ -14,8 +14,10 @@ use crate::{edge_kind_str, layer_str, level_str, vertex_kind_str, GRAPH_VERSION}
 pub fn write_graph(writer: impl Write, graph: &Graph) -> serde_json::Result<()> {
     let edges = graph.edges();
     let view = GraphView {
+        analysis: crate::diagnostics::analysis_docs(graph),
         edges: Edges(&edges),
         limitations: graph.limitations(),
+        origins: crate::diagnostics::origin_docs(graph),
         version: GRAPH_VERSION,
         vertices: Vertices(graph),
     };
@@ -24,9 +26,13 @@ pub fn write_graph(writer: impl Write, graph: &Graph) -> serde_json::Result<()> 
 
 #[derive(Serialize)]
 struct GraphView<'a> {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    analysis: Vec<crate::diagnostics::AnalysisDoc>,
     edges: Edges<'a>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     limitations: &'a [String],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    origins: Vec<crate::diagnostics::OriginDoc>,
     version: u32,
     vertices: Vertices<'a>,
 }
