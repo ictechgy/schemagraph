@@ -106,15 +106,92 @@ func (h *harvester) extractMSSQL() CatalogDocument {
 	return doc
 }
 
+func (h *harvester) mssqlSchemaNames() []string {
+	names := []string{}
+	h.bestEffort("schemas", `SELECT DISTINCT s.name
+		FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id
+		WHERE o.type IN ('U','V','SN','P','FN','IF','TF') AND o.is_ms_shipped = 0
+		ORDER BY s.name`, func(rs *sql.Rows) error {
+		var name string
+		if err := rs.Scan(&name); err != nil {
+			return err
+		}
+		if h.keepSchema(name) {
+			names = append(names, name)
+		}
+		return nil
+	})
+	return names
+}
+
+func (h *harvester) mssqlSchema(schema string) SchemaDoc {
+	objects := h.mssqlObjects()[schema]
+	columns := h.mssqlColumns()
+	pkPos, pkCons := h.mssqlPrimaryKeys()
+	fks := h.mssqlForeignKeys()
+	indexes := h.mssqlIndexes()
+	views := h.mssqlViews()
+	triggers := h.mssqlTriggers()
+	routines := h.mssqlRoutines()[schema]
+	for i := range objects {
+		key := schema + "." + objects[i].Name
+		objects[i].Columns = columns[key]
+		for j := range objects[i].Columns {
+			objects[i].Columns[j].PkPosition = pkPos[key][objects[i].Columns[j].Name]
+		}
+		if objects[i].Columns == nil {
+			objects[i].Columns = []ColumnDoc{}
+		}
+		objects[i].Constraints = append(pkCons[key], fks[key]...)
+		if objects[i].Constraints == nil {
+			objects[i].Constraints = []ConstraintDoc{}
+		}
+		if objects[i].Kind == "table" {
+			objects[i].Indexes = indexes[key]
+		}
+		if objects[i].Indexes == nil {
+			objects[i].Indexes = []IndexDoc{}
+		}
+		if body, ok := views[key]; ok {
+			objects[i].Body = &body
+		}
+		objects[i].Triggers = triggers[key]
+		if objects[i].Triggers == nil {
+			objects[i].Triggers = []TriggerDoc{}
+		}
+	}
+	sd := SchemaDoc{Name: schema, Objects: objects, Routines: routines}
+	normalizeSchema(&sd)
+	return sd
+}
+
+func (h *harvester) streamMSSQL(stream *ndjsonStreamWriter) error {
+	schemas := h.mssqlSchemaNames()
+	original := h.schemaFilter
+	originalActive := h.activeSchema
+	defer func() {
+		h.schemaFilter = original
+		h.activeSchema = originalActive
+	}()
+	for _, schema := range schemas {
+		h.schemaFilter = map[string]bool{schema: true}
+		h.activeSchema = &schema
+		if err := stream.schema(h.mssqlSchema(schema)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // mssqlObjects — sys.objects의 사용자 객체. is_ms_shipped=0이 시스템 객체를
 // 걸러 JDBC getTables의 TABLE_TYPE 필터와 같은 멤버를 낸다.
 func (h *harvester) mssqlObjects() map[string][]ObjectDoc {
 	out := map[string][]ObjectDoc{}
-	h.bestEffort("objects",
-		`SELECT s.name, o.name, o.type
+	query, args := h.mssqlScopedQuery(`SELECT s.name, o.name, o.type
 		 FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id
 		 WHERE o.type IN ('U','V','SN') AND o.is_ms_shipped = 0
-		 ORDER BY s.name, o.name`,
+		 ORDER BY s.name, o.name`, "s.name = @schema")
+	h.bestEffortArgs("objects", query, args,
 		func(rs *sql.Rows) error {
 			var schema, name, typ string
 			if err := rs.Scan(&schema, &name, &typ); err != nil {
@@ -141,8 +218,7 @@ func (h *harvester) mssqlObjects() map[string][]ObjectDoc {
 // — JDBC COLUMN_DEF와 같은 역할이다.
 func (h *harvester) mssqlColumns() map[string][]ColumnDoc {
 	out := map[string][]ColumnDoc{}
-	h.bestEffort("columns",
-		`SELECT s.name, o.name, c.name, t.name, c.is_nullable, dc.definition, c.column_id
+	query, args := h.mssqlScopedQuery(`SELECT s.name, o.name, c.name, t.name, c.is_nullable, dc.definition, c.column_id
 		 FROM sys.columns c
 		 JOIN sys.objects o ON o.object_id = c.object_id
 		 JOIN sys.schemas s ON s.schema_id = o.schema_id
@@ -150,7 +226,8 @@ func (h *harvester) mssqlColumns() map[string][]ColumnDoc {
 		 LEFT JOIN sys.default_constraints dc
 		   ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
 		 WHERE o.type IN ('U','V','SN') AND o.is_ms_shipped = 0
-		 ORDER BY s.name, o.name, c.column_id`,
+		 ORDER BY s.name, o.name, c.column_id`, "s.name = @schema")
+	h.bestEffortArgs("columns", query, args,
 		func(rs *sql.Rows) error {
 			var schema, obj, name, dtype string
 			var nullable bool
@@ -158,6 +235,9 @@ func (h *harvester) mssqlColumns() map[string][]ColumnDoc {
 			var ord int
 			if err := rs.Scan(&schema, &obj, &name, &dtype, &nullable, &def, &ord); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			k := schema + "." + obj
 			out[k] = append(out[k], ColumnDoc{
@@ -175,8 +255,7 @@ func (h *harvester) mssqlColumns() map[string][]ColumnDoc {
 func (h *harvester) mssqlPrimaryKeys() (map[string]map[string]int, map[string][]ConstraintDoc) {
 	pos := map[string]map[string]int{}
 	cons := map[string][]ConstraintDoc{}
-	h.bestEffort("primary keys",
-		`SELECT s.name, o.name, kc.name, c.name, ic.key_ordinal
+	query, args := h.mssqlScopedQuery(`SELECT s.name, o.name, kc.name, c.name, ic.key_ordinal
 		 FROM sys.key_constraints kc
 		 JOIN sys.objects o ON o.object_id = kc.parent_object_id
 		 JOIN sys.schemas s ON s.schema_id = o.schema_id
@@ -184,12 +263,16 @@ func (h *harvester) mssqlPrimaryKeys() (map[string]map[string]int, map[string][]
 		   ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id
 		 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
 		 WHERE kc.type = 'PK' AND o.is_ms_shipped = 0
-		 ORDER BY s.name, o.name, ic.key_ordinal`,
+		 ORDER BY s.name, o.name, ic.key_ordinal`, "s.name = @schema")
+	h.bestEffortArgs("primary keys", query, args,
 		func(rs *sql.Rows) error {
 			var schema, obj, name, col string
 			var ord int
 			if err := rs.Scan(&schema, &obj, &name, &col, &ord); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			k := schema + "." + obj
 			if pos[k] == nil {
@@ -211,8 +294,7 @@ func (h *harvester) mssqlPrimaryKeys() (map[string]map[string]int, map[string][]
 // referenced_object_id의 스키마라 크로스 스키마 FK도 원래 소유자를 가리킨다.
 func (h *harvester) mssqlForeignKeys() map[string][]ConstraintDoc {
 	out := map[string][]ConstraintDoc{}
-	h.bestEffort("foreign keys",
-		`SELECT s.name, o.name, fk.name, fc.name, rs.name, ro.name, rc.name,
+	query, args := h.mssqlScopedQuery(`SELECT s.name, o.name, fk.name, fc.name, rs.name, ro.name, rc.name,
 		        fkc.constraint_column_id
 		 FROM sys.foreign_keys fk
 		 JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
@@ -225,12 +307,16 @@ func (h *harvester) mssqlForeignKeys() map[string][]ConstraintDoc {
 		 JOIN sys.columns rc
 		   ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
 		 WHERE o.is_ms_shipped = 0
-		 ORDER BY s.name, o.name, fk.name, fkc.constraint_column_id`,
+		 ORDER BY s.name, o.name, fk.name, fkc.constraint_column_id`, "s.name = @schema")
+	h.bestEffortArgs("foreign keys", query, args,
 		func(rs *sql.Rows) error {
 			var schema, obj, name, col, rschema, rtable, rcol string
 			var ord int
 			if err := rs.Scan(&schema, &obj, &name, &col, &rschema, &rtable, &rcol, &ord); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			k := schema + "." + obj
 			n := len(out[k])
@@ -253,8 +339,7 @@ func (h *harvester) mssqlForeignKeys() map[string][]ConstraintDoc {
 // INCLUDE 컬럼을 뺀다 — JDBC getIndexInfo가 돌려주는 건 키 컬럼뿐이다.
 func (h *harvester) mssqlIndexes() map[string][]IndexDoc {
 	out := map[string][]IndexDoc{}
-	h.bestEffort("indexes",
-		`SELECT s.name, o.name, i.name, i.is_unique, c.name, ic.key_ordinal
+	query, args := h.mssqlScopedQuery(`SELECT s.name, o.name, i.name, i.is_unique, c.name, ic.key_ordinal
 		 FROM sys.indexes i
 		 JOIN sys.objects o ON o.object_id = i.object_id
 		 JOIN sys.schemas s ON s.schema_id = o.schema_id
@@ -262,13 +347,17 @@ func (h *harvester) mssqlIndexes() map[string][]IndexDoc {
 		 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
 		 WHERE i.type > 0 AND i.is_hypothetical = 0 AND i.name IS NOT NULL
 		   AND ic.is_included_column = 0 AND o.is_ms_shipped = 0
-		 ORDER BY s.name, o.name, i.name, ic.key_ordinal`,
+		 ORDER BY s.name, o.name, i.name, ic.key_ordinal`, "s.name = @schema")
+	h.bestEffortArgs("indexes", query, args,
 		func(rs *sql.Rows) error {
 			var schema, obj, name, col string
 			var uniq bool
 			var ord int
 			if err := rs.Scan(&schema, &obj, &name, &uniq, &col, &ord); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			k := schema + "." + obj
 			n := len(out[k])
@@ -285,14 +374,17 @@ func (h *harvester) mssqlIndexes() map[string][]IndexDoc {
 // (INFORMATION_SCHEMA.VIEWS는 4000자에서 잘린다 — Kotlin과 같은 이유).
 func (h *harvester) mssqlViews() map[string]string {
 	out := map[string]string{}
-	h.bestEffort("views",
-		`SELECT SCHEMA_NAME(o.schema_id), o.name, m.definition
+	query, args := h.mssqlScopedQuery(`SELECT SCHEMA_NAME(o.schema_id), o.name, m.definition
 		 FROM sys.views o
-		 JOIN sys.sql_modules m ON m.object_id = o.object_id`,
+		 JOIN sys.sql_modules m ON m.object_id = o.object_id`, "SCHEMA_NAME(o.schema_id) = @schema")
+	h.bestEffortArgs("views", query, args,
 		func(rs *sql.Rows) error {
 			var schema, name, def string
 			if err := rs.Scan(&schema, &name, &def); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			out[schema+"."+name] = def
 			return nil
@@ -303,16 +395,19 @@ func (h *harvester) mssqlViews() map[string]string {
 // mssqlTriggers — parent_class=1은 테이블/뷰 트리거만(0은 DDL 트리거).
 func (h *harvester) mssqlTriggers() map[string][]TriggerDoc {
 	out := map[string][]TriggerDoc{}
-	h.bestEffort("triggers",
-		`SELECT SCHEMA_NAME(p.schema_id), p.name, t.name, m.definition
+	query, args := h.mssqlScopedQuery(`SELECT SCHEMA_NAME(p.schema_id), p.name, t.name, m.definition
 		 FROM sys.triggers t
 		 JOIN sys.objects p ON p.object_id = t.parent_id
 		 JOIN sys.sql_modules m ON m.object_id = t.object_id
-		 WHERE t.parent_class = 1`,
+		 WHERE t.parent_class = 1`, "SCHEMA_NAME(p.schema_id) = @schema")
+	h.bestEffortArgs("triggers", query, args,
 		func(rs *sql.Rows) error {
 			var schema, obj, name, def string
 			if err := rs.Scan(&schema, &obj, &name, &def); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			k := schema + "." + obj
 			out[k] = append(out[k], TriggerDoc{Name: name, Body: &def})
@@ -326,11 +421,11 @@ func (h *harvester) mssqlTriggers() map[string][]TriggerDoc {
 // language는 "sql" — 엔진이 MsSqlDialect로 파싱한다.
 func (h *harvester) mssqlRoutines() map[string][]RoutineDoc {
 	bodies := map[string][]RoutineDoc{}
-	h.bestEffort("routines",
-		`SELECT SCHEMA_NAME(o.schema_id), o.name, o.type, m.definition
+	query, args := h.mssqlScopedQuery(`SELECT SCHEMA_NAME(o.schema_id), o.name, o.type, m.definition
 		 FROM sys.objects o
 		 JOIN sys.sql_modules m ON m.object_id = o.object_id
-		 WHERE o.type IN ('P','FN','IF','TF')`,
+		 WHERE o.type IN ('P','FN','IF','TF')`, "SCHEMA_NAME(o.schema_id) = @schema")
+	h.bestEffortArgs("routines", query, args,
 		func(rs *sql.Rows) error {
 			var schema, name, typ, def string
 			if err := rs.Scan(&schema, &name, &typ, &def); err != nil {
@@ -351,16 +446,19 @@ func (h *harvester) mssqlRoutines() map[string][]RoutineDoc {
 		})
 
 	params := map[string]string{}
-	h.bestEffort("routine parameters",
-		`SELECT SCHEMA_NAME(o.schema_id), o.name, TYPE_NAME(p.user_type_id)
+	query, args = h.mssqlScopedQuery(`SELECT SCHEMA_NAME(o.schema_id), o.name, TYPE_NAME(p.user_type_id)
 		 FROM sys.parameters p
 		 JOIN sys.objects o ON o.object_id = p.object_id
 		 WHERE o.type IN ('P','FN','IF','TF') AND p.parameter_id > 0
-		 ORDER BY o.name, p.parameter_id`,
+		 ORDER BY o.name, p.parameter_id`, "SCHEMA_NAME(o.schema_id) = @schema")
+	h.bestEffortArgs("routine parameters", query, args,
 		func(rs *sql.Rows) error {
 			var schema, name, dtype string
 			if err := rs.Scan(&schema, &name, &dtype); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			k := schema + "." + name
 			if cur := params[k]; cur != "" {

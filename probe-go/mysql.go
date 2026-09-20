@@ -11,31 +11,39 @@ import (
 // 방언별로 노출되는 항목도 가능한 한 같은 wire 계약으로 보존한다.
 func (h *harvester) extractMySQL() CatalogDocument {
 	schemas := h.mysqlSchemas()
-	objects := map[string][]ObjectDoc{}
-	routines := map[string][]RoutineDoc{}
-	for _, schema := range schemas {
-		objects[schema] = h.mysqlObjects(schema)
-		for i := range objects[schema] {
-			obj := &objects[schema][i]
-			obj.Columns = h.mysqlColumns(schema, obj.Name)
-			obj.Constraints = h.mysqlConstraints(schema, obj.Name)
-			obj.Indexes = h.mysqlIndexes(schema, obj.Name)
-			obj.Triggers = h.mysqlTriggers(schema, obj.Name)
-		}
-		h.mysqlObjectUsage(schema, objects[schema])
-		routines[schema] = h.mysqlRoutines(schema)
-	}
-
 	doc := CatalogDocument{
 		Version: documentVersion, Dialect: "mysql", Reader: "probe-go",
-		Schemas: []SchemaDoc{}, Limitations: append([]string{}, h.limitations...),
+		Schemas: []SchemaDoc{}, Limitations: []string{},
 	}
 	for _, schema := range schemas {
-		sd := SchemaDoc{Name: schema, Objects: objects[schema], Routines: routines[schema]}
-		normalizeSchema(&sd)
-		doc.Schemas = append(doc.Schemas, sd)
+		doc.Schemas = append(doc.Schemas, h.mysqlSchema(schema))
 	}
+	doc.Limitations = append([]string{}, h.limitations...)
 	return doc
+}
+
+func (h *harvester) mysqlSchema(schema string) SchemaDoc {
+	objects := h.mysqlObjects(schema)
+	for i := range objects {
+		obj := &objects[i]
+		obj.Columns = h.mysqlColumns(schema, obj.Name)
+		obj.Constraints = h.mysqlConstraints(schema, obj.Name)
+		obj.Indexes = h.mysqlIndexes(schema, obj.Name)
+		obj.Triggers = h.mysqlTriggers(schema, obj.Name)
+	}
+	h.mysqlObjectUsage(schema, objects)
+	sd := SchemaDoc{Name: schema, Objects: objects, Routines: h.mysqlRoutines(schema)}
+	normalizeSchema(&sd)
+	return sd
+}
+
+func (h *harvester) streamMySQL(stream *ndjsonStreamWriter) error {
+	for _, schema := range h.mysqlSchemas() {
+		if err := stream.schema(h.mysqlSchema(schema)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // mysqlSchemaAllowed — information_schema의 시스템 schema는 기본 수확에서

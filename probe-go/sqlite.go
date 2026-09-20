@@ -27,29 +27,42 @@ func (h *harvester) extractSQLite() CatalogDocument {
 		Schemas: []SchemaDoc{}, Limitations: []string{},
 	}
 	for _, schema := range schemas {
-		objects := h.sqliteObjects(schema)
-		sd := SchemaDoc{Name: schema, Objects: []ObjectDoc{}, Routines: []RoutineDoc{}}
-		for _, raw := range objects {
-			columns := h.sqliteColumns(schema, raw.name)
-			constraints := h.sqliteConstraints(schema, raw.name)
-			indexes := h.sqliteIndexes(schema, raw.name)
-			obj := ObjectDoc{
-				Name: raw.name, Kind: raw.kind, Columns: columns,
-				Constraints: constraints, Indexes: indexes, Triggers: []TriggerDoc{},
-				Body: raw.body,
-			}
-			for i := range obj.Columns {
-				obj.Columns[i].PkPosition = sqlitePrimaryPosition(obj.Columns[i])
-			}
-			sd.Objects = append(sd.Objects, obj)
-		}
-		h.sqliteTriggers(schema, sd.Objects)
-		sort.Slice(sd.Objects, func(i, j int) bool { return sd.Objects[i].Name < sd.Objects[j].Name })
-		doc.Schemas = append(doc.Schemas, sd)
+		doc.Schemas = append(doc.Schemas, h.sqliteSchema(schema))
 	}
 	sort.Slice(doc.Schemas, func(i, j int) bool { return doc.Schemas[i].Name < doc.Schemas[j].Name })
 	doc.Limitations = append(doc.Limitations, h.limitations...)
 	return doc
+}
+
+func (h *harvester) sqliteSchema(schema string) SchemaDoc {
+	objects := h.sqliteObjects(schema)
+	sd := SchemaDoc{Name: schema, Objects: []ObjectDoc{}, Routines: []RoutineDoc{}}
+	for _, raw := range objects {
+		columns := h.sqliteColumns(schema, raw.name)
+		constraints := h.sqliteConstraints(schema, raw.name)
+		indexes := h.sqliteIndexes(schema, raw.name)
+		obj := ObjectDoc{
+			Name: raw.name, Kind: raw.kind, Columns: columns,
+			Constraints: constraints, Indexes: indexes, Triggers: []TriggerDoc{},
+			Body: raw.body,
+		}
+		for i := range obj.Columns {
+			obj.Columns[i].PkPosition = sqlitePrimaryPosition(obj.Columns[i])
+		}
+		sd.Objects = append(sd.Objects, obj)
+	}
+	h.sqliteTriggers(schema, sd.Objects)
+	sort.Slice(sd.Objects, func(i, j int) bool { return sd.Objects[i].Name < sd.Objects[j].Name })
+	return sd
+}
+
+func (h *harvester) streamSQLite(stream *ndjsonStreamWriter) error {
+	for _, schema := range h.sqliteSchemas() {
+		if err := stream.schema(h.sqliteSchema(schema)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // sqliteSchemas — database_list의 attached 순서를 정렬해 결과를 결정적으로 만든다.

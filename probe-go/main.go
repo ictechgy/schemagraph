@@ -128,12 +128,17 @@ type harvester struct {
 	dialect      string
 	schemaFilter map[string]bool
 	limitations  []string
+	activeSchema *string
 }
 
 // bestEffort — 수확 실패를 limitation으로 변환한다. Kotlin Extractor의 규칙과
 // 같다: 쿼리가 안 먹는 DB는 그 사실을 숨기지 않고 신고해야 한다.
 func (h *harvester) bestEffort(label, query string, row func(rows *sql.Rows) error) {
-	rows, err := h.db.Query(query)
+	h.bestEffortArgs(label, query, nil, row)
+}
+
+func (h *harvester) bestEffortArgs(label, query string, args []any, row func(rows *sql.Rows) error) {
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.limitations = append(h.limitations,
 			fmt.Sprintf("%s 원문 미수확(%s) — 간선이 빠질 수 있다", label, oneLine(err.Error())))
@@ -209,6 +214,27 @@ func main() {
 		if schema = strings.TrimSpace(schema); schema != "" {
 			h.schemaFilter[schema] = true
 		}
+	}
+	if *format == "ndjson" {
+		if *output == "-" {
+			if err := h.streamNDJSON(os.Stdout, *wireVersion); err != nil {
+				fatal("document streaming failed", err)
+			}
+		} else {
+			file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+			if err != nil {
+				fatal("document output failed", err)
+			}
+			err = h.streamNDJSON(file, *wireVersion)
+			closeErr := file.Close()
+			if err != nil {
+				fatal("document streaming failed", err)
+			}
+			if closeErr != nil {
+				fatal("document output failed", closeErr)
+			}
+		}
+		return
 	}
 	doc := h.extract()
 	doc.Limitations = sortedDistinct(doc.Limitations)
@@ -320,11 +346,19 @@ func (h *harvester) extract() CatalogDocument {
 func (h *harvester) collectObjects() map[string][]ObjectDoc {
 	type raw struct{ schema, name, kind string }
 	var rows []raw
-	h.bestEffort("objects",
-		`SELECT OWNER, TABLE_NAME, 'table' FROM ALL_TABLES WHERE TEMPORARY = 'N'
+	query := `SELECT OWNER, TABLE_NAME, 'table' FROM ALL_TABLES WHERE TEMPORARY = 'N'
 		 UNION ALL SELECT OWNER, VIEW_NAME, 'view' FROM ALL_VIEWS
 		 UNION ALL SELECT OWNER, MVIEW_NAME, 'materialized-view' FROM ALL_MVIEWS
-		 UNION ALL SELECT OWNER, SYNONYM_NAME, 'synonym' FROM ALL_SYNONYMS`,
+		 UNION ALL SELECT OWNER, SYNONYM_NAME, 'synonym' FROM ALL_SYNONYMS`
+	var args []any
+	if h.activeSchema != nil {
+		query = `SELECT OWNER, TABLE_NAME, 'table' FROM ALL_TABLES WHERE TEMPORARY = 'N' AND OWNER = :schema
+		 UNION ALL SELECT OWNER, VIEW_NAME, 'view' FROM ALL_VIEWS WHERE OWNER = :schema
+		 UNION ALL SELECT OWNER, MVIEW_NAME, 'materialized-view' FROM ALL_MVIEWS WHERE OWNER = :schema
+		 UNION ALL SELECT OWNER, SYNONYM_NAME, 'synonym' FROM ALL_SYNONYMS WHERE OWNER = :schema`
+		args = []any{sql.Named("schema", *h.activeSchema)}
+	}
+	h.bestEffortArgs("objects", query, args,
 		func(rs *sql.Rows) error {
 			var r raw
 			if err := rs.Scan(&r.schema, &r.name, &r.kind); err != nil {
@@ -376,14 +410,17 @@ func (h *harvester) collectColumns() map[string][]ColumnDoc {
 	// DATA_DEFAULT는 LONG이라 본문과 분리해 두 단계로 수확한다 — LONG을 못
 	// 읽는 드라이버에서도 컬럼 목록은 살아남는다.
 	out := map[string][]ColumnDoc{}
-	h.bestEffort("columns",
-		`SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, NULLABLE, COLUMN_ID
-		 FROM ALL_TAB_COLUMNS ORDER BY OWNER, TABLE_NAME, COLUMN_ID`,
+	query, args := h.oracleScopedQuery(`SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, NULLABLE, COLUMN_ID
+		 FROM ALL_TAB_COLUMNS ORDER BY OWNER, TABLE_NAME, COLUMN_ID`, "OWNER = :schema")
+	h.bestEffortArgs("columns", query, args,
 		func(rs *sql.Rows) error {
 			var schema, table, name, dtype, nullable string
 			var ord int
 			if err := rs.Scan(&schema, &table, &name, &dtype, &nullable, &ord); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			key := schema + "." + table
 			out[key] = append(out[key], ColumnDoc{
@@ -393,13 +430,16 @@ func (h *harvester) collectColumns() map[string][]ColumnDoc {
 			return nil
 		})
 	defaults := map[string]*string{}
-	h.bestEffort("column defaults",
-		`SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_DEFAULT FROM ALL_TAB_COLUMNS`,
+	query, args = h.oracleScopedQuery(`SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_DEFAULT FROM ALL_TAB_COLUMNS`, "OWNER = :schema")
+	h.bestEffortArgs("column defaults", query, args,
 		func(rs *sql.Rows) error {
 			var schema, table, name string
 			var def sql.NullString
 			if err := rs.Scan(&schema, &table, &name, &def); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			defaults[schema+"."+table+"."+name] = ns(def)
 			return nil
@@ -419,18 +459,21 @@ func (h *harvester) collectPrimaryKeys() (map[string]map[string]int, map[string]
 		cols map[int]string
 	}
 	byTable := map[string]map[string]map[int]string{}
-	h.bestEffort("primary keys",
-		`SELECT c.OWNER, c.TABLE_NAME, c.CONSTRAINT_NAME, cc.COLUMN_NAME, cc.POSITION
+	query, args := h.oracleScopedQuery(`SELECT c.OWNER, c.TABLE_NAME, c.CONSTRAINT_NAME, cc.COLUMN_NAME, cc.POSITION
 		 FROM ALL_CONSTRAINTS c
 		 JOIN ALL_CONS_COLUMNS cc ON cc.OWNER = c.OWNER
 		   AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME AND cc.TABLE_NAME = c.TABLE_NAME
 		 WHERE c.CONSTRAINT_TYPE = 'P'
-		 ORDER BY c.OWNER, c.TABLE_NAME, c.CONSTRAINT_NAME, cc.POSITION`,
+		 ORDER BY c.OWNER, c.TABLE_NAME, c.CONSTRAINT_NAME, cc.POSITION`, "c.OWNER = :schema")
+	h.bestEffortArgs("primary keys", query, args,
 		func(rs *sql.Rows) error {
 			var schema, table, cname, col string
 			var p int
 			if err := rs.Scan(&schema, &table, &cname, &col, &p); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			key := schema + "." + table
 			if byTable[key] == nil {
@@ -475,8 +518,7 @@ func (h *harvester) collectForeignKeys() map[string][]ConstraintDoc {
 	}
 	byName := map[string]map[int]row{}
 	order := map[string][]string{}
-	h.bestEffort("foreign keys",
-		`SELECT c.OWNER, c.TABLE_NAME, c.CONSTRAINT_NAME, cc.COLUMN_NAME, cc.POSITION,
+	query, args := h.oracleScopedQuery(`SELECT c.OWNER, c.TABLE_NAME, c.CONSTRAINT_NAME, cc.COLUMN_NAME, cc.POSITION,
 		        rc.OWNER, rc.TABLE_NAME, rcc.COLUMN_NAME
 		 FROM ALL_CONSTRAINTS c
 		 JOIN ALL_CONS_COLUMNS cc ON cc.OWNER = c.OWNER
@@ -487,12 +529,16 @@ func (h *harvester) collectForeignKeys() map[string][]ConstraintDoc {
 		   AND rcc.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
 		   AND rcc.TABLE_NAME = rc.TABLE_NAME AND rcc.POSITION = cc.POSITION
 		 WHERE c.CONSTRAINT_TYPE = 'R'
-		 ORDER BY c.OWNER, c.TABLE_NAME, c.CONSTRAINT_NAME, cc.POSITION`,
+		 ORDER BY c.OWNER, c.TABLE_NAME, c.CONSTRAINT_NAME, cc.POSITION`, "c.OWNER = :schema")
+	h.bestEffortArgs("foreign keys", query, args,
 		func(rs *sql.Rows) error {
 			var r row
 			if err := rs.Scan(&r.schema, &r.table, &r.name, &r.col, &r.pos,
 				&r.rSchema, &r.rTable, &r.rCol); err != nil {
 				return err
+			}
+			if !h.keepSchema(r.schema) {
+				return nil
 			}
 			key := r.schema + "." + r.table
 			if byName[key] == nil {
@@ -545,18 +591,21 @@ func (h *harvester) collectIndexes() map[string][]IndexDoc {
 		cols   map[int]string
 	}
 	byTable := map[string]map[string]*idx{}
-	h.bestEffort("indexes",
-		`SELECT i.OWNER, i.TABLE_NAME, i.INDEX_NAME, i.UNIQUENESS,
+	query, args := h.oracleScopedQuery(`SELECT i.OWNER, i.TABLE_NAME, i.INDEX_NAME, i.UNIQUENESS,
 		        ic.COLUMN_NAME, ic.COLUMN_POSITION
 		 FROM ALL_INDEXES i
 		 JOIN ALL_IND_COLUMNS ic ON ic.INDEX_OWNER = i.OWNER
 		   AND ic.INDEX_NAME = i.INDEX_NAME
-		 ORDER BY i.OWNER, i.TABLE_NAME, i.INDEX_NAME, ic.COLUMN_POSITION`,
+		 ORDER BY i.OWNER, i.TABLE_NAME, i.INDEX_NAME, ic.COLUMN_POSITION`, "i.OWNER = :schema")
+	h.bestEffortArgs("indexes", query, args,
 		func(rs *sql.Rows) error {
 			var schema, table, name, uniq, col string
 			var pos int
 			if err := rs.Scan(&schema, &table, &name, &uniq, &col, &pos); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			key := schema + "." + table
 			if byTable[key] == nil {
@@ -591,26 +640,32 @@ func (h *harvester) collectIndexes() map[string][]IndexDoc {
 
 func (h *harvester) collectViews() map[string]string {
 	out := map[string]string{}
-	h.bestEffort("views",
-		"SELECT OWNER, VIEW_NAME, TEXT FROM ALL_VIEWS",
+	query, args := h.oracleScopedQuery("SELECT OWNER, VIEW_NAME, TEXT FROM ALL_VIEWS", "OWNER = :schema")
+	h.bestEffortArgs("views", query, args,
 		func(rs *sql.Rows) error {
 			var schema, name string
 			var text sql.NullString
 			if err := rs.Scan(&schema, &name, &text); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			if text.Valid {
 				out[schema+"."+name] = text.String
 			}
 			return nil
 		})
-	h.bestEffort("materialized views",
-		"SELECT OWNER, MVIEW_NAME, QUERY FROM ALL_MVIEWS",
+	query, args = h.oracleScopedQuery("SELECT OWNER, MVIEW_NAME, QUERY FROM ALL_MVIEWS", "OWNER = :schema")
+	h.bestEffortArgs("materialized views", query, args,
 		func(rs *sql.Rows) error {
 			var schema, name string
 			var text sql.NullString
 			if err := rs.Scan(&schema, &name, &text); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			if text.Valid {
 				out[schema+"."+name] = text.String
@@ -622,13 +677,16 @@ func (h *harvester) collectViews() map[string]string {
 
 func (h *harvester) collectTriggers() map[string][]TriggerDoc {
 	out := map[string][]TriggerDoc{}
-	h.bestEffort("triggers",
-		"SELECT OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGER_BODY FROM ALL_TRIGGERS",
+	query, args := h.oracleScopedQuery("SELECT OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGER_BODY FROM ALL_TRIGGERS", "OWNER = :schema")
+	h.bestEffortArgs("triggers", query, args,
 		func(rs *sql.Rows) error {
 			var schema, table, name string
 			var body sql.NullString
 			if err := rs.Scan(&schema, &table, &name, &body); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			out[schema+"."+table] = append(out[schema+"."+table],
 				TriggerDoc{Name: name, Body: ns(body)})
@@ -647,18 +705,21 @@ func (h *harvester) collectTriggers() map[string][]TriggerDoc {
 func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 	type key struct{ schema, name, typ string }
 	bodies := map[key]*strings.Builder{}
-	h.bestEffort("routines",
-		`SELECT o.OWNER, o.OBJECT_NAME, o.OBJECT_TYPE, s.LINE, s.TEXT
+	query, args := h.oracleScopedQuery(`SELECT o.OWNER, o.OBJECT_NAME, o.OBJECT_TYPE, s.LINE, s.TEXT
 		 FROM ALL_OBJECTS o
 		 JOIN ALL_SOURCE s ON s.OWNER = o.OWNER
 		   AND s.NAME = o.OBJECT_NAME AND s.TYPE = o.OBJECT_TYPE
 		 WHERE o.OBJECT_TYPE IN ('PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY')
-		 ORDER BY o.OWNER, o.OBJECT_NAME, s.LINE`,
+		 ORDER BY o.OWNER, o.OBJECT_NAME, s.LINE`, "o.OWNER = :schema")
+	h.bestEffortArgs("routines", query, args,
 		func(rs *sql.Rows) error {
 			var schema, name, typ, text string
 			var line int
 			if err := rs.Scan(&schema, &name, &typ, &line, &text); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			k := key{schema, name, typ}
 			if bodies[k] == nil {
@@ -669,14 +730,17 @@ func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 		})
 
 	params := map[string]string{}
-	h.bestEffort("routine parameters",
-		`SELECT OWNER, OBJECT_NAME, DATA_TYPE FROM ALL_ARGUMENTS
+	query, args = h.oracleScopedQuery(`SELECT OWNER, OBJECT_NAME, DATA_TYPE FROM ALL_ARGUMENTS
 		 WHERE POSITION > 0 AND PACKAGE_NAME IS NULL
-		 ORDER BY OWNER, OBJECT_NAME, SEQUENCE`,
+		 ORDER BY OWNER, OBJECT_NAME, SEQUENCE`, "OWNER = :schema")
+	h.bestEffortArgs("routine parameters", query, args,
 		func(rs *sql.Rows) error {
 			var schema, name, dtype string
 			if err := rs.Scan(&schema, &name, &dtype); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			k := schema + "." + name
 			if cur := params[k]; cur != "" {
@@ -694,15 +758,18 @@ func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 		overload string
 	}
 	pkgMembers := map[string][]member{}
-	h.bestEffort("package members",
-		`SELECT OWNER, OBJECT_NAME, PROCEDURE_NAME, OVERLOAD
+	query, args = h.oracleScopedQuery(`SELECT OWNER, OBJECT_NAME, PROCEDURE_NAME, OVERLOAD
 		 FROM ALL_PROCEDURES WHERE PROCEDURE_NAME IS NOT NULL
-		 ORDER BY OWNER, OBJECT_NAME, SUBPROGRAM_ID`,
+		 ORDER BY OWNER, OBJECT_NAME, SUBPROGRAM_ID`, "OWNER = :schema")
+	h.bestEffortArgs("package members", query, args,
 		func(rs *sql.Rows) error {
 			var schema, pkg, mname string
 			var ov sql.NullString
 			if err := rs.Scan(&schema, &pkg, &mname, &ov); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			k := schema + "." + pkg
 			pkgMembers[k] = append(pkgMembers[k], member{mname, ov.String})
@@ -713,16 +780,19 @@ func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 	// 반환값이라 함수의 표시다. 키는 "owner.pkg.member[#overload]".
 	memberParams := map[string]string{}
 	memberFunctions := map[string]bool{}
-	h.bestEffort("package member arguments",
-		`SELECT OWNER, PACKAGE_NAME, OBJECT_NAME, DATA_TYPE, POSITION, OVERLOAD
+	query, args = h.oracleScopedQuery(`SELECT OWNER, PACKAGE_NAME, OBJECT_NAME, DATA_TYPE, POSITION, OVERLOAD
 		 FROM ALL_ARGUMENTS WHERE PACKAGE_NAME IS NOT NULL
-		 ORDER BY OWNER, PACKAGE_NAME, OBJECT_NAME, OVERLOAD, SEQUENCE`,
+		 ORDER BY OWNER, PACKAGE_NAME, OBJECT_NAME, OVERLOAD, SEQUENCE`, "OWNER = :schema")
+	h.bestEffortArgs("package member arguments", query, args,
 		func(rs *sql.Rows) error {
 			var schema, pkg, mname, dtype string
 			var pos int
 			var ov sql.NullString
 			if err := rs.Scan(&schema, &pkg, &mname, &dtype, &pos, &ov); err != nil {
 				return err
+			}
+			if !h.keepSchema(schema) {
+				return nil
 			}
 			k := schema + "." + pkg + "." + mname
 			if ov.Valid {

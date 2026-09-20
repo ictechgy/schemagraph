@@ -12,34 +12,41 @@ import (
 // 수확한다.
 func (h *harvester) extractPostgres() CatalogDocument {
 	schemas := h.postgresSchemas()
-	objects := map[string][]ObjectDoc{}
-	for _, schema := range schemas {
-		objects[schema] = h.postgresObjects(schema)
-		for i := range objects[schema] {
-			obj := &objects[schema][i]
-			obj.Columns = h.postgresColumns(schema, obj.Name)
-			obj.Constraints = h.postgresConstraints(schema, obj.Name)
-			obj.Indexes = h.postgresIndexes(schema, obj.Name)
-			obj.Triggers = h.postgresTriggers(schema, obj.Name)
-		}
-		h.postgresObjectUsage(schema, objects[schema])
-	}
-	routines := map[string][]RoutineDoc{}
-	for _, schema := range schemas {
-		routines[schema] = h.postgresRoutines(schema)
-		h.postgresRoutineUsage(schema, routines[schema])
-	}
-
 	doc := CatalogDocument{
 		Version: documentVersion, Dialect: "postgres", Reader: "probe-go",
-		Schemas: []SchemaDoc{}, Limitations: append([]string{}, h.limitations...),
+		Schemas: []SchemaDoc{}, Limitations: []string{},
 	}
 	for _, schema := range schemas {
-		sd := SchemaDoc{Name: schema, Objects: objects[schema], Routines: routines[schema]}
-		normalizeSchema(&sd)
-		doc.Schemas = append(doc.Schemas, sd)
+		doc.Schemas = append(doc.Schemas, h.postgresSchema(schema))
 	}
+	doc.Limitations = append([]string{}, h.limitations...)
 	return doc
+}
+
+func (h *harvester) postgresSchema(schema string) SchemaDoc {
+	objects := h.postgresObjects(schema)
+	for i := range objects {
+		obj := &objects[i]
+		obj.Columns = h.postgresColumns(schema, obj.Name)
+		obj.Constraints = h.postgresConstraints(schema, obj.Name)
+		obj.Indexes = h.postgresIndexes(schema, obj.Name)
+		obj.Triggers = h.postgresTriggers(schema, obj.Name)
+	}
+	h.postgresObjectUsage(schema, objects)
+	routines := h.postgresRoutines(schema)
+	h.postgresRoutineUsage(schema, routines)
+	sd := SchemaDoc{Name: schema, Objects: objects, Routines: routines}
+	normalizeSchema(&sd)
+	return sd
+}
+
+func (h *harvester) streamPostgres(stream *ndjsonStreamWriter) error {
+	for _, schema := range h.postgresSchemas() {
+		if err := stream.schema(h.postgresSchema(schema)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // postgresSchemaAllowed — PostgreSQL의 system namespace 필터와 사용자가 준

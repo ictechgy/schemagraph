@@ -40,3 +40,16 @@ func TestConnectionErrorsDoNotEchoCredentials(t *testing.T) {
 		t.Fatal("invalid URL error leaked credentials or accepted malformed encoding")
 	}
 }
+
+func TestStreamingCatalogQueriesBindActiveSchema(t *testing.T) {
+	schema := "SGFIX"
+	h := &harvester{activeSchema: &schema}
+	query, args := h.mssqlScopedQuery("SELECT * FROM sys.objects WHERE type = 'U' ORDER BY name", "s.name = @schema")
+	if !strings.Contains(query, "AND s.name = @schema ORDER BY") || len(args) != 1 {
+		t.Fatalf("scoped query = %q args = %#v", query, args)
+	}
+	query, args = h.oracleScopedQuery("SELECT OWNER FROM ALL_OBJECTS", "OWNER = :schema")
+	if !strings.Contains(query, "WHERE OWNER = :schema") || len(args) != 1 {
+		t.Fatalf("unfiltered scoped query = %q args = %#v", query, args)
+	}
+}
