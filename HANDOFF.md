@@ -4,34 +4,36 @@
 
 ## 지금 상태
 
-- 2026-09-20: **추가 확장 3건 구현·로컬 검증 완료, 배포 진행 중** (`feature/scaling-db2-informix-maven`).
-  사용자가 대형 DB 성능·메모리 개선, DB2·Informix 특화 수집, JDBC 프로브의
-  Maven 배포를 모두 승인했다. Rust는 입력 원문·NDJSON Value·출력 그래프의
-  중복 보관을 줄이고, Go는 수집 단계부터 NDJSON을 순차 방출하도록 변경 중이다.
-  `Scripts/benchmark-catalog.py`가 실제 컬럼·PK·FK·인덱스가 있는 1천·1만 객체로
-  시간·프로세스별 최고 RSS·출력 해시를 기록한다. 기준 버전은 crates.io의 0.2.0.
-  JVM DB2·Informix 카탈로그 및 fixture 구현과 Maven Central용 패키징은 병행 중이다.
-  실제 DB fixture 검증 전에는 새 DB 지원을 검증 완료로 표시하지 않는다.
-  사용자에게 Maven namespace/게시 설정 유무와 사용할 DB 환경을 질문한 상태다.
-  토큰·서명키·기존 인증 파일은 읽지 않았다. 현재 로컬 Docker는 ARM64·4GB다.
-  사용자는 이후 **GitHub 공개 Maven 저장소 배포**를 명시적으로 선택했고,
-  Central 계정은 아직 없다고 답했다. Central 준비 안내는 MAVEN.md에 있으며
-  이번 배포는 별도 계정·서명키 없이 진행한다. GitHub Pages Actions source를
-  활성화했고 공개 Maven 배포 workflow·이전 버전 보존 도구를 검증했다.
-  기존 DB+Maven 소비자 CI는 c97bc40에서 통과했다(35506083480).
-  Db2 전송 네 조합도 CI에서 통과했다(35505632878의 Db2 단계, 24정점·33간선).
-  초기 Db2 연결 종료는 setup 중 재시작 전에 테스트를 시작한 문제였고,
-  공식 setup 완료 표시를 기다리도록 고쳤다. Informix는 환경 스크립트 로딩,
-  기본 코드셋의 파일 안내 주석 처리, 실제 트리거 원문, opaque 인자 타입을
-  실서버에서 보정하며 최종 전송 조합 검증을 이어가고 있다.
-  Informix의 최종 실제 DB 검증도 통과했다. opaque 인자 타입은 별도 query에서
-  LVARCHAR로 받아 행 크기 제한을 피하고, 256자 원문 조각은 인위적 줄바꿈 없이
-  결합한다. 긴 literal 전체 일치와 전송 네 조합의 그래프 일치를 확인했다
-  (SQL 호출 가능 public routine을 포함해 543정점·558간선).
-  Rust 148개 테스트, Go test·vet, JDBC check·shadowJar와 Maven 소비자 검증이
-  통과했다. 메모리 측정·재현 방법은 PERFORMANCE.md에 기록했다. GitHub Pages 배포,
-  최종 CI, v0.3 릴리스와 main 반영은 아직 진행 중이다.
-
+- 2026-09-20: **v0.3.0 — 요청한 추가 3건 구현·검증·공개 배포 완료**.
+  [CLI](https://crates.io/crates/schemagraph-cli/0.3.0) ·
+  [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.3.0) ·
+  [공개 Maven 저장소](https://ictechgy.github.io/schemagraph/maven/).
+  소스·태그·6개 크레이트의 기준 커밋은 `6da322efd877ddebb7bf56248c44a383a6569598`.
+  레지스트리 체크섬·로컬 게시 아카이브·소스 커밋의 일치를 확인하고, 별도
+  crates.io 설치로 SQLite 골든·문서 왕복·거부 경로·query·impact를 검증했다.
+  - **메모리**: Rust의 원문·Value·출력 전체 복제를 줄이고 Go NDJSON을 스키마별로
+    수집·방출한다. 1만 객체의 Rust RSS 중앙값은 JSON 633.5→268.8MiB,
+    NDJSON 723.5→170.1MiB. 실제 PostgreSQL 4천 테이블에서 Go는 53.4→23.8MiB.
+    모든 비교에서 그래프 내용과 usage 키 유무를 보존했다. [측정](PERFORMANCE.md).
+  - **Db2 LUW·Informix**: 외부 JDBC 드라이버로 catalog·원문·시그니처를 읽고 SQL/SPL
+    해석은 Rust가 담당한다. 실제 루틴·트리거 실행, 필요한/금지된 간선, overload,
+    긴 원문 조각과 전송 네 조합을 검증했다. Db2는 24정점·33간선, Informix는
+    SQL에서 호출 가능한 public routine을 포함해 543정점·558간선이다. [검증](IBM.md).
+    Db2의 초기 연결 종료는 공식 setup 중 재시작 전에 테스트를 시작한 문제였고,
+    완료 표시를 기다리게 고쳤다. Informix 환경 로딩·코드셋·opaque 타입·256자
+    원문 조각은 실제 카탈로그로 확인해 처리한다.
+  - **Maven**: 사용자가 선택한 GitHub Pages에
+    `io.github.ictechgy:schemagraph-probe:0.3.0`을 익명 접근 가능한 저장소로 게시했다.
+    thin·all·sources·Javadoc·POM과 체크섬을 확인하고, 깨끗한 Maven 저장소에서
+    공개 URL만으로 의존성을 받아 H2 테이블·컬럼·PK를 읽었다. 독립 all JAR도
+    같은 카탈로그를 냈다. 재게시 시 과거 버전·체크섬·동일 바이트를 보존한다.
+    Central 계정은 아직 없으며 이번 배포에 필요하지 않다. 준비 절차는 [MAVEN.md](MAVEN.md).
+  Rust 148개 테스트, Go test·vet·CGO 없는 빌드, JVM 테스트, Maven/Gradle 소비자,
+  6개 크레이트 패키지 빌드와 실제 DB 전체 검증을 통과했다.
+  [릴리스 소스 통합 CI](https://github.com/ictechgy/schemagraph/actions/runs/35509238204) ·
+  [IBM 실서버 CI](https://github.com/ictechgy/schemagraph/actions/runs/35509238260) ·
+  [Maven 공개 배포](https://github.com/ictechgy/schemagraph/actions/runs/35509238244).
+  이 기록 이후의 문서 갱신은 위 실행 코드의 검증을 재사용한다.
 - 2026-09-20: **v0.2.0 배포·설치 검증 완료** —
   [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.2.0) ·
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.2.0) ·
@@ -389,9 +391,9 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 
 ## 다음 할 일
 
-1. 최신 소스의 두 CI를 확인하고 v0.3 크레이트·GitHub 릴리스를 게시한다.
-2. main에 반영해 사용자가 선택한 GitHub Pages Maven 저장소를 배포하고,
-   공개 URL을 쓰는 별도 Maven 소비자로 설치·실행을 확인한다.
+요청한 성능·메모리 개선, Db2·Informix 특화 지원, 공개 Maven 배포를 완료했다.
+필수 후속 작업은 없다. 사용자가 선택하지 않은 Central 게시는 필요할 때
+MAVEN.md의 별도 계정·namespace·서명 준비 절차를 따른다.
 
 ## 의도적으로 남긴 경계
 
