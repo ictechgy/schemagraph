@@ -228,6 +228,12 @@ dependencies and can be tested from file fixtures without a database.
 
 ## Development
 
+The [CI workflow](.github/workflows/ci.yml) runs on pushes, pull requests,
+and manual dispatch. It checks Rust formatting, builds and tests the engine,
+builds all six crate packages, builds both probes, and runs the full database
+fixture suite. Skipped checks fail CI. Bundled skill and license files must
+also match their repository originals.
+
 From the repository root:
 
 ```sh

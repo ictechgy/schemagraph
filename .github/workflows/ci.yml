@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  RUST_TOOLCHAIN: "1.96.0"
+
+jobs:
+  verify:
+    name: Build, package, and database fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install native fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libsqlite3-dev sqlite3 postgresql-16
+          echo /usr/lib/postgresql/16/bin >> "$GITHUB_PATH"
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Cache Rust dependencies and builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            engine/target/debug
+          key: ${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('engine/Cargo.lock', 'engine/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path engine/Cargo.toml --all -- --check
+
+      - name: Build and test the Rust workspace
+        run: |
+          cargo build --manifest-path engine/Cargo.toml --workspace --locked
+          cargo test --manifest-path engine/Cargo.toml --workspace --locked
+
+      - name: Check bundled documents and licenses
+        run: |
+          cmp skills/schemagraph/SKILL.md engine/cli/SKILL.md
+          engine/target/debug/schemagraph skill > "$RUNNER_TEMP/skill.md"
+          cmp skills/schemagraph/SKILL.md "$RUNNER_TEMP/skill.md"
+          for crate in core source parser analysis export cli; do
+            cmp LICENSE-MIT "engine/$crate/LICENSE-MIT"
+            cmp LICENSE-APACHE "engine/$crate/LICENSE-APACHE"
+          done
+
+      - name: Build all distributable crates
+        run: cargo package --manifest-path engine/Cargo.toml --workspace --locked
+
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          gradle-version: "9.6.1"
+          cache-provider: basic
+
+      - name: Build the JDBC probe
+        run: gradle -p probe shadowJar --no-daemon --console=plain
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: probe-go/go.mod
+          cache-dependency-path: probe-go/go.sum
+
+      - name: Check and build the Go probe
+        working-directory: probe-go
+        run: |
+          gofmt -l . | tee "$RUNNER_TEMP/gofmt-files.txt"
+          test ! -s "$RUNNER_TEMP/gofmt-files.txt"
+          go vet ./...
+          go build ./...
+
+      - name: Download external JDBC fixture drivers
+        run: |
+          curl --fail --location --retry 3 \
+            https://repo.maven.apache.org/maven2/com/mysql/mysql-connector-j/26.7.0/mysql-connector-j-26.7.0.jar \
+            --output "$RUNNER_TEMP/mysql-connector-j.jar"
+          curl --fail --location --retry 3 \
+            https://repo.maven.apache.org/maven2/com/oracle/ojdbc/ojdbc8/19.3.0.0/ojdbc8-19.3.0.0.jar \
+            --output "$RUNNER_TEMP/ojdbc8.jar"
+          echo "69084713593a4aa8d07c383619b9639276f08bccf8faf1c562178147d389b1e1  $RUNNER_TEMP/mysql-connector-j.jar" | sha256sum --check
+          echo "a66d27a14f3adee484427cc4de008af85a5c3e78e2e3285a4dba1277332978a5  $RUNNER_TEMP/ojdbc8.jar" | sha256sum --check
+
+      - name: Verify every database fixture
+        env:
+          SG_MYSQL_JAR: ${{ runner.temp }}/mysql-connector-j.jar
+          SG_ORACLE_JAR: ${{ runner.temp }}/ojdbc8.jar
+        run: |
+          # 선택 검증을 건너뛰어도 로컬 스크립트는 성공하므로 CI에서는 경고를 실패로 바꾼다.
+          Scripts/verify-fixtures.sh 2>&1 | tee "$RUNNER_TEMP/fixtures.log"
+          if grep -q '^주의:' "$RUNNER_TEMP/fixtures.log"; then
+            echo '::error::Fixture coverage is incomplete; resolve the warnings above.'
+            exit 1
+          fi
