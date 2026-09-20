@@ -127,8 +127,8 @@ Use `--user` for the database user and `SG_DB_PASSWORD` for the password.
 default, the probe collects non-system schemas.
 
 Db2 LUW and Informix driver setup and live fixture checks are described in
-[IBM.md](IBM.md). Maven coordinates, anonymous repository configuration, and
-optional Central publication are documented in [MAVEN.md](MAVEN.md).
+[IBM.md](IBM.md). Maven Central installation, the additional GitHub Pages
+repository, and publication instructions are documented in [MAVEN.md](MAVEN.md).
 
 ### Go probe
 

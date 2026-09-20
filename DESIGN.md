@@ -267,10 +267,11 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
   시그니처를 수집한다. 불투명 타입의 표현 변환은 DB의 메타데이터 cast에 맡기고,
   트리거·routine의 SQL 해석은 Rust에서 수행한다. 실제 이미지·드라이버를 고정한
   전용 fixture가 전송 네 조합과 필요한 간선·생기면 안 되는 간선을 확인한다.
-- **Maven 배포** — 공개 Maven Repository Layout은 GitHub Pages에서 제공한다.
-  소비자는 저장소 URL을 추가한다. Central은 별도 선택 경로이며 계정·namespace
-  인증과 PGP 서명이 필요하다. 과거 버전은 보존하고 게시된 파일의 다른 바이트로
-  덮어쓰기를 거부한다. 절차는 [MAVEN.md](MAVEN.md)에 있다.
+- **Maven 배포** — Maven Central과 GitHub Pages에 같은 JAR·POM 바이트를 게시한다.
+  Central 소비자는 별도 저장소 URL을 추가할 필요가 없다. 게시자는 계정·namespace
+  인증과 PGP 서명을 준비한다. 과거 버전은 보존하고 게시된 파일의 다른 바이트로
+  덮어쓰기를 거부한다. Central 업로드 전에 Pages와 파일 내용이 일치하는지
+  비교한다. 절차는 [MAVEN.md](MAVEN.md)에 있다.
 - **명시적으로 보류한 범위** — 멤버 id에 항상 kind를 붙이는 안은 호환성
   때문에 보류한다. 현재는 충돌할 때만 `@kind`를 쓴다. 전체 파이프라인의
   고정 메모리 상한은 아직 보장하지 않는다. 새 방언과 더 큰 스케일의 분석은

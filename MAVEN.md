@@ -13,13 +13,33 @@ schemagraph-probe-0.3.0-sources.jar
 schemagraph-probe-0.3.0-javadoc.jar
 ```
 
+## Install from Maven Central
+
+Use Maven Central to resolve
+[`io.github.ictechgy:schemagraph-probe:0.3.0`](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.3.0).
+No project-specific repository URL or publishing credentials are needed:
+
+```kotlin
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("io.github.ictechgy:schemagraph-probe:0.3.0")
+}
+```
+
+The Central and GitHub Pages releases contain identical JAR and POM bytes.
+Central also carries detached PGP signatures. The v0.3.0 signing key fingerprint
+is `0A98034C6F045509D1EE58EE329F94DC51434A1B`; its public key is available from
+[`keyserver.ubuntu.com`](https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x0A98034C6F045509D1EE58EE329F94DC51434A1B).
+
 ## Anonymous GitHub Pages Maven repository
 
-The default public distribution is an anonymous Maven repository served from
+An additional anonymous Maven repository is served from
 GitHub Pages at
 `https://ictechgy.github.io/schemagraph/maven/`. It is a repository for Maven
-consumers and is separate from Maven Central; it does not claim Central
-validation or Central publication.
+consumers and remains available alongside Maven Central.
 
 ```kotlin
 repositories {
@@ -82,13 +102,13 @@ preserved version (thin, `all`, sources, Javadoc, and POM), and refuses changed
 bytes when a version already exists. Re-running the same version with identical
 bytes is idempotent.
 
-## Maven Central
+## Publish to Maven Central
 
 Maven Central is a separate release path. The existing GitHub Pages publication
 remains available. You do not need a Central account, namespace,
 PGP key, or token to consume or deploy the GitHub Pages repository.
 
-If Central is needed later, complete these steps in the Central Portal. Never
+Before publishing, complete these steps in the Central Portal. Never
 put passwords, user tokens, or private keys in chat or in a command copied into
 shell history.
 

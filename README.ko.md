@@ -124,7 +124,7 @@ DB 사용자는 `--user`, 비밀번호는 `SG_DB_PASSWORD` 환경 변수로 전�
 시스템 스키마를 제외한 전체입니다.
 
 Db2 LUW·Informix 드라이버 설정과 실DB 검증은 [IBM.md](IBM.md)에,
-Maven 좌표·공개 저장소 설정·선택적인 Central 게시 방법은 [MAVEN.md](MAVEN.md)에
+Maven Central 설치·추가 GitHub Pages 저장소·게시 방법은 [MAVEN.md](MAVEN.md)에
 있습니다.
 
 ### Go 프로브

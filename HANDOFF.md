@@ -4,17 +4,29 @@
 
 ## 지금 상태
 
-- 2026-09-20: **Maven Central 추가 게시 준비 중** (`feature/maven-central-publication`).
+- 2026-09-20: **Maven Central v0.3.0 게시·설치 검증 완료**.
+  [`io.github.ictechgy:schemagraph-probe:0.3.0`](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.3.0)을
+  Central에 추가 게시했다. 소비자는 `mavenCentral()`만 사용하면 된다.
   사용자가 Central 게시 진행을 요청했고 `io.github.ictechgy` namespace가
   **Verified**라고 확인했다. 게시용 토큰을 GitHub Actions repository secrets의
-  `CENTRAL_TOKEN_USERNAME`·`CENTRAL_TOKEN_PASSWORD`에 직접 등록하도록 안내했다.
-  비밀값은 요청하거나 읽지 않았다. 전용 PGP 키 생성·보관·공개키 배포는 사용자
-  승인 전이며 `MAVEN_SIGNING_KEY`·`MAVEN_SIGNING_PASSWORD`도 아직 준비되지 않았다.
+  `CENTRAL_TOKEN_USERNAME`·`CENTRAL_TOKEN_PASSWORD`에 직접 등록했다.
+  이후 사용자가 전용 PGP 키 생성·보관·공개키 배포를 승인했다. 전용 RSA 서명키를
+  암호화해 저장소 밖 사용자 전용 경로에 보관하고 `MAVEN_SIGNING_KEY`·
+  `MAVEN_SIGNING_PASSWORD`에 등록했다. 공개키 지문은
+  `0A98034C6F045509D1EE58EE329F94DC51434A1B`이며 keyserver.ubuntu.com에서
+  다시 내려받은 키로 5개 payload의 실제 서명을 검증했다. 비밀값은 출력하지 않았다.
   수동 Central workflow는 릴리스 태그에서 빌드하고 기존 Pages의 5개 payload와
   바이트가 일치해야 업로드한다. `publish=true`에서만 VALIDATED→PUBLISHED를
   진행한다. actionlint·셸/Python 구문과 동일 바이트 수용, 변조·필수 JAR 누락·
-  HTTP/인증정보 포함 URL 거부 검사를 통과했다. Central 실제 업로드·서명 검증·
-  게시·익명 설치는 아직 실행하지 않았다.
+  HTTP/인증정보 포함 URL 거부 검사를 통과했다. 로컬 실제 서명 빌드·Pages와의
+  5개 파일 일치도 확인했다. [main 통합 CI](https://github.com/ictechgy/schemagraph/actions/runs/35510942967)와
+  [Central 게시](https://github.com/ictechgy/schemagraph/actions/runs/35511249308)가
+  통과했다. deployment `232b5aac-1fe2-4557-8df3-95fb231cd1f1`의
+  VALIDATED→PUBLISHED를 확인했다. Central에서 익명으로 받은 5개 payload의
+  체크섬·서명·Pages와의 바이트 일치를 검증하고, 별도 Maven 저장소를 쓰는
+  Central 전용 소비자로 H2 테이블·컬럼·PK를 읽었다. 독립 all JAR도 같은
+  카탈로그를 냈다. 게시 도구는 `01208bb`, 빌드한 릴리스 소스는 `6da322e`다.
+  이후 설치 문서·README·이 완료 기록만 갱신하며 위 실행 검증을 재사용한다.
 - 2026-09-20: **v0.3.0 — 요청한 추가 3건 구현·검증·공개 배포 완료**.
   [CLI](https://crates.io/crates/schemagraph-cli/0.3.0) ·
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.3.0) ·
@@ -404,9 +416,8 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 ## 다음 할 일
 
 요청한 성능·메모리 개선, Db2·Informix 특화 지원, 공개 Maven 배포를 완료했다.
-추가 요청된 Central 게시는 namespace 인증이 끝났으며, 토큰 등록과 전용 서명키
-준비가 남았다. 설정 후 `publish-central.yml`을 `publish=true`로 실행하고,
-PUBLISHED 상태와 실제 Maven Central 소비자 설치까지 검증한다.
+추가 요청된 Maven Central 게시도 실제 익명 설치까지 검증했다.
+필수 후속 작업은 없다. 서명키와 토큰은 다음 릴리스에서도 기존 설정을 재사용한다.
 
 ## 의도적으로 남긴 경계
 
@@ -415,7 +426,7 @@ PUBLISHED 상태와 실제 Maven Central 소비자 설치까지 검증한다.
   전체 메모리를 사용한다. Go JSON도 전체 문서를 유지한다. 성능과 메모리 한계는
   [PERFORMANCE.md](PERFORMANCE.md)에 측정 근거와 함께 설명한다.
 - 모든 멤버 id에 kind를 넣는 변경은 기존 id 호환성 때문에 보류한다.
-- GitHub Pages Maven 저장소는 이미 공개되어 있다. Central 추가 게시의 상태는
-  위 인계 기록으로 구분하며, 실제 게시 전에 Central 이용 가능으로 표시하지 않는다.
+- Central·GitHub Pages의 기존 버전은 불변이며, 같은 좌표로 다른 JAR·POM을
+  게시하지 않는다. 새 배포는 기존 릴리스 태그와 Pages 파일을 기준으로 검증한다.
 
 세부 근거는 DESIGN.md "호환 계약과 확장 경계" 절을 참고한다.
