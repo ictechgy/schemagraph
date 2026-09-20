@@ -80,6 +80,12 @@ def wait_db2(container: str) -> None:
     deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
         require_running(container)
+        # 공식 entrypoint는 DB 생성 뒤 설정을 바꾸고 서버를 재시작한다.
+        # 초기 접속 성공만으로 준비 완료를 판단하면 검증 중 연결이 끊긴다.
+        startup = docker(["logs", "--tail", "120", container], "check Db2 setup completion")
+        if "(*) Setup has completed." not in startup:
+            time.sleep(5)
+            continue
         result = subprocess.run([
             "docker", "exec", container, "bash", "-lc",
             "su - db2inst1 -c 'db2 connect to SGTEST >/dev/null 2>&1'",

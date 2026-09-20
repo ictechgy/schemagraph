@@ -65,6 +65,9 @@ func (s *ndjsonStreamWriter) schema(schema SchemaDoc) error {
 }
 
 func (s *ndjsonStreamWriter) limitations(limitations []string) error {
+	if limitations == nil {
+		limitations = []string{}
+	}
 	return s.line(map[string]any{"type": "limitations", "data": limitations})
 }
 

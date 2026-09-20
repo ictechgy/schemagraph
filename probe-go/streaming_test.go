@@ -43,6 +43,27 @@ func TestSQLiteNDJSONStreamHasBoundedRecordEnvelope(t *testing.T) {
 	}
 }
 
+func TestNDJSONEmptyLimitationsRemainAnArray(t *testing.T) {
+	var output bytes.Buffer
+	stream := newNDJSONStreamWriter(&output)
+	if err := stream.limitations(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.flush(); err != nil {
+		t.Fatal(err)
+	}
+	var record struct {
+		Type string   `json:"type"`
+		Data []string `json:"data"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Type != "limitations" || record.Data == nil || len(record.Data) != 0 {
+		t.Fatalf("empty limitation evidence must be an array: %s", output.String())
+	}
+}
+
 func TestNDJSONStreamFeatureHeadersUseDialectCapabilities(t *testing.T) {
 	tests := []struct {
 		dialect string
