@@ -4,7 +4,18 @@
 
 ## 지금 상태
 
-- 2026-09-20: **v0.2.0 로드맵 구현·로컬 검증 완료** (`feature/remaining-roadmap`).
+- 2026-09-20: **v0.2.0 배포·설치 검증 완료** —
+  [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.2.0) ·
+  [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.2.0) ·
+  [최종 CI](https://github.com/ictechgy/schemagraph/actions/runs/35500610906).
+  6개 크레이트를 게시하고 레지스트리 체크섬·로컬 게시 아카이브·소스 커밋
+  `54549e657446df864b2b4f3d671650f84d009e75`의 일치를 확인했다. `v0.2.0` 태그는
+  이 소스를 가리킨다. 레지스트리에서 별도 경로에 설치한 CLI로 버전·스킬·SQLite
+  골든·v1/v2·NDJSON 왕복과 거부 경로·query·impact를 검증했다. 최종 CI의
+  Rust 132개 테스트와 전체 DB fixture가 통과했고, 생산자 전송 조합 14개와
+  건너뜀 0을 로그에서 확인했다. 이 뒤의 HANDOFF 갱신은 문서만 바꾸며 위 검증을
+  재사용한다. `main`은 릴리스 소스와 이 완료 기록을 함께 유지한다.
+- 2026-09-20: **v0.2.0 로드맵 구현 완료** (`feature/remaining-roadmap`).
   Go 프로브가 SQLite·PostgreSQL·MySQL/MariaDB를 추가해 Oracle·SQL Server와
   함께 5개 방언 계열을 수집한다. `CGO_ENABLED=0` 빌드와 네이티브/JDBC
   그래프 대조를 통과했다. SQL 상수 연결·PG `format` 일부·직선 구간의
@@ -23,7 +34,7 @@
   최종 검토에서 index usage를 구조 diff에서 제외하고 package 소속 이동을
   graph id의 제거·추가로 보고하도록 수정했다. 미지 필드 경로의 무표시 절단을
   없애고, 중복 카탈로그 식별자는 종류별 실측 수를 limitation으로 남긴다.
-  통합 CI·6개 크레이트 게시·레지스트리 설치 검증·GitHub 릴리스를 진행한다.
+  통합 CI·6개 크레이트 게시·레지스트리 설치 검증·GitHub 릴리스까지 완료했다.
 - 2026-09-20: **동적 SQL 리터럴 복구와 오탐 방지 보강**.
   PostgreSQL dollar-quote·Oracle q-quote·T-SQL 괄호/N 리터럴을 복구하고,
   FOR/OPEN/RETURN QUERY EXECUTE와 Oracle OPEN FOR에서도 같은 경로를 쓴다.
@@ -350,8 +361,8 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 
 ## 다음 할 일
 
-요청된 v0.2 로드맵 구현은 완료했다. 위 통합 CI·배포 결과를 확인한 뒤 기록을
-갱신한다. 기능 확장은 재현 가능한 실제 사용 사례가 생길 때 진행한다.
+요청된 v0.2 로드맵의 구현·검증·배포는 모두 완료했다. 계획된 필수 후속 작업은
+없으며, 기능 확장은 재현 가능한 실제 사용 사례가 생길 때 진행한다.
 
 ## 의도적으로 남긴 경계
 
