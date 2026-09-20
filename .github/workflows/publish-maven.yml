@@ -1,0 +1,130 @@
+name: Publish Maven repository to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/publish-maven.yml"
+      - "MAVEN.md"
+      - "Scripts/build-maven-site.py"
+      - "probe/**"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Maven version to publish to Pages
+        required: true
+        default: "0.3.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages-maven
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build anonymous Maven repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pages: read
+    env:
+      PROBE_VERSION: ${{ inputs.version || '0.3.0' }}
+      PROBE_GROUP: io.github.ictechgy
+      PROBE_ARTIFACT: schemagraph-probe
+      MAVEN_PAGES_URL: https://ictechgy.github.io/schemagraph/maven/
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          gradle-version: "9.6.1"
+          cache-provider: basic
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Record reproducible source timestamp
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: Publish probe to an isolated Maven repository
+        run: |
+          gradle -p probe publishMavenJavaPublicationToLocalStagingRepository \
+            -PprobeGroup="$PROBE_GROUP" \
+            -PprobeVersion="$PROBE_VERSION" \
+            -PprobeRepositoryDir="$RUNNER_TEMP/probe-maven" \
+            --console=plain --no-daemon
+
+      - name: Merge previous Pages versions and build site
+        run: |
+          python3 Scripts/build-maven-site.py \
+            --publication-root "$RUNNER_TEMP/probe-maven" \
+            --site-dir "$RUNNER_TEMP/maven-site" \
+            --group "$PROBE_GROUP" \
+            --artifact "$PROBE_ARTIFACT" \
+            --version "$PROBE_VERSION" \
+            --existing-base-url "$MAVEN_PAGES_URL" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --archive-output "$RUNNER_TEMP/maven-repository-$PROBE_VERSION.zip"
+
+      - name: Smoke-test the Maven layout over HTTP
+        run: |
+          python3 -m http.server 18765 --directory "$RUNNER_TEMP/maven-site" >/tmp/maven-site.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in 1 2 3 4 5; do
+            if curl --fail --silent \
+              "http://127.0.0.1:18765/maven/io/github/ictechgy/schemagraph-probe/$PROBE_VERSION/schemagraph-probe-$PROBE_VERSION.pom" \
+              >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/maven-site.log >&2
+          exit 1
+
+      - name: Upload Maven repository package for diagnosis
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: maven-repository-${{ env.PROBE_VERSION }}
+          path: ${{ runner.temp }}/maven-repository-${{ env.PROBE_VERSION }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+        with:
+          path: ${{ runner.temp }}/maven-site
+
+  deploy:
+    name: Deploy Maven repository to Pages
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

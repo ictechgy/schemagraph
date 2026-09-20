@@ -1,4 +1,5 @@
 import org.gradle.jvm.tasks.Jar
+import org.gradle.api.tasks.bundling.AbstractArchiveTask
 
 plugins {
     kotlin("jvm") version "2.3.21"
@@ -83,6 +84,11 @@ tasks.test {
     useJUnitPlatform()
 }
 
+tasks.withType<AbstractArchiveTask>().configureEach {
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
+}
+
 tasks.shadowJar {
     archiveBaseName.set("schemagraph-probe")
     archiveClassifier.set("all")
@@ -133,9 +139,10 @@ publishing {
                     }
                 }
                 scm {
-                    connection = "scm:git:git://github.com/ictechgy/schemagraph.git"
+                    connection = "scm:git:https://github.com/ictechgy/schemagraph.git"
                     developerConnection = "scm:git:ssh://git@github.com/ictechgy/schemagraph.git"
                     url = "https://github.com/ictechgy/schemagraph/tree/main"
+                    tag = "v${project.version}"
                 }
             }
         }
