@@ -4,6 +4,23 @@
 
 ## 지금 상태
 
+- 2026-09-20: **v0.2.0 로드맵 구현·로컬 검증 완료** (`feature/remaining-roadmap`).
+  Go 프로브가 SQLite·PostgreSQL·MySQL/MariaDB를 추가해 Oracle·SQL Server와
+  함께 5개 방언 계열을 수집한다. `CGO_ENABLED=0` 빌드와 네이티브/JDBC
+  그래프 대조를 통과했다. SQL 상수 연결·PG `format` 일부·직선 구간의
+  텍스트 변수 추적은 분기·불확실한 대입·지원하지 않는 형 변환에서 무효화하며,
+  입력 크기·중첩 한도를 둔다. Oracle 패키지 슬라이서는 인용·주석·로컬 선언을
+  구분하고 각 멤버의 실제 END 경계까지만 몸체를 귀속한다.
+  catalog v2는 `reader`를 `producer.name`으로 바꾸고 `required_features`를
+  요구한다. 기본 출력과 내부 모델은 v1이며, 두 버전은 같은 그래프로 정규화한다.
+  v2 NDJSON에는 마지막 limitations 레코드가 필수다. `document-capabilities`,
+  엔진·두 프로브의 `--document-version`, JSON↔NDJSON document diff를 추가했다.
+  명세는 [CATALOG.md](CATALOG.md), 조합 검증은
+  `Scripts/verify-document-versions.py`·`Scripts/verify-probe-versions.py`다.
+  Rust 127개 테스트, Go test·vet·CGO 없는 빌드, JDBC shadowJar,
+  전체 DB fixture(건너뜀 0)와 생산자별 v1/v2 × JSON/NDJSON 조합 14개가
+  통과했다. PostgreSQL 골든은 새 동적 SQL 간선만 추가됐음을 확인해 갱신했다.
+  통합 CI·6개 크레이트 게시·레지스트리 설치 검증·GitHub 릴리스를 진행한다.
 - 2026-09-20: **동적 SQL 리터럴 복구와 오탐 방지 보강**.
   PostgreSQL dollar-quote·Oracle q-quote·T-SQL 괄호/N 리터럴을 복구하고,
   FOR/OPEN/RETURN QUERY EXECUTE와 Oracle OPEN FOR에서도 같은 경로를 쓴다.
@@ -14,7 +31,7 @@
   새 회귀 테스트를 포함한 Rust 96개 테스트와 전체 DB fixture(건너뜀 0)가
   통과했다. PG·Oracle·SQL Server fixture는 새 구문을 실제로 실행하며,
   `Scripts/verify-dynamic-sql.py`가 필요한 간선과 생기면 안 되는 간선을 함께
-  확인한다. 문자열 연결식 계산·format 평가·변수 값 추적은 계속 미지원이다.
+  확인한다. 당시 미지원이던 문자열 연결식·format·변수 추적은 위 v0.2.0에서 보강했다.
   CI에서 `cargo package`가 `target/debug/schemagraph`를 레지스트리 의존성으로
   링크한 바이너리로 덮어쓰는 문제도 재현했다. 패키징은 별도 target 경로로
   분리하고 작업용 CLI 해시가 변하지 않는지 검사한다. 기존 혼합 산출물 캐시를
@@ -315,8 +332,8 @@
 ## 검증 명령
 
 ```bash
-cd engine && cargo build && cargo test        # 빌드 + 96개 테스트
-Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + JDBC probe 양방향 검증
+(cd engine && cargo build --workspace --locked && cargo test --workspace --locked) # 127개 테스트
+Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체 DB/전송 조합 검증
 # PG는 initdb로, MySQL·MariaDB·MSSQL·Oracle은 docker로 자동 프로비전한다.
 #   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh      (폐기용 DB만!)
 #   SG_MYSQL_URL=mysql://user@host/db SG_MYSQL_CONTAINER=<이름> ...
@@ -330,15 +347,16 @@ Scripts/verify-fixtures.sh                    # SQLite + PG + MySQL + MariaDB + 
 
 ## 다음 할 일
 
-1. routine 파싱 잔여 — T-SQL `TRY/CATCH`·`EXEC`·`WHILE`·커서는 복구됐고
-   완전한 문자열 리터럴의 동적 SQL도 복구한다. 남은 것은 문자열 연결식·
-   format 평가·변수 값 추적과 드문 절차형 구문이다. 패키지 멤버 귀속은
-   완료됐고, 멤버 경계가 모호한 경우의 추가 정밀도는 남아 있다.
-2. Go 프로브 확장 — Oracle·SQL Server를 커버. pure-Go 드라이버가 있는
-   방언(pgwire·mysql·sqlite)으로 수요별 확장.
-3. document v2 — additive 필드 너머의 협상(변경·제거 필드의 버전 계약).
+요청된 v0.2 로드맵 구현은 완료했다. 위 통합 CI·배포 결과를 확인한 뒤 기록을
+갱신한다. 기능 확장은 재현 가능한 실제 사용 사례가 생길 때 진행한다.
 
-## 미결
+## 의도적으로 남긴 경계
 
-DESIGN.md "미결 사항" 절 참조: document 스키마 v2(additive 너머의 협상),
-프로브 Tier 1 방언 확장, 멤버 id v2(보류 결정 유지).
+- 실행 시점 입력·분기 결과에 의존하는 SQL은 추측하지 않고 limitation으로 남긴다.
+- JDBC는 스키마 단위로 출력하지만 Go 수집과 Rust 입력·그래프 구성은 전체
+  메모리를 사용한다. 전체 파이프라인의 메모리 상한 보장은 별도 설계가 필요하다.
+- 모든 멤버 id에 kind를 넣는 변경은 기존 id 호환성 때문에 보류한다.
+- DB2·Informix 등 추가 방언의 특화 수집과 Maven 배포는 구체적인 수요가 있을 때
+  진행한다. 현재 Generic JDBC 경로와 소스 빌드는 제공한다.
+
+세부 근거는 DESIGN.md "호환 계약과 확장 경계" 절을 참고한다.

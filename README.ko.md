@@ -17,7 +17,7 @@ JSON을 출력하며, Mermaid와 Graphviz DOT 다이어그램도 지원합니다
 Rust와 Cargo로 CLI를 설치합니다.
 
 ```sh
-cargo install schemagraph-cli --version 0.1.0 --locked
+cargo install schemagraph-cli --version 0.2.0 --locked
 ```
 
 ### 소스에서 빌드
@@ -53,9 +53,9 @@ fixture에는 외래 키 체인, 뷰, 트리거, 의존성 순환이 포함되�
 
 | 데이터베이스 | 네이티브 reader | JDBC 프로브 | Go 프로브 |
 | --- | --- | --- | --- |
-| SQLite | 지원 | 드라이버 번들 | — |
-| PostgreSQL | 지원 | 드라이버 번들 | — |
-| MySQL / MariaDB | 지원 | 외부 MySQL 드라이버 | — |
+| SQLite | 지원 | 드라이버 번들 | 지원 |
+| PostgreSQL | 지원 | 드라이버 번들 | 지원 |
+| MySQL / MariaDB | 지원 | 외부 MySQL 드라이버 | 지원 |
 | SQL Server | — | 드라이버 번들 | 지원 |
 | Oracle | — | 외부 Oracle 드라이버 | 지원 |
 | H2 | — | 드라이버 번들 | — |
@@ -87,8 +87,9 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 | `dead` | DB 그래프 안에 남은 의존자가 없는 뷰·루틴 후보를 보고합니다. |
 | `stats` | 수집된 사용 통계와 수집 범위를 보여줍니다. |
 | `rules --config <path>` | TOML 규칙으로 의존 간선을 검사합니다. |
-| `diff <old> <new>` | JSON 형식의 그래프 스냅샷 두 개 또는 catalog document 두 개를 비교합니다. |
+| `diff <old> <new>` | 그래프 스냅샷 두 개 또는 JSON/NDJSON catalog document 두 개를 비교합니다. |
 | `skill` | 코딩 에이전트를 위한 출력 계약과 사용 안내를 출력합니다. |
+| `document-capabilities` | 지원하는 catalog 버전·필수 기능·전송 형식을 보고합니다. |
 
 `cycles`, `dead`, `rules`, `diff`는 `--strict`를 지원합니다. 보고서를 출력하면서
 각각 순환·후보·규칙 위반·차이를 발견하면 종료 코드 **1**을 반환합니다.
@@ -120,27 +121,36 @@ DB 사용자는 `--user`, 비밀번호는 `SG_DB_PASSWORD` 환경 변수로 전�
 `--schema app,reporting`은 수집 범위를 지정한 스키마로 제한합니다. 기본값은
 시스템 스키마를 제외한 전체입니다.
 
-### Go: Oracle과 SQL Server
+### Go 프로브
 
-Go 프로브는 `go-ora`와 `go-mssqldb`를 사용하며 JVM이나 JDBC jar 없이 실행됩니다.
+Go 프로브는 JVM이나 JDBC jar 없이 SQLite·PostgreSQL·MySQL/MariaDB·Oracle·
+SQL Server를 지원합니다. 드라이버는 `CGO_ENABLED=0` 빌드도 지원합니다.
 [probe-go/go.mod](probe-go/go.mod)에 맞는 Go 도구 체인으로 빌드합니다.
 
 ```sh
-(cd probe-go && go build -o schemagraph-probe-go .)
+(cd probe-go && CGO_ENABLED=0 go build -o schemagraph-probe-go .)
 ./probe-go/schemagraph-probe-go --url "$SG_DATABASE_URL" -o catalog.json
 schemagraph scan --document catalog.json -o graph.json
 ```
 
-`SG_DATABASE_URL`에 Oracle(`oracle://…`) 또는 SQL Server(`sqlserver://…`)
-접속 URL을 설정합니다. `--schema`와 `--format json|ndjson`도 지원합니다.
-fixture 검증은 Oracle과 SQL Server에서 Go 프로브와 JDBC 프로브가 만든
-그래프를 비교합니다.
+`SG_DATABASE_URL`에 `sqlite:/path/to/database.db`, `postgres://…`, `mysql://…`,
+`oracle://…`, `sqlserver://…` 중 하나를 설정합니다. MySQL URL에 DB가 있으면
+그 스키마만 수집하며 `--schema`로 범위를 바꿀 수 있습니다. SQLite는 읽기 전용
+모드로 엽니다. `--schema`, `--format json|ndjson`, `--document-version 1|2`를
+지원합니다.
 
 ### 문서 형식
 
 두 프로브는 기본적으로 JSON을 출력하며 `--format ndjson`도 지원합니다.
 `scan --document`는 두 형식을 자동으로 구분합니다. NDJSON은 `document` 헤더,
 `schema` / `object` / `routine` 레코드, 마지막 `limitations` 레코드로 구성됩니다.
+
+두 프로브는 호환성을 위해 catalog 버전 1을 기본값으로 사용합니다.
+`--document-version 2`를 선택하면 v2 생산자 메타데이터와 필수 기능 계약을
+사용합니다. 엔진은 두 버전을 같은 그래프 모델로 읽으며, 모르는 필수 기능과
+불완전한 v2 NDJSON 전송은 거부합니다. `schemagraph document-capabilities`로
+호환 형식을 선택할 수 있습니다. 전송 계약과 이행 규칙은 [CATALOG.md](CATALOG.md)를
+참고하세요.
 
 JDBC 프로브는 스키마 단위로 NDJSON을 출력합니다. 현재 Go 프로브는 전체 문서를
 수집한 뒤 직렬화하고, Rust CLI는 입력 파일 전체를 읽은 뒤 그래프를 구성합니다.
@@ -165,8 +175,10 @@ JDBC 프로브는 스키마 단위로 NDJSON을 출력합니다. 현재 Go 프�
   멤버도 포함합니다. 동적 SQL은 PostgreSQL dollar-quote, Oracle q-quote,
   T-SQL `EXEC(N'…')` / `EXECUTE(N'…')`처럼 전체 명령이 보이는 형태를 지원합니다.
   커서·루프·결과 반환 구문에서도 리터럴 명령과 바인딩 함수 호출을 복구합니다.
-  연결식이나 변수로 조립하는 명령은 한계로 보고하며, 문자열 앞부분만 완성된
-  명령으로 판정하지 않습니다. 중첩 컬럼 스코프의 분석 한계도 보고합니다.
+  상수 연결식, 의미가 명확한 PostgreSQL `format()` 일부 형식, 직선 구간의
+  알려진 텍스트 변수는 보수적으로 평가합니다. 분기·루프·불확실한 대입·지원하지
+  않는 형 변환·미지 값에서는 이 정보를 무효화합니다. 문자열 앞부분만 완성된
+  명령으로 판정하지 않으며, 중첩 컬럼 스코프의 분석 한계도 보고합니다.
 
 ### 사용 통계
 
@@ -246,9 +258,9 @@ DB 통합 검증을 수행합니다. 외부 MySQL·Oracle JDBC jar은 `SG_MYSQL_
 스크립트를 시작하기 전에 CLI를 빌드하고 검증이 끝날 때까지 바이너리를
 교체하지 마세요.
 
-P0–P6 단계는 구현되어 있습니다. 다음 작업은 절차형 SQL 분석 범위 보강,
-Go 프로브 지원 방언 확장, additive 필드를 넘어서는 문서 버전
-협상입니다.
+P0–P6와 v0.2 로드맵의 보수적 SQL 텍스트 평가, Go 프로브 5개 방언,
+패키지 멤버 경계 처리, catalog v2 협상을 구현했습니다. 실행 시점 값에 의존하는
+SQL은 계속 명시적인 한계로 남으며, 추가 방언은 구체적인 사용 사례에 따라 확장합니다.
 
 설계와 출력 계약은 [DESIGN.md](DESIGN.md), 구현 상태와 검증 기록은
 [HANDOFF.md](HANDOFF.md), 기여 지침은 [AGENTS.md](AGENTS.md)를 참고하세요.

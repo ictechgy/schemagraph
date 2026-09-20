@@ -231,34 +231,37 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
 | Azimutt | GUI 탐색 + 추정 간선 | CLI 판정·판정/추정 간선 분리 |
 | DataGrip/DBeaver | IDE ERD | headless·CI·에이전트 소비 |
 
-## 미결 사항
+## 호환 계약과 확장 경계
 
-- **catalog document 스키마** — version 1로 고정됨(`document.rs`의
-  `DOCUMENT_VERSION`). 정책: 필드 추가는 하위호환(additive), 이름·의미 변경은
-  버전을 올린다. 버전 불일치는 거부하고, 같은 버전 안의 미지 필드는 받되
-  무시된 경로를 `limitations`에 신고한다(`unknown_field_paths`).
-- **routine 몸체 파싱 커버리지** — `sql`·`plpgsql`·`plsql`은 문장 추출로
-  파싱됨(P5). T-SQL의 TRY/CATCH·EXEC·WHILE·커서와 Oracle 패키지 멤버
-  귀속도 지원한다(P6). 동적 SQL은 전체 문자열이 보이는 경우에만 복구한다:
-  PG dollar-quote, Oracle q-quote, T-SQL 괄호·N 리터럴과 FOR/OPEN/RETURN
-  QUERY EXECUTE 경로. INTO·USING 식의 함수 호출도 수집한다. 문자열 뒤에
-  연결식·연산이나 원격 실행 꼬리(AT)가 있으면 접두부를 완성된 SQL로 보지
-  않고 미추출로 보고한다. 상수 연결식 계산·format 평가·변수 값 추적·나머지
-  언어는 미지원이며 limitation을 유지한다. 문법 기준은
+- **catalog document v1/v2** — 기본 출력과 내부 모델은 v1을 유지한다.
+  v2는 `reader`를 `producer.name`으로 바꾸고 `required_features`를 요구한다.
+  현재 기능은 `usage-v1`·`package-members-v1`이며, 모르는 필수 기능은 거부한다.
+  지원 버전은 `document-capabilities`로 조회한다. 같은 버전의 선택 필드는
+  추가할 수 있지만 무시된 경로를 `limitations`에 신고한다. 필드의 삭제·의미
+  변경은 새 전송 버전 또는 소비자가 명시적으로 이해하는 기능 계약이 필요하다.
+  두 버전은 같은 내부 catalog로 정규화되므로 graph 버전과 정점 id는 바뀌지
+  않는다. 상세 전송 명세와 이행 예시는 [CATALOG.md](CATALOG.md)에 있다.
+- **SQL 텍스트 평가** — 리터럴, 방언별 상수 연결, PostgreSQL의 명확한 builtin
+  `format()` 일부 형식, 직선 구간의 안전한 텍스트 변수만 평가한다. 분기·루프·
+  미모델링 대입·형 변환·외부 효과가 개입하면 값을 무효화하고 한계를 남긴다.
+  출력 크기·재귀 깊이·인자 수를 제한하며, 변수에 의존하는 문자열 접두부를
+  완성된 SQL로 판정하지 않는다. 완전한 절차형 인터프리터나 임의 함수 실행은
+  분석기의 역할이 아니다. 문법 기준은
   [PostgreSQL EXECUTE](https://www.postgresql.org/docs/16/plpgsql-statements.html#PLPGSQL-STATEMENTS-EXECUTING-DYN),
   [Oracle EXECUTE IMMEDIATE](https://docs.oracle.com/en/database/oracle/oracle-database/19/lnpls/EXECUTE-IMMEDIATE-statement.html),
   [SQL Server EXECUTE](https://learn.microsoft.com/en-us/sql/t-sql/language-elements/execute-transact-sql?view=sql-server-ver16)다.
-- **프로브 전송 방식** — 파일·stdout에 NDJSON 형식이 더해짐(P5). 프로브 측
-  진짜 스트리밍(수확과 동시에 행 출력)은 아직 — 현재는 문서를 만든 뒤
-  직렬화만 행 단위다. 수요가 생기면 Extractor를 행 방출로 고친다.
-- **crates.io / Maven Central 이름** — `schemagraph`는 둘 다 비어 있음
-  (2026-09-19 확인). 선점·퍼블리시는 아직이다.
-- **멤버 id 공간 v2** — 모든 멤버 id에 kind를 박는 안은 보류(호환 깨짐).
-  현행: 충돌 시에만 `@kind` 접미사.
-- **Oracle package 멤버별 귀속** — 패키지 정점 하나에 몸체 간선이 모인다.
-  멤버 id로 쪼개려면 ALL_ARGUMENTS의 PACKAGE_NAME 경로로 시그니처를
-  복원해 정점을 나누는 설계가 필요하다.
-- **프로브 Tier 1 추가 확장** — DB2, Informix 등의 몸체 소스는 수요별로.
-- **Go 프로브 확장** — Oracle만 커버(ojdbc 마찰이 큰 곳부터). 다른 방언은
-  JVM 프로브가 번들 드라이버로 충분 — 수요가 생기면 pure-Go 드라이버가
-  있는 방언(pgwire, mysql, sqlserver, sqlite)으로 넓힌다.
+- **프로브 전송** — JSON·NDJSON을 지원한다. JDBC는 스키마 단위로 NDJSON을
+  방출하며 Go 프로브와 Rust 입력 경로는 전체 문서를 메모리에 보관한다.
+  v2 NDJSON은 마지막 limitations 레코드를 요구해 중간에 끊긴 전송을 거부한다.
+  v1의 트레일러 없는 옛 형식은 계속 허용한다.
+- **Oracle 패키지 멤버** — 카탈로그의 `member_of`로 정점을 나누고 raw body를
+  멤버에 붙인다. 문자열·주석의 가짜 헤더, 로컬 서브프로그램, 패키지 초기화
+  블록을 멤버 경계로 오인하지 않으며, 경계를 확정하지 못하면 원문 귀속을
+  추측하지 않고 limitation으로 신고한다. 그래프 간선 해석은 엔진에만 있다.
+- **Go 프로브** — SQLite·PostgreSQL·MySQL/MariaDB·Oracle·SQL Server를 지원한다.
+  CGO 없이 빌드하며 카탈로그와 원문만 수집한다. 통계 비활성화와 미수집은
+  실제 관측으로 보고하고, 관측된 0과 구분한다.
+- **명시적으로 보류한 범위** — 멤버 id에 항상 kind를 붙이는 안은 호환성
+  때문에 보류한다. 현재는 충돌할 때만 `@kind`를 쓴다. DB2·Informix 등 추가
+  Tier 1 방언, Maven 배포, 전체 파이프라인의 메모리 제한은 사용 사례에 따라
+  별도로 설계한다. 현재 로드맵을 완료하려고 이 범위를 임의로 확대하지 않는다.

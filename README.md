@@ -18,7 +18,7 @@ as Mermaid and Graphviz DOT.
 Install the CLI with Rust and Cargo:
 
 ```sh
-cargo install schemagraph-cli --version 0.1.0 --locked
+cargo install schemagraph-cli --version 0.2.0 --locked
 ```
 
 ### Build from source
@@ -54,9 +54,9 @@ cycles. `query main.orders` shows its dependency on `main.customers`;
 
 | Database | Native reader | JDBC probe | Go probe |
 | --- | --- | --- | --- |
-| SQLite | Yes | Bundled driver | — |
-| PostgreSQL | Yes | Bundled driver | — |
-| MySQL / MariaDB | Yes | External MySQL driver | — |
+| SQLite | Yes | Bundled driver | Yes |
+| PostgreSQL | Yes | Bundled driver | Yes |
+| MySQL / MariaDB | Yes | External MySQL driver | Yes |
 | SQL Server | — | Bundled driver | Yes |
 | Oracle | — | External Oracle driver | Yes |
 | H2 | — | Bundled driver | — |
@@ -88,8 +88,9 @@ read that file by default; use `--graph <path>` to select another snapshot.
 | `dead` | Report candidate views and routines with no remaining dependents in the database graph. |
 | `stats` | List collected usage evidence and collection coverage. |
 | `rules --config <path>` | Check dependency edges against TOML rules. |
-| `diff <old> <new>` | Compare two graph snapshots or two catalog documents in JSON format. |
+| `diff <old> <new>` | Compare two graph snapshots or two JSON/NDJSON catalog documents. |
 | `skill` | Print the output contract and usage guide for coding agents. |
+| `document-capabilities` | Report supported catalog versions, features, and formats. |
 
 `cycles`, `dead`, `rules`, and `diff` accept `--strict`: the command still
 prints its report but exits with code **1** when it finds cycles,
@@ -123,21 +124,23 @@ Use `--user` for the database user and `SG_DB_PASSWORD` for the password.
 `--schema app,reporting` restricts collection to the named schemas; by
 default, the probe collects non-system schemas.
 
-### Go: Oracle and SQL Server
+### Go probe
 
-The Go probe uses `go-ora` and `go-mssqldb` and runs without a JVM or JDBC
-jars. Use a Go toolchain compatible with [probe-go/go.mod](probe-go/go.mod):
+The Go probe supports SQLite, PostgreSQL, MySQL/MariaDB, Oracle, and SQL Server
+without a JVM or JDBC jars. Its drivers also support `CGO_ENABLED=0` builds.
+Use a Go toolchain compatible with [probe-go/go.mod](probe-go/go.mod):
 
 ```sh
-(cd probe-go && go build -o schemagraph-probe-go .)
+(cd probe-go && CGO_ENABLED=0 go build -o schemagraph-probe-go .)
 ./probe-go/schemagraph-probe-go --url "$SG_DATABASE_URL" -o catalog.json
 schemagraph scan --document catalog.json -o graph.json
 ```
 
-Set `SG_DATABASE_URL` to an Oracle (`oracle://…`) or SQL Server
-(`sqlserver://…`) connection URL. The probe also accepts `--schema` and
-`--format json|ndjson`. The fixture suite compares its graphs with those
-produced by the JDBC probe on Oracle and SQL Server.
+Set `SG_DATABASE_URL` to `sqlite:/path/to/database.db`, `postgres://…`,
+`mysql://…`, `oracle://…`, or `sqlserver://…`. A database in a MySQL URL
+limits collection to that schema unless `--schema` overrides it. SQLite
+connections use read-only mode. The probe also accepts `--schema`,
+`--format json|ndjson`, and `--document-version 1|2`.
 
 ### Document formats
 
@@ -145,6 +148,13 @@ Both probes emit JSON by default and accept `--format ndjson`.
 `scan --document` detects either format automatically. NDJSON uses a
 `document` header, `schema` / `object` / `routine` records, and a final
 `limitations` record.
+
+Both probes default to catalog version 1 for compatibility. Select
+`--document-version 2` to use the v2 producer metadata and required-feature
+contract. The engine reads both versions into the same graph model. It rejects
+unknown required features and incomplete v2 NDJSON streams. Use
+`schemagraph document-capabilities` to choose a compatible producer format;
+[CATALOG.md](CATALOG.md) specifies the wire contract and migration rules.
 
 The JDBC probe emits NDJSON one schema at a time. The Go probe currently
 collects the full document before serialization, and the Rust CLI reads the
@@ -172,9 +182,11 @@ views, functions, procedures, and packages can be.
   SQL forms include complete PostgreSQL dollar-quoted commands, Oracle
   q-quoted commands, and T-SQL `EXEC(N'…')` / `EXECUTE(N'…')`. Cursor, loop,
   and return-query forms also recover literal commands and binding calls.
-  Concatenated or variable-built commands remain limitations; a literal
-  prefix is never treated as the full command. Nested column scopes can
-  also leave reported gaps.
+  Constant concatenations, an unambiguous PostgreSQL `format()` subset, and
+  known text variables in straight-line code are evaluated conservatively.
+  Branches, loops, uncertain writes, unsupported conversions, and unknown
+  values invalidate that knowledge. A literal prefix is never treated as
+  the full command. Nested column scopes can also leave reported gaps.
 
 ### Usage evidence
 
@@ -255,9 +267,10 @@ Unavailable checks print skip warnings; an exit code of zero alone does not
 mean every database was tested. Build the CLI before starting the script
 and keep that binary unchanged until the run finishes.
 
-The P0–P6 milestones are implemented. Next work includes broader procedural
-SQL coverage, more Go probe dialects, and
-document version negotiation beyond additive fields.
+The P0–P6 milestones and the v0.2 roadmap are implemented: conservative SQL
+text evaluation, five Go probe dialects, package member boundary handling,
+and catalog v2 negotiation. Runtime-dependent SQL remains an explicit
+limitation; further dialects are added as concrete use cases require them.
 
 See [DESIGN.md](DESIGN.md) for the design and output contract,
 [HANDOFF.md](HANDOFF.md) for implementation status and verification notes,

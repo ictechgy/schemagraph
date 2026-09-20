@@ -18,6 +18,7 @@ schemagraph dead                                # no-internal-consumer candidate
 schemagraph cycles [--level object|column]      # dependency cycles
 schemagraph rules [--strict]                    # declared rules, CI gate
 schemagraph stats                               # collected usage evidence
+schemagraph document-capabilities               # catalog versions and required features
 schemagraph graph --format mermaid|json|dot     # render
 ```
 
@@ -62,8 +63,16 @@ schemagraph graph --format mermaid|json|dot     # render
 
 ## Workflow
 
-1. `scan` the database (or run the JDBC probe → `scan --document`).
+1. `scan` the database (or run a JDBC/Go probe → `scan --document`).
 2. Read `limitations` in graph.json **first** — know what was not visible.
 3. Use `query`/`impact`/`dead`/`stats` for the question at hand.
 4. When reporting candidates, quote the evidence (`usage`, `evidence`,
    `limitations`) rather than paraphrasing it into a verdict.
+
+## Catalog compatibility
+
+The engine accepts catalog v1 and v2; graph format remains v1. Both probes
+default to catalog v1. Query `document-capabilities` before selecting
+`--document-version 2`. Unknown required features and incomplete v2 NDJSON
+are errors; do not silently downgrade them. See [CATALOG.md](https://github.com/ictechgy/schemagraph/blob/main/CATALOG.md)
+in the source repository for the producer and required-feature contract.
