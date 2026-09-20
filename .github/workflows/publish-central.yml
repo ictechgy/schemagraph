@@ -1,0 +1,103 @@
+name: Publish probe to Maven Central
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release version to publish from its Git tag
+        required: true
+        default: "0.3.0"
+      publish:
+        description: Publish after validation (false leaves a validated deployment)
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maven-central-probe
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    name: Sign, compare, validate, and publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PROBE_VERSION: ${{ inputs.version }}
+      PROBE_GROUP: io.github.ictechgy
+      PROBE_SOURCE_DIR: ${{ github.workspace }}/release/probe
+    steps:
+      - name: Check out publication tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check release version and credential availability
+        env:
+          MAVEN_SIGNING_KEY: ${{ secrets.MAVEN_SIGNING_KEY }}
+          MAVEN_SIGNING_PASSWORD: ${{ secrets.MAVEN_SIGNING_PASSWORD }}
+          CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+        run: |
+          [[ "$PROBE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "error: version must be an existing stable release, such as 0.3.0" >&2
+            exit 2
+          }
+          for name in MAVEN_SIGNING_KEY MAVEN_SIGNING_PASSWORD CENTRAL_TOKEN_USERNAME CENTRAL_TOKEN_PASSWORD; do
+            [[ -n "${!name}" ]] || {
+              echo "error: missing repository secret: $name" >&2
+              exit 2
+            }
+          done
+
+      - name: Check out the released probe source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v${{ inputs.version }}
+          path: release
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          gradle-version: "9.6.1"
+          cache-disabled: true
+
+      - name: Sign the release and submit it to Central
+        env:
+          MAVEN_SIGNING_KEY: ${{ secrets.MAVEN_SIGNING_KEY }}
+          MAVEN_SIGNING_PASSWORD: ${{ secrets.MAVEN_SIGNING_PASSWORD }}
+          CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          args=(--output "$RUNNER_TEMP/central-bundle-$PROBE_VERSION.zip"
+                --compare-repository https://ictechgy.github.io/schemagraph/maven/
+                --upload)
+          if [[ "$PUBLISH" == true ]]; then
+            args+=(--publish)
+          fi
+          Scripts/publish-probe-maven.sh "${args[@]}"
+
+      - name: Keep the signed public bundle
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: central-bundle-${{ inputs.version }}
+          path: ${{ runner.temp }}/central-bundle-${{ inputs.version }}.zip
+          if-no-files-found: ignore
+          retention-days: 30

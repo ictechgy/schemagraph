@@ -82,10 +82,10 @@ preserved version (thin, `all`, sources, Javadoc, and POM), and refuses changed
 bytes when a version already exists. Re-running the same version with identical
 bytes is idempotent.
 
-## Maven Central (optional)
+## Maven Central
 
-Maven Central is an optional, separate release path. It is not used by the
-chosen GitHub Pages publication. You do not need a Central account, namespace,
+Maven Central is a separate release path. The existing GitHub Pages publication
+remains available. You do not need a Central account, namespace,
 PGP key, or token to consume or deploy the GitHub Pages repository.
 
 If Central is needed later, complete these steps in the Central Portal. Never
@@ -132,6 +132,22 @@ credentials before closing the dialog. Sonatype does not show the token again.
 Inject them only as `CENTRAL_TOKEN_USERNAME` and `CENTRAL_TOKEN_PASSWORD`; never
 commit them or print them.
 
+For the repository's manual [Central workflow](.github/workflows/publish-central.yml),
+store all four values as [GitHub Actions repository secrets](https://github.com/ictechgy/schemagraph/settings/secrets/actions):
+
+| Secret | Value |
+| --- | --- |
+| `CENTRAL_TOKEN_USERNAME` | Username issued with the Central user token |
+| `CENTRAL_TOKEN_PASSWORD` | Password issued with the Central user token |
+| `MAVEN_SIGNING_KEY` | Complete ASCII-armored private signing key |
+| `MAVEN_SIGNING_PASSWORD` | Passphrase protecting that key |
+
+These are token credentials, not your GitHub or Central login password.
+The workflow requires a passphrase-protected key whose public half has already
+been distributed to a supported keyserver. Secret values are injected only
+into the credential check and publication steps; no private key is uploaded as
+a workflow artifact.
+
 ### 4. Build and validate locally
 
 With the signing key supplied securely, create the Central bundle. This command
@@ -177,6 +193,26 @@ after reviewing the Central validation result; the helper then waits for and
 reads back `PUBLISHED`. Before publishing, verify the namespace, token
 permissions, public signing key, and that `0.3.0` has not already been released.
 Central releases are immutable.
+
+Alternatively, run the manual workflow from `main` after the four secrets are
+configured:
+
+```sh
+gh workflow run publish-central.yml --ref main -f version=0.3.0 -f publish=true
+```
+
+It builds the probe from the existing `v0.3.0` tag, compares all five unsigned
+payloads byte-for-byte with the public Pages repository, then uploads the signed
+bundle. Publication proceeds only after Central reports `VALIDATED`, and the
+workflow waits for `PUBLISHED`. With `publish=false` (the default), it stops
+after validation. The workflow keeps the signed public bundle for 30 days.
+If polling times out after upload, use the deployment ID in the log to inspect
+or publish that deployment in the Portal rather than blindly uploading again.
+
+The same byte comparison is available in the local helper with
+`--compare-repository https://ictechgy.github.io/schemagraph/maven/`.
+`PROBE_SOURCE_DIR` can select the `probe` directory in a separate release
+checkout while using the current publication helper.
 
 The publication metadata includes the MIT and Apache-2.0 licenses, project
 description and URL, developer information, and Git SCM coordinates. Central

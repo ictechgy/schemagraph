@@ -4,6 +4,17 @@
 
 ## 지금 상태
 
+- 2026-09-20: **Maven Central 추가 게시 준비 중** (`feature/maven-central-publication`).
+  사용자가 Central 게시 진행을 요청했고 `io.github.ictechgy` namespace가
+  **Verified**라고 확인했다. 게시용 토큰을 GitHub Actions repository secrets의
+  `CENTRAL_TOKEN_USERNAME`·`CENTRAL_TOKEN_PASSWORD`에 직접 등록하도록 안내했다.
+  비밀값은 요청하거나 읽지 않았다. 전용 PGP 키 생성·보관·공개키 배포는 사용자
+  승인 전이며 `MAVEN_SIGNING_KEY`·`MAVEN_SIGNING_PASSWORD`도 아직 준비되지 않았다.
+  수동 Central workflow는 릴리스 태그에서 빌드하고 기존 Pages의 5개 payload와
+  바이트가 일치해야 업로드한다. `publish=true`에서만 VALIDATED→PUBLISHED를
+  진행한다. actionlint·셸/Python 구문과 동일 바이트 수용, 변조·필수 JAR 누락·
+  HTTP/인증정보 포함 URL 거부 검사를 통과했다. Central 실제 업로드·서명 검증·
+  게시·익명 설치는 아직 실행하지 않았다.
 - 2026-09-20: **v0.3.0 — 요청한 추가 3건 구현·검증·공개 배포 완료**.
   [CLI](https://crates.io/crates/schemagraph-cli/0.3.0) ·
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.3.0) ·
@@ -27,7 +38,8 @@
     thin·all·sources·Javadoc·POM과 체크섬을 확인하고, 깨끗한 Maven 저장소에서
     공개 URL만으로 의존성을 받아 H2 테이블·컬럼·PK를 읽었다. 독립 all JAR도
     같은 카탈로그를 냈다. 재게시 시 과거 버전·체크섬·동일 바이트를 보존한다.
-    Central 계정은 아직 없으며 이번 배포에 필요하지 않다. 준비 절차는 [MAVEN.md](MAVEN.md).
+    당시 Central 계정은 없었으며 이 배포에 필요하지 않았다. 이후 진행은 위 기록과
+    [MAVEN.md](MAVEN.md)를 참고한다.
   Rust 148개 테스트, Go test·vet·CGO 없는 빌드, JVM 테스트, Maven/Gradle 소비자,
   6개 크레이트 패키지 빌드와 실제 DB 전체 검증을 통과했다.
   [릴리스 소스 통합 CI](https://github.com/ictechgy/schemagraph/actions/runs/35509238204) ·
@@ -392,8 +404,9 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 ## 다음 할 일
 
 요청한 성능·메모리 개선, Db2·Informix 특화 지원, 공개 Maven 배포를 완료했다.
-필수 후속 작업은 없다. 사용자가 선택하지 않은 Central 게시는 필요할 때
-MAVEN.md의 별도 계정·namespace·서명 준비 절차를 따른다.
+추가 요청된 Central 게시는 namespace 인증이 끝났으며, 토큰 등록과 전용 서명키
+준비가 남았다. 설정 후 `publish-central.yml`을 `publish=true`로 실행하고,
+PUBLISHED 상태와 실제 Maven Central 소비자 설치까지 검증한다.
 
 ## 의도적으로 남긴 경계
 
@@ -402,7 +415,7 @@ MAVEN.md의 별도 계정·namespace·서명 준비 절차를 따른다.
   전체 메모리를 사용한다. Go JSON도 전체 문서를 유지한다. 성능과 메모리 한계는
   [PERFORMANCE.md](PERFORMANCE.md)에 측정 근거와 함께 설명한다.
 - 모든 멤버 id에 kind를 넣는 변경은 기존 id 호환성 때문에 보류한다.
-- Maven Central은 사용자가 선택한 배포 경로가 아니다. 준비 안내와 서명·게시
-  도구는 제공하되 실제 공개 배포는 GitHub Pages Maven 저장소를 사용한다.
+- GitHub Pages Maven 저장소는 이미 공개되어 있다. Central 추가 게시의 상태는
+  위 인계 기록으로 구분하며, 실제 게시 전에 Central 이용 가능으로 표시하지 않는다.
 
 세부 근거는 DESIGN.md "호환 계약과 확장 경계" 절을 참고한다.

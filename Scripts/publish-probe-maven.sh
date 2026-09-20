@@ -6,13 +6,14 @@ set -euo pipefail
 # 비밀값은 MAVEN_SIGNING_KEY/PASSWORD와 CENTRAL_TOKEN_* 환경변수에서만 받는다.
 
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
-PROBE_DIR="$ROOT_DIR/probe"
+PROBE_DIR=${PROBE_SOURCE_DIR:-"$ROOT_DIR/probe"}
 VERSION=${PROBE_VERSION:-0.3.0}
 GROUP_ID=${PROBE_GROUP:-io.github.ictechgy}
 ARTIFACT_ID=schemagraph-probe
 UPLOAD=false
 PUBLISH=false
 DEPLOYMENT_ID=""
+COMPARE_REPOSITORY=""
 POLL_SECONDS=${CENTRAL_POLL_SECONDS:-10}
 POLL_TIMEOUT=${CENTRAL_POLL_TIMEOUT:-1800}
 OUTPUT_PATH="$ROOT_DIR/probe/build/central-bundle-$VERSION.zip"
@@ -21,10 +22,14 @@ usage() {
     cat <<'EOF'
 usage: Scripts/publish-probe-maven.sh [--output PATH] [--upload] [--publish]
        [--deployment-id ID] [--poll-seconds N] [--poll-timeout N]
+       [--compare-repository HTTPS_URL]
 
 Builds and validates a signed Central Publisher Portal bundle. The upload
 step is disabled unless --upload is supplied explicitly. --publish is also
 explicit and acts only after Central reports VALIDATED.
+--compare-repository requires all five payloads to match an existing public
+Maven repository byte-for-byte before upload. PROBE_SOURCE_DIR can point to
+the probe directory of a separate release checkout.
 
 Required for bundle creation:
   MAVEN_SIGNING_KEY       ASCII-armored private key injected into Gradle
@@ -53,6 +58,11 @@ while (($#)); do
         --deployment-id)
             (($# >= 2)) || { echo "error: --deployment-id needs an id" >&2; exit 2; }
             DEPLOYMENT_ID=$2
+            shift 2
+            ;;
+        --compare-repository)
+            (($# >= 2)) || { echo "error: --compare-repository needs a URL" >&2; exit 2; }
+            COMPARE_REPOSITORY=$2
             shift 2
             ;;
         --poll-seconds)
@@ -97,6 +107,10 @@ command -v curl >/dev/null 2>&1 || {
 BUILD_BUNDLE=true
 if [[ -n "$DEPLOYMENT_ID" && "$UPLOAD" != true ]]; then
     BUILD_BUNDLE=false
+fi
+if [[ "$BUILD_BUNDLE" == false && -n "$COMPARE_REPOSITORY" ]]; then
+    echo "error: --compare-repository requires building a new bundle" >&2
+    exit 2
 fi
 if [[ "$BUILD_BUNDLE" == true && -z ${MAVEN_SIGNING_KEY:-} ]]; then
     echo "error: MAVEN_SIGNING_KEY is required; no signing key file is read" >&2
@@ -148,7 +162,7 @@ gradle -p "$PROBE_DIR" \
     -PprobeVersion="$VERSION" \
     -PprobeRepositoryDir="$repo_dir" \
     -PsigningRequired=true \
-    --console=plain
+    --console=plain --no-daemon
 
 group_path=$(printf '%s' "$GROUP_ID" | tr '.' '/')
 artifact_dir="$repo_dir/$group_path/$ARTIFACT_ID/$VERSION"
@@ -219,6 +233,35 @@ done
 (cd "$bundle_root" && zip -q -r "$OUTPUT_PATH" "$group_path")
 test -s "$OUTPUT_PATH"
 echo "created Central bundle: $OUTPUT_PATH"
+fi
+
+if [[ -n "$COMPARE_REPOSITORY" ]]; then
+    python3 - "$OUTPUT_PATH" "$COMPARE_REPOSITORY" "$GROUP_ID" "$ARTIFACT_ID" "$VERSION" <<'PY'
+import sys
+import urllib.parse
+import urllib.request
+import zipfile
+
+bundle, repository, group, artifact, version = sys.argv[1:]
+url = urllib.parse.urlsplit(repository)
+if url.scheme != "https" or not url.hostname or url.username or url.password or url.query or url.fragment:
+    raise SystemExit("error: comparison repository must be an HTTPS URL without credentials, query, or fragment")
+prefix = f"{group.replace('.', '/')}/{artifact}/{version}/"
+names = [f"{artifact}-{version}{suffix}" for suffix in (
+    ".pom", ".jar", "-all.jar", "-sources.jar", "-javadoc.jar"
+)]
+with zipfile.ZipFile(bundle) as archive:
+    for name in names:
+        path = prefix + name
+        if archive.namelist().count(path) != 1:
+            raise SystemExit(f"error: missing or duplicate bundle payload: {name}")
+        local = archive.read(path)
+        with urllib.request.urlopen(repository.rstrip("/") + "/" + path, timeout=60) as response:
+            remote = response.read(len(local) + 1)
+        if remote != local:
+            raise SystemExit(f"error: existing public Maven payload differs: {name}")
+        print(f"verified existing public Maven payload: {name}")
+PY
 fi
 
 if [[ "$UPLOAD" == true ]]; then
