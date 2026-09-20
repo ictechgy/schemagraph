@@ -4,6 +4,19 @@
 
 ## 지금 상태
 
+- 2026-09-20: **GitHub Actions CI 추가** —
+  [워크플로](.github/workflows/ci.yml) ·
+  [실행 기록](https://github.com/ictechgy/schemagraph/actions/workflows/ci.yml).
+  push·PR·수동 실행에서 Rust fmt·빌드·테스트, 스킬·라이선스 사본 일치,
+  6개 크레이트 패키징, JDBC shadowJar, Go fmt·vet·빌드, 전체 DB fixture를
+  검증한다. 기존 fixture 스크립트의 `주의:` 경고는 CI 실패로 취급해 검사를
+  건너뛰고 성공하는 경우를 막는다. 실제 게시 명령이나 게시 토큰은 사용하지
+  않는다. Ubuntu 24.04·Rust 1.96.0·JDK 17·Gradle 9.6.1을 사용하고 Go 버전은
+  `probe-go/go.mod`에서 읽는다. 외부 액션은 커밋 SHA로, MySQL·Oracle 검증용
+  JDBC jar은 버전과 SHA-256으로 고정했다. 워크플로 문법·셸 구문, 건너뜀
+  실패 처리, 로컬 전체 패키징과 Go vet·빌드를 확인했다.
+  [첫 GitHub 실행](https://github.com/ictechgy/schemagraph/actions/runs/35492301542)도
+  Ubuntu 러너에서 전체 단계가 통과했고 DB fixture 건너뜀은 없었다.
 - 2026-09-20: **v0.1.0 crates.io 배포 완료** —
   [CLI 패키지](https://crates.io/crates/schemagraph-cli/0.1.0) ·
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.1.0).
