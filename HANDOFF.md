@@ -15,6 +15,10 @@
   통과했다. PG·Oracle·SQL Server fixture는 새 구문을 실제로 실행하며,
   `Scripts/verify-dynamic-sql.py`가 필요한 간선과 생기면 안 되는 간선을 함께
   확인한다. 문자열 연결식 계산·format 평가·변수 값 추적은 계속 미지원이다.
+  CI에서 `cargo package`가 `target/debug/schemagraph`를 레지스트리 의존성으로
+  링크한 바이너리로 덮어쓰는 문제도 재현했다. 패키징은 별도 target 경로로
+  분리하고 작업용 CLI 해시가 변하지 않는지 검사한다. 기존 혼합 산출물 캐시를
+  재사용하지 않도록 CI Rust 캐시 이름도 바꿨다.
 - 2026-09-20: **GitHub Actions CI 추가** —
   [워크플로](.github/workflows/ci.yml) ·
   [실행 기록](https://github.com/ictechgy/schemagraph/actions/workflows/ci.yml).
