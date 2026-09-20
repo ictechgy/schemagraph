@@ -250,8 +250,10 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
   [PostgreSQL EXECUTE](https://www.postgresql.org/docs/16/plpgsql-statements.html#PLPGSQL-STATEMENTS-EXECUTING-DYN),
   [Oracle EXECUTE IMMEDIATE](https://docs.oracle.com/en/database/oracle/oracle-database/19/lnpls/EXECUTE-IMMEDIATE-statement.html),
   [SQL Server EXECUTE](https://learn.microsoft.com/en-us/sql/t-sql/language-elements/execute-transact-sql?view=sql-server-ver16)다.
-- **프로브 전송** — JSON·NDJSON을 지원한다. JDBC는 스키마 단위로 NDJSON을
-  방출하며 Go 프로브와 Rust 입력 경로는 전체 문서를 메모리에 보관한다.
+- **프로브 전송** — JSON·NDJSON을 지원한다. JDBC·Go는 스키마 단위로 NDJSON을
+  방출한다. Rust는 레코드별로 읽어 전송 Value를 바로 해제하고, 그래프 JSON은
+  도메인을 빌려 출력한다. 교차 참조를 위한 내부 카탈로그와 그래프는 여전히
+  전체 메모리에 보관한다. Go의 JSON 경로도 전체 문서를 유지한다.
   v2 NDJSON은 마지막 limitations 레코드를 요구해 중간에 끊긴 전송을 거부한다.
   v1의 트레일러 없는 옛 형식은 계속 허용한다.
 - **Oracle 패키지 멤버** — 카탈로그의 `member_of`로 정점을 나누고 raw body를
@@ -261,7 +263,15 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
 - **Go 프로브** — SQLite·PostgreSQL·MySQL/MariaDB·Oracle·SQL Server를 지원한다.
   CGO 없이 빌드하며 카탈로그와 원문만 수집한다. 통계 비활성화와 미수집은
   실제 관측으로 보고하고, 관측된 0과 구분한다.
+- **Db2 LUW·Informix** — JDBC로 방언별 catalog와 SQL/SPL 원문·routine
+  시그니처를 수집한다. 불투명 타입의 표현 변환은 DB의 메타데이터 cast에 맡기고,
+  트리거·routine의 SQL 해석은 Rust에서 수행한다. 실제 이미지·드라이버를 고정한
+  전용 fixture가 전송 네 조합과 필요한 간선·생기면 안 되는 간선을 확인한다.
+- **Maven 배포** — 공개 Maven Repository Layout은 GitHub Pages에서 제공한다.
+  소비자는 저장소 URL을 추가한다. Central은 별도 선택 경로이며 계정·namespace
+  인증과 PGP 서명이 필요하다. 과거 버전은 보존하고 게시된 파일의 다른 바이트로
+  덮어쓰기를 거부한다. 절차는 [MAVEN.md](MAVEN.md)에 있다.
 - **명시적으로 보류한 범위** — 멤버 id에 항상 kind를 붙이는 안은 호환성
-  때문에 보류한다. 현재는 충돌할 때만 `@kind`를 쓴다. DB2·Informix 등 추가
-  Tier 1 방언, Maven 배포, 전체 파이프라인의 메모리 제한은 사용 사례에 따라
-  별도로 설계한다. 현재 로드맵을 완료하려고 이 범위를 임의로 확대하지 않는다.
+  때문에 보류한다. 현재는 충돌할 때만 `@kind`를 쓴다. 전체 파이프라인의
+  고정 메모리 상한은 아직 보장하지 않는다. 새 방언과 더 큰 스케일의 분석은
+  실제 사용 사례와 [PERFORMANCE.md](PERFORMANCE.md)의 측정을 기준으로 확장한다.

@@ -17,7 +17,7 @@ JSON을 출력하며, Mermaid와 Graphviz DOT 다이어그램도 지원합니다
 Rust와 Cargo로 CLI를 설치합니다.
 
 ```sh
-cargo install schemagraph-cli --version 0.2.0 --locked
+cargo install schemagraph-cli --version 0.3.0 --locked
 ```
 
 ### 소스에서 빌드
@@ -59,6 +59,8 @@ fixture에는 외래 키 체인, 뷰, 트리거, 의존성 순환이 포함되�
 | SQL Server | — | 드라이버 번들 | 지원 |
 | Oracle | — | 외부 Oracle 드라이버 | 지원 |
 | H2 | — | 드라이버 번들 | — |
+| Db2 LUW | — | 외부 IBM JCC 드라이버 | — |
+| Informix | — | 외부 Informix 드라이버 | — |
 | 기타 JDBC 데이터베이스 | — | 호환 드라이버로 기본 메타데이터 수집 | — |
 
 네이티브 reader는 `sqlite:PATH`, `postgres://…` 또는 `postgresql://…`,
@@ -121,6 +123,10 @@ DB 사용자는 `--user`, 비밀번호는 `SG_DB_PASSWORD` 환경 변수로 전�
 `--schema app,reporting`은 수집 범위를 지정한 스키마로 제한합니다. 기본값은
 시스템 스키마를 제외한 전체입니다.
 
+Db2 LUW·Informix 드라이버 설정과 실DB 검증은 [IBM.md](IBM.md)에,
+Maven 좌표·공개 저장소 설정·선택적인 Central 게시 방법은 [MAVEN.md](MAVEN.md)에
+있습니다.
+
 ### Go 프로브
 
 Go 프로브는 JVM이나 JDBC jar 없이 SQLite·PostgreSQL·MySQL/MariaDB·Oracle·
@@ -152,10 +158,10 @@ schemagraph scan --document catalog.json -o graph.json
 호환 형식을 선택할 수 있습니다. 전송 계약과 이행 규칙은 [CATALOG.md](CATALOG.md)를
 참고하세요.
 
-JDBC 프로브는 스키마 단위로 NDJSON을 출력합니다. 현재 Go 프로브는 전체 문서를
-수집한 뒤 직렬화하고, Rust CLI는 입력 파일 전체를 읽은 뒤 그래프를 구성합니다.
-따라서 NDJSON을 사용해도 전체 처리 과정의 메모리 사용량이 일정하게 제한되지는
-않습니다.
+두 프로브는 스키마 단위로 NDJSON을 출력합니다. Rust CLI는 NDJSON을 레코드별로
+읽고 그래프 전체를 복제하지 않고 JSON을 씁니다. 정규화된 카탈로그와 그래프는
+여전히 메모리에 남으며, Go의 JSON 출력도 전체 카탈로그를 보관합니다. 측정한
+메모리 개선, 재현 방법과 남은 한계는 [PERFORMANCE.md](PERFORMANCE.md)에 있습니다.
 
 ## 결과 읽기
 
@@ -258,9 +264,10 @@ DB 통합 검증을 수행합니다. 외부 MySQL·Oracle JDBC jar은 `SG_MYSQL_
 스크립트를 시작하기 전에 CLI를 빌드하고 검증이 끝날 때까지 바이너리를
 교체하지 마세요.
 
-P0–P6와 v0.2 로드맵의 보수적 SQL 텍스트 평가, Go 프로브 5개 방언,
-패키지 멤버 경계 처리, catalog v2 협상을 구현했습니다. 실행 시점 값에 의존하는
-SQL은 계속 명시적인 한계로 남으며, 추가 방언은 구체적인 사용 사례에 따라 확장합니다.
+P0–P6와 v0.2 로드맵을 구현했습니다. v0.3에는 카탈로그 메모리 개선,
+Db2 LUW·Informix JDBC 특화 수집, JDBC 프로브의 Maven 배포를 추가했습니다.
+실행 시점 값에 의존하는 SQL은 명시적인 한계로 남습니다. 배포와 검증 상태는
+[HANDOFF.md](HANDOFF.md)에 기록합니다.
 
 설계와 출력 계약은 [DESIGN.md](DESIGN.md), 구현 상태와 검증 기록은
 [HANDOFF.md](HANDOFF.md), 기여 지침은 [AGENTS.md](AGENTS.md)를 참고하세요.

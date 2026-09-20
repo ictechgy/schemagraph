@@ -18,7 +18,7 @@ as Mermaid and Graphviz DOT.
 Install the CLI with Rust and Cargo:
 
 ```sh
-cargo install schemagraph-cli --version 0.2.0 --locked
+cargo install schemagraph-cli --version 0.3.0 --locked
 ```
 
 ### Build from source
@@ -60,6 +60,8 @@ cycles. `query main.orders` shows its dependency on `main.customers`;
 | SQL Server | — | Bundled driver | Yes |
 | Oracle | — | External Oracle driver | Yes |
 | H2 | — | Bundled driver | — |
+| Db2 LUW | — | External IBM JCC driver | — |
+| Informix | — | External Informix driver | — |
 | Other JDBC databases | — | Metadata baseline, with a compatible driver | — |
 
 Native readers accept `sqlite:PATH`, `postgres://…` (or `postgresql://…`),
@@ -124,6 +126,10 @@ Use `--user` for the database user and `SG_DB_PASSWORD` for the password.
 `--schema app,reporting` restricts collection to the named schemas; by
 default, the probe collects non-system schemas.
 
+Db2 LUW and Informix driver setup and live fixture checks are described in
+[IBM.md](IBM.md). Maven coordinates, anonymous repository configuration, and
+optional Central publication are documented in [MAVEN.md](MAVEN.md).
+
 ### Go probe
 
 The Go probe supports SQLite, PostgreSQL, MySQL/MariaDB, Oracle, and SQL Server
@@ -156,10 +162,11 @@ unknown required features and incomplete v2 NDJSON streams. Use
 `schemagraph document-capabilities` to choose a compatible producer format;
 [CATALOG.md](CATALOG.md) specifies the wire contract and migration rules.
 
-The JDBC probe emits NDJSON one schema at a time. The Go probe currently
-collects the full document before serialization, and the Rust CLI reads the
-entire input file before constructing the graph. NDJSON therefore does not
-provide bounded memory use throughout the pipeline.
+Both probes emit NDJSON one schema at a time. The Rust CLI decodes NDJSON
+record by record and writes graph JSON without cloning the entire output.
+The normalized catalog and graph still reside in memory; Go JSON output also
+retains the full catalog. See [PERFORMANCE.md](PERFORMANCE.md) for measured
+memory reductions, reproducible benchmarks, and the remaining limits.
 
 ## Interpreting results
 
@@ -267,10 +274,10 @@ Unavailable checks print skip warnings; an exit code of zero alone does not
 mean every database was tested. Build the CLI before starting the script
 and keep that binary unchanged until the run finishes.
 
-The P0–P6 milestones and the v0.2 roadmap are implemented: conservative SQL
-text evaluation, five Go probe dialects, package member boundary handling,
-and catalog v2 negotiation. Runtime-dependent SQL remains an explicit
-limitation; further dialects are added as concrete use cases require them.
+The P0–P6 milestones and the v0.2 roadmap are implemented. Version 0.3 adds
+catalog memory improvements, specialized Db2 LUW / Informix JDBC collection,
+and Maven distribution of the JDBC probe. Runtime-dependent SQL remains an
+explicit limitation. [HANDOFF.md](HANDOFF.md) records release and validation status.
 
 See [DESIGN.md](DESIGN.md) for the design and output contract,
 [HANDOFF.md](HANDOFF.md) for implementation status and verification notes,

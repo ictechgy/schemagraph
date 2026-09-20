@@ -4,7 +4,7 @@
 
 ## 지금 상태
 
-- 2026-09-20: **추가 확장 3건 진행 중** (`feature/scaling-db2-informix-maven`).
+- 2026-09-20: **추가 확장 3건 구현·로컬 검증 완료, 배포 진행 중** (`feature/scaling-db2-informix-maven`).
   사용자가 대형 DB 성능·메모리 개선, DB2·Informix 특화 수집, JDBC 프로브의
   Maven 배포를 모두 승인했다. Rust는 입력 원문·NDJSON Value·출력 그래프의
   중복 보관을 줄이고, Go는 수집 단계부터 NDJSON을 순차 방출하도록 변경 중이다.
@@ -14,6 +14,23 @@
   실제 DB fixture 검증 전에는 새 DB 지원을 검증 완료로 표시하지 않는다.
   사용자에게 Maven namespace/게시 설정 유무와 사용할 DB 환경을 질문한 상태다.
   토큰·서명키·기존 인증 파일은 읽지 않았다. 현재 로컬 Docker는 ARM64·4GB다.
+  사용자는 이후 **GitHub 공개 Maven 저장소 배포**를 명시적으로 선택했고,
+  Central 계정은 아직 없다고 답했다. Central 준비 안내는 MAVEN.md에 있으며
+  이번 배포는 별도 계정·서명키 없이 진행한다. GitHub Pages Actions source를
+  활성화했고 공개 Maven 배포 workflow·이전 버전 보존 도구를 검증했다.
+  기존 DB+Maven 소비자 CI는 c97bc40에서 통과했다(35506083480).
+  Db2 전송 네 조합도 CI에서 통과했다(35505632878의 Db2 단계, 24정점·33간선).
+  초기 Db2 연결 종료는 setup 중 재시작 전에 테스트를 시작한 문제였고,
+  공식 setup 완료 표시를 기다리도록 고쳤다. Informix는 환경 스크립트 로딩,
+  기본 코드셋의 파일 안내 주석 처리, 실제 트리거 원문, opaque 인자 타입을
+  실서버에서 보정하며 최종 전송 조합 검증을 이어가고 있다.
+  Informix의 최종 실제 DB 검증도 통과했다. opaque 인자 타입은 별도 query에서
+  LVARCHAR로 받아 행 크기 제한을 피하고, 256자 원문 조각은 인위적 줄바꿈 없이
+  결합한다. 긴 literal 전체 일치와 전송 네 조합의 그래프 일치를 확인했다
+  (SQL 호출 가능 public routine을 포함해 543정점·558간선).
+  Rust 148개 테스트, Go test·vet, JDBC check·shadowJar와 Maven 소비자 검증이
+  통과했다. 메모리 측정·재현 방법은 PERFORMANCE.md에 기록했다. GitHub Pages 배포,
+  최종 CI, v0.3 릴리스와 main 반영은 아직 진행 중이다.
 
 - 2026-09-20: **v0.2.0 배포·설치 검증 완료** —
   [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.2.0) ·
@@ -372,16 +389,18 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 
 ## 다음 할 일
 
-요청된 v0.2 로드맵의 구현·검증·배포는 모두 완료했다. 계획된 필수 후속 작업은
-없으며, 기능 확장은 재현 가능한 실제 사용 사례가 생길 때 진행한다.
+1. 최신 소스의 두 CI를 확인하고 v0.3 크레이트·GitHub 릴리스를 게시한다.
+2. main에 반영해 사용자가 선택한 GitHub Pages Maven 저장소를 배포하고,
+   공개 URL을 쓰는 별도 Maven 소비자로 설치·실행을 확인한다.
 
 ## 의도적으로 남긴 경계
 
 - 실행 시점 입력·분기 결과에 의존하는 SQL은 추측하지 않고 limitation으로 남긴다.
-- JDBC는 스키마 단위로 출력하지만 Go 수집과 Rust 입력·그래프 구성은 전체
-  메모리를 사용한다. 전체 파이프라인의 메모리 상한 보장은 별도 설계가 필요하다.
+- JDBC·Go의 NDJSON은 스키마 단위로 방출하지만 Rust 내부 카탈로그·그래프는
+  전체 메모리를 사용한다. Go JSON도 전체 문서를 유지한다. 성능과 메모리 한계는
+  [PERFORMANCE.md](PERFORMANCE.md)에 측정 근거와 함께 설명한다.
 - 모든 멤버 id에 kind를 넣는 변경은 기존 id 호환성 때문에 보류한다.
-- DB2·Informix 등 추가 방언의 특화 수집과 Maven 배포는 구체적인 수요가 있을 때
-  진행한다. 현재 Generic JDBC 경로와 소스 빌드는 제공한다.
+- Maven Central은 사용자가 선택한 배포 경로가 아니다. 준비 안내와 서명·게시
+  도구는 제공하되 실제 공개 배포는 GitHub Pages Maven 저장소를 사용한다.
 
 세부 근거는 DESIGN.md "호환 계약과 확장 경계" 절을 참고한다.
