@@ -126,6 +126,33 @@ BEGIN
 END;
 GO
 
+CREATE PROCEDURE dynamic_concat AS
+BEGIN
+    DECLARE @sql NVARCHAR(MAX) = N'UPDATE ' + N'customers' + N' SET name = name';
+    EXEC(@sql);
+END;
+GO
+
+CREATE PROCEDURE dynamic_reassign AS
+BEGIN
+    DECLARE @sql NVARCHAR(MAX) = N'DELETE FROM customers';
+    SET @sql = N'DELETE FROM orders';
+    EXEC(@sql);
+END;
+GO
+
+-- 분기 뒤의 값은 어느 경로인지 모르면 보수적으로 미추출한다.
+CREATE PROCEDURE dynamic_branch @flag INT AS
+BEGIN
+    DECLARE @sql NVARCHAR(MAX) = N'DELETE FROM customers';
+    IF @flag = 1
+    BEGIN
+        SET @sql = N'DELETE FROM orders';
+    END
+    EXEC(@sql);
+END;
+GO
+
 -- 실행할 이름에 변수가 섞이면 리터럴 접두부를 완성된 SQL로 보지 않는다.
 CREATE PROCEDURE dynamic_cleanup @suffix NVARCHAR(32) AS
 BEGIN
@@ -134,5 +161,8 @@ END;
 GO
 
 EXEC dynamic_touch;
+EXEC dynamic_concat;
+EXEC dynamic_reassign;
+EXEC dynamic_branch 0;
 EXEC dynamic_cleanup N'';
 GO

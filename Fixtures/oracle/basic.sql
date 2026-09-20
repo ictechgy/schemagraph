@@ -88,6 +88,10 @@ CREATE OR REPLACE PACKAGE order_ops AS
 END order_ops;
 /
 CREATE OR REPLACE PACKAGE BODY order_ops AS
+    /* 인용·주석 안에 실제 멤버와 같은 헤더가 있어도 경계로 취급하지 않는다.
+    PROCEDURE touch(cid IN NUMBER) IS BEGIN UPDATE standalone SET note = 'x'; END;
+    FUNCTION count_all RETURN NUMBER IS BEGIN SELECT id FROM standalone; END;
+    */
     PROCEDURE touch(cid IN NUMBER) IS
     BEGIN
         UPDATE customers SET name = name WHERE id = cid;
@@ -103,6 +107,15 @@ CREATE OR REPLACE PACKAGE BODY order_ops AS
         n NUMBER;
     BEGIN
         n := order_ops.count_all();
+        DECLARE
+            inert_sql VARCHAR2(300) := q'[
+                FUNCTION count_all RETURN NUMBER IS
+                BEGIN
+                    SELECT id FROM standalone;
+                END;]';
+        BEGIN
+            NULL;
+        END;
         UPDATE tickets SET note = 'refreshed' WHERE id = n;
     END refresh;
 END order_ops;
@@ -117,6 +130,30 @@ BEGIN
     CLOSE cur;
 END;
 /
+
+CREATE OR REPLACE PROCEDURE dynamic_concat AS
+    sql_text VARCHAR2(200) := 'UPDATE ' || 'customers' || ' SET name = name';
+BEGIN
+    EXECUTE IMMEDIATE sql_text;
+END;
+/
+CREATE OR REPLACE PROCEDURE dynamic_reassign AS
+    sql_text VARCHAR2(200) := 'DELETE FROM customers';
+BEGIN
+    sql_text := 'DELETE FROM orders';
+    EXECUTE IMMEDIATE sql_text;
+END;
+/
+-- 분기 뒤의 값은 어느 경로인지 모르면 보수적으로 미추출한다.
+CREATE OR REPLACE PROCEDURE dynamic_branch(flag IN NUMBER) AS
+    sql_text VARCHAR2(200) := 'DELETE FROM customers';
+BEGIN
+    IF flag = 1 THEN
+        sql_text := 'DELETE FROM orders';
+    END IF;
+    EXECUTE IMMEDIATE sql_text;
+END;
+/
 CREATE OR REPLACE PROCEDURE dynamic_cleanup(suffix IN VARCHAR2) AS
 BEGIN
     EXECUTE IMMEDIATE 'DELETE FROM customers' || suffix;
@@ -124,6 +161,9 @@ END;
 /
 BEGIN
     dynamic_touch;
+    dynamic_concat;
+    dynamic_reassign;
+    dynamic_branch(0);
     dynamic_cleanup('');
 END;
 /

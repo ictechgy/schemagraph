@@ -18,12 +18,32 @@
     {
       "from": "public",
       "kind": "contains",
+      "to": "public.dynamic_branch(flag boolean)"
+    },
+    {
+      "from": "public",
+      "kind": "contains",
       "to": "public.dynamic_cleanup(suffix text)"
     },
     {
       "from": "public",
       "kind": "contains",
+      "to": "public.dynamic_concat"
+    },
+    {
+      "from": "public",
+      "kind": "contains",
+      "to": "public.dynamic_format"
+    },
+    {
+      "from": "public",
+      "kind": "contains",
       "to": "public.dynamic_key"
+    },
+    {
+      "from": "public",
+      "kind": "contains",
+      "to": "public.dynamic_reassign"
     },
     {
       "from": "public",
@@ -178,6 +198,39 @@
       "from": "public.customers",
       "kind": "contains",
       "to": "public.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_concat Writes public.customers",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_concat",
+      "kind": "writes",
+      "to": "public.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_format Writes public.customers",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_format",
+      "kind": "writes",
+      "to": "public.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_reassign Writes public.orders",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_reassign",
+      "kind": "writes",
+      "to": "public.orders"
     },
     {
       "evidence": [
@@ -569,6 +622,7 @@
   "limitations": [
     "track_functions=none \u2014 routine usage \ubbf8\uc218\uc9d1(\ud568\uc218 \ud1b5\uacc4 \ube44\ud65c\uc131)",
     "\uba64\ubc84 id \ucda9\ub3cc: public.products.products_sku_key\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 public.products.products_sku_key@index\ub85c \ubd84\ub9ac",
+    "routine public.dynamic_branch(flag boolean): \ubab8\uccb4 \ubb38\uc7a5 1\uac74 \ubbf8\ucd94\ucd9c(\ub3d9\uc801 SQL\u00b7\ube44SQL \uad6c\ubb38) \u2014 \ubab8\uccb4 \uac04\uc120 \ubd88\uc644\uc804",
     "routine public.dynamic_cleanup(suffix text): \ubab8\uccb4 \ubb38\uc7a5 1\uac74 \ubbf8\ucd94\ucd9c(\ub3d9\uc801 SQL\u00b7\ube44SQL \uad6c\ubb38) \u2014 \ubab8\uccb4 \uac04\uc120 \ubd88\uc644\uc804"
   ],
   "version": 1,
@@ -694,6 +748,13 @@
       "schema": "public"
     },
     {
+      "id": "public.dynamic_branch(flag boolean)",
+      "kind": "function",
+      "level": "object",
+      "name": "dynamic_branch",
+      "schema": "public"
+    },
+    {
       "id": "public.dynamic_cleanup(suffix text)",
       "kind": "function",
       "level": "object",
@@ -701,10 +762,31 @@
       "schema": "public"
     },
     {
+      "id": "public.dynamic_concat",
+      "kind": "function",
+      "level": "object",
+      "name": "dynamic_concat",
+      "schema": "public"
+    },
+    {
+      "id": "public.dynamic_format",
+      "kind": "function",
+      "level": "object",
+      "name": "dynamic_format",
+      "schema": "public"
+    },
+    {
       "id": "public.dynamic_key",
       "kind": "function",
       "level": "object",
       "name": "dynamic_key",
+      "schema": "public"
+    },
+    {
+      "id": "public.dynamic_reassign",
+      "kind": "function",
+      "level": "object",
+      "name": "dynamic_reassign",
       "schema": "public"
     },
     {

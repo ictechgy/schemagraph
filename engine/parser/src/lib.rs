@@ -21,6 +21,8 @@ use sqlparser::dialect::{
     Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
 };
 
+mod constant_sql;
+
 /// document의 몸체들을 파싱해 그래프에 간선을 보강한다.
 ///
 /// 반환값은 (간선을 만든 객체 수, 실패·주의로 limitation에 실을 메시지들).
@@ -32,6 +34,12 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
     // orders라 정확 일치가 없다. 대소문자 구분 방언(PG 등)에 켜면 다른
     // 객체를 잘못 가리키므로 접힘 의미론이 확실한 방언에만 켠다.
     let ci = doc.dialect == "oracle";
+    let format_shadowed = matches!(doc.dialect.as_str(), "postgres" | "postgresql")
+        && doc
+            .schemas
+            .iter()
+            .flat_map(|schema| &schema.routines)
+            .any(|routine| routine.name.eq_ignore_ascii_case("format"));
     let mut enriched = 0usize;
     let mut notes: Vec<String> = Vec::new();
 
@@ -130,9 +138,16 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                         // 같은 절차형 구문이 섞이면 sqlparser가 문장 목록째
                         // 거부한다. 문장 추출로 부분 복구해 파싱된 문장의
                         // 간선만 취하고, 미추출은 limitation으로 센다.
-                        let (parsed, unextracted) = parse_procedural_body(dialect.as_deref(), body);
-                        if parsed.has_edges() {
-                            apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                        let (parsed, unextracted) = parse_procedural_body(
+                            dialect.as_deref(),
+                            body,
+                            constant_sql::dialect(&doc.dialect),
+                            format_shadowed,
+                        );
+                        if parsed.has_edges() || unextracted > 0 {
+                            if parsed.has_edges() {
+                                apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                            }
                             // 미추출 0건은 완전 복구 — 한계가 아니므로 조용히 둔다.
                             if unextracted > 0 {
                                 notes.push(format!(
@@ -149,7 +164,12 @@ pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec
                 // plpgsql·plsql은 문장 단위 추출기로 SQL 문장만 꺼내 파싱한다.
                 // 꺼내지 못한 문장(동적 SQL 등)은 수를 세어 limitation으로 남긴다.
                 Some("plpgsql" | "plsql" | "pl/sql") => {
-                    let (parsed, unextracted) = parse_procedural_body(dialect.as_deref(), body);
+                    let (parsed, unextracted) = parse_procedural_body(
+                        dialect.as_deref(),
+                        body,
+                        constant_sql::dialect(&doc.dialect),
+                        format_shadowed,
+                    );
                     apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
                     // 멤버가 member_of로 나오는 문서에서 패키지 몸체는 스펙이라
                     // 실행 간선이 거의 없다 — 패키지 정점에 간선이 붙는다는 건
@@ -278,6 +298,8 @@ struct ParsedView {
     tables: Vec<(Option<String>, String)>,
     /// (스키마?, 테이블, 컬럼) — 최상위 별칭 맵으로 해석된 것만.
     columns: Vec<(Option<String>, String, String)>,
+    /// database qualifier가 있어 catalog identity로 귀속할 수 없는 관계.
+    ignored_relations: BTreeSet<String>,
     /// CTE나 서브쿼리가 있어 컬럼 해석이 불완전한 경우.
     has_nested_scope: bool,
 }
@@ -291,6 +313,7 @@ fn parse_view(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedView, S
     let mut parsed = ParsedView {
         tables: Vec::new(),
         columns: Vec::new(),
+        ignored_relations: BTreeSet::new(),
         has_nested_scope: false,
     };
     for stmt in &statements {
@@ -303,7 +326,7 @@ fn parse_view(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedView, S
             collect_query(q, &mut parsed);
         }
     }
-    if parsed.tables.is_empty() {
+    if parsed.tables.is_empty() && parsed.ignored_relations.is_empty() {
         return Err("몸체에서 테이블 참조를 찾지 못함".to_owned());
     }
     Ok(parsed)
@@ -329,15 +352,41 @@ fn object_name_parts(name: &ObjectName) -> (Option<String>, String) {
     }
 }
 
+/// 테이블 관계는 database qualifier를 보존할 catalog 필드가 없으므로
+/// 두 부분(schema.table)까지만 안전하게 귀속한다. routine/package 이름은
+/// object_name_parts를 계속 사용해 3부분 이름을 별도로 지원한다.
+fn relation_name_parts(name: &ObjectName) -> Option<(Option<String>, String)> {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .filter_map(|part| part.as_ident().map(|ident| ident.value.clone()))
+        .collect();
+    match parts.as_slice() {
+        [] => None,
+        [table] => Some((None, table.clone())),
+        [schema, table] => Some((Some(schema.clone()), table.clone())),
+        _ => None,
+    }
+}
+
+fn relation_name_key(name: &ObjectName) -> String {
+    name.0
+        .iter()
+        .filter_map(|part| part.as_ident().map(|ident| ident.value.clone()))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// 테이블 관계 전부(visitor) + 최상위 select의 컬럼 참조를 모은다.
 fn collect_query(query: &Query, parsed: &mut ParsedView) {
     if query.with.is_some() {
         parsed.has_nested_scope = true;
     }
     let _ = visit_relations(query, |name| {
-        let (schema, table) = object_name_parts(name);
-        if !table.is_empty() {
+        if let Some((schema, table)) = relation_name_parts(name) {
             parsed.tables.push((schema, table));
+        } else {
+            parsed.ignored_relations.insert(relation_name_key(name));
         }
         ControlFlow::<()>::Continue(())
     });
@@ -403,10 +452,9 @@ fn fill_alias(
 ) {
     match factor {
         TableFactor::Table { name, alias, .. } => {
-            let (schema, table) = object_name_parts(name);
-            if table.is_empty() {
+            let Some((schema, table)) = relation_name_parts(name) else {
                 return;
-            }
+            };
             let key = alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
@@ -490,6 +538,7 @@ fn apply_view(
             "view {owner}: 서브쿼리/CTE의 컬럼 참조는 미해석 — reads 간선이 부분적일 수 있음"
         ));
     }
+    note_ignored_relations(owner, &parsed.ignored_relations, notes);
 
     let mut made = std::collections::BTreeSet::new();
     for (ref_schema, table) in &parsed.tables {
@@ -543,6 +592,8 @@ struct ParsedTrigger {
     fired_columns: Vec<String>,
     /// EXECUTE FUNCTION/PROCEDURE로 부르는 routine (스키마?, 이름).
     calls: Vec<(Option<String>, String)>,
+    /// database qualifier가 있어 local catalog로 귀속하지 않은 관계.
+    ignored_relations: BTreeSet<String>,
 }
 
 impl ParsedTrigger {
@@ -552,7 +603,8 @@ impl ParsedTrigger {
         !(self.writes.is_empty()
             && self.reads.is_empty()
             && self.fired_columns.is_empty()
-            && self.calls.is_empty())
+            && self.calls.is_empty()
+            && self.ignored_relations.is_empty())
     }
 }
 
@@ -571,9 +623,17 @@ fn parse_trigger_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<Parse
         reads: Vec::new(),
         fired_columns: Vec::new(),
         calls,
+        ignored_relations: BTreeSet::new(),
     };
     match statements {
         Ok(stmts) if !stmts.is_empty() => {
+            // 일부 T-SQL 파서는 DECLARE/SET/EXEC 조각을 성공으로 분류하지만
+            // 변수와 동적 SQL의 의미는 AST에 남기지 않는다. 그런 몸체는
+            // 절차형 추출기로 다시 읽어야 한다. trigger의 EXECUTE FUNCTION은
+            // 위에서 calls를 이미 채취했으므로 예외로 둔다.
+            if parsed.calls.is_empty() && needs_procedural_recovery(body) {
+                return Err("절차형 변수·동적 SQL 추출이 필요함".to_owned());
+            }
             for stmt in &stmts {
                 collect_trigger_stmt(stmt, &mut parsed);
             }
@@ -585,6 +645,19 @@ fn parse_trigger_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<Parse
         Ok(_) => Err("본문에서 문장을 찾지 못함".to_owned()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// AST 도매 파싱이 성공해도 변수·동적 실행을 잃는 표면 구문인지 확인한다.
+fn needs_procedural_recovery(body: &str) -> bool {
+    if ["DECLARE", "EXECUTE", "EXEC"]
+        .iter()
+        .any(|keyword| !find_all_keywords(body, keyword).is_empty())
+    {
+        return true;
+    }
+    find_all_keywords(body, "SET")
+        .into_iter()
+        .any(|position| body[position + "SET".len()..].trim_start().starts_with('@'))
 }
 
 /// routine 몸체 파싱 — CREATE FUNCTION 전문이 들어오면 AS 뒤의 몸체만
@@ -742,12 +815,141 @@ fn word_boundary(s: &str, i: usize, len: usize) -> bool {
     before_ok && after_ok
 }
 
+/// 절차형 몸체에서 안전하게 재사용할 수 있는 텍스트 변수 상태.
+///
+/// 외부 함수 호출·분기·루프·중첩 블록을 만나면 전체 평가를 끄고 변수 값을
+/// 비운다. 경로가 여러 개일 때 한 경로의 값으로 다른 경로의 SQL을 추측하지
+/// 않기 위해서다.
+struct ExtractionState {
+    dialect: constant_sql::TextDialect,
+    variables: BTreeMap<String, String>,
+    capacities: BTreeMap<String, constant_sql::TextCapacity>,
+    unicode_capable: BTreeSet<String>,
+    format_shadowed: bool,
+    evaluation_enabled: bool,
+    outer_block_seen: bool,
+}
+
+impl ExtractionState {
+    fn new(dialect: constant_sql::TextDialect, format_shadowed: bool) -> Self {
+        Self {
+            dialect,
+            variables: BTreeMap::new(),
+            capacities: BTreeMap::new(),
+            unicode_capable: BTreeSet::new(),
+            format_shadowed,
+            evaluation_enabled: true,
+            outer_block_seen: false,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.evaluation_enabled = false;
+        self.variables.clear();
+    }
+
+    fn observe_begin(&mut self) {
+        if self.outer_block_seen {
+            self.invalidate();
+        } else {
+            self.outer_block_seen = true;
+        }
+    }
+
+    fn invalidate_control_flow(&mut self) {
+        self.invalidate();
+    }
+
+    fn assign(&mut self, name: &str, expression: &str) {
+        let variables = self.variables.clone();
+        self.assign_from(name, expression, &variables);
+    }
+
+    fn assign_from(&mut self, name: &str, expression: &str, variables: &BTreeMap<String, String>) {
+        let key = normalize_variable_name(name);
+        if key.is_empty() {
+            return;
+        }
+        if self.evaluation_enabled {
+            if let Some(capacity) = self.capacities.get(&key).copied() {
+                if let Some(value) = constant_sql::evaluate_with_format(
+                    expression,
+                    self.dialect,
+                    variables,
+                    !self.format_shadowed,
+                ) {
+                    let unicode_safe = self.dialect != constant_sql::TextDialect::MsSql
+                        || self.unicode_capable.contains(&key)
+                        || value.is_ascii();
+                    if unicode_safe && constant_sql::fits_capacity(&value, capacity) {
+                        self.variables.insert(key, value);
+                        return;
+                    }
+                }
+            }
+        }
+        self.variables.remove(&key);
+    }
+
+    fn declare(&mut self, name: &str, type_text: &str, expression: Option<&str>) {
+        let key = normalize_variable_name(name);
+        self.variables.remove(&key);
+        self.capacities.remove(&key);
+        self.unicode_capable.remove(&key);
+        let Some(capacity) = constant_sql::declared_text_capacity(type_text) else {
+            return;
+        };
+        self.capacities.insert(key.clone(), capacity);
+        if constant_sql::is_unicode_text_type(type_text) {
+            self.unicode_capable.insert(key);
+        }
+        if let Some(expression) = expression {
+            self.assign(name, expression);
+        }
+    }
+
+    fn invalidate_all_variables(&mut self) {
+        self.variables.clear();
+    }
+
+    fn invalidate_variable(&mut self, name: &str) {
+        self.variables.remove(&normalize_variable_name(name));
+    }
+
+    fn evaluate(&self, expression: &str) -> Option<String> {
+        let allow_format = !self.format_shadowed;
+        if self.evaluation_enabled {
+            constant_sql::evaluate_with_format(
+                expression,
+                self.dialect,
+                &self.variables,
+                allow_format,
+            )
+        } else {
+            // 분기 이후에도 경로와 무관한 리터럴·리터럴 format은 복구한다.
+            // 변수는 이미 비웠으므로 이 호출이 값을 추측하지 않는다.
+            constant_sql::evaluate_with_format(
+                expression,
+                self.dialect,
+                &BTreeMap::new(),
+                allow_format,
+            )
+        }
+    }
+}
+
 /// plpgsql/plsql 몸체 — 문장 추출기가 꺼낸 SQL을 문장별로 파싱한다.
 /// 한 문장이 이상해도 나머지가 살도록 개별 파싱하고, 실패는 미추출 수에
 /// 합산한다. 반환의 usize는 추출·파싱에 실패한 문장 수다.
-fn parse_procedural_body(dialect: Option<&dyn Dialect>, body: &str) -> (ParsedTrigger, usize) {
+fn parse_procedural_body(
+    dialect: Option<&dyn Dialect>,
+    body: &str,
+    text_dialect: constant_sql::TextDialect,
+    format_shadowed: bool,
+) -> (ParsedTrigger, usize) {
     let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
-    let (stmts, mut unextracted) = extract_procedural_statements(&inner);
+    let mut state = ExtractionState::new(text_dialect, format_shadowed);
+    let (stmts, mut unextracted) = extract_procedural_statements(&inner, &mut state);
     let default = GenericDialect {};
     let dialect = dialect.unwrap_or(&default);
     let mut parsed = ParsedTrigger {
@@ -755,6 +957,7 @@ fn parse_procedural_body(dialect: Option<&dyn Dialect>, body: &str) -> (ParsedTr
         reads: Vec::new(),
         fired_columns: Vec::new(),
         calls: Vec::new(),
+        ignored_relations: BTreeSet::new(),
     };
     for stmt in &stmts {
         match sqlparser::parser::Parser::parse_sql(dialect, stmt) {
@@ -779,7 +982,7 @@ fn parse_procedural_body(dialect: Option<&dyn Dialect>, body: &str) -> (ParsedTr
 /// `:=` 대입·PL/SQL bare 호출은 그에 맞는 SQL로 재작성한다. 꺼내지 못한
 /// 문장(동적 SQL 식, 인식 못 한 구문)은 수를 돌려 limitation으로 남긴다 —
 /// 추측으로 채우지 않는다.
-fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
+fn extract_procedural_statements(body: &str, state: &mut ExtractionState) -> (Vec<String>, usize) {
     let mut stmts: Vec<String> = Vec::new();
     let mut unextracted = 0usize;
     // DECLARE/IS 섹션 안의 조각은 선언문 — 의존 대상이 아니라 미추출로 세지
@@ -805,6 +1008,7 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
             let (word, wlen) = head_word(rest);
             match word.to_ascii_uppercase().as_str() {
                 "BEGIN" => {
+                    state.observe_begin();
                     in_declare = false;
                     rest = &rest[wlen..];
                 }
@@ -824,10 +1028,12 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                 // 오는 한정자라 소비한다 — 독립 문장 머리가 아니다.
                 "LOOP" | "ELSE" | "EXCEPTION" | "REPEAT" | "TRY" | "CATCH" | "TRAN"
                 | "TRANSACTION" => {
+                    state.invalidate_control_flow();
                     rest = &rest[wlen..];
                 }
                 // T-SQL은 조건 뒤가 THEN/LOOP가 아니라 BEGIN이라 둘 다 본다.
                 "IF" | "ELSIF" | "ELSEIF" | "WHEN" => {
+                    state.invalidate_control_flow();
                     rest = strip_condition(
                         rest,
                         wlen,
@@ -837,6 +1043,7 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                     );
                 }
                 "WHILE" => {
+                    state.invalidate_control_flow();
                     rest = strip_condition(
                         rest,
                         wlen,
@@ -846,11 +1053,18 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                     );
                 }
                 "UNTIL" => {
+                    state.invalidate_control_flow();
                     rest = strip_condition(rest, wlen, &["END"], &mut stmts, &mut unextracted);
                 }
-                "FOR" => rest = strip_for(rest, wlen, &mut stmts, &mut unextracted),
-                "CASE" => rest = strip_case_operand(rest, wlen, &mut unextracted),
-                "RETURN" => rest = strip_return(rest, wlen, &mut stmts, &mut unextracted),
+                "FOR" => {
+                    state.invalidate_control_flow();
+                    rest = strip_for(rest, wlen, &mut stmts, &mut unextracted, state)
+                }
+                "CASE" => {
+                    state.invalidate_control_flow();
+                    rest = strip_case_operand(rest, wlen, &mut unextracted)
+                }
+                "RETURN" => rest = strip_return(rest, wlen, &mut stmts, &mut unextracted, state),
                 "PERFORM" => {
                     // PERFORM은 결과를 버리는 SELECT — 몸체로는 SELECT와 같다.
                     let target = rest[wlen..].trim();
@@ -860,17 +1074,17 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                     break;
                 }
                 "OPEN" => {
-                    strip_open(rest, wlen, &mut stmts, &mut unextracted);
+                    strip_open(rest, wlen, &mut stmts, &mut unextracted, state);
                     break;
                 }
                 "EXECUTE" => {
-                    strip_execute(rest, wlen, &mut stmts, &mut unextracted);
+                    strip_execute(rest, wlen, &mut stmts, &mut unextracted, state);
                     break;
                 }
                 "EXEC" => {
                     // T-SQL `EXEC proc <args>`는 CALL의 별칭 — EXECUTE와
                     // 달리 동적 SQL이 아니라 routine 호출이 기본이다.
-                    strip_exec_call(rest, wlen, &mut stmts, &mut unextracted);
+                    strip_exec_call(rest, wlen, &mut stmts, &mut unextracted, state);
                     break;
                 }
                 "SET" => {
@@ -882,7 +1096,11 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                     if tail.starts_with('@') {
                         if let Some(eq) = find_top_level(tail, "=", false) {
                             let rhs = tail[eq + 1..].trim();
-                            if rhs.contains('(') {
+                            let name = variable_name(&tail[..eq]);
+                            if let Some(name) = name {
+                                state.assign(name, rhs);
+                            }
+                            if rhs.contains('(') && !is_constant_text(rhs, state) {
                                 stmts.push(format!("SELECT {rhs}"));
                             }
                         }
@@ -895,7 +1113,10 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                     strip_tail_condition(rest, wlen, &mut stmts);
                     break;
                 }
-                "DO" => rest = strip_do(rest, wlen, &mut stmts, &mut unextracted),
+                "DO" => {
+                    state.invalidate_control_flow();
+                    rest = strip_do(rest, wlen, &mut stmts, &mut unextracted, state)
+                }
                 "PROCEDURE" | "FUNCTION" | "PACKAGE" => {
                     rest = strip_routine_header(rest, wlen, &mut unextracted);
                     in_declare = true;
@@ -911,13 +1132,22 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                 }
                 "GOTO" | "GET" | "RAISE" | "SIGNAL" | "RESIGNAL" | "NULL" | "PRAGMA" | "CLOSE"
                 | "FETCH" | "MOVE" | "LEAVE" | "ITERATE" | "PRINT" | "THROW" | "RAISERROR"
-                | "WAITFOR" | "DEALLOCATE" | "BREAK" => break,
+                | "WAITFOR" | "DEALLOCATE" | "BREAK" => {
+                    if word.eq_ignore_ascii_case("FETCH") {
+                        let tail = &rest[wlen..];
+                        if let Some(into) = find_top_level(tail, "INTO", true) {
+                            invalidate_variable_list(&tail[into + "INTO".len()..], state);
+                        }
+                    }
+                    break;
+                }
                 _ => {
                     // 문장 머리가 오면 선언 섹션은 끝났다 — T-SQL은 DECLARE가
                     // BEGIN..END 안의 문장이라 뒤따르는 UPDATE 등이 선언으로
                     // 오인되지 않게 실제 SQL 문장을 우선 본다.
                     if is_statement_head(&word) {
                         in_declare = false;
+                        record_variable_writes(rest, &word, state);
                         // SELECT .. INTO <변수>·RETURNING .. INTO <변수>는
                         // 변수 귀속 절 — 벗기지 않으면 변수가 테이블로 오인된다.
                         let stmt = match word.to_ascii_uppercase().as_str() {
@@ -934,14 +1164,17 @@ fn extract_procedural_statements(body: &str) -> (Vec<String>, usize) {
                             stmts.push(stmt);
                         }
                     } else if in_declare {
-                        extract_decl_default(rest, &mut stmts);
+                        extract_decl_default(rest, &mut stmts, state);
                     } else if let Some(p) = find_top_level(rest, ":=", false) {
                         // 대입문 — 우변의 서브쿼리·함수 호출만 SELECT로 살린다.
                         let rhs = rest[p + 2..].trim();
-                        if rhs.contains('(') {
+                        if let Some(name) = variable_name(&rest[..p]) {
+                            state.assign(name, rhs);
+                        }
+                        if rhs.contains('(') && !is_constant_text(rhs, state) {
                             stmts.push(format!("SELECT {rhs}"));
                         }
-                    } else if !bare_call(rest, &mut stmts) {
+                    } else if !bare_call(rest, &mut stmts, state) {
                         unextracted += 1;
                     }
                     break;
@@ -1238,20 +1471,28 @@ fn strip_condition<'a>(
 }
 
 /// T-SQL `EXEC <routine> <args>` — EXECUTE와 달리 기본이 routine 호출이다.
-/// 괄호로 감싼 문자열 실행은 전체가 리터럴일 때만 복구한다.
-fn strip_exec_call(rest: &str, kwlen: usize, stmts: &mut Vec<String>, unextracted: &mut usize) {
+/// 문자열·변수·상수 연결식으로 확정되는 괄호 실행은 동적 SQL로 복구한다.
+fn strip_exec_call(
+    rest: &str,
+    kwlen: usize,
+    stmts: &mut Vec<String>,
+    unextracted: &mut usize,
+    state: &mut ExtractionState,
+) {
     let tail = skip_ws_comments(&rest[kwlen..]);
     if tail.starts_with('(')
         || tail.starts_with('\'')
         || tail.starts_with("N'")
         || tail.starts_with("n'")
+        || tail.starts_with('@')
         || sql_string_literal(tail).is_some()
     {
-        push_dynamic_sql(tail, false, stmts, unextracted);
+        push_dynamic_sql(tail, false, stmts, unextracted, state);
         return;
     }
     let len = dotted_name_len(tail);
     if len > 0 && !tail[..len].starts_with('(') {
+        invalidate_call_arguments(&tail[len..], state);
         stmts.push(format!("CALL {}()", &tail[..len]));
     } else {
         *unextracted += 1;
@@ -1265,6 +1506,7 @@ fn strip_for<'a>(
     kwlen: usize,
     stmts: &mut Vec<String>,
     unextracted: &mut usize,
+    state: &mut ExtractionState,
 ) -> &'a str {
     let tail = &rest[kwlen..];
     let Some(in_pos) = find_top_level(tail, "IN", true) else {
@@ -1278,7 +1520,7 @@ fn strip_for<'a>(
     };
     let inner = after_in[..loop_pos].trim();
     if starts_with_keyword(inner, "EXECUTE") {
-        strip_execute(inner, "EXECUTE".len(), stmts, unextracted);
+        strip_execute(inner, "EXECUTE".len(), stmts, unextracted, state);
     } else if is_query_text(inner) {
         stmts.push(inner.to_owned());
     }
@@ -1304,12 +1546,13 @@ fn strip_return<'a>(
     kwlen: usize,
     stmts: &mut Vec<String>,
     unextracted: &mut usize,
+    state: &mut ExtractionState,
 ) -> &'a str {
     let mut tail = rest[kwlen..].trim_start();
     if starts_with_keyword(tail, "QUERY") {
         tail = tail["QUERY".len()..].trim_start();
         if starts_with_keyword(tail, "EXECUTE") {
-            strip_execute(tail, "EXECUTE".len(), stmts, unextracted);
+            strip_execute(tail, "EXECUTE".len(), stmts, unextracted, state);
         } else if !tail.is_empty() {
             stmts.push(tail.to_owned());
         }
@@ -1330,26 +1573,34 @@ fn strip_open<'a>(
     kwlen: usize,
     stmts: &mut Vec<String>,
     unextracted: &mut usize,
+    state: &mut ExtractionState,
 ) -> &'a str {
     let tail = &rest[kwlen..];
     if let Some(p) = find_top_level(tail, "FOR", true) {
         let inner = tail[p + "FOR".len()..].trim();
         if starts_with_keyword(inner, "EXECUTE") {
-            strip_execute(inner, "EXECUTE".len(), stmts, unextracted);
+            strip_execute(inner, "EXECUTE".len(), stmts, unextracted, state);
         } else if is_query_text(inner) {
             stmts.push(inner.to_owned());
         } else {
             // Oracle OPEN .. FOR는 EXECUTE 없이 문자열을 직접 받는다.
-            push_dynamic_sql(inner, true, stmts, unextracted);
+            push_dynamic_sql(inner, true, stmts, unextracted, state);
         }
     }
     ""
 }
 
-/// `EXECUTE '문자열'`은 리터럴 안의 SQL을 살리고, `EXECUTE <식>`(format 등
-/// 동적 SQL)은 미추출로 센다. `EXECUTE FUNCTION/PROCEDURE f()`는 CALL로
-/// 재작성한다 — 인자는 이름 해석에 필요 없어 버린다.
-fn strip_execute(rest: &str, kwlen: usize, stmts: &mut Vec<String>, unextracted: &mut usize) {
+/// `EXECUTE` 뒤의 제한된 상수 텍스트 식만 SQL로 복구한다. PostgreSQL
+/// `format()`도 evaluator가 지원하는 형식과 알려진 인자일 때만 통과한다.
+/// `EXECUTE FUNCTION/PROCEDURE f()`는 CALL로 재작성한다 — 인자는 이름
+/// 해석에 필요 없어 버린다.
+fn strip_execute(
+    rest: &str,
+    kwlen: usize,
+    stmts: &mut Vec<String>,
+    unextracted: &mut usize,
+    state: &mut ExtractionState,
+) {
     let mut tail = skip_ws_comments(&rest[kwlen..]);
     if starts_with_keyword(tail, "IMMEDIATE") {
         tail = skip_ws_comments(&tail["IMMEDIATE".len()..]);
@@ -1359,12 +1610,13 @@ fn strip_execute(rest: &str, kwlen: usize, stmts: &mut Vec<String>, unextracted:
             let name = tail[kw.len()..].trim_start();
             let len = dotted_name_len(name);
             if len > 0 {
+                invalidate_call_arguments(&name[len..], state);
                 stmts.push(format!("CALL {}()", &name[..len]));
                 return;
             }
         }
     }
-    push_dynamic_sql(tail, true, stmts, unextracted);
+    push_dynamic_sql(tail, true, stmts, unextracted, state);
 }
 
 /// 리터럴 한 개와 소비하지 않은 꼬리를 함께 돌려 연결식을 놓치지 않는다.
@@ -1390,22 +1642,6 @@ fn sql_string_literal(rest: &str) -> Option<(std::borrow::Cow<'_, str>, &str)> {
     None
 }
 
-/// 괄호는 리터럴을 감싸는 경우만 허용한다. 연산·변수·함수 평가는 추측하지 않는다.
-fn dynamic_sql_literal(rest: &str) -> Option<(std::borrow::Cow<'_, str>, &str)> {
-    let mut tail = skip_ws_comments(rest);
-    let mut parentheses = 0;
-    while let Some(inner) = tail.strip_prefix('(') {
-        parentheses += 1;
-        tail = skip_ws_comments(inner);
-    }
-    let (sql, remaining) = sql_string_literal(tail)?;
-    tail = skip_ws_comments(remaining);
-    for _ in 0..parentheses {
-        tail = skip_ws_comments(tail.strip_prefix(')')?);
-    }
-    Some((sql, tail))
-}
-
 /// SQL 본문이 끝났는지 확인한 뒤에만 간선 후보로 넘긴다. AT 같은 원격 실행
 /// 꼬리는 로컬 객체로 오귀속하지 않고 미추출로 남긴다.
 fn push_dynamic_sql(
@@ -1413,8 +1649,14 @@ fn push_dynamic_sql(
     allow_bindings: bool,
     stmts: &mut Vec<String>,
     unextracted: &mut usize,
+    state: &ExtractionState,
 ) {
-    let Some((sql, remaining)) = dynamic_sql_literal(tail) else {
+    let tail = skip_ws_comments(tail);
+    let Some((expression, remaining)) = split_dynamic_expression(tail) else {
+        *unextracted += 1;
+        return;
+    };
+    let Some(sql) = state.evaluate(expression) else {
         *unextracted += 1;
         return;
     };
@@ -1422,8 +1664,23 @@ fn push_dynamic_sql(
         *unextracted += 1;
         return;
     }
-    stmts.push(sql.into_owned());
+    stmts.push(sql);
     collect_dynamic_bindings(remaining, stmts, unextracted);
+}
+
+/// 동적 SQL 식과 `INTO`·`USING` 바인딩 꼬리를 나눈다. 인용·괄호 안의
+/// 키워드는 식의 데이터이므로 최상위 위치에서만 경계를 찾는다.
+fn split_dynamic_expression(rest: &str) -> Option<(&str, &str)> {
+    let boundary = ["RETURNING", "INTO", "USING", "BULK"]
+        .iter()
+        .filter_map(|keyword| find_top_level(rest, keyword, true))
+        .min();
+    let (expression, remaining) = match boundary {
+        Some(position) => (&rest[..position], &rest[position..]),
+        None => (rest, ""),
+    };
+    let expression = expression.trim();
+    (!expression.is_empty()).then_some((expression, remaining.trim_start()))
 }
 
 /// INTO 대상·USING 인자는 SQL 문자열 밖의 식이다. 함수 호출이 있으면
@@ -1487,6 +1744,7 @@ fn strip_do<'a>(
     kwlen: usize,
     stmts: &mut Vec<String>,
     unextracted: &mut usize,
+    state: &mut ExtractionState,
 ) -> &'a str {
     let tail = rest[kwlen..].trim_start();
     let inner = if tail.starts_with('$') {
@@ -1498,7 +1756,7 @@ fn strip_do<'a>(
     };
     match inner {
         Some(b) => {
-            let (mut s, u) = extract_procedural_statements(&b);
+            let (mut s, u) = extract_procedural_statements(&b, state);
             stmts.append(&mut s);
             *unextracted += u;
         }
@@ -1549,6 +1807,216 @@ fn create_is_routine_header(rest: &str) -> bool {
     false
 }
 
+/// SQL 문장이 변수에 결과를 쓰면 그 값을 상수로 유지하지 않는다. 한 행인지
+/// 여러 행인지, 실행 시 오류가 나는지까지 절차형 추출기에서 판정할 수 없기
+/// 때문에 이후 동적 SQL은 unknown으로 남겨야 한다.
+fn record_variable_writes(stmt: &str, head: &str, state: &mut ExtractionState) {
+    let upper = head.to_ascii_uppercase();
+    if upper == "CALL" {
+        invalidate_call_arguments(&stmt[head.len()..], state);
+        return;
+    }
+    if upper == "SELECT" || upper == "WITH" {
+        if upper == "WITH" {
+            // CTE 내부의 T-SQL 변수 대입 범위를 문장 추출기만으로
+            // 구분하지 못하므로, 기존 값을 보존하지 않는다.
+            state.invalidate_all_variables();
+        }
+        if let Some(position) =
+            find_top_level(stmt, "INTO", true).or_else(|| find_top_level(stmt, "BULK", true))
+        {
+            let after = &stmt[position..];
+            let target_start = if starts_with_keyword(after, "BULK") {
+                let after_bulk = skip_ws_comments(&after["BULK".len()..]);
+                if starts_with_keyword(after_bulk, "COLLECT") {
+                    skip_ws_comments(&after_bulk["COLLECT".len()..])
+                } else {
+                    after_bulk
+                }
+            } else {
+                skip_ws_comments(&after["INTO".len()..])
+            };
+            let target_start = if starts_with_keyword(target_start, "STRICT") {
+                skip_ws_comments(&target_start["STRICT".len()..])
+            } else {
+                target_start
+            };
+            let end = find_top_level(target_start, "FROM", true).unwrap_or(target_start.len());
+            invalidate_variable_list(&target_start[..end], state);
+        }
+        record_select_assignments(stmt, head, state);
+        return;
+    }
+    if matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE") {
+        let Some(returning) = find_top_level(stmt, "RETURNING", true) else {
+            return;
+        };
+        let after = &stmt[returning + "RETURNING".len()..];
+        if let Some(into) = find_top_level(after, "INTO", true) {
+            let targets = skip_ws_comments(&after[into + "INTO".len()..]);
+            let targets = if starts_with_keyword(targets, "STRICT") {
+                &targets["STRICT".len()..]
+            } else {
+                targets
+            };
+            invalidate_variable_list(targets, state);
+        }
+    }
+}
+
+/// T-SQL `SELECT @a = ..., @b = ...`의 모든 대입을 처리한다. 일부 조각을
+/// 해석하지 못하면 전체 환경을 비워 stale 변수로 SQL을 추측하지 않는다.
+fn record_select_assignments(stmt: &str, head: &str, state: &mut ExtractionState) {
+    let after_head = skip_ws_comments(&stmt[head.len()..]);
+    let end = ["FROM", "INTO"]
+        .iter()
+        .filter_map(|keyword| find_top_level(after_head, keyword, true))
+        .min()
+        .unwrap_or(after_head.len());
+    let mut assignments = Vec::new();
+    let mut saw_assignment = false;
+    let mut unmodeled = false;
+    for item in split_top_level_commas(&after_head[..end]) {
+        let item = item.trim();
+        let Some(eq) = find_top_level(item, "=", false) else {
+            if saw_assignment && !item.is_empty() {
+                unmodeled = true;
+            }
+            continue;
+        };
+        let lhs = item[..eq].trim();
+        let Some(name) = variable_name(lhs).filter(|name| lhs[name.len()..].trim().is_empty())
+        else {
+            if saw_assignment {
+                unmodeled = true;
+            }
+            continue;
+        };
+        saw_assignment = true;
+        assignments.push((name.to_owned(), item[eq + 1..].trim().to_owned()));
+    }
+    if unmodeled {
+        state.invalidate_all_variables();
+        return;
+    }
+    if assignments.is_empty() {
+        return;
+    }
+    let targets: BTreeSet<String> = assignments
+        .iter()
+        .map(|(name, _)| normalize_variable_name(name))
+        .collect();
+    let original = state.variables.clone();
+    for (name, expression) in assignments {
+        let key = normalize_variable_name(&name);
+        if constant_sql::references_variables(&expression, state.dialect, &targets) {
+            state.invalidate_variable(&name);
+        } else {
+            state.assign_from(&name, &expression, &original);
+            // A value may have become unknown due to type/capacity constraints;
+            // leave it unknown instead of restoring an older assignment.
+            if !state.variables.contains_key(&key) {
+                state.invalidate_variable(&name);
+            }
+        }
+    }
+}
+
+fn invalidate_variable_list(list: &str, state: &mut ExtractionState) {
+    let end = ["FROM", "RETURNING", "USING"]
+        .iter()
+        .filter_map(|keyword| find_top_level(list, keyword, true))
+        .min()
+        .unwrap_or(list.len());
+    for target in split_top_level_commas(&list[..end]) {
+        if let Some(name) = variable_name(target.trim()) {
+            state.invalidate_variable(name);
+        }
+    }
+}
+
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    let mut position = 0;
+    while position < bytes.len() {
+        if let Some(end) = quoted_or_comment_end(s, position) {
+            position = end;
+            continue;
+        }
+        match bytes[position] {
+            b'(' => depth += 1,
+            b')' => depth = (depth - 1).max(0),
+            b',' if depth == 0 => {
+                parts.push(&s[start..position]);
+                start = position + 1;
+            }
+            _ => {}
+        }
+        position += 1;
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// 호출 인자 중 변수는 routine의 OUT/INOUT 또는 드라이버별 output 표기일
+/// 수 있으므로 호출 뒤의 확정값으로 재사용하지 않는다.
+fn invalidate_call_arguments(rest: &str, state: &mut ExtractionState) {
+    let arguments = parenthesized_arguments(rest).unwrap_or(rest);
+    for argument in split_top_level_commas(arguments) {
+        let argument = strip_call_mode(argument.trim());
+        if let Some(name) = variable_name(argument) {
+            state.invalidate_variable(name);
+        }
+    }
+}
+
+fn parenthesized_arguments(rest: &str) -> Option<&str> {
+    let bytes = rest.as_bytes();
+    let mut position = 0;
+    let mut open = None;
+    let mut depth = 0i32;
+    while position < bytes.len() {
+        if let Some(end) = quoted_or_comment_end(rest, position) {
+            position = end;
+            continue;
+        }
+        match bytes[position] {
+            b'(' if open.is_none() => {
+                open = Some(position + 1);
+                depth = 1;
+            }
+            b'(' if open.is_some() => depth += 1,
+            b')' if open.is_some() => {
+                depth -= 1;
+                if depth == 0 {
+                    let start = open?;
+                    return Some(&rest[start..position]);
+                }
+            }
+            _ => {}
+        }
+        position += 1;
+    }
+    None
+}
+
+fn strip_call_mode(mut argument: &str) -> &str {
+    for mode in ["IN OUT", "INOUT", "OUTPUT", "OUT", "IN"] {
+        if argument.len() >= mode.len()
+            && argument.as_bytes()[..mode.len()].eq_ignore_ascii_case(mode.as_bytes())
+            && (argument.len() == mode.len()
+                || argument.as_bytes()[mode.len()].is_ascii_whitespace())
+        {
+            argument = skip_ws_comments(&argument[mode.len()..]);
+            break;
+        }
+    }
+    argument
+}
+
 /// `SELECT .. [BULK COLLECT] INTO <변수> [FROM ..]` — plpgsql/plsql의 변수
 /// 귀속 절을 벗긴다. 벗기지 않으면 변수명이 FROM 없는 테이블로 오인된다.
 fn strip_select_into(stmt: &str) -> String {
@@ -1574,15 +2042,71 @@ fn strip_returning_into(stmt: &str, returning_pos: usize) -> String {
     }
 }
 
+/// 방언 표기(`@name`)와 관계없이 변수 환경에서 사용할 키를 만든다.
+fn normalize_variable_name(name: &str) -> String {
+    name.trim().trim_start_matches('@').to_ascii_lowercase()
+}
+
+/// 대입 왼쪽 또는 선언 시작에서 단순 변수 이름을 꺼낸다. 선언의 나머지
+/// 타입 정보는 호출자가 따로 해석하지 않으므로 첫 이름 뒤는 무시한다.
+fn variable_name(fragment: &str) -> Option<&str> {
+    let fragment = skip_ws_comments(fragment);
+    let bytes = fragment.as_bytes();
+    let mut end = 0;
+    if bytes.get(end) == Some(&b'@') {
+        end += 1;
+    }
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#'))
+    {
+        end += 1;
+    }
+    if end == 0 || (end == 1 && bytes[0] == b'@') {
+        None
+    } else {
+        Some(&fragment[..end])
+    }
+}
+
+fn is_constant_text(expression: &str, state: &ExtractionState) -> bool {
+    state.evaluate(expression).is_some()
+}
+
+fn declaration_type<'a>(chunk: &'a str, name: &str) -> &'a str {
+    let start = skip_ws_comments(chunk);
+    let after_name = &start[name.len()..];
+    let end = find_top_level(after_name, ":=", false)
+        .or_else(|| find_top_level(after_name, "DEFAULT", true))
+        .or_else(|| find_top_level(after_name, "=", false))
+        .unwrap_or(after_name.len());
+    after_name[..end].trim()
+}
+
 /// 선언 조각에서 의존이 될 수 있는 질의만 꺼낸다 — `:=`·`DEFAULT`의
 /// 서브쿼리와 `CURSOR FOR <질의>`(plpgsql·T-SQL 공통). 선언 그 자체는
 /// 미추출로 세지 않는다 — 의존이 아니라 변수 선언일 뿐이다.
-fn extract_decl_default(chunk: &str, stmts: &mut Vec<String>) {
+fn extract_decl_default(chunk: &str, stmts: &mut Vec<String>, state: &mut ExtractionState) {
     let rhs = find_top_level(chunk, ":=", false)
         .map(|p| &chunk[p + 2..])
-        .or_else(|| find_top_level(chunk, "DEFAULT", true).map(|p| &chunk[p + "DEFAULT".len()..]));
+        .or_else(|| find_top_level(chunk, "DEFAULT", true).map(|p| &chunk[p + "DEFAULT".len()..]))
+        .or_else(|| find_top_level(chunk, "=", false).map(|p| &chunk[p + 1..]));
+    if let Some(name) = variable_name(chunk) {
+        let type_text = declaration_type(chunk, name);
+        if let Some(rhs) = rhs.map(str::trim).filter(|rhs| !rhs.is_empty()) {
+            state.declare(name, type_text, Some(rhs));
+            if rhs.contains('(') && !is_constant_text(rhs, state) {
+                stmts.push(format!("SELECT {rhs}"));
+                return;
+            }
+        } else {
+            state.declare(name, type_text, None);
+        }
+    }
     if let Some(rhs) = rhs.map(str::trim).filter(|r| r.contains('(')) {
-        stmts.push(format!("SELECT {rhs}"));
+        if !is_constant_text(rhs, state) {
+            stmts.push(format!("SELECT {rhs}"));
+        }
         return;
     }
     if let Some(p) = find_top_level(chunk, "FOR", true) {
@@ -1596,9 +2120,10 @@ fn extract_decl_default(chunk: &str, stmts: &mut Vec<String>) {
 /// `f(a)`·`pkg.f(a)` 꼴의 bare 호출을 `CALL f(a)`로 재작성한다 —
 /// PL/SQL은 CALL 없이 프로시저를 부른다. 대상이 routine이 아니면
 /// resolve 단계에서 내장 함수·미수집으로 걸러진다.
-fn bare_call(rest: &str, stmts: &mut Vec<String>) -> bool {
+fn bare_call(rest: &str, stmts: &mut Vec<String>, state: &mut ExtractionState) -> bool {
     let n = dotted_name_len(rest);
     if n > 0 && rest[n..].trim_start().starts_with('(') {
+        invalidate_call_arguments(&rest[n..], state);
         stmts.push(format!("CALL {}", rest.trim()));
         true
     } else {
@@ -1675,7 +2200,10 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger) {
         }
     }
     let _ = visit_relations(stmt, |name| {
-        let t = object_name_parts(name);
+        let Some(t) = relation_name_parts(name) else {
+            parsed.ignored_relations.insert(relation_name_key(name));
+            return ControlFlow::<()>::Continue(());
+        };
         // 재귀 방문으로 중첩 문장이 여러 번 오므로 중복을 거른다.
         if !t.1.is_empty() && !write_targets.contains(&t) && !parsed.reads.contains(&t) {
             parsed.reads.push(t);
@@ -1815,19 +2343,16 @@ fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
     match stmt {
         Statement::Update { table, .. } => table_factor_name(&table.relation).into_iter().collect(),
         Statement::Insert(insert) => match &insert.table {
-            TableObject::TableName(name) => {
-                let t = object_name_parts(name);
-                if t.1.is_empty() {
-                    vec![]
-                } else {
-                    vec![t]
-                }
-            }
+            TableObject::TableName(name) => relation_name_parts(name).into_iter().collect(),
             _ => vec![],
         },
         Statement::Delete(delete) => {
             if !delete.tables.is_empty() {
-                delete.tables.iter().map(object_name_parts).collect()
+                delete
+                    .tables
+                    .iter()
+                    .filter_map(relation_name_parts)
+                    .collect()
             } else {
                 // DELETE FROM t — from 절이 쓰기 대상이다.
                 let tables: &[sqlparser::ast::TableWithJoins] = match &delete.from {
@@ -1847,8 +2372,7 @@ fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
 /// TableFactor::Table이면 (스키마?, 테이블)을 돌린다.
 fn table_factor_name(factor: &TableFactor) -> Option<(Option<String>, String)> {
     if let TableFactor::Table { name, .. } = factor {
-        let t = object_name_parts(name);
-        (!t.1.is_empty()).then_some(t)
+        relation_name_parts(name)
     } else {
         None
     }
@@ -1987,6 +2511,7 @@ fn apply_trigger(
         ));
         return;
     }
+    note_ignored_relations(trigger_id, &parsed.ignored_relations, notes);
     apply_dml_edges(g, schema, trigger_id, parsed, notes, ci);
     apply_call_edges(g, schema, trigger_id, &parsed.calls, notes, ci);
     // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다. 컬럼이 id 충돌로
@@ -2035,8 +2560,20 @@ fn apply_routine(
         ));
         return;
     }
+    note_ignored_relations(owner, &parsed.ignored_relations, notes);
     apply_dml_edges(g, schema, owner, parsed, notes, ci);
     apply_call_edges(g, schema, owner, &parsed.calls, notes, ci);
+}
+
+fn note_ignored_relations(from: &VertexId, relations: &BTreeSet<String>, notes: &mut Vec<String>) {
+    if relations.is_empty() {
+        return;
+    }
+    notes.push(format!(
+        "{from}: database 한정 관계 {}건은 catalog identity가 없어 간선 생략 ({})",
+        relations.len(),
+        relations.iter().cloned().collect::<Vec<_>>().join(", ")
+    ));
 }
 
 /// 몸체 문장의 writes/reads 대상을 간선으로 만든다 — trigger와 routine이 공유.
@@ -2764,9 +3301,8 @@ mod tests {
     }
 
     #[test]
-    fn plpgsql의_리터럴_동적sql은_파싱하고_식은_미추출로_남긴다() {
-        // EXECUTE '리터럴'은 안의 SQL이 보이지만 EXECUTE <식>은 못 본다 —
-        // 보이는 만큼만 간선으로, 못 본 건 수로 남는다.
+    fn plpgsql의_리터럴과_format_동적sql은_파싱한다() {
+        // PostgreSQL format은 제한된 %I/%L/%s 형식과 상수 인자를 평가한다.
         let doc = doc_with_routine(
             vec![routine(
                 "wipe",
@@ -2780,17 +3316,16 @@ mod tests {
         assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
             && e.from.as_str() == "public.wipe"
             && e.to.as_str() == "public.customers"));
-        assert!(
-            notes.iter().any(|n| n.contains("미추출")),
-            "notes: {notes:?}"
-        );
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.wipe"
+            && e.to.as_str() == "public.orders"));
+        assert!(notes.is_empty(), "notes: {notes:?}");
     }
 
     #[test]
     fn dynamic_sql_does_not_treat_a_literal_prefix_as_the_complete_command() {
         for command in [
             "EXECUTE 'DELETE FROM customers' || suffix",
-            "EXECUTE 'DELETE FROM customers' || '_archive'",
             "EXECUTE ('DELETE FROM customers' || suffix)",
         ] {
             let doc = doc_with_routine(
@@ -2817,6 +3352,393 @@ mod tests {
                 "{notes:?}"
             );
         }
+    }
+
+    #[test]
+    fn dynamic_sql_evaluates_a_whole_constant_concatenation() {
+        for (dialect, language, command) in [
+            (
+                "postgres",
+                "plpgsql",
+                "EXECUTE ('DELETE FROM ' || 'customers')",
+            ),
+            (
+                "oracle",
+                "plsql",
+                "EXECUTE IMMEDIATE ('DELETE FROM ' || 'customers')",
+            ),
+            ("sqlserver", "sql", "EXEC(N'DELETE FROM ' + N'customers')"),
+        ] {
+            let mut doc = doc_with_routine(
+                vec![routine(
+                    "dynamic_cleanup",
+                    Some(language),
+                    &format!("BEGIN {command}; END"),
+                )],
+                "",
+            );
+            doc.dialect = dialect.into();
+            let (graph, notes) = build(&doc);
+            assert!(notes.is_empty(), "{dialect}: {notes:?}");
+            assert!(graph
+                .edges()
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::Writes
+                    && edge.from.as_str() == "public.dynamic_cleanup"
+                    && edge.to.as_str() == "public.customers"));
+        }
+    }
+
+    #[test]
+    fn dynamic_sql_tracks_straight_line_variables_and_reassignment() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "dynamic_cleanup",
+                Some("plpgsql"),
+                "DECLARE sql_text text := 'DELETE FROM ' || 'customers'; \
+                 BEGIN sql_text := 'DELETE FROM orders'; EXECUTE sql_text; END",
+            )],
+            "",
+        );
+        let (graph, notes) = build(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.dynamic_cleanup"
+                && edge.to.as_str() == "public.orders"));
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.dynamic_cleanup"
+                && edge.to.as_str() == "public.customers"));
+    }
+
+    #[test]
+    fn dynamic_sql_tracks_tsql_set_variables() {
+        let mut doc = doc_with_routine(
+            vec![routine(
+                "dynamic_cleanup",
+                Some("sql"),
+                "BEGIN DECLARE @sql_text nvarchar(max) = N'DELETE FROM customers'; \
+                 SET @sql_text = N'DELETE FROM orders'; EXEC @sql_text; END",
+            )],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (graph, notes) = build(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.dynamic_cleanup"
+                && edge.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn dynamic_sql_tracks_all_tsql_select_assignments() {
+        let mut doc = doc_with_routine(
+            vec![routine(
+                "dynamic_cleanup",
+                Some("sql"),
+                "BEGIN DECLARE @a nvarchar(max) = N'DELETE FROM customers'; \
+                 DECLARE @b nvarchar(max) = N'DELETE FROM customers'; \
+                 SELECT @a = N'x', @b = N'DELETE FROM orders'; EXEC(@b); END",
+            )],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (graph, notes) = build(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.dynamic_cleanup"
+                && edge.to.as_str() == "public.orders"));
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.dynamic_cleanup"
+                && edge.to.as_str() == "public.customers"));
+    }
+
+    #[test]
+    fn dynamic_sql_does_not_assume_tsql_select_assignment_order() {
+        let mut doc = doc_with_routine(
+            vec![routine(
+                "dynamic_cleanup",
+                Some("sql"),
+                "BEGIN DECLARE @a nvarchar(max) = N'DELETE FROM customers'; \
+                 DECLARE @b nvarchar(max) = N'DELETE FROM customers'; \
+                 SELECT @a = @b, @b = N'DELETE FROM orders'; \
+                 EXEC(@a); EXEC(@b); END",
+            )],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (graph, notes) = build(&doc);
+        assert!(graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.dynamic_cleanup"
+                && edge.to.as_str() == "public.orders"));
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.dynamic_cleanup"
+                && edge.to.as_str() == "public.customers"));
+        assert!(
+            notes.iter().any(|note| note.contains("미추출")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_sql_requires_tsql_unicode_literals_and_targets() {
+        for (name, declaration, expect_orders) in [
+            (
+                "plain_unicode",
+                "DECLARE @sql nvarchar(max) = 'DELETE FROM orders -- 한글';",
+                false,
+            ),
+            (
+                "n_unicode",
+                "DECLARE @sql nvarchar(max) = N'DELETE FROM orders -- 한글';",
+                true,
+            ),
+            (
+                "n_to_varchar",
+                "DECLARE @sql varchar(max) = N'DELETE FROM orders -- 한글';",
+                false,
+            ),
+        ] {
+            let mut doc = doc_with_routine(
+                vec![routine(
+                    name,
+                    Some("sql"),
+                    &format!("BEGIN {declaration} EXEC(@sql); END"),
+                )],
+                "",
+            );
+            doc.dialect = "sqlserver".into();
+            let (graph, notes) = build(&doc);
+            let has_orders = graph.edges().iter().any(|edge| {
+                edge.kind == EdgeKind::Writes
+                    && edge.from.as_str() == format!("public.{name}")
+                    && edge.to.as_str() == "public.orders"
+            });
+            assert_eq!(has_orders, expect_orders, "{name}: {notes:?}");
+            if !expect_orders {
+                assert!(notes
+                    .iter()
+                    .any(|note| note.contains(name) && note.contains("미추출")));
+            } else {
+                assert!(notes.is_empty(), "{name}: {notes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_sql_rejects_truncated_text_declarations() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "dynamic_cleanup",
+                Some("plpgsql"),
+                "DECLARE sql_text varchar(8) := 'DELETE FROM customers'; \
+                 BEGIN EXECUTE sql_text; END",
+            )],
+            "",
+        );
+        let (graph, notes) = build(&doc);
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
+        assert!(
+            notes.iter().any(|note| note.contains("미추출")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_sql_invalidates_exec_output_arguments_and_fetch_targets() {
+        let mut doc = doc_with_routine(
+            vec![
+                routine("mutate", Some("sql"), "SELECT 1"),
+                routine(
+                    "exec_caller",
+                    Some("sql"),
+                    "BEGIN DECLARE @sql nvarchar(max) = N'DELETE FROM customers'; \
+                     EXEC mutate @sql OUTPUT; EXEC(@sql); END",
+                ),
+                routine(
+                    "fetch_caller",
+                    Some("plpgsql"),
+                    "DECLARE sql_text text := 'DELETE FROM customers'; \
+                     DECLARE c CURSOR FOR SELECT id FROM customers; \
+                     BEGIN FETCH c INTO sql_text; EXECUTE sql_text; END",
+                ),
+            ],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (graph, notes) = build(&doc);
+        assert!(!graph.edges().iter().any(|edge| {
+            (edge.from.as_str() == "public.exec_caller"
+                || edge.from.as_str() == "public.fetch_caller")
+                && edge.kind == EdgeKind::Writes
+        }));
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("exec_caller") && note.contains("미추출")));
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("fetch_caller") && note.contains("미추출")));
+
+        let mut callee = routine("mutate", Some("plpgsql"), "SELECT 1");
+        callee.kind = "procedure".into();
+        let call_doc = doc_with_routine(
+            vec![
+                callee,
+                routine(
+                    "call_caller",
+                    Some("plpgsql"),
+                    "DECLARE sql_text text := 'DELETE FROM customers'; \
+                     BEGIN CALL mutate(sql_text); EXECUTE sql_text; END",
+                ),
+            ],
+            "",
+        );
+        let (call_graph, call_notes) = build(&call_doc);
+        assert!(!call_graph.edges().iter().any(|edge| {
+            edge.from.as_str() == "public.call_caller" && edge.kind == EdgeKind::Writes
+        }));
+        assert!(
+            call_notes
+                .iter()
+                .any(|note| note.contains("call_caller") && note.contains("미추출")),
+            "{call_notes:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_sql_does_not_fold_shadowed_postgres_format() {
+        let doc = doc_with_routine(
+            vec![
+                routine("format", Some("sql"), "SELECT 1"),
+                routine(
+                    "dynamic_cleanup",
+                    Some("plpgsql"),
+                    "BEGIN EXECUTE format('DELETE FROM %I', 'customers'); END",
+                ),
+            ],
+            "",
+        );
+        let (graph, notes) = build(&doc);
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("dynamic_cleanup") && note.contains("미추출")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_sql_invalidates_variables_after_a_branch() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "dynamic_cleanup",
+                Some("plpgsql"),
+                "DECLARE sql_text text := 'DELETE FROM customers'; \
+                 BEGIN IF true THEN sql_text := 'DELETE FROM orders'; END IF; \
+                 EXECUTE sql_text; END",
+            )],
+            "",
+        );
+        let (graph, notes) = build(&doc);
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"
+                && edge.kind == EdgeKind::Writes));
+        assert!(
+            notes.iter().any(|note| note.contains("1건 미추출")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_sql_unknown_assignment_and_nested_scope_do_not_guess() {
+        for body in [
+            "DECLARE sql_text text := 'DELETE FROM customers'; BEGIN sql_text := make_sql(); EXECUTE sql_text; END",
+            "DECLARE sql_text text := 'DELETE FROM customers'; BEGIN BEGIN sql_text := 'DELETE FROM orders'; END; EXECUTE sql_text; END",
+        ] {
+            let doc = doc_with_routine(
+                vec![routine("dynamic_cleanup", Some("plpgsql"), body)],
+                "",
+            );
+            let (graph, notes) = build(&doc);
+            assert!(!graph
+                .edges()
+                .iter()
+                .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
+            assert!(notes.iter().any(|note| note.contains("미추출")), "{notes:?}");
+        }
+    }
+
+    #[test]
+    fn dynamic_sql_invalidates_values_written_by_select_into() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "dynamic_cleanup",
+                Some("plpgsql"),
+                "DECLARE sql_text text := 'DELETE FROM customers'; \
+                 BEGIN SELECT body INTO sql_text FROM command_text; EXECUTE sql_text; END",
+            )],
+            "",
+        );
+        let (graph, notes) = build(&doc);
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
+        assert!(
+            notes.iter().any(|note| note.contains("미추출")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_sql_rejects_format_outside_postgres() {
+        let mut doc = doc_with_routine(
+            vec![routine(
+                "dynamic_cleanup",
+                Some("plsql"),
+                "BEGIN EXECUTE IMMEDIATE format('DELETE FROM %I', 'customers'); END",
+            )],
+            "",
+        );
+        doc.dialect = "oracle".into();
+        let (graph, notes) = build(&doc);
+        assert!(!graph
+            .edges()
+            .iter()
+            .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
+        assert!(
+            notes.iter().any(|note| note.contains("미추출")),
+            "{notes:?}"
+        );
     }
 
     #[test]
@@ -2930,6 +3852,35 @@ mod tests {
             .any(|edge| edge.kind == EdgeKind::Writes
                 && edge.from.as_str() == "public.remote_read"
                 && edge.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn dynamic_sql_does_not_drop_database_qualifiers_for_local_edges() {
+        let mut doc = doc_with_routine(
+            vec![routine(
+                "remote_read",
+                Some("sql"),
+                "BEGIN EXEC(N'SELECT id FROM otherdb.dbo.customers'); \
+                 UPDATE orders SET customer_id = 1; END",
+            )],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (graph, notes) = build(&doc);
+        assert!(!graph.edges().iter().any(|edge| {
+            edge.from.as_str() == "public.remote_read" && edge.to.as_str() == "public.customers"
+        }));
+        assert!(graph.edges().iter().any(|edge| {
+            edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "public.remote_read"
+                && edge.to.as_str() == "public.orders"
+        }));
+        assert!(
+            notes.iter().any(|note| {
+                note.contains("otherdb.dbo.customers") && note.contains("database")
+            }),
+            "{notes:?}"
+        );
     }
 
     #[test]

@@ -105,6 +105,48 @@ BEGIN
 END;
 $body$ LANGUAGE plpgsql;
 
+-- 상수 연결·format·직선형 변수 재대입은 실행 SQL 전체가 확정된다.
+CREATE FUNCTION dynamic_concat() RETURNS void AS $body$
+DECLARE
+    sql_text text := ('UPDATE ' || 'customers' || ' SET name = name');
+BEGIN
+    EXECUTE sql_text;
+END;
+$body$ LANGUAGE plpgsql;
+
+CREATE FUNCTION dynamic_format() RETURNS void AS $body$
+DECLARE
+    sql_text text;
+BEGIN
+    sql_text := format(
+        'UPDATE %1$I SET %2$s = %2$s WHERE id = %3$L /* %% */',
+        'customers', 'name', '1'
+    );
+    EXECUTE sql_text;
+END;
+$body$ LANGUAGE plpgsql;
+
+CREATE FUNCTION dynamic_reassign() RETURNS void AS $body$
+DECLARE
+    sql_text text := 'DELETE FROM customers';
+BEGIN
+    sql_text := 'DELETE FROM orders';
+    EXECUTE sql_text;
+END;
+$body$ LANGUAGE plpgsql;
+
+-- 분기 뒤의 값은 어느 경로인지 모르면 보수적으로 미추출한다.
+CREATE FUNCTION dynamic_branch(flag boolean) RETURNS void AS $body$
+DECLARE
+    sql_text text := 'DELETE FROM customers';
+BEGIN
+    IF flag THEN
+        sql_text := 'DELETE FROM orders';
+    END IF;
+    EXECUTE sql_text;
+END;
+$body$ LANGUAGE plpgsql;
+
 -- suffix가 바뀌면 다른 테이블을 가리킨다. customers 삭제 간선을 추측하면 안 된다.
 CREATE FUNCTION dynamic_cleanup(suffix text) RETURNS void AS $body$
 BEGIN
@@ -115,4 +157,8 @@ $body$ LANGUAGE plpgsql;
 -- 빈 fixture에서 실제 실행해 DB가 이 구문을 받아들이는지도 검증한다.
 SELECT dynamic_touch();
 SELECT * FROM dynamic_rows();
+SELECT dynamic_concat();
+SELECT dynamic_format();
+SELECT dynamic_reassign();
+SELECT dynamic_branch(false);
 SELECT dynamic_cleanup('');
