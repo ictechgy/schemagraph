@@ -16,7 +16,11 @@ public final class ApplySqlStatements {
         List<String> statements = split(Files.readString(Path.of(args[3])));
         try (var conn = DriverManager.getConnection(args[0], args[1], args[2])) {
             int failed = 0;
-            for (String statement : statements) {
+            for (String raw : statements) {
+                // 파일 안내 주석은 DB 코드셋으로 변환할 필요가 없다. 루틴 본문의
+                // 주석과 문자열은 보존해 실제 저장된 SQL의 의미를 바꾸지 않는다.
+                String statement = stripLeadingComments(raw);
+                if (statement.isBlank()) continue;
                 try (var st = conn.createStatement()) {
                     st.execute(statement);
                 } catch (Exception error) {
@@ -31,6 +35,22 @@ public final class ApplySqlStatements {
                 System.exit(1);
             }
         }
+    }
+
+    private static String stripLeadingComments(String statement) {
+        String rest = statement.stripLeading();
+        while (rest.startsWith("--") || rest.startsWith("/*")) {
+            if (rest.startsWith("--")) {
+                int end = rest.indexOf('\n');
+                if (end < 0) return "";
+                rest = rest.substring(end + 1).stripLeading();
+            } else {
+                int end = rest.indexOf("*/", 2);
+                if (end < 0) throw new IllegalArgumentException("Unterminated fixture comment");
+                rest = rest.substring(end + 2).stripLeading();
+            }
+        }
+        return rest;
     }
 
     private static List<String> split(String input) {

@@ -22,8 +22,8 @@ private fun dialectQuery(
     schema: String,
     limitations: MutableList<String>,
     row: (ResultSet) -> Unit,
-) {
-    runCatching {
+) : Boolean {
+    return runCatching {
         conn.prepareStatement(sql).use { statement ->
             statement.setString(1, schema)
             statement.executeQuery().use { result ->
@@ -32,7 +32,7 @@ private fun dialectQuery(
         }
     }.onFailure {
         limitations += "$label unavailable for schema $schema (${it.javaClass.simpleName}: ${it.message})"
-    }
+    }.isSuccess
 }
 
 internal fun db2Objects(conn: Connection, schema: String, limitations: MutableList<String>): List<DialectObject> {
@@ -195,8 +195,8 @@ internal fun informixBodies(conn: Connection, schema: String, limitations: Mutab
         limitations,
     ) { rs -> viewLines.getOrPut(rs.getString(1)) { mutableListOf() } += rs.getInt(2) to rs.getString(3) }
     for ((name, lines) in viewLines) {
-        // SYSVIEWS는 viewtext 한 행과 seqno를 보관하므로 줄 경계를 복원한다.
-        views[schema to name] = lines.sortedBy { it.first }.joinToString("\n") { it.second }
+        // SYSVIEWS의 viewtext는 이미 원문 조각이다 — seqno 순으로 이어 붙인다.
+        views[schema to name] = concatenateInformixFragments(lines)
     }
 
     val triggerChunks = mutableMapOf<Pair<String, String>, MutableList<InformixChunk>>()
@@ -227,9 +227,10 @@ internal fun informixBodies(conn: Connection, schema: String, limitations: Mutab
         conn,
         "Informix routines",
         """
-            SELECT p.procid, p.procname, p.specificname, p.isproc, p.langid, p.paramtypes, l.langname
+            SELECT p.procid, p.procname, p.specificname, p.isproc, p.langid,
+                   l.langname
             FROM sysprocedures p LEFT JOIN sysroutinelangs l ON l.langid = p.langid
-            WHERE p.owner = ? ORDER BY p.procname, p.procid
+            WHERE p.owner = ? AND p.internal = 'f' ORDER BY p.procname, p.procid
         """.trimIndent(),
         schema,
         limitations,
@@ -239,9 +240,33 @@ internal fun informixBodies(conn: Connection, schema: String, limitations: Mutab
             name = rs.getString(2),
             specific = rs.getString(3)?.trim().takeUnless { it.isNullOrEmpty() } ?: "procid:${rs.getInt(1)}",
             isProcedure = rs.getString(4).equals("t", ignoreCase = true),
-            language = rs.getString(7)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() },
-            signature = rs.getString(6)?.trim()?.takeIf { it.isNotEmpty() },
+            language = rs.getString(6)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() },
+            signature = null,
         )
+    }
+    val signatureByProcid = mutableMapOf<Int, String>()
+    val signaturesRead = dialectQuery(
+        conn,
+        "Informix routine signatures",
+        """
+            SELECT p.procid, CAST(p.paramtypes AS LVARCHAR(32739))
+            FROM sysprocedures p
+            WHERE p.owner = ? AND p.internal = 'f'
+            ORDER BY p.procid
+        """.trimIndent(),
+        schema,
+        limitations,
+    ) { rs ->
+        rs.getString(2)?.trim()?.takeIf { it.isNotEmpty() }?.let { signatureByProcid[rs.getInt(1)] = it }
+    }
+    if (!signaturesRead) {
+        // RTNPARAMTYPES는 opaque라 일부 JDBC 드라이버가 getString을 거부한다.
+        // core routine 행은 보존하고 signature만 limitation으로 남긴다.
+        limitations += "$schema: Informix RTNPARAMTYPES signature cast unavailable; routine signatures omitted"
+    }
+    for (index in routineRows.indices) {
+        val routine = routineRows[index]
+        routineRows[index] = routine.copy(signature = signatureByProcid[routine.procid])
     }
     val bodyLines = mutableMapOf<Int, MutableList<Pair<Int, String>>>()
     dialectQuery(
@@ -250,16 +275,16 @@ internal fun informixBodies(conn: Connection, schema: String, limitations: Mutab
         """
             SELECT p.procid, b.seqno, b.data
             FROM sysprocedures p JOIN sysprocbody b ON b.procid = p.procid
-            WHERE p.owner = ? AND b.datakey = 'T' ORDER BY p.procid, b.seqno
+            WHERE p.owner = ? AND p.internal = 'f' AND b.datakey = 'T' ORDER BY p.procid, b.seqno
         """.trimIndent(),
         schema,
         limitations,
     ) { rs -> bodyLines.getOrPut(rs.getInt(1)) { mutableListOf() } += rs.getInt(2) to rs.getString(3) }
     var unavailableBodies = 0
     for (routine in routineRows) {
-        // SYSPROCBODY의 seqno는 routine 안의 줄 번호다. 256자 CHAR 조각을
-        // 임의로 이어 붙여 토큰을 합치지 않고 catalog가 준 줄 경계를 보존한다.
-        val body = bodyLines[routine.procid]?.sortedBy { it.first }?.joinToString("\n") { it.second }
+        // SYSPROCBODY의 data는 고정 길이 원문 조각일 수 있어 임의의 줄바꿈을
+        // 넣으면 문자열·식별자가 깨진다. seqno 순으로 그대로 이어 붙인다.
+        val body = bodyLines[routine.procid]?.let(::concatenateInformixFragments)
         if (body == null) unavailableBodies++
         routines += Triple(
             schema,
@@ -284,9 +309,18 @@ internal data class InformixRoutineRow(
     val signature: String?,
 )
 
-internal fun assembleInformixFragments(chunks: List<InformixChunk>): String =
-    chunks.sortedWith(compareBy<InformixChunk>({ if (it.key == "D") 0 else 1 }, { it.seq }))
-        .joinToString("\n") { it.data }
+internal fun concatenateInformixFragments(fragments: List<Pair<Int, String>>): String =
+    fragments.sortedBy { it.first }.joinToString(separator = "") { it.second }
+
+internal fun assembleInformixFragments(chunks: List<InformixChunk>): String {
+    val header = concatenateInformixFragments(chunks.filter { it.key == "D" }.map { it.seq to it.data })
+    val action = concatenateInformixFragments(chunks.filter { it.key == "A" }.map { it.seq to it.data })
+    return when {
+        header.isEmpty() -> action
+        action.isEmpty() -> header
+        else -> "$header\n$action"
+    }
+}
 
 internal fun db2RoutineDocument(row: Db2RoutineRow, signature: String?): RoutineDoc =
     RoutineDoc(

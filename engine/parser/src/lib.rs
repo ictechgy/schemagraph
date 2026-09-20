@@ -848,7 +848,60 @@ fn parse_informix_trigger_body(
         .or_else(|| strip_catalog_trigger_header("informix", body))
         .or_else(|| strip_outer_parentheses(body))
         .unwrap_or(body);
+    if let Some(alias) = informix_new_alias(body) {
+        let normalized = replace_trigger_alias(inner, &alias);
+        return parse_trigger_body(dialect, &normalized);
+    }
     parse_trigger_body(dialect, inner)
+}
+
+fn informix_new_alias(body: &str) -> Option<String> {
+    let referencing = find_all_keywords(body, "REFERENCING").first().copied()?;
+    let rest = &body[referencing + "REFERENCING".len()..];
+    let new_position = find_all_keywords(rest, "NEW").first().copied()?;
+    let after_new = rest[new_position + "NEW".len()..].trim_start();
+    if !starts_with_keyword(after_new, "AS") {
+        return None;
+    }
+    let after_as = after_new["AS".len()..].trim_start();
+    let (alias, length) = head_word(after_as);
+    (length > 0).then(|| alias.to_owned())
+}
+
+fn replace_trigger_alias(body: &str, alias: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut output = String::with_capacity(body.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(end) = quoted_or_comment_end(body, index) {
+            output.push_str(&body[index..end]);
+            index = end;
+            continue;
+        }
+        let remaining = &body[index..];
+        if remaining
+            .get(..alias.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(alias))
+            && (index == 0 || !is_identifier_byte(bytes[index - 1]))
+            && bytes.get(index + alias.len()) == Some(&b'.')
+        {
+            output.push_str("NEW.");
+            index += alias.len() + 1;
+            continue;
+        }
+        let width = body[index..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+        output.push_str(&body[index..index + width]);
+        index += width;
+    }
+    output
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#' | b'.') || byte >= 128
 }
 
 fn parse_db2_trigger_body(
@@ -885,13 +938,17 @@ fn strip_catalog_trigger_header<'a>(dialect: &str, body: &'a str) -> Option<&'a 
 
 fn strip_outer_parentheses(text: &str) -> Option<&str> {
     let trimmed = text.trim();
-    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+    if !trimmed.starts_with('(') {
+        return None;
+    }
+    let end = trimmed.trim_end_matches(';').trim_end().len();
+    if end == 0 || trimmed.as_bytes().get(end - 1) != Some(&b')') {
         return None;
     }
     let bytes = trimmed.as_bytes();
     let mut depth = 0usize;
     let mut index = 0;
-    while index < bytes.len() {
+    while index < end {
         if let Some(end) = quoted_or_comment_end(trimmed, index) {
             index = end;
             continue;
@@ -900,7 +957,7 @@ fn strip_outer_parentheses(text: &str) -> Option<&str> {
             b'(' => depth += 1,
             b')' => {
                 depth = depth.checked_sub(1)?;
-                if depth == 0 && index + 1 != bytes.len() {
+                if depth == 0 && index + 1 != end {
                     return None;
                 }
             }
@@ -908,7 +965,7 @@ fn strip_outer_parentheses(text: &str) -> Option<&str> {
         }
         index += 1;
     }
-    (depth == 0).then(|| trimmed[1..trimmed.len() - 1].trim())
+    (depth == 0).then(|| trimmed[1..end - 1].trim())
 }
 
 /// `AS $$...$$`·`AS $tag$...$tag$`·`AS '...'` 안의 몸체를 꺼낸다 —
@@ -4756,6 +4813,64 @@ mod tests {
                 && edge.to.as_str() == "main.customers"
         }));
         assert!(notes.is_empty(), "notes: {notes:?}");
+    }
+
+    #[test]
+    fn informix_jdbc_raw_trigger의_qualified_assignment와_세미콜론을_추출한다() {
+        let mut doc = doc_with_trigger(
+            "create trigger \"informix\".orders_touch insert on \"informix\".orders \
+             referencing new as n \
+             for each row \
+             ( update \"informix\".customers \
+               set \"informix\".customers.name = 'observed' \
+               where (id = n.customer_id ) );",
+        );
+        doc.dialect = "informix".into();
+        doc.schemas[0].name = "informix".into();
+        let (graph, notes) = build(&doc);
+        assert!(graph.edges().iter().any(|edge| {
+            edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "informix.orders.trg_touch"
+                && edge.to.as_str() == "informix.customers"
+        }));
+        assert!(
+            graph.edges().iter().any(|edge| {
+                edge.kind == EdgeKind::Reads
+                    && edge.from.as_str() == "informix.orders.trg_touch"
+                    && edge.to.as_str() == "informix.orders.customer_id"
+            }),
+            "edges: {:?}, notes: {:?}",
+            graph.edges(),
+            notes
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("parsing failed")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn informix_malformed_full_trigger_wrapper는_limitation을_남긴다() {
+        let mut doc = doc_with_trigger(
+            "create trigger \"informix\".orders_touch insert on \"informix\".orders \
+             referencing new as n for each row ( update ((( broken );",
+        );
+        doc.dialect = "informix".into();
+        doc.schemas[0].name = "informix".into();
+        let (graph, notes) = build(&doc);
+        assert!(!graph.edges().iter().any(|edge| {
+            edge.kind == EdgeKind::Writes && edge.from.as_str() == "informix.orders.trg_touch"
+        }));
+        assert!(notes.iter().any(|note| note.contains("파싱 실패")));
+    }
+
+    #[test]
+    fn informix_row_alias_rewrite_preserves_unicode_and_qualified_names() {
+        let text = "한글 = n.id; 한n.id; schema.n.id; foo$n.id; 'n.id'; n.id";
+        assert_eq!(
+            replace_trigger_alias(text, "n"),
+            "한글 = NEW.id; 한n.id; schema.n.id; foo$n.id; 'n.id'; NEW.id"
+        );
     }
 
     #[test]

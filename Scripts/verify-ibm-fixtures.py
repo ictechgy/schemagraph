@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -165,8 +166,10 @@ def assert_graph(graph_path: Path, document_path: Path, label: str, schema_hint:
         long_body = next((routine.get("body") for schema_doc in document.get("schemas", [])
                           for routine in schema_doc.get("routines", [])
                           if routine.get("name", "").lower() == "long_literal"), None)
-        if not long_body or "LONG_FRAGMENT_MARKER" not in long_body or len(long_body) < 300:
-            raise RuntimeError(f"{label}: long routine body fragments were not reconstructed")
+        fixture = (ROOT / "Fixtures/informix/basic.sql").read_text(encoding="utf-8")
+        expected = re.search(r"RETURN '(LONG_FRAGMENT_MARKER_x+)';", fixture)
+        if not expected or not long_body or expected.group(1) not in long_body:
+            raise RuntimeError(f"{label}: catalog fragmentation changed the long literal")
     if not any((("body" in note.lower() or "bodies" in note.lower()) and "unavailable" in note.lower()) or ("language" in note.lower() and "unsupported" in note.lower()) for note in graph.get("limitations", [])):
         raise RuntimeError(f"{label}: missing external-body limitation")
 

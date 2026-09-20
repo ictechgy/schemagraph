@@ -8,6 +8,7 @@ import hashlib
 import os
 from pathlib import Path
 import secrets
+import re
 import subprocess
 import sys
 import time
@@ -100,9 +101,9 @@ def wait_informix(container: str) -> None:
     deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
         require_running(container)
-        result = subprocess.run(["docker", "exec", container, "sh", "-c", '"$INFORMIXDIR/bin/onstat" -'],
+        result = subprocess.run(["docker", "exec", container, "bash", "-c", '. /usr/local/bin/informix_inf.env; "$INFORMIXDIR/bin/onstat" -'],
                                 capture_output=True, text=True, check=False)
-        if result.returncode == 0 and "On-Line" in result.stdout:
+        if re.search(r"--\s+On-Line\s+--", result.stdout):
             return
         time.sleep(5)
     raise RuntimeError("Informix container did not become ready within 600 seconds")
@@ -117,7 +118,7 @@ def verify_driver(path: Path, expected: str, label: str) -> None:
 
 
 def create_db_informix(container: str) -> None:
-    docker(["exec", "-i", "-u", "informix", container, "sh", "-c", '\"$INFORMIXDIR/bin/dbaccess\" - -'],
+    docker(["exec", "-i", "-u", "informix", container, "bash", "-c", '. /usr/local/bin/informix_inf.env; "$INFORMIXDIR/bin/dbaccess" - -'],
            "create Informix fixture database", input_text="CREATE DATABASE sgfix WITH LOG;\n")
 
 
@@ -190,7 +191,7 @@ def main() -> int:
                    input_text=f"informix:{password}\n")
             create_db_informix(name)
             informix_port = port(name, 9088)
-            server = docker(["exec", name, "sh", "-c", 'printf "%s" "$INFORMIXSERVER"'], "read Informix server name")
+            server = docker(["exec", name, "bash", "-c", '. /usr/local/bin/informix_inf.env; printf "%s" "$INFORMIXSERVER"'], "read Informix server name")
             informix_url = f"jdbc:informix-sqli://127.0.0.1:{informix_port}/sgfix:INFORMIXSERVER={server};"
             run([sys.executable, str(VERIFY), str(args.engine), str(args.probe_jar),
                  "--database", "informix", "--require-all", "--java", args.java,

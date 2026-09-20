@@ -15,9 +15,16 @@ class DialectCatalogTest {
             ),
         )
         assertEquals(
-            "CREATE TRIGGER trg AFTER INSERT ON orders\nFOR EACH ROW\nINSERT INTO audit_log VALUES (1);",
+            "CREATE TRIGGER trg AFTER INSERT ON orders\nFOR EACH ROWINSERT INTO audit_log VALUES (1);",
             body,
         )
+    }
+
+    @Test
+    fun fixedSizeRoutineFragmentsDoNotGainNewlinesInsideTokens() {
+        val first = "LONG_FRAGMENT_MARKER_" + "x".repeat(238)
+        val second = "y".repeat(256) + "_tail"
+        assertEquals(first + second, concatenateInformixFragments(listOf(1 to first, 2 to second)))
     }
 
     @Test
