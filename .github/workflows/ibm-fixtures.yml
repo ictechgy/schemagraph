@@ -95,4 +95,5 @@ jobs:
             engine/target/debug/schemagraph \
             probe/build/libs/schemagraph-probe-all.jar \
             --database "${{ inputs.database || 'all' }}" \
+            --memory 5g \
             --drivers-dir "$RUNNER_TEMP/ibm-drivers"

@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("engine", type=Path, help="schemagraph executable")
     parser.add_argument("probe_jar", type=Path, help="JVM probe fat jar")
+    parser.add_argument("--output-dir", type=Path, help="keep fixture documents and graphs in this directory")
     parser.add_argument("--java", default=os.environ.get("JAVA", "java"))
     parser.add_argument("--db2-url", default=os.environ.get("SG_DB2_URL"))
     parser.add_argument("--db2-user", default=os.environ.get("SG_DB2_USER", "db2inst1"))
@@ -166,7 +167,7 @@ def assert_graph(graph_path: Path, document_path: Path, label: str, schema_hint:
                           if routine.get("name", "").lower() == "long_literal"), None)
         if not long_body or "LONG_FRAGMENT_MARKER" not in long_body or len(long_body) < 300:
             raise RuntimeError(f"{label}: long routine body fragments were not reconstructed")
-    if not any(("body" in note.lower() and "unavailable" in note.lower()) or ("language" in note.lower() and "unsupported" in note.lower()) for note in graph.get("limitations", [])):
+    if not any((("body" in note.lower() or "bodies" in note.lower()) and "unavailable" in note.lower()) or ("language" in note.lower() and "unsupported" in note.lower()) for note in graph.get("limitations", [])):
         raise RuntimeError(f"{label}: missing external-body limitation")
 
 
@@ -205,8 +206,8 @@ def main() -> int:
     if args.require_all and not all(configured[name] for name in selected):
         print(f"error: --require-all needs URL and JDBC jar for {', '.join(sorted(selected))}", file=sys.stderr)
         return 2
-    temporary = Path(os.environ.get("TMPDIR", "/tmp")) / f"schemagraph-ibm-fixtures-{os.getpid()}"
-    temporary.mkdir(parents=True, exist_ok=False)
+    temporary = args.output_dir or Path(os.environ.get("TMPDIR", "/tmp")) / f"schemagraph-ibm-fixtures-{os.getpid()}"
+    temporary.mkdir(parents=True, exist_ok=bool(args.output_dir))
     try:
         ran = 0
         if "db2" in selected:
@@ -224,9 +225,10 @@ def main() -> int:
         print(f"error: {scrub(str(error), [args.db2_password, args.informix_password])}", file=sys.stderr)
         return 1
     finally:
-        for child in temporary.glob("*"):
-            child.unlink(missing_ok=True)
-        temporary.rmdir()
+        if not args.output_dir:
+            for child in temporary.glob("*"):
+                child.unlink(missing_ok=True)
+            temporary.rmdir()
 
 
 if __name__ == "__main__":

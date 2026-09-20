@@ -113,8 +113,11 @@ class Extractor(
     private fun extractSchema(schema: String, usage: UsageHarvest): SchemaDoc? {
         val bodies = collectBodies(schema)
         val objects = rawObjectsOf(schema).map { raw ->
-            val columns = columnsOf(raw)
-            val (constraints, pkPos) = constraintsOf(raw)
+            // 시퀀스에는 테이블 컬럼·키가 없다. 드라이버에 테이블 메타데이터로
+            // 질의하면 불필요한 카탈로그 작업이나 방언별 오류를 일으킨다.
+            val columns = if (raw.kind == "sequence") emptyList() else columnsOf(raw)
+            val (constraints, pkPos) = if (raw.kind == "sequence")
+                emptyList<ConstraintDoc>() to emptyMap<String, Int>() else constraintsOf(raw)
             ObjectDoc(
                 name = raw.name,
                 kind = raw.kind,

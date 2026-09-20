@@ -120,6 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("engine", type=Path)
     parser.add_argument("probe_jar", type=Path)
     parser.add_argument("--database", choices=("db2", "informix", "all"), default="all")
+    parser.add_argument("--output-dir", type=Path, default=Path("engine/target/scaling-validation/ibm"))
     parser.add_argument("--memory", default="3g", help="Docker memory limit for one disposable server")
     parser.add_argument("--java", default=os.environ.get("JAVA", "java"))
     parser.add_argument("--drivers-dir", type=Path,
@@ -157,6 +158,7 @@ def main() -> int:
             db2_url = f"jdbc:db2://127.0.0.1:{db2_port}/SGTEST"
             run([sys.executable, str(VERIFY), str(args.engine), str(args.probe_jar),
                  "--database", "db2", "--require-all", "--java", args.java,
+                 "--output-dir", str(args.output_dir.resolve() / f"db2-{run_id}"),
                  "--db2-url", db2_url, "--db2-user", "db2inst1", "--db2-password", password,
                  "--db2-jdbc", str(db2_driver), "--db2-schema", "SGFIX"],
                 "Db2 fixture verification", timeout=900)
@@ -186,6 +188,7 @@ def main() -> int:
             informix_url = f"jdbc:informix-sqli://127.0.0.1:{informix_port}/sgfix:INFORMIXSERVER={server};"
             run([sys.executable, str(VERIFY), str(args.engine), str(args.probe_jar),
                  "--database", "informix", "--require-all", "--java", args.java,
+                 "--output-dir", str(args.output_dir.resolve() / f"informix-{run_id}"),
                  "--informix-url", informix_url, "--informix-user", "informix",
                  "--informix-password", password, "--informix-jdbc", str(informix_driver)],
                 "Informix fixture verification", timeout=900)
@@ -196,6 +199,14 @@ def main() -> int:
         return 0
     except RuntimeError as error:
         print(f"error: {scrub(str(error))}", file=sys.stderr)
+        for container in containers:
+            metrics = subprocess.run(["docker", "exec", container, "cat", "/sys/fs/cgroup/memory.events"],
+                                     capture_output=True, text=True, check=False)
+            if metrics.returncode == 0:
+                print("Container memory events: " + metrics.stdout.strip(), file=sys.stderr)
+            result = subprocess.run(["docker", "logs", "--tail", "40", container],
+                                    capture_output=True, text=True, check=False)
+            print(scrub((result.stdout + result.stderr)[-3000:]), file=sys.stderr)
         return 1
     finally:
         for container in containers:
