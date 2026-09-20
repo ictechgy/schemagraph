@@ -31,31 +31,51 @@ pub fn is_ndjson_document(text: &str) -> bool {
 /// 경로와 같은 규칙으로 검사하고, `schema` 없이 온 `object`·`routine`이나
 /// 알 수 없는 `type`은 오류다.
 pub fn document_from_ndjson(text: &str) -> Result<CatalogDocument, String> {
-    let mut header: Option<Value> = None;
-    let mut schemas: Vec<Value> = Vec::new();
-    let mut limitations: Vec<String> = Vec::new();
-    let mut extra_notes = std::collections::BTreeSet::new();
+    document_from_reader(std::io::Cursor::new(text.as_bytes()))
+}
+
+/// 한 레코드씩 타입으로 옮겨 전체 원문·Value 트리를 동시에 보관하지 않는다.
+/// 그래프의 교차 참조를 위해 반환 문서 자체는 여전히 전체 카탈로그를 가진다.
+pub fn document_from_reader(mut reader: impl std::io::BufRead) -> Result<CatalogDocument, String> {
+    use crate::document::{unknown_field_paths, SchemaDoc};
+    use std::collections::BTreeSet;
+
+    let mut doc: Option<CatalogDocument> = None;
+    let mut unknown = BTreeSet::new();
+    let mut extra_notes = BTreeSet::new();
+    let mut declared = BTreeSet::new();
     let mut trailer_seen = false;
     let mut version = 0;
-    for (number, raw) in text.lines().enumerate() {
-        if raw.trim().is_empty() {
+    let mut number = 0;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        number += 1;
+        let read = reader.read_line(&mut line).map_err(|error| {
+            format!("cannot read NDJSON line {number}: {error}; check the input stream")
+        })?;
+        if read == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
             continue;
         }
-        let record: Value = serde_json::from_str(raw)
-            .map_err(|error| format!("invalid NDJSON at line {}: {error}", number + 1))?;
+        let mut record: Value = serde_json::from_str(&line)
+            .map_err(|error| format!("invalid NDJSON at line {number}: {error}"))?;
         let kind = record
             .get("type")
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("NDJSON line {} has no record type", number + 1))?;
-        if header.is_none() && kind != "document" {
+            .ok_or_else(|| format!("NDJSON line {number} has no record type"))?
+            .to_owned();
+        if doc.is_none() && kind != "document" {
             return Err("NDJSON must start with a document header".into());
         }
         if version == 2 && trailer_seen {
             return Err("catalog v2 NDJSON must end with exactly one limitations trailer".into());
         }
-        match kind {
+        match kind.as_str() {
             "document" => {
-                if header.is_some() {
+                if doc.is_some() {
                     return Err("NDJSON has more than one document header".into());
                 }
                 version = crate::codec::wire_version(&record)?;
@@ -64,8 +84,10 @@ pub fn document_from_ndjson(text: &str) -> Result<CatalogDocument, String> {
                         "NDJSON header cannot embed schemas; emit schema and data records".into(),
                     );
                 }
-                let mut value = record;
-                let fields = value
+                if let Some(features) = record.get("required_features").and_then(Value::as_array) {
+                    declared.extend(features.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+                let fields = record
                     .as_object_mut()
                     .ok_or("NDJSON header must be an object")?;
                 fields.remove("type");
@@ -77,52 +99,81 @@ pub fn document_from_ndjson(text: &str) -> Result<CatalogDocument, String> {
                 fields
                     .entry("limitations")
                     .or_insert_with(|| serde_json::json!([]));
-                header = Some(value);
+                fields.insert("schemas".into(), serde_json::json!([]));
+                unknown.extend(unknown_field_paths(&record));
+                // 헤더의 필수 기능 이름·버전부터 검사하되 최종 한계 집계는 미룬다.
+                doc = Some(crate::codec::decode_document(record)?);
             }
             "schema" => {
                 let name = record
                     .get("name")
                     .and_then(Value::as_str)
-                    .ok_or("NDJSON schema requires a name")?;
-                schemas.push(serde_json::json!({"name":name, "objects":[], "routines":[]}));
+                    .ok_or("NDJSON schema requires a name")?
+                    .to_owned();
+                let catalog = doc.as_mut().ok_or("NDJSON document header is missing")?;
+                catalog.schemas.push(SchemaDoc {
+                    name,
+                    objects: Vec::new(),
+                    routines: Vec::new(),
+                });
                 record_unknown_keys(&record, &["type", "name"], &mut extra_notes);
             }
             "object" | "routine" => {
-                let schema = schemas
+                let catalog = doc.as_mut().ok_or("NDJSON document header is missing")?;
+                let schema = catalog
+                    .schemas
                     .last_mut()
                     .ok_or("NDJSON object/routine appeared before its schema")?;
                 if let Some(owner) = record.get("schema") {
-                    if owner.as_str() != schema["name"].as_str() {
+                    if owner.as_str() != Some(schema.name.as_str()) {
                         return Err(
                             "NDJSON record schema does not match the preceding schema record"
                                 .into(),
                         );
                     }
                 }
+                record_unknown_keys(&record, &["type", "schema", "data"], &mut extra_notes);
                 let data = record
-                    .get("data")
-                    .ok_or("NDJSON object/routine requires data")?;
+                    .get_mut("data")
+                    .ok_or("NDJSON object/routine requires data")?
+                    .take();
                 let collection = if kind == "object" {
                     "objects"
                 } else {
                     "routines"
                 };
-                // 스키마 레코드 생성 시 두 컬렉션을 배열로 만들었다.
-                schema[collection]
-                    .as_array_mut()
-                    .expect("schema collections are arrays")
-                    .push(data.clone());
-                record_unknown_keys(&record, &["type", "schema", "data"], &mut extra_notes);
+                // 레코드의 소유권을 옮겨 공통 미지 필드 탐색기를 쓰며 몸체 문자열은 복제하지 않는다.
+                let mut schema_fields = serde_json::Map::new();
+                schema_fields.insert(collection.into(), Value::Array(vec![data]));
+                let mut wrapper = serde_json::json!({"version":1});
+                wrapper["schemas"] = Value::Array(vec![Value::Object(schema_fields)]);
+                unknown.extend(unknown_field_paths(&wrapper));
+                let data = wrapper["schemas"][0][collection][0].take();
+                if kind == "object" {
+                    schema
+                        .objects
+                        .push(serde_json::from_value(data).map_err(|error| {
+                            format!("invalid object at NDJSON line {number}: {error}")
+                        })?);
+                } else {
+                    schema
+                        .routines
+                        .push(serde_json::from_value(data).map_err(|error| {
+                            format!("invalid routine at NDJSON line {number}: {error}")
+                        })?);
+                }
             }
             "limitations" => {
-                let data = record
-                    .get("data")
-                    .ok_or("NDJSON limitations trailer requires data")?;
-                let items: Vec<String> = serde_json::from_value(data.clone())
-                    .map_err(|error| format!("invalid NDJSON limitations: {error}"))?;
-                limitations.extend(items);
-                trailer_seen = true;
                 record_unknown_keys(&record, &["type", "data"], &mut extra_notes);
+                let data = record
+                    .get_mut("data")
+                    .ok_or("NDJSON limitations trailer requires data")?
+                    .take();
+                let items: Vec<String> = serde_json::from_value(data)
+                    .map_err(|error| format!("invalid NDJSON limitations: {error}"))?;
+                let catalog = doc.as_mut().ok_or("NDJSON document header is missing")?;
+                catalog.limitations.extend(items);
+                trailer_seen = true;
             }
             _ => {
                 return Err(format!(
@@ -131,17 +182,21 @@ pub fn document_from_ndjson(text: &str) -> Result<CatalogDocument, String> {
             }
         }
     }
-    let mut value = header.ok_or("NDJSON document header is missing")?;
-    if version == 2 && !trailer_seen {
-        return Err("catalog v2 NDJSON is incomplete: limitations trailer is missing".into());
+    let mut catalog = doc.ok_or("NDJSON document header is missing")?;
+    if version == 2 {
+        if !trailer_seen {
+            return Err("catalog v2 NDJSON is incomplete: limitations trailer is missing".into());
+        }
+        for feature in crate::codec::document_features(&catalog) {
+            if !declared.contains(feature) {
+                return Err(format!(
+                    "catalog v2 uses '{feature}' without declaring it in required_features"
+                ));
+            }
+        }
     }
-    let mut from_header: Vec<String> = serde_json::from_value(value["limitations"].clone())
-        .map_err(|error| format!("invalid header limitations: {error}"))?;
-    from_header.append(&mut limitations);
-    from_header.extend(extra_notes);
-    value["limitations"] = serde_json::json!(from_header);
-    value["schemas"] = serde_json::json!(schemas);
-    crate::codec::document_from_value(value)
+    catalog.limitations.extend(extra_notes);
+    Ok(crate::codec::finish_document(catalog, unknown))
 }
 
 fn record_unknown_keys(

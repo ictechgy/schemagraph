@@ -11,6 +11,8 @@ use schemagraph_analysis::{self as analysis, Resolve};
 use schemagraph_core::{Graph, Level};
 use schemagraph_export::{self as export, GraphDoc};
 use schemagraph_source::{self as source};
+use serde::Deserialize;
+use std::io::{BufReader, BufWriter, Seek, Write};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -243,9 +245,9 @@ async fn scan(
     inferred: bool,
 ) -> Result<i32> {
     let doc = match (url, document) {
-        (Some(url), None) => source::read(url)
-            .await
-            .with_context(|| format!("스캔 실패: {url}"))?,
+        (Some(url), None) => source::read(url).await.context(
+            "database scan failed; check the connection settings and catalog permissions",
+        )?,
         (None, Some(path)) => load_document(path)?,
         (None, None) => bail!("URL 또는 --document 중 하나는 필요하다"),
         (Some(_), Some(_)) => bail!("URL과 --document는 같이 쓸 수 없다 — 둘 중 하나만"),
@@ -271,9 +273,9 @@ async fn scan(
             graph.add_limitation(note);
         }
     }
-    let graph_doc = export::graph_to_doc(&graph);
-    let json = export::to_pretty_json(&graph_doc)?;
-    write_output(output, &json)?;
+    // 그래프가 몸체 원문을 소유하지 않으므로 출력 전에 카탈로그를 해제한다.
+    drop(doc);
+    write_graph_output(output, &graph)?;
     Ok(0)
 }
 
@@ -281,20 +283,20 @@ async fn scan(
 /// 자동으로 구분하고, 버전이 다르면 명확히 거절한다 — 조용히 읽으면 스키마가
 /// 어긋난 채 그래프가 나와 소비자가 모른다.
 fn load_document(path: &std::path::Path) -> Result<source::CatalogDocument> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("catalog document를 못 읽음: {}", path.display()))?;
-    if source::ndjson::is_ndjson_document(&text) {
-        return source::ndjson::document_from_ndjson(&text)
-            .map_err(|e| anyhow!("NDJSON document 파싱 실패: {} — {e}", path.display()));
+    let mut reader = open_reader(path)?;
+    let probe = SnapshotProbe::deserialize(&mut serde_json::Deserializer::from_reader(&mut reader));
+    reader.rewind().context("cannot rewind catalog input")?;
+    // 잘못된 입력은 아래 실제 리더가 상세 오류를 내므로 형식 탐색 실패를 여기서 확정하지 않는다.
+    if probe.is_ok_and(|probe| probe.kind.as_deref() == Some("document")) {
+        return source::ndjson::document_from_reader(reader)
+            .map_err(|error| anyhow!("invalid NDJSON catalog {}: {error}", path.display()));
     }
-    source::codec::document_from_json(&text)
+    source::codec::document_from_reader(reader)
         .map_err(|error| anyhow!("invalid catalog document {}: {error}", path.display()))
 }
 
 fn load_graph(path: &std::path::Path) -> Result<Graph> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("graph.json을 못 읽음: {}", path.display()))?;
-    let doc: GraphDoc = serde_json::from_str(&text)
+    let doc: GraphDoc = serde_json::from_reader(open_reader(path)?)
         .with_context(|| format!("graph.json 파싱 실패: {}", path.display()))?;
     if doc.version != export::GRAPH_VERSION {
         bail!(
@@ -313,8 +315,8 @@ fn render_graph(path: &std::path::Path, format: GraphFormat, level: Level) -> Re
         GraphFormat::Mermaid => export::mermaid::to_mermaid(&projected),
         GraphFormat::Dot => to_dot(&projected),
         GraphFormat::Json => {
-            let doc = export::graph_to_doc(&projected);
-            export::to_pretty_json(&doc)?
+            write_graph_output("-", &projected)?;
+            return Ok(0);
         }
     };
     println!("{out}");
@@ -404,16 +406,16 @@ fn stats(path: &std::path::Path) -> Result<i32> {
 /// 입력 파일이 graph.json인지 catalog document인지 꼴로 판별한다 —
 /// 두 산출물은 계약이 달라 같은 명령으로 비교할 수 없다.
 fn snapshot_kind(path: &std::path::Path) -> Result<SnapshotKind> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("스냅샷을 못 읽음: {}", path.display()))?;
-    if source::ndjson::is_ndjson_document(&text) {
+    let probe = SnapshotProbe::deserialize(&mut serde_json::Deserializer::from_reader(
+        open_reader(path)?,
+    ))
+    .with_context(|| format!("invalid snapshot {}", path.display()))?;
+    if probe.kind.as_deref() == Some("document") {
         return Ok(SnapshotKind::Document);
     }
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("스냅샷 JSON 파싱 실패: {}", path.display()))?;
-    if value.get("vertices").is_some() && value.get("edges").is_some() {
+    if probe.vertices.is_some() && probe.edges.is_some() {
         Ok(SnapshotKind::Graph)
-    } else if value.get("schemas").is_some() {
+    } else if probe.schemas.is_some() {
         Ok(SnapshotKind::Document)
     } else {
         bail!(
@@ -426,6 +428,26 @@ fn snapshot_kind(path: &std::path::Path) -> Result<SnapshotKind> {
 enum SnapshotKind {
     Graph,
     Document,
+}
+
+// 큰 배열·몸체는 IgnoredAny로 건너뛰고 형식 구분에 필요한 키만 보관한다.
+#[derive(Deserialize)]
+struct SnapshotProbe {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    vertices: Option<serde::de::IgnoredAny>,
+    edges: Option<serde::de::IgnoredAny>,
+    schemas: Option<serde::de::IgnoredAny>,
+}
+
+fn open_reader(path: &std::path::Path) -> Result<BufReader<std::fs::File>> {
+    let file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "cannot open input {}; check the path and permissions",
+            path.display()
+        )
+    })?;
+    Ok(BufReader::new(file))
 }
 
 /// diff — 같은 종류의 산출물 둘을 비교한다. usage는 델타에서 뺀다 —
@@ -540,12 +562,19 @@ fn rules(path: &std::path::Path, config: &std::path::Path, strict: bool) -> Resu
     })
 }
 
-fn write_output(output: &str, json: &str) -> Result<()> {
-    if output == "-" {
-        println!("{json}");
-    } else {
-        std::fs::write(output, format!("{json}\n"))
-            .with_context(|| format!("출력 쓰기 실패: {output}"))?;
+fn write_graph_output(output: &str, graph: &Graph) -> Result<()> {
+    fn write(mut writer: impl Write, graph: &Graph) -> Result<()> {
+        export::stream::write_graph(&mut writer, graph)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
     }
-    Ok(())
+    if output == "-" {
+        write(BufWriter::new(std::io::stdout().lock()), graph)
+    } else {
+        let file = std::fs::File::create(output).with_context(|| {
+            format!("cannot create graph output {output}; check the directory and permissions")
+        })?;
+        write(BufWriter::new(file), graph)
+    }
 }

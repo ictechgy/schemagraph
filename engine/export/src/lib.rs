@@ -13,6 +13,7 @@ use schemagraph_core::{Edge, EdgeKind, EvidenceLayer, Graph, Level, Vertex, Vert
 use serde::{Deserialize, Serialize};
 
 pub mod mermaid;
+pub mod stream;
 
 /// graph.json의 와이어 버전. 형식이 깨지는 변경은 올린다.
 pub const GRAPH_VERSION: u32 = 1;

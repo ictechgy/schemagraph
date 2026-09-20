@@ -33,10 +33,23 @@ pub fn document_from_json(text: &str) -> Result<CatalogDocument, String> {
     document_from_value(value)
 }
 
+/// 원문 전체 문자열을 따로 보관하지 않고 입력을 읽어 큰 카탈로그의 복제를 줄인다.
+pub fn document_from_reader(reader: impl std::io::Read) -> Result<CatalogDocument, String> {
+    let value = serde_json::from_reader(reader)
+        .map_err(|error| format!("invalid catalog JSON: {error}"))?;
+    document_from_value(value)
+}
+
 /// v2에서 제거된 키와 필수 기능을 검사한 후 v1 도메인 타입으로 정규화한다.
-pub fn document_from_value(mut value: Value) -> Result<CatalogDocument, String> {
+pub fn document_from_value(value: Value) -> Result<CatalogDocument, String> {
+    let unknown = unknown_field_paths(&value).into_iter().collect();
+    let doc = decode_document(value)?;
+    Ok(finish_document(doc, unknown))
+}
+
+/// NDJSON은 헤더와 본문을 따로 읽으므로 필드 변환과 최종 진단 집계를 분리한다.
+pub(crate) fn decode_document(mut value: Value) -> Result<CatalogDocument, String> {
     let version = wire_version(&value)?;
-    let unknown = unknown_field_paths(&value);
     if version == 2 {
         validate_v2(&value)?;
         let reader = value["producer"]["name"].clone();
@@ -48,16 +61,23 @@ pub fn document_from_value(mut value: Value) -> Result<CatalogDocument, String> 
         map.insert("reader".into(), reader);
         map.insert("version".into(), json!(DOCUMENT_VERSION));
     }
-    let mut doc: CatalogDocument = serde_json::from_value(value)
-        .map_err(|error| format!("invalid catalog fields: {error}"))?;
+    serde_json::from_value(value).map_err(|error| format!("invalid catalog fields: {error}"))
+}
+
+pub(crate) fn finish_document(
+    mut doc: CatalogDocument,
+    unknown: BTreeSet<String>,
+) -> CatalogDocument {
     if !unknown.is_empty() {
-        doc.limitations
-            .push(format!("ignored catalog fields: {}", unknown.join(", ")));
+        doc.limitations.push(format!(
+            "ignored catalog fields: {}",
+            unknown.into_iter().collect::<Vec<_>>().join(", ")
+        ));
     }
     doc.limitations.extend(duplicate_record_notes(&doc));
     doc.limitations.sort();
     doc.limitations.dedup();
-    Ok(doc)
+    doc
 }
 
 /// 같은 식별자의 반복을 버전과 무관하게 세어 그래프 병합이 손실 없이 보이지 않게 한다.

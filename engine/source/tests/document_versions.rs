@@ -205,3 +205,42 @@ fn v1_without_trailer_remains_accepted_and_large_version_is_rejected() {
     let error = document_from_json(overflow).unwrap_err();
     assert!(error.contains("unsupported catalog version"), "{error}");
 }
+
+#[test]
+fn buffered_inputs_preserve_documents_across_tiny_read_boundaries() {
+    use std::io::{BufReader, Cursor};
+    let document = sample_document();
+    for version in [1, 2] {
+        let json = serde_json::to_vec(&document_to_value(&document, version).unwrap()).unwrap();
+        let reader = BufReader::with_capacity(3, Cursor::new(json));
+        assert_eq!(
+            schemagraph_source::codec::document_from_reader(reader).unwrap(),
+            document
+        );
+        let ndjson = document_to_ndjson_version(&document, version).unwrap();
+        let reader = BufReader::with_capacity(3, Cursor::new(ndjson.as_bytes()));
+        assert_eq!(
+            schemagraph_source::ndjson::document_from_reader(reader).unwrap(),
+            document
+        );
+    }
+}
+
+#[test]
+fn stream_io_failures_cannot_look_like_complete_catalogs() {
+    use std::io::{self, BufReader, Read};
+    struct Interrupted;
+    impl Read for Interrupted {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "fixture input failure",
+            ))
+        }
+    }
+    let error =
+        schemagraph_source::ndjson::document_from_reader(BufReader::new(Interrupted)).unwrap_err();
+    assert!(error.contains("fixture input failure"), "{error}");
+    let error = schemagraph_source::codec::document_from_reader(Interrupted).unwrap_err();
+    assert!(error.contains("fixture input failure"), "{error}");
+}
