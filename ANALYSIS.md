@@ -83,6 +83,9 @@ signal, not a prediction that every reported dependent will fail at runtime.
 collection scope cannot be compared. `--require-complete` also exits 2 for
 partial analysis or truncated results. Graph-only `diff` compares graph
 structure; use catalog documents for column definitions and other DDL facts.
+Incomplete index definitions or foreign-key mappings also make review coverage
+partial. Catalog dependency records with unresolved endpoints prevent a verified
+comparison, including references outside the collected schema scope.
 
 ```sh
 schemagraph lint --graph after.graph.json --strict

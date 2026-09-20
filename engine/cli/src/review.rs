@@ -263,11 +263,27 @@ pub(crate) fn run(
     let before = super::analyze_document(&old, false);
     let after = super::analyze_document(&new, false);
     let diff = source::diff::diff_documents(&old, &new);
+    let mut notes = source::context::comparison_notes(&old, &new);
+    for (label, document, graph) in [("before", &old, &before), ("after", &new, &after)] {
+        let missing = document
+            .dependencies
+            .iter()
+            .filter(|dependency| {
+                source::dependencies::resolve_reference(graph, document, &dependency.source)
+                    .is_none()
+                    || source::dependencies::resolve_reference(graph, document, &dependency.target)
+                        .is_none()
+            })
+            .count();
+        if missing > 0 {
+            notes.push(format!("{label} snapshot has {missing} catalog dependency records with uncollected or ambiguous endpoints"));
+        }
+    }
     let mut changes = Changes {
         before: &before,
         after: &after,
         items: vec![],
-        notes: source::context::comparison_notes(&old, &new),
+        notes,
     };
     changes.collect(&diff, &old, &new)?;
     let report = schemagraph_analysis::review::review_with_budget(

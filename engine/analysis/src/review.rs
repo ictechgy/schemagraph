@@ -109,7 +109,20 @@ pub fn review_with_budget(
                     .is_none_or(|a| a.state != AnalysisState::Complete)
             })
     };
-    let analysis_partial = partial(before) || partial(after);
+    let incomplete_indexes = [before, after]
+        .iter()
+        .filter_map(|graph| graph.schema_metadata())
+        .flat_map(|metadata| metadata.indexes.values())
+        .filter(|index| !index.complete)
+        .count();
+    let incomplete_foreign_keys = [before, after]
+        .iter()
+        .filter_map(|graph| graph.schema_metadata())
+        .flat_map(|metadata| metadata.foreign_keys.values())
+        .filter(|key| !key.complete)
+        .count();
+    let analysis_partial =
+        partial(before) || partial(after) || incomplete_indexes > 0 || incomplete_foreign_keys > 0;
     let mut truncated = total_changes > max_changes;
     let mut visited = 0usize;
     let mut examined_edges = 0usize;
@@ -176,7 +189,10 @@ pub fn review_with_budget(
         .chain(after.limitations().iter().map(|n| format!("after: {n}")))
         .collect();
     if analysis_partial {
-        limitations.push("one or both snapshots have missing or partial SQL analysis; absence of impact is not proof of safety".into());
+        limitations.push("one or both snapshots have missing or partial dependency/schema analysis; absence of impact is not proof of safety".into());
+    }
+    if incomplete_indexes > 0 || incomplete_foreign_keys > 0 {
+        limitations.push(format!("across both snapshots, {incomplete_indexes} index definitions and {incomplete_foreign_keys} foreign-key mappings are incomplete"));
     }
     limitations.sort();
     limitations.dedup();
@@ -199,6 +215,28 @@ pub fn review_with_budget(
 mod tests {
     use super::*;
     use schemagraph_core::{Edge, EdgeKind, Vertex, VertexKind};
+    #[test]
+    fn incomplete_index_definition_cannot_look_like_complete_change_coverage() {
+        let mut graph = Graph::new();
+        let mut metadata = schemagraph_core::SchemaMetadata::default();
+        metadata.indexes.insert(
+            VertexId::member("s", "t", "expression"),
+            schemagraph_core::IndexMetadata {
+                table: VertexId::object("s", "t"),
+                columns: vec![],
+                unique: false,
+                has_predicate: false,
+                complete: false,
+            },
+        );
+        graph.set_schema_metadata(metadata);
+        let report = review(&graph, &Graph::new(), vec![], vec![], 10, 10);
+        assert!(report.analysis_partial);
+        assert!(report
+            .limitations
+            .iter()
+            .any(|note| note.contains("1 index definitions")));
+    }
     #[test]
     fn deleted_target_is_traced_in_the_previous_graph() {
         let mut before = Graph::new();
