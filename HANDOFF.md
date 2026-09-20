@@ -4,6 +4,14 @@
 
 ## 지금 상태
 
+- 2026-09-20: **경쟁 조사 후속 개선 구현 시작** (`feature/competitive-roadmap`).
+  사용자가 [경쟁 조사](COMPETITIVE-ANALYSIS.md)의 권장 작업을 순서대로 진행하도록
+  승인했다. 진행 순서는 (1) 컬럼 스코프·진단·보존 루트, (2) 경로·변경 검토·
+  카탈로그 근거·규칙, (3) 배포/CI·SQL 파일·MCP/HTML·실행 예산/증분 분석이다.
+  신규 데이터웨어하우스는 보고서의 수요 조건에 따라 사용자 선호를 질문했다.
+  완료 조건은 기존 출력 호환, 결정적 결과, 필요한/금지된 간선, 실제 DB fixture다.
+  v0.3.0은 공개되어 있으며 새 기능은 아직 배포하지 않았다. 최근 로컬 빌드·검증
+  산출물은 정리했으므로 필요한 빌드를 다시 생성한다. 서명키 백업은 건드리지 않는다.
 - 2026-09-20: **Maven Central v0.3.0 게시·설치 검증 완료**.
   [`io.github.ictechgy:schemagraph-probe:0.3.0`](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.3.0)을
   Central에 추가 게시했다. 소비자는 `mavenCentral()`만 사용하면 된다.
