@@ -21,6 +21,29 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# 프로브는 한 번 빌드해 전 DB/전송 버전 조합에서 같은 바이너리를 사용한다.
+GO_PROBE=""
+if command -v go >/dev/null 2>&1; then
+    GO_PROBE="$tmp/schemagraph-probe-go"
+    (cd probe-go && CGO_ENABLED=0 go build -o "$GO_PROBE" .)
+else
+    echo "주의: go가 없어 Go 프로브 전체 검증 건너뜀" >&2
+fi
+
+verify_go_versions() {
+    if [ -n "$GO_PROBE" ]; then
+        python3 Scripts/verify-probe-versions.py "$BIN" "$2" "$tmp/go-$3" \
+            -- "$GO_PROBE" --url "$1"
+    fi
+}
+
+verify_jdbc_versions() {
+    local reference="$1" label="$2"
+    shift 2
+    python3 Scripts/verify-probe-versions.py "$BIN" "$reference" "$tmp/jdbc-$label" \
+        -- "$JAVABIN" -jar "$JAR" "$@"
+}
+
 # usage 통계는 환경 의존이다(시각·누적 카운트) — 골든 비교 전에 값을
 # 정규화해 "usage가 있었다" 사실만 비교한다. 골든도 이 형태로 저장한다.
 norm_usage() {
@@ -36,7 +59,9 @@ EOF
 
 sqlite3 "$tmp/basic.db" < "$FIX/basic.sql"
 
-"$BIN" scan "sqlite:$tmp/basic.db" -o "$tmp/graph.json"
+"$BIN" scan "sqlite:$tmp/basic.db" -o "$tmp/graph.json" --emit-document "$tmp/sqlite-document.json"
+python3 Scripts/verify-document-versions.py "$BIN" "$tmp/sqlite-document.json" "$tmp/protocol-sqlite"
+verify_go_versions "sqlite:$tmp/basic.db" "$tmp/graph.json" sqlite
 
 # 골든과 비교 — 출력이 결정적이어야 diff가 성립한다.
 if [ -f "$FIX/basic.graph.golden.json" ]; then
@@ -192,8 +217,10 @@ if [ -n "$pg_url" ]; then
         psql "$pg_url" -v ON_ERROR_STOP=1 -qf "$PGFIX/basic.sql"
     fi
 
-    "$BIN" scan "$pg_url" -o "$tmp/graph-pg.json"
+    "$BIN" scan "$pg_url" -o "$tmp/graph-pg.json" --emit-document "$tmp/pg-document.json"
     python3 Scripts/verify-dynamic-sql.py "$tmp/graph-pg.json" postgres
+    python3 Scripts/verify-document-versions.py "$BIN" "$tmp/pg-document.json" "$tmp/protocol-pg"
+    verify_go_versions "$pg_url" "$tmp/graph-pg.json" postgres
 
     if [ -f "$PGFIX/basic.graph.golden.json" ]; then
         # usage 값(시각·카운트)은 환경 의존 — 정규화 후 비교한다.
@@ -305,6 +332,7 @@ if [ -n "$my_url" ]; then
     fi
 
     "$BIN" scan "$my_url" -o "$tmp/graph-my.json"
+    verify_go_versions "$my_url" "$tmp/graph-my.json" mysql
 
     if [ -f "$MYFIX/basic.graph.golden.json" ]; then
         # usage 값(시각·카운트)은 환경 의존 — 정규화 후 비교한다.
@@ -402,6 +430,7 @@ elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     maria_up
     maria_url="mysql://root@localhost:$maria_port/sgfix"
     "$BIN" scan "$maria_url" -o "$tmp/graph-maria-off.json"
+    verify_go_versions "$maria_url" "$tmp/graph-maria-off.json" mariadb-off
     python3 - "$tmp/graph-maria-off.json" <<'EOF'
 import json, sys
 g = json.load(open(sys.argv[1]))
@@ -434,6 +463,7 @@ if [ -n "$maria_url" ]; then
     fi
 
     "$BIN" scan "$maria_url" -o "$tmp/graph-maria.json"
+    verify_go_versions "$maria_url" "$tmp/graph-maria.json" mariadb-on
 
     # 골든은 MariaDB 전용이다 — MySQL과 구조는 같아도 시그니처 표기
     # (int(11))와 sys 뷰 범위가 다르다.
@@ -508,6 +538,7 @@ if [ -n "$JAVABIN" ] && [ -f "$JAR" ]; then
         --url "jdbc:h2:file:$tmp/sgfix-h2;INIT=RUNSCRIPT FROM '$PWD/Fixtures/h2/basic.sql'" \
         -o "$tmp/probe-doc.json"
     "$BIN" scan --document "$tmp/probe-doc.json" -o "$tmp/probe-graph.json"
+    verify_jdbc_versions "$tmp/probe-graph.json" h2 --url "jdbc:h2:file:$tmp/sgfix-h2"
 
     "$BIN" cycles --graph "$tmp/probe-graph.json" > "$tmp/cycles-h2.json"
     grep -q '"PUBLIC.LOOP_A"' "$tmp/cycles-h2.json" \
@@ -535,6 +566,7 @@ EOF
     "$JAVABIN" -jar "$JAR" --url "jdbc:sqlite:$tmp/probe-sqlite.db" \
         -o "$tmp/probe-sqlite-doc.json"
     "$BIN" scan --document "$tmp/probe-sqlite-doc.json" -o "$tmp/probe-sqlite-graph.json"
+    verify_jdbc_versions "$tmp/probe-sqlite-graph.json" sqlite --url "jdbc:sqlite:$tmp/probe-sqlite.db"
     python3 - "$tmp/graph.json" "$tmp/probe-sqlite-graph.json" <<'EOF'
 import json, sys
 def load(p):
@@ -576,6 +608,7 @@ EOF
             [ -n "${BASH_REMATCH[4]:-}" ] && probe_pg_args+=(--password "${BASH_REMATCH[4]}")
             "$JAVABIN" -jar "$JAR" "${probe_pg_args[@]}" -o "$tmp/probe-pg-doc.json"
             "$BIN" scan --document "$tmp/probe-pg-doc.json" -o "$tmp/probe-pg-graph.json"
+            verify_jdbc_versions "$tmp/probe-pg-graph.json" postgres "${probe_pg_args[@]}"
             python3 Scripts/verify-dynamic-sql.py "$tmp/probe-pg-graph.json" postgres
             python3 - "$tmp/probe-pg-graph.json" <<'EOF'
 import json, sys
@@ -600,9 +633,11 @@ EOF
     if [ -n "${my_url:-}" ] && [ -n "${SG_MYSQL_JAR:-}" ] && [ -f "${SG_MYSQL_JAR:-}" ]; then
         if [[ "$my_url" =~ mysql://([^:/@]+)(:([^@]*))?@([^:/]+)(:([0-9]+))?/([^?]+) ]]; then
             jdbc_my="jdbc:mysql://${BASH_REMATCH[4]}:${BASH_REMATCH[6]:-3306}/${BASH_REMATCH[7]}"
-            "$JAVABIN" -jar "$JAR" --url "$jdbc_my" --user "${BASH_REMATCH[1]}" \
-                --driver "$SG_MYSQL_JAR" -o "$tmp/probe-my-doc.json"
+            probe_mysql_args=(--url "$jdbc_my" --user "${BASH_REMATCH[1]}" --driver "$SG_MYSQL_JAR")
+            [ -n "${BASH_REMATCH[3]:-}" ] && probe_mysql_args+=(--password "${BASH_REMATCH[3]}")
+            "$JAVABIN" -jar "$JAR" "${probe_mysql_args[@]}" -o "$tmp/probe-my-doc.json"
             "$BIN" scan --document "$tmp/probe-my-doc.json" -o "$tmp/probe-my-graph.json"
+            verify_jdbc_versions "$tmp/probe-my-graph.json" mysql "${probe_mysql_args[@]}"
             python3 - "$tmp/probe-my-graph.json" <<'EOF'
 import json, sys
 g = json.load(open(sys.argv[1]))
@@ -624,9 +659,11 @@ EOF
     if [ -n "${maria_url:-}" ] && [ -n "${SG_MYSQL_JAR:-}" ] && [ -f "${SG_MYSQL_JAR:-}" ]; then
         if [[ "$maria_url" =~ mysql://([^:/@]+)(:([^@]*))?@([^:/]+)(:([0-9]+))?/([^?]+) ]]; then
             jdbc_maria="jdbc:mysql://${BASH_REMATCH[4]}:${BASH_REMATCH[6]:-3306}/${BASH_REMATCH[7]}"
-            "$JAVABIN" -jar "$JAR" --url "$jdbc_maria" --user "${BASH_REMATCH[1]}" \
-                --driver "$SG_MYSQL_JAR" -o "$tmp/probe-maria-doc.json"
+            probe_maria_args=(--url "$jdbc_maria" --user "${BASH_REMATCH[1]}" --driver "$SG_MYSQL_JAR")
+            [ -n "${BASH_REMATCH[3]:-}" ] && probe_maria_args+=(--password "${BASH_REMATCH[3]}")
+            "$JAVABIN" -jar "$JAR" "${probe_maria_args[@]}" -o "$tmp/probe-maria-doc.json"
             "$BIN" scan --document "$tmp/probe-maria-doc.json" -o "$tmp/probe-maria-graph.json"
+            verify_jdbc_versions "$tmp/probe-maria-graph.json" mariadb "${probe_maria_args[@]}"
             python3 - "$tmp/probe-maria-graph.json" <<'EOF'
 import json, sys
 g = json.load(open(sys.argv[1]))
@@ -719,6 +756,7 @@ EOF
         "$JAVABIN" -jar "$JAR" --url "$mssql_jdbc" \
             --user "$ms_user" --password "$ms_pass" -o "$tmp/probe-ms-doc.json"
         "$BIN" scan --document "$tmp/probe-ms-doc.json" -o "$tmp/probe-ms-graph.json"
+        verify_jdbc_versions "$tmp/probe-ms-graph.json" sqlserver --url "$mssql_jdbc" --user "$ms_user" --password "$ms_pass"
         python3 Scripts/verify-dynamic-sql.py "$tmp/probe-ms-graph.json" sqlserver
         python3 - "$tmp/probe-ms-graph.json" <<'EOF'
 import json, sys
@@ -761,6 +799,7 @@ EOF
                 { echo "probe-go 빌드 실패" >&2; exit 1; }
             "$tmp/schemagraph-probe-go" --url "$ms_go_url" -o "$tmp/probe-go-ms-doc.json"
             "$BIN" scan --document "$tmp/probe-go-ms-doc.json" -o "$tmp/probe-go-ms-graph.json"
+            verify_go_versions "$ms_go_url" "$tmp/probe-go-ms-graph.json" sqlserver
             python3 - "$tmp/probe-ms-graph.json" "$tmp/probe-go-ms-graph.json" <<'EOF'
 import json, sys
 def load(p):
@@ -838,6 +877,8 @@ EOF
             --user "$oracle_user" --password "$oracle_pass" \
             --driver "$OJAR" -o "$tmp/probe-or-doc.json"
         "$BIN" scan --document "$tmp/probe-or-doc.json" -o "$tmp/probe-or-graph.json"
+        verify_jdbc_versions "$tmp/probe-or-graph.json" oracle --url "$oracle_jdbc" --user "$oracle_user" --password "$oracle_pass" --driver "$OJAR"
+        python3 Scripts/verify-document-versions.py "$BIN" "$tmp/probe-or-doc.json" "$tmp/protocol-oracle"
         python3 Scripts/verify-dynamic-sql.py "$tmp/probe-or-graph.json" oracle
         python3 - "$tmp/probe-or-graph.json" <<'EOF'
 import json, sys
@@ -898,10 +939,11 @@ EOF
         if command -v go >/dev/null 2>&1 && \
             [[ "$oracle_jdbc" =~ jdbc:oracle:thin:@(//)?([^:/]+):([0-9]+)/(.+) ]]; then
             go_url="oracle://${oracle_user}:${oracle_pass}@${BASH_REMATCH[2]}:${BASH_REMATCH[3]}/${BASH_REMATCH[4]}"
-            (cd "$PWD/probe-go" && go build -o "$tmp/schemagraph-probe-go" .) || \
+            (cd "$PWD/probe-go" && CGO_ENABLED=0 go build -o "$tmp/schemagraph-probe-go" .) || \
                 { echo "probe-go 빌드 실패" >&2; exit 1; }
             "$tmp/schemagraph-probe-go" --url "$go_url" -o "$tmp/probe-go-doc.json"
             "$BIN" scan --document "$tmp/probe-go-doc.json" -o "$tmp/probe-go-graph.json"
+            verify_go_versions "$go_url" "$tmp/probe-go-graph.json" oracle
             python3 - "$tmp/probe-or-graph.json" "$tmp/probe-go-graph.json" <<'EOF'
 import json, sys
 def load(p):

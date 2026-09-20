@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 계약 버전. 형식이 깨지는 변경은 이 숫자를 올린다.
+/// 내부 모델과 기본 출력의 버전. v2 전송 메타데이터는 codec에서 정규화한다.
 pub const DOCUMENT_VERSION: u32 = 1;
 
 /// reader가 채우는 스키마 스냅샷. 결정적 출력을 위해 모든 컬렉션은
@@ -173,6 +173,7 @@ pub fn unknown_field_paths(doc: &serde_json::Value) -> Vec<String> {
             "indexes" => INDEX_KEYS,
             "triggers" => TRIGGER_KEYS,
             "usage" => USAGE_KEYS,
+            "producer" => &["name"],
             _ => return None,
         })
     }
@@ -207,11 +208,24 @@ pub fn unknown_field_paths(doc: &serde_json::Value) -> Vec<String> {
     }
 
     let mut out = BTreeSet::new();
-    walk(doc, "", DOC_KEYS, &mut out);
+    let keys = if doc.get("version").and_then(serde_json::Value::as_u64) == Some(2) {
+        DOC_V2_KEYS
+    } else {
+        DOC_KEYS
+    };
+    walk(doc, "", keys, &mut out);
     out.into_iter().take(MAX).collect()
 }
 
 const DOC_KEYS: &[&str] = &["version", "dialect", "reader", "schemas", "limitations"];
+const DOC_V2_KEYS: &[&str] = &[
+    "version",
+    "dialect",
+    "producer",
+    "required_features",
+    "schemas",
+    "limitations",
+];
 const SCHEMA_KEYS: &[&str] = &["name", "objects", "routines"];
 const OBJECT_KEYS: &[&str] = &[
     "name",

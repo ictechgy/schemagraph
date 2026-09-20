@@ -36,6 +36,9 @@ enum Command {
         /// Also dump the raw catalog document to this path (debugging / fixtures).
         #[arg(long)]
         emit_document: Option<PathBuf>,
+        /// Wire version for --emit-document; v1 remains the compatibility default.
+        #[arg(long, requires = "emit_document", value_parser = clap::value_parser!(u32).range(1..=2))]
+        document_version: Option<u32>,
         /// Build the graph from a catalog document (probe output) instead of a live URL.
         #[arg(long)]
         document: Option<PathBuf>,
@@ -114,6 +117,8 @@ enum Command {
     },
     /// Print the agent skill document for consuming this tool's output.
     Skill,
+    /// Describe catalog versions and features so producers can choose a compatible format.
+    DocumentCapabilities,
     /// Check declared dependency rules against the graph (CI gate).
     Rules {
         #[arg(short, long, default_value = "graph.json")]
@@ -171,6 +176,7 @@ async fn run(cli: Cli) -> Result<i32> {
             url,
             output,
             emit_document,
+            document_version,
             document,
             inferred,
         } => {
@@ -179,6 +185,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 document.as_deref(),
                 &output,
                 emit_document.as_deref(),
+                document_version.unwrap_or(1),
                 inferred,
             )
             .await
@@ -209,6 +216,16 @@ async fn run(cli: Cli) -> Result<i32> {
             print!("{}", include_str!("../SKILL.md"));
             Ok(0)
         }
+        Command::DocumentCapabilities => {
+            let value = serde_json::json!({
+                "defaultVersion": source::document::DOCUMENT_VERSION,
+                "supportedVersions": [1, source::codec::LATEST_DOCUMENT_VERSION],
+                "supportedFeatures": source::codec::SUPPORTED_FEATURES,
+                "formats": ["json", "ndjson"],
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(0)
+        }
         Command::Rules {
             graph,
             config,
@@ -222,6 +239,7 @@ async fn scan(
     document: Option<&std::path::Path>,
     output: &str,
     emit_document: Option<&std::path::Path>,
+    document_version: u32,
     inferred: bool,
 ) -> Result<i32> {
     let doc = match (url, document) {
@@ -233,7 +251,9 @@ async fn scan(
         (Some(_), Some(_)) => bail!("URL과 --document는 같이 쓸 수 없다 — 둘 중 하나만"),
     };
     if let Some(path) = emit_document {
-        let json = export::to_pretty_json(&doc)?;
+        let value = source::codec::document_to_value(&doc, document_version)
+            .map_err(|error| anyhow!(error))?;
+        let json = export::to_pretty_json(&value)?;
         std::fs::write(path, format!("{json}\n"))
             .with_context(|| format!("catalog document 쓰기 실패: {}", path.display()))?;
     }
@@ -267,26 +287,8 @@ fn load_document(path: &std::path::Path) -> Result<source::CatalogDocument> {
         return source::ndjson::document_from_ndjson(&text)
             .map_err(|e| anyhow!("NDJSON document 파싱 실패: {} — {e}", path.display()));
     }
-    let doc: source::CatalogDocument = serde_json::from_str(&text)
-        .with_context(|| format!("catalog document 파싱 실패: {}", path.display()))?;
-    if doc.version != source::document::DOCUMENT_VERSION {
-        bail!(
-            "catalog document 버전 {}는 이 바이너리({})와 다르다 — 프로브 버전을 확인해라",
-            doc.version,
-            source::document::DOCUMENT_VERSION
-        );
-    }
-    let mut doc = doc;
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-        let unknown = source::document::unknown_field_paths(&v);
-        if !unknown.is_empty() {
-            doc.limitations.push(format!(
-                "document에 엔진이 모르는 필드가 있어 무시했다: {}",
-                unknown.join(", ")
-            ));
-        }
-    }
-    Ok(doc)
+    source::codec::document_from_json(&text)
+        .map_err(|error| anyhow!("invalid catalog document {}: {error}", path.display()))
 }
 
 fn load_graph(path: &std::path::Path) -> Result<Graph> {
@@ -404,6 +406,9 @@ fn stats(path: &std::path::Path) -> Result<i32> {
 fn snapshot_kind(path: &std::path::Path) -> Result<SnapshotKind> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("스냅샷을 못 읽음: {}", path.display()))?;
+    if source::ndjson::is_ndjson_document(&text) {
+        return Ok(SnapshotKind::Document);
+    }
     let value: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("스냅샷 JSON 파싱 실패: {}", path.display()))?;
     if value.get("vertices").is_some() && value.get("edges").is_some() {

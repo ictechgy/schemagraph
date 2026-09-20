@@ -23,6 +23,10 @@ probe-go/schemagraph-probe-go
 # OS
 .DS_Store
 
+# Python 검증 도구 캐시
+__pycache__/
+*.py[cod]
+
 # 산출물
 *.graph.json
 *.catalog.json
