@@ -112,6 +112,8 @@ prints its report but exits with code **1** when it finds cycles,
 candidates, violations, or differences, respectively. `query` and `impact`
 also exit **1** when a name cannot be resolved. Usage and engine errors exit
 **2**. Use `schemagraph <command> --help` for all options.
+Source builds after v0.4.1 add cooperative Ctrl+C and MCP request cancellation;
+see [the cancellation contract](ANALYSIS.md#trace-a-dependency).
 
 `scan --inferred` adds optional naming-based guesses for undeclared `*_id`
 references. Declared foreign keys take precedence, and ambiguous matches

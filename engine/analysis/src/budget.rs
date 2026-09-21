@@ -83,6 +83,9 @@ pub fn walk(
     cancel: Option<&AtomicBool>,
 ) -> BudgetedReport {
     let mut reasons = BTreeSet::new();
+    if cancelled(cancel) {
+        reasons.insert("cancelled");
+    }
     let root_found = graph.vertex(root).is_some();
     if !root_found {
         reasons.insert("root-not-found");
@@ -184,20 +187,27 @@ pub fn walk(
         }
     }
 
-    let mut neighbors: Vec<Neighbor> = seen
-        .into_iter()
-        .filter_map(|(id, (distance, edges))| {
-            if id == *root {
-                return None;
-            }
-            graph.vertex(&id).map(|vertex| Neighbor {
+    let mut neighbors = Vec::new();
+    for (id, (distance, edges)) in seen {
+        if cancelled(cancel) {
+            reasons.insert("cancelled");
+            break;
+        }
+        if id == *root {
+            continue;
+        }
+        if let Some(vertex) = graph.vertex(&id) {
+            neighbors.push(Neighbor {
                 vertex: vertex.clone(),
                 edges: edges.into_iter().collect(),
                 distance,
-            })
-        })
-        .collect();
+            });
+        }
+    }
     neighbors.sort_by(|a, b| a.vertex.id.cmp(&b.vertex.id));
+    if cancelled(cancel) {
+        reasons.insert("cancelled");
+    }
 
     if neighbors.len() > max_results {
         reasons.insert("result-limit");
@@ -401,6 +411,24 @@ mod tests {
         assert_eq!(cancelled.visited, 1);
         assert_eq!(cancelled.truncation_reasons, vec!["cancelled"]);
         assert!(!cancelled.complete);
+
+        let cancelled_zero_budget = walk(
+            &graph,
+            &root,
+            3,
+            usize::MAX,
+            false,
+            Budget {
+                max_visited: 0,
+                max_examined_edges: usize::MAX,
+            },
+            Some(&cancelled_flag),
+        );
+        assert_eq!(
+            cancelled_zero_budget.truncation_reasons,
+            vec!["cancelled", "visited-limit"]
+        );
+        assert!(!cancelled_zero_budget.complete);
     }
 
     #[test]
@@ -419,5 +447,19 @@ mod tests {
         assert!(!report.complete);
         assert!(report.neighbors.is_empty());
         assert_eq!(report.truncation_reasons, vec!["root-not-found"]);
+
+        let cancelled_missing = walk(
+            &graph,
+            &VertexId::object("s", "missing"),
+            2,
+            10,
+            false,
+            Budget::unlimited(),
+            Some(&AtomicBool::new(true)),
+        );
+        assert_eq!(
+            cancelled_missing.truncation_reasons,
+            vec!["cancelled", "root-not-found"]
+        );
     }
 }

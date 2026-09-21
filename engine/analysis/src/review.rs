@@ -2,6 +2,7 @@
 
 use crate::{budget, Neighbor};
 use schemagraph_core::{AnalysisState, Graph, VertexId};
+use std::sync::atomic::AtomicBool;
 
 /// 변경 탐지 계층이 전달하는 사실이며 실제 DB의 안전성 판정은 아니다.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -60,7 +61,7 @@ pub fn review(
     max_changes: usize,
     max_impacted: usize,
 ) -> ReviewReport {
-    review_with_budget(
+    review_with_cancellation(
         before,
         after,
         changes,
@@ -68,6 +69,7 @@ pub fn review(
         max_changes,
         max_impacted,
         budget::Budget::unlimited(),
+        None,
     )
 }
 
@@ -75,11 +77,34 @@ pub fn review(
 pub fn review_with_budget(
     before: &Graph,
     after: &Graph,
+    changes: Vec<Change>,
+    comparison_notes: Vec<String>,
+    max_changes: usize,
+    max_impacted: usize,
+    budget: budget::Budget,
+) -> ReviewReport {
+    review_with_cancellation(
+        before,
+        after,
+        changes,
+        comparison_notes,
+        max_changes,
+        max_impacted,
+        budget,
+        None,
+    )
+}
+
+/// 변경별 영향 탐색을 취소 토큰과 예산에 맞춰 수행한다.
+pub fn review_with_cancellation(
+    before: &Graph,
+    after: &Graph,
     mut changes: Vec<Change>,
     mut comparison_notes: Vec<String>,
     max_changes: usize,
     max_impacted: usize,
     budget: budget::Budget,
+    cancel: Option<&AtomicBool>,
 ) -> ReviewReport {
     changes.sort();
     changes.dedup();
@@ -126,12 +151,17 @@ pub fn review_with_budget(
     let mut truncated = total_changes > max_changes;
     let mut visited = 0usize;
     let mut examined_edges = 0usize;
-    let mut truncation_reasons = std::collections::BTreeSet::new();
+    let mut truncation_reasons = std::collections::BTreeSet::<String>::new();
     let mut complete = total_changes <= max_changes;
-    let findings = changes
-        .into_iter()
-        .take(max_changes)
-        .map(|change| {
+    let mut findings = Vec::new();
+    for change in changes.into_iter().take(max_changes) {
+        if cancelled(cancel) {
+            truncation_reasons.insert("cancelled".into());
+            truncated = true;
+            complete = false;
+            break;
+        }
+        let finding = {
             let (graph, basis) = if before.vertex(&change.id).is_some() {
                 (before, "before")
             } else {
@@ -152,7 +182,7 @@ pub fn review_with_budget(
                     max_impacted,
                     true,
                     budget,
-                    None,
+                    cancel,
                 );
                 visited += impact.visited;
                 examined_edges += impact.examined_edges;
@@ -180,8 +210,27 @@ pub fn review_with_budget(
                 impact_complete,
                 basis,
             }
-        })
-        .collect();
+        };
+        if finding
+            .impact_truncation_reasons
+            .iter()
+            .any(|reason| reason == "cancelled")
+        {
+            truncation_reasons.insert("cancelled".into());
+        }
+        findings.push(finding);
+        if cancelled(cancel) {
+            truncation_reasons.insert("cancelled".into());
+            truncated = true;
+            complete = false;
+            break;
+        }
+    }
+    if cancelled(cancel) {
+        truncation_reasons.insert("cancelled".into());
+        truncated = true;
+        complete = false;
+    }
     let mut limitations: Vec<_> = before
         .limitations()
         .iter()
@@ -211,10 +260,15 @@ pub fn review_with_budget(
     }
 }
 
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use schemagraph_core::{Edge, EdgeKind, Vertex, VertexKind};
+    use std::sync::atomic::AtomicBool;
     #[test]
     fn incomplete_index_definition_cannot_look_like_complete_change_coverage() {
         let mut graph = Graph::new();
@@ -289,5 +343,49 @@ mod tests {
             budgeted.findings[0].impact_truncation_reasons,
             ["visited-limit"]
         );
+    }
+
+    #[test]
+    fn cancellation_preserves_counts_and_reason_without_processing_changes() {
+        let cancelled = AtomicBool::new(true);
+        let absent = Change {
+            id: VertexId::object("s", "missing"),
+            kind: "object-removed".into(),
+            before: None,
+            after: None,
+        };
+        let report = review_with_cancellation(
+            &Graph::new(),
+            &Graph::new(),
+            vec![absent],
+            vec!["comparison unavailable".into()],
+            10,
+            10,
+            budget::Budget::unlimited(),
+            Some(&cancelled),
+        );
+        assert_eq!(report.total_changes, 1);
+        assert_eq!(report.review_required, 1);
+        assert!(report.findings.is_empty());
+        assert!(report.truncated);
+        assert!(!report.complete);
+        assert_eq!(report.truncation_reasons, vec!["cancelled"]);
+
+        let empty = review_with_cancellation(
+            &Graph::new(),
+            &Graph::new(),
+            vec![],
+            vec![],
+            10,
+            10,
+            budget::Budget::unlimited(),
+            Some(&cancelled),
+        );
+        assert_eq!(empty.total_changes, 0);
+        assert_eq!(empty.review_required, 0);
+        assert!(empty.findings.is_empty());
+        assert!(empty.truncated);
+        assert!(!empty.complete);
+        assert_eq!(empty.truncation_reasons, vec!["cancelled"]);
     }
 }

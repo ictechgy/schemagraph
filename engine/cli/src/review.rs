@@ -5,6 +5,7 @@ use schemagraph_analysis::review::Change;
 use schemagraph_core::{EdgeKind, Graph, VertexId, VertexKind};
 use schemagraph_source::{self as source, diff::DocumentDiff};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 fn root_id(graph: &Graph, id: &str, kind: Option<&str>) -> Option<VertexId> {
     let expected = match kind {
@@ -258,10 +259,23 @@ pub(crate) fn run(
     budget: schemagraph_analysis::budget::Budget,
     markdown: bool,
 ) -> Result<i32> {
+    let cancel = super::cancellation::install()?;
     let old = super::load_document(before).context("review requires a before catalog document")?;
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(130);
+    }
     let new = super::load_document(after).context("review requires an after catalog document")?;
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(130);
+    }
     let before = super::analyze_document(&old, false);
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(130);
+    }
     let after = super::analyze_document(&new, false);
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(130);
+    }
     let diff = source::diff::diff_documents(&old, &new);
     let mut notes = source::context::comparison_notes(&old, &new);
     for (label, document, graph) in [("before", &old, &before), ("after", &new, &after)] {
@@ -286,7 +300,7 @@ pub(crate) fn run(
         notes,
     };
     changes.collect(&diff, &old, &new)?;
-    let report = schemagraph_analysis::review::review_with_budget(
+    let report = schemagraph_analysis::review::review_with_cancellation(
         &before,
         &after,
         changes.items,
@@ -294,6 +308,7 @@ pub(crate) fn run(
         max_changes,
         max_impacted,
         budget,
+        Some(cancel),
     );
     if markdown {
         print!("{}", schemagraph_export::review::to_markdown(&report));

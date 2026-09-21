@@ -32,8 +32,16 @@ treating a missing result as evidence. `--max` limits displayed results after
 traversal. The separate vertex and edge budgets can stop traversal itself.
 `path` uses `--max-edges`; `query`, `impact`, and `review` use
 `--max-examined-edges`. Library callers can pass cancellation flags to path and
-budgeted traversal. CLI/MCP calls are synchronous and do not promise cooperative
-cancellation of an in-flight request.
+budgeted traversal, including the cancellation-aware review entry point.
+
+Cancellation support described here is available in source builds after v0.4.1.
+For `query`, `impact`, `path`, and `review`, the first **Ctrl+C** requests a
+cooperative stop and exits with status **130**. When traversal observes the stop,
+its partial report includes `cancelled` in `truncationReasons` and `truncated: true`;
+query, impact, and review also report `complete: false`. Cancellation during
+review preparation may exit before a report is available. A second Ctrl+C exits
+immediately. Loading, individual sorts, and output I/O are not preempted by the
+first signal, so there is no fixed cancellation latency guarantee.
 
 Graph version 2 includes optional object analysis, source origins, and schema
 metadata. Version 1 graphs remain readable; missing analysis or lint metadata
@@ -164,3 +172,26 @@ metadata; share it with the same audience as the graph snapshot.
 connection or arbitrary file-reading tools. Configure the MCP client to launch
 the command above. The tool results preserve the CLI analysis contract and
 explicit result/traversal limits.
+
+In source builds after v0.4.1, stdin remains responsive while a single worker
+executes tool calls. Use a fresh request ID for each call in the session. To
+cancel an active or queued call, send the same request ID
+(including its string/number type) in an MCP notification:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"query-42"}}
+```
+
+The cancelled call produces no response, in accordance with the
+[MCP cancellation protocol](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation).
+Other calls and `ping` remain usable. Malformed, unknown, and completed request
+IDs are ignored; initialization cannot be cancelled. A completion that wins the
+race may still return its response. At most 16 tool calls can be active or queued;
+requests beyond that bounded capacity
+receive a server-busy error, and duplicate active IDs are rejected.
+
+`query`, `impact`, and `path` observe cancellation within traversal. Other tool
+reports check at request boundaries; sorting, serialization, and blocked output
+I/O are not preempted. Responses can arrive out of request order, so match them
+by ID. Closing stdin drains accepted requests before shutdown; send cancellation
+notifications first if those requests should be abandoned.

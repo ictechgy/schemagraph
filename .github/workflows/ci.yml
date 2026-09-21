@@ -76,6 +76,7 @@ jobs:
           "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-contracts.py \
             --engine engine/target/debug/schemagraph
           python3 Scripts/verify-competitive.py --engine engine/target/debug/schemagraph
+          python3 Scripts/verify-cancellation.py --engine engine/target/debug/schemagraph
           python3 Scripts/verify-html.py --engine engine/target/debug/schemagraph \
             --screenshot "$RUNNER_TEMP/html-smoke.png"
 
