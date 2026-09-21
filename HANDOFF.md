@@ -4,6 +4,27 @@
 
 ## 지금 상태
 
+- 2026-09-22: **MySQL·MariaDB fixture 기동 경합 재현·로컬 수정 검증 완료**
+  (`fix/mysql-fixture-readiness`). 아래 main CI 실패의 준비 완료 오판을 실제
+  MySQL 8.4·MariaDB 11.4에서 확인했다. 초기화 스크립트를 잠시 대기시킨 상태에서
+  기존 admin ping과 소켓 `sgfix` 쿼리는 모두 성공하지만 TCP 연결은 실패한다.
+  초기화용 서버의 로그도 port 0을 보인다. 과거 CI의 서버 로그는 없으므로 당시
+  정확한 기동 타이밍을 확정한 것은 아니며, 동일한 오판 조건을 실제 DB로 재현했다.
+  - `Scripts/wait-mysql-ready.py`가 최종 서버의 TCP `sgfix` 쿼리를 기다린다.
+    180초 전체 기한과 개별 Docker 호출 제한을 두고, 컨테이너 종료·조회 실패·
+    시간 초과는 비정상 종료한다. `verify-fixtures.sh`의 자동 생성 MySQL과
+    MariaDB 두 단계에 적용하며 사용자 제공 DB 경로는 유지한다.
+  - 회귀 테스트 7개, 실제 두 DB의 초기화 중 timeout·최종 서버 기동·fixture 적용·
+    종료 컨테이너 거부를 통과했다. 기존 fixture 스크립트의 영향 구간을 그대로
+    실행해 SQLite·PostgreSQL·MySQL·MariaDB PFS OFF/ON의 native golden 및
+    Go v1/v2 JSON/NDJSON 패리티 5개를 검증했다(건너뜀 0).
+    Rust workspace 오프라인 빌드·셸/Python 구문·workflow YAML 로딩도 통과했다.
+  - 회귀 검사를 CI에 연결했다. **수정본 원격 CI·main 반영은 아직 미완료**다.
+    사용자가 원격 브랜치 push·PR·전체 CI 실행을 승인했다. 로컬 검증을 아래
+    실패한 main 실행의 복구로 간주하지 않는다. 재현 코드·서버 로그·검증 요약은
+    저장소 밖 `~/Library/Application Support/schemagraph/verification/ci-readiness-20260922`에
+    보관했다. 소유한 임시 DB는 정리했다.
+
 - 2026-09-21: **main CI 실패 1건 확인 — 기동 대기 수정·재검증 미완료**.
   사용자가 남은 작업을 물어 확인한 결과, 아래 PR #9의 병합 전 검사는 통과했지만
   병합 커밋 `05b843abf2b10db8317bc05a9d9b2cec12057987`의
@@ -643,13 +664,12 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 설치본 검증까지 완료했다. 승인된 릴리스 작업에 미완료 항목은 없다. 이후 승인된
 MySQL·MariaDB 공개 표본 평가도 main에 반영했다. 다만 **main CI 복구는 남아 있다.**
 
-1. `Scripts/verify-fixtures.sh`의 MySQL 기동 경합을 재현·확인하고, 초기화 서버가
-   아닌 최종 서버의 TCP 접속과 `sgfix` 쿼리 성공을 기다리도록 수정한다. MariaDB의
-   같은 대기 패턴도 함께 검토한다. 시간 초과·컨테이너 종료 시 명확히 실패해야 한다.
-   새 정확도 검증기의 TCP 대기를 참고하되 기존 사용자 제공 DB 경로를 보존한다.
-2. 부팅 중 잘못된 준비 완료 판정과 시간 초과를 검증하고, 실제 MySQL·MariaDB
-   기동 및 전체 CI를 통과시킨다. 실패 실행과 수정 후 성공 실행을 구분해 기록한다.
-   테스트를 건너뛰거나 근거 없이 재실행 성공만으로 원인이 해결됐다고 보지 않는다.
+1. `fix/mysql-fixture-readiness`의 로컬 수정·검증을 원격 브랜치와 PR에 반영하고
+   전체 CI를 실행한다. 사용자가 push·PR·전체 CI 실행을 승인했다.
+   기동 오판 재현·TCP 대기·timeout/종료 실패 처리와 실제 두 DB 검증은 완료했다.
+2. 수정본 CI 통과 후 main에 반영하고 main 실행도 확인한다. 실패 실행과 수정 후
+   성공 실행을 구분해 기록한다. 로컬 영향 구간 검증이나 재실행 성공만으로
+   main CI가 복구됐다고 기록하지 않는다.
 
 CI 복구 후 선택적 과제는 SQL Server·Oracle 등 나머지 DB의 공개 표본과 저장
 프로시저·트리거 사례 확대, 단일 대형 스키마·밀집 그래프의 메모리·반복 조회·취소
