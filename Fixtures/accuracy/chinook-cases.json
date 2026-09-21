@@ -1,0 +1,443 @@
+{
+  "cases": [
+    {
+      "lineage": {
+        "customer_name": [
+          "main.Customer.FirstName",
+          "main.Customer.LastName"
+        ],
+        "invoice_id": [
+          "main.Invoice.InvoiceId"
+        ],
+        "line_total": [
+          "main.InvoiceLine.Quantity",
+          "main.InvoiceLine.UnitPrice"
+        ]
+      },
+      "name": "invoice_totals",
+      "reads": [
+        "main.Customer",
+        "main.Customer.CustomerId",
+        "main.Customer.FirstName",
+        "main.Customer.LastName",
+        "main.Invoice",
+        "main.Invoice.CustomerId",
+        "main.Invoice.InvoiceId",
+        "main.InvoiceLine",
+        "main.InvoiceLine.InvoiceId",
+        "main.InvoiceLine.Quantity",
+        "main.InvoiceLine.UnitPrice"
+      ],
+      "reason": "Joins invoice headers, customers, and lines while keeping join and grouping columns as reads and line values as output lineage.",
+      "sql": "SELECT i.InvoiceId AS invoice_id, c.FirstName || ' ' || c.LastName AS customer_name, SUM(il.UnitPrice * il.Quantity) AS line_total FROM Invoice AS i JOIN Customer AS c ON c.CustomerId = i.CustomerId JOIN InvoiceLine AS il ON il.InvoiceId = i.InvoiceId GROUP BY i.InvoiceId, c.FirstName, c.LastName HAVING SUM(il.Quantity) > 0 ORDER BY i.InvoiceId",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "join"
+      ]
+    },
+    {
+      "lineage": {
+        "employee_id": [
+          "main.Employee.EmployeeId"
+        ],
+        "invoice_count": [],
+        "rep_name": [
+          "main.Employee.FirstName",
+          "main.Employee.LastName"
+        ],
+        "revenue": [
+          "main.Invoice.Total"
+        ]
+      },
+      "name": "support_rep_sales",
+      "reads": [
+        "main.Customer",
+        "main.Customer.CustomerId",
+        "main.Customer.SupportRepId",
+        "main.Employee",
+        "main.Employee.EmployeeId",
+        "main.Employee.FirstName",
+        "main.Employee.LastName",
+        "main.Invoice",
+        "main.Invoice.CustomerId",
+        "main.Invoice.Total"
+      ],
+      "reason": "Groups invoice revenue by employee through customer support assignments and uses COUNT(*) as a source-free row count.",
+      "sql": "SELECT e.EmployeeId AS employee_id, e.FirstName || ' ' || e.LastName AS rep_name, COUNT(*) AS invoice_count, SUM(i.Total) AS revenue FROM Employee AS e JOIN Customer AS c ON c.SupportRepId = e.EmployeeId JOIN Invoice AS i ON i.CustomerId = c.CustomerId GROUP BY e.EmployeeId, e.FirstName, e.LastName HAVING SUM(i.Total) > 0 ORDER BY revenue DESC, rep_name",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "join"
+      ]
+    },
+    {
+      "lineage": {
+        "manager_id": [
+          "main.Employee.EmployeeId"
+        ],
+        "manager_name": [
+          "main.Employee.FirstName",
+          "main.Employee.LastName"
+        ],
+        "report_id": [
+          "main.Employee.EmployeeId"
+        ],
+        "report_name": [
+          "main.Employee.FirstName",
+          "main.Employee.LastName"
+        ]
+      },
+      "name": "employee_hierarchy",
+      "reads": [
+        "main.Employee",
+        "main.Employee.EmployeeId",
+        "main.Employee.FirstName",
+        "main.Employee.LastName",
+        "main.Employee.ReportsTo"
+      ],
+      "reason": "Self-joins employees to report manager and report names while the ReportsTo predicate remains a read-only dependency.",
+      "sql": "SELECT manager.EmployeeId AS manager_id, manager.FirstName || ' ' || manager.LastName AS manager_name, report.EmployeeId AS report_id, report.FirstName || ' ' || report.LastName AS report_name FROM Employee AS manager JOIN Employee AS report ON report.ReportsTo = manager.EmployeeId WHERE report.EmployeeId IS NOT NULL ORDER BY manager.LastName, report.LastName",
+      "state": "complete",
+      "tags": [
+        "join",
+        "self-join"
+      ]
+    },
+    {
+      "lineage": {
+        "AlbumId": [
+          "main.Track.AlbumId"
+        ],
+        "Bytes": [
+          "main.Track.Bytes"
+        ],
+        "Composer": [
+          "main.Track.Composer"
+        ],
+        "GenreId": [
+          "main.Track.GenreId"
+        ],
+        "MediaTypeId": [
+          "main.Track.MediaTypeId"
+        ],
+        "Milliseconds": [
+          "main.Track.Milliseconds"
+        ],
+        "Name": [
+          "main.Track.Name"
+        ],
+        "TrackId": [
+          "main.Track.TrackId"
+        ],
+        "UnitPrice": [
+          "main.Track.UnitPrice"
+        ]
+      },
+      "name": "track_wildcard",
+      "reads": [
+        "main.Track",
+        "main.Track.AlbumId",
+        "main.Track.Bytes",
+        "main.Track.Composer",
+        "main.Track.GenreId",
+        "main.Track.MediaTypeId",
+        "main.Track.Milliseconds",
+        "main.Track.Name",
+        "main.Track.TrackId",
+        "main.Track.UnitPrice"
+      ],
+      "reason": "Expands a table wildcard into every Track column while the filter and ordering reuse columns already covered by that expansion.",
+      "sql": "SELECT t.* FROM Track AS t WHERE t.GenreId IS NOT NULL AND t.UnitPrice >= 0.99 ORDER BY t.Name",
+      "state": "complete",
+      "tags": [
+        "filter",
+        "wildcard"
+      ]
+    },
+    {
+      "lineage": {
+        "month": [
+          "main.Invoice.InvoiceDate"
+        ],
+        "revenue": [
+          "main.Invoice.Total"
+        ]
+      },
+      "name": "monthly_invoice_revenue",
+      "reads": [
+        "main.Invoice",
+        "main.Invoice.InvoiceDate",
+        "main.Invoice.Total"
+      ],
+      "reason": "Normalizes invoice dates in a CTE and aggregates invoice totals by the derived month value.",
+      "sql": "WITH invoice_month AS (SELECT substr(i.InvoiceDate, 1, 7) AS invoice_month, i.Total AS invoice_total FROM Invoice AS i) SELECT invoice_month AS month, SUM(invoice_total) AS revenue FROM invoice_month GROUP BY invoice_month HAVING SUM(invoice_total) > 0 ORDER BY month",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "cte"
+      ]
+    },
+    {
+      "lineage": {
+        "album_title": [
+          "main.Album.Title"
+        ],
+        "revenue": [
+          "main.InvoiceLine.Quantity",
+          "main.InvoiceLine.UnitPrice"
+        ],
+        "track_count": [
+          "main.InvoiceLine.InvoiceLineId"
+        ]
+      },
+      "name": "top_album_sales",
+      "reads": [
+        "main.Album",
+        "main.Album.AlbumId",
+        "main.Album.Title",
+        "main.InvoiceLine",
+        "main.InvoiceLine.InvoiceLineId",
+        "main.InvoiceLine.Quantity",
+        "main.InvoiceLine.TrackId",
+        "main.InvoiceLine.UnitPrice",
+        "main.Track",
+        "main.Track.AlbumId",
+        "main.Track.TrackId"
+      ],
+      "reason": "Aggregates track sales in a derived table, then joins the result to album titles for a reporting ranking.",
+      "sql": "SELECT a.Title AS album_title, sales.track_count, sales.revenue FROM Album AS a JOIN (SELECT t.AlbumId AS album_id, COUNT(il.InvoiceLineId) AS track_count, SUM(il.UnitPrice * il.Quantity) AS revenue FROM Track AS t JOIN InvoiceLine AS il ON il.TrackId = t.TrackId GROUP BY t.AlbumId) AS sales ON sales.album_id = a.AlbumId WHERE sales.revenue > 10 ORDER BY sales.revenue DESC, album_title",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "derived",
+        "join"
+      ]
+    },
+    {
+      "lineage": {
+        "customer_id": [
+          "main.Customer.CustomerId"
+        ],
+        "customer_name": [
+          "main.Customer.FirstName",
+          "main.Customer.LastName"
+        ],
+        "lifetime_value": [
+          "main.Invoice.Total"
+        ]
+      },
+      "name": "customer_lifetime_value",
+      "reads": [
+        "main.Customer",
+        "main.Customer.CustomerId",
+        "main.Customer.FirstName",
+        "main.Customer.LastName",
+        "main.Invoice",
+        "main.Invoice.CustomerId",
+        "main.Invoice.Total"
+      ],
+      "reason": "Uses correlated scalar subqueries to compute each customer's invoice total and retain only customers with invoices.",
+      "sql": "SELECT c.CustomerId AS customer_id, c.FirstName || ' ' || c.LastName AS customer_name, (SELECT SUM(i.Total) FROM Invoice AS i WHERE i.CustomerId = c.CustomerId) AS lifetime_value FROM Customer AS c WHERE (SELECT COUNT(*) FROM Invoice AS i WHERE i.CustomerId = c.CustomerId) > 0 ORDER BY lifetime_value DESC",
+      "state": "complete",
+      "tags": [
+        "correlated",
+        "scalar",
+        "subquery"
+      ]
+    },
+    {
+      "lineage": {
+        "customer_id": [
+          "main.Customer.CustomerId"
+        ],
+        "email": [
+          "main.Customer.Email"
+        ]
+      },
+      "name": "engaged_customers",
+      "reads": [
+        "main.Customer",
+        "main.Customer.CustomerId",
+        "main.Customer.Email",
+        "main.Customer.SupportRepId",
+        "main.Invoice",
+        "main.Invoice.CustomerId",
+        "main.Invoice.Total"
+      ],
+      "reason": "Filters customers with a qualifying invoice and excludes customers sharing the same support representative.",
+      "sql": "SELECT c.CustomerId AS customer_id, c.Email AS email FROM Customer AS c WHERE EXISTS (SELECT 1 FROM Invoice AS i WHERE i.CustomerId = c.CustomerId AND i.Total >= 20) AND NOT EXISTS (SELECT 1 FROM Customer AS c2 WHERE c2.SupportRepId = c.SupportRepId AND c2.CustomerId <> c.CustomerId) ORDER BY c.Email",
+      "state": "complete",
+      "tags": [
+        "exists",
+        "filter",
+        "subquery"
+      ]
+    },
+    {
+      "lineage": {
+        "track_id": [
+          "main.InvoiceLine.TrackId",
+          "main.PlaylistTrack.TrackId"
+        ],
+        "track_name": [
+          "main.Track.Name"
+        ]
+      },
+      "name": "playlist_or_premium_tracks",
+      "reads": [
+        "main.InvoiceLine",
+        "main.InvoiceLine.TrackId",
+        "main.InvoiceLine.UnitPrice",
+        "main.PlaylistTrack",
+        "main.PlaylistTrack.TrackId",
+        "main.Track",
+        "main.Track.Name",
+        "main.Track.TrackId"
+      ],
+      "reason": "Unions playlist membership with premium invoice lines, preserving both track-id sources and the shared track name source.",
+      "sql": "SELECT pt.TrackId AS track_id, t.Name AS track_name FROM PlaylistTrack AS pt JOIN Track AS t ON t.TrackId = pt.TrackId UNION SELECT il.TrackId AS track_id, t.Name AS track_name FROM InvoiceLine AS il JOIN Track AS t ON t.TrackId = il.TrackId WHERE il.UnitPrice >= 0.99",
+      "state": "complete",
+      "tags": [
+        "join",
+        "union"
+      ]
+    },
+    {
+      "lineage": {
+        "customer_id": [
+          "main.Customer.CustomerId"
+        ],
+        "email": [
+          "main.Customer.Email"
+        ]
+      },
+      "name": "customers_without_recent_invoices",
+      "reads": [
+        "main.Customer",
+        "main.Customer.CustomerId",
+        "main.Customer.Email",
+        "main.Invoice",
+        "main.Invoice.CustomerId",
+        "main.Invoice.InvoiceDate"
+      ],
+      "reason": "Uses EXCEPT to report customer rows absent from the recent-invoice set; right-side columns affect membership only.",
+      "sql": "SELECT c.CustomerId AS customer_id, c.Email AS email FROM Customer AS c EXCEPT SELECT c.CustomerId, c.Email FROM Customer AS c JOIN Invoice AS i ON i.CustomerId = c.CustomerId WHERE i.InvoiceDate >= '2023-01-01' ORDER BY email",
+      "state": "complete",
+      "tags": [
+        "except",
+        "set-operation"
+      ]
+    },
+    {
+      "lineage": {
+        "track_name": [
+          "main.Track.Name"
+        ]
+      },
+      "name": "long_rock_tracks",
+      "reads": [
+        "main.Track",
+        "main.Track.GenreId",
+        "main.Track.Milliseconds",
+        "main.Track.Name",
+        "main.Track.UnitPrice"
+      ],
+      "reason": "Returns only the track name while duration, genre, price, and ordering predicates remain read dependencies.",
+      "sql": "SELECT t.Name AS track_name FROM Track AS t WHERE t.Milliseconds >= 300000 AND t.GenreId IN (1, 3, 13) AND t.UnitPrice < 1.00 ORDER BY t.Milliseconds DESC",
+      "state": "complete",
+      "tags": [
+        "filter",
+        "predicate"
+      ]
+    },
+    {
+      "name": "left_using",
+      "tags": [
+        "outer-join",
+        "using"
+      ],
+      "sql": "SELECT CustomerId AS id FROM Invoice LEFT JOIN Customer USING (CustomerId)",
+      "reads": [
+        "main.Customer",
+        "main.Customer.CustomerId",
+        "main.Invoice",
+        "main.Invoice.CustomerId"
+      ],
+      "lineage": {
+        "id": [
+          "main.Invoice.CustomerId"
+        ]
+      },
+      "state": "complete",
+      "reason": "LEFT/RIGHT USING returns the preserved key; FULL coalesces both. Both keys remain join reads."
+    },
+    {
+      "name": "right_using",
+      "tags": [
+        "outer-join",
+        "using"
+      ],
+      "sql": "SELECT CustomerId AS id FROM Invoice RIGHT JOIN Customer USING (CustomerId)",
+      "reads": [
+        "main.Customer",
+        "main.Customer.CustomerId",
+        "main.Invoice",
+        "main.Invoice.CustomerId"
+      ],
+      "lineage": {
+        "id": [
+          "main.Customer.CustomerId"
+        ]
+      },
+      "state": "complete",
+      "reason": "LEFT/RIGHT USING returns the preserved key; FULL coalesces both. Both keys remain join reads."
+    },
+    {
+      "name": "full_using",
+      "tags": [
+        "outer-join",
+        "using"
+      ],
+      "sql": "SELECT CustomerId AS id FROM Invoice FULL JOIN Customer USING (CustomerId)",
+      "reads": [
+        "main.Customer",
+        "main.Customer.CustomerId",
+        "main.Invoice",
+        "main.Invoice.CustomerId"
+      ],
+      "lineage": {
+        "id": [
+          "main.Customer.CustomerId",
+          "main.Invoice.CustomerId"
+        ]
+      },
+      "state": "complete",
+      "reason": "LEFT/RIGHT USING returns the preserved key; FULL coalesces both. Both keys remain join reads."
+    },
+    {
+      "name": "derived_alias_star",
+      "tags": [
+        "derived",
+        "wildcard",
+        "alias"
+      ],
+      "sql": "SELECT report.* FROM (SELECT InvoiceId AS sale, Total AS amount FROM Invoice) report",
+      "reads": [
+        "main.Invoice",
+        "main.Invoice.InvoiceId",
+        "main.Invoice.Total"
+      ],
+      "lineage": {
+        "sale": [
+          "main.Invoice.InvoiceId"
+        ],
+        "amount": [
+          "main.Invoice.Total"
+        ]
+      },
+      "state": "complete",
+      "reason": "Wildcard expansion preserves derived output aliases instead of replacing them with physical source column names."
+    }
+  ]
+}
