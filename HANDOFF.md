@@ -4,8 +4,31 @@
 
 ## 지금 상태
 
+- 2026-09-21: **main CI 실패 1건 확인 — 기동 대기 수정·재검증 미완료**.
+  사용자가 남은 작업을 물어 확인한 결과, 아래 PR #9의 병합 전 검사는 통과했지만
+  병합 커밋 `05b843abf2b10db8317bc05a9d9b2cec12057987`의
+  [main CI](https://github.com/ictechgy/schemagraph/actions/runs/35577312049)는
+  `Verify every database fixture` 단계에서 실패했다. Rust 테스트와 기존
+  PostgreSQL·SQLite 및 새 MySQL·MariaDB 정확도 검사는 이 실행에서도 통과했다.
+  - 실패 로그는 `mysqld is alive` 직후
+    `ERROR 2002 (HY000): Can't connect to local MySQL server through socket
+    '/var/run/mysqld/mysqld.sock' (2)`를 보인다. 실패 위치는 기존
+    [Scripts/verify-fixtures.sh](Scripts/verify-fixtures.sh)의 MySQL fixture 적용 단계다.
+  - 현재 대기는 `mysqladmin ping`과 `mysql ... sgfix -e "SELECT 1"`을 모두
+    기본 소켓으로 실행한다. 초기화용 임시 서버를 준비 완료로 오인한 뒤 서버
+    전환 중 fixture를 적용하는 경합이 원인 후보다. 기동 로그·재현으로 확정하지는
+    않았다. MariaDB의 `maria_up`도 같은 대기 패턴이지만 이번 실패는 MySQL에서
+    관측됐으므로 MariaDB 실패로 기록하지 않는다.
+  - 이 세션은 상태 확인과 HANDOFF 갱신만 수행했다. 대기 코드 수정이나 실패한
+    main CI 재실행은 아직 하지 않았다. 병합 전 성공을 main CI 복구로 간주하지 않는다.
+
 - 2026-09-21: **MySQL·MariaDB 공개 표본 정확도 평가·CI 추가**
   (`feature/mysql-accuracy`). v0.4.2 이후 사용자가 승인한 후속 평가다.
+  [PR #9](https://github.com/ictechgy/schemagraph/pull/9)을 위 `05b843a`로 병합했다.
+  검사 소스 `449339d22051406bd3bdf9cfa5ce1d07c301d1c5`의
+  [병합 전 전체 CI](https://github.com/ictechgy/schemagraph/actions/runs/35576341637)는
+  통과했으며, 병합 트리가 해당 소스와 동일함을 확인했다. 이후 main 재실행 결과는
+  위 실패 기록을 따른다.
   Chinook v1.4.5 MySQL DDL·라이선스·체크섬과 공식 DB 이미지 digest를 고정했다.
   별도로 작성한 SQL 16개는 두 DB에서 유효성을 확인하고, 엔진 출력 확인 전에
   `8df2996`에서 기대값을 고정했다. MariaDB가 거부한 ROW_NUMBER 프레임은
@@ -25,6 +48,11 @@
     actionlint·Python 구문·문서 참조·원본 체크섬을 확인했다. CI가 두 DB를 검사하고
     `mysql-accuracy.json`을 기존 정확도 report와 함께 보관하도록 추가했다.
     이번 변경은 평가·CI·문서이며 공개 v0.4.2 런타임 바이트를 바꾸지 않는다.
+  - CI artifact의 사례·검증기 체크섬과 53개 계보·91개 읽기·26개 MySQL 참조를
+    직접 확인했다. 첫 평가·비교·실패 경로·CI report 근거는 저장소 밖
+    `~/Library/Application Support/schemagraph/verification/mysql-accuracy-20260921`에
+    보관한다. 소유한 임시 DB를 정리했고, 원본 다운로드·중복 로그 등 11개 파일
+    (876,385 bytes)을 휴지통으로 옮겼다. 다른 프로젝트의 컨테이너는 건드리지 않았다.
 
 - 2026-09-21: **v0.4.2 취소 지원 공개 배포·설치 검증 완료**.
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.2) ·
@@ -613,8 +641,20 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 공개 정확도 평가 후속과 v0.4.1 배포·설치 검증도 완료했다. 서명키와 토큰은
 다음 릴리스에서도 기존 설정을 재사용한다. CLI/MCP 요청 취소도 v0.4.2 배포와 공개
 설치본 검증까지 완료했다. 승인된 릴리스 작업에 미완료 항목은 없다. 이후 승인된
-MySQL·MariaDB 공개 표본 평가도 위와 같이 추가했다. 선택적 후속 과제는 나머지 DB·
-실사용 SQL 표본 확대, 대규모 그래프의 메모리·탐색 성능 검증이다.
+MySQL·MariaDB 공개 표본 평가도 main에 반영했다. 다만 **main CI 복구는 남아 있다.**
+
+1. `Scripts/verify-fixtures.sh`의 MySQL 기동 경합을 재현·확인하고, 초기화 서버가
+   아닌 최종 서버의 TCP 접속과 `sgfix` 쿼리 성공을 기다리도록 수정한다. MariaDB의
+   같은 대기 패턴도 함께 검토한다. 시간 초과·컨테이너 종료 시 명확히 실패해야 한다.
+   새 정확도 검증기의 TCP 대기를 참고하되 기존 사용자 제공 DB 경로를 보존한다.
+2. 부팅 중 잘못된 준비 완료 판정과 시간 초과를 검증하고, 실제 MySQL·MariaDB
+   기동 및 전체 CI를 통과시킨다. 실패 실행과 수정 후 성공 실행을 구분해 기록한다.
+   테스트를 건너뛰거나 근거 없이 재실행 성공만으로 원인이 해결됐다고 보지 않는다.
+
+CI 복구 후 선택적 과제는 SQL Server·Oracle 등 나머지 DB의 공개 표본과 저장
+프로시저·트리거 사례 확대, 단일 대형 스키마·밀집 그래프의 메모리·반복 조회·취소
+응답 시간 검증이다. 현재 추가분은 평가·CI·문서로 런타임이 바뀌지 않아 새 릴리스가
+필수인 상태는 아니다.
 
 ## 의도적으로 남긴 경계
 
