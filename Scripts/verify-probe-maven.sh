@@ -7,7 +7,7 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 PROBE_DIR="$ROOT_DIR/probe"
-VERSION=${PROBE_VERSION:-0.4.1}
+VERSION=${PROBE_VERSION:-0.4.2}
 GROUP_ID=${PROBE_GROUP:-io.github.ictechgy}
 ARTIFACT_ID=schemagraph-probe
 

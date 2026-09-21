@@ -74,7 +74,7 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
 
 - `query <x>` — direct neighbors both directions + reachability context.
 - `impact <x>` — transitive dependents that may be affected if `x` changed.
-- Source builds after v0.4.1 support Ctrl+C for `query`, `impact`, `path`, and
+- Version 0.4.2 and later support Ctrl+C for `query`, `impact`, `path`, and
   `review` (exit 130). A traversal stopped by cancellation reports `cancelled`
   in `truncationReasons`; partial results never establish absence. MCP clients
   cancel by request ID; cancelled calls may have no response. See ANALYSIS.md

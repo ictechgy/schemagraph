@@ -34,7 +34,7 @@ traversal. The separate vertex and edge budgets can stop traversal itself.
 `--max-examined-edges`. Library callers can pass cancellation flags to path and
 budgeted traversal, including the cancellation-aware review entry point.
 
-Cancellation support described here is available in source builds after v0.4.1.
+Cancellation support described here is available since v0.4.2.
 For `query`, `impact`, `path`, and `review`, the first **Ctrl+C** requests a
 cooperative stop and exits with status **130**. When traversal observes the stop,
 its partial report includes `cancelled` in `truncationReasons` and `truncated: true`;
@@ -173,7 +173,7 @@ connection or arbitrary file-reading tools. Configure the MCP client to launch
 the command above. The tool results preserve the CLI analysis contract and
 explicit result/traversal limits.
 
-In source builds after v0.4.1, stdin remains responsive while a single worker
+Since v0.4.2, stdin remains responsive while a single worker
 executes tool calls. Use a fresh request ID for each call in the session. To
 cancel an active or queued call, send the same request ID
 (including its string/number type) in an MCP notification:
