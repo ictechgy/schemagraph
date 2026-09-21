@@ -14,11 +14,12 @@
     엔진 실행 전에 `8e53c4f`에서 고정했다. DB별 기대값은 뷰 읽기 63개·값 계보
     34개이며 실제 정확도 점수가 아니다. `Scripts/verify-sqlserver-oracle-accuracy.py`,
     `Scripts/AccuracySql.java`, 전용 CI workflow를 준비했다. 평가기 실패 검사
-    17개와 실제 H2의 batch/query·JSON·실패 차단·비밀번호 비노출 검사는 통과했다.
+    18개와 실제 H2의 batch/query·JSON·실패 차단·비밀번호 비노출 검사는 통과했다.
   - **새 원본 DDL·라이선스·체크섬·이미지 manifest와 실제 SQL Server/Oracle 실행은
     미완료**다. 새 사례에 엔진을 실행하거나 점수를 보고하지 않았다.
     `ACCURACY.md`에도 준비 상태를 명시했다. 필요한 파일이 없는 전용 workflow는
-    아직 원격으로 실행하지 않는다.
+    아직 원격으로 실행하지 않는다. 변경은 현재 로컬 커밋으로만 보관하며,
+    새 branch push·PR·CI는 prerequisites가 갖춰진 뒤 진행한다.
   - 규모 검증은 외부 부하 없는 구간에서 고정 release 바이너리(`c28928ce3ade`,
     source `8e53c4f`, v0.4.2)로 실행했다. 1만 테이블·8컬럼 문서의 12만 정점·
     139,997개 간선을 독립 검증했다. JSON/NDJSON peak RSS 중앙값은

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """정확도 평가가 누락·오탐·거짓 complete와 유령 간선을 거부하는지 확인한다."""
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import subprocess
@@ -188,6 +189,34 @@ class AccuracyTests(unittest.TestCase):
         with patch.object(CHECK, 'run', return_value=result):
             with self.assertRaisesRegex(RuntimeError, 'ownership differs'):
                 CHECK.inspect_owned('fixture', 'owner')
+
+    def test_failed_transport_input_is_preserved_before_engine_decode(self):
+        """NDJSON 경로만 실패해도 그 입력을 CI artifact에서 재현할 수 있어야 한다."""
+        graph, definition = fixture()
+        definition['cases'][0]['sql'] = 'SELECT Name AS label FROM Genre WHERE GenreId > 0'
+        native = {'schemas': [{'name': 'dbo', 'objects': [{'name': 'acc_sample', 'kind': 'view', 'body': 'SELECT Name FROM Genre'}], 'routines': []}]}
+        with tempfile.TemporaryDirectory(prefix='sg-transport-artifact-test-') as directory:
+            work = Path(directory) / 'work'
+            work.mkdir()
+            artifacts = Path(directory) / 'artifacts'
+            args = SimpleNamespace(engine=Path('engine'), artifacts=artifacts)
+            sql = SimpleNamespace(password='unit-credential-not-in-output')
+            def command(arguments, **_kwargs):
+                output = Path(arguments[arguments.index('-o')+1])
+                if str(arguments[0]) == 'producer':
+                    output.write_text('invalid-transport\n' if '.ndjson.' in output.name else json.dumps(native))
+                elif '.ndjson.' in str(arguments[arguments.index('--document')+1]):
+                    raise RuntimeError('transport decode failed')
+                else:
+                    output.write_text(json.dumps(graph))
+                return SimpleNamespace(returncode=0)
+            with patch.object(CHECK, 'producer_commands', return_value=({'go': ['producer']}, {}, ())), \
+                    patch.object(CHECK, 'run', side_effect=command):
+                with self.assertRaisesRegex(RuntimeError, 'transport decode failed'):
+                    CHECK.analyze(args, Path('java'), sql, {}, definition,
+                                  {'scope': 'object', 'source': 'test', 'reads': {}}, work, {})
+            preserved = artifacts / 'sqlserver' / 'go.v1.ndjson.document'
+            self.assertEqual(preserved.read_text(), 'invalid-transport\n')
 
 
 if __name__ == '__main__':
