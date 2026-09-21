@@ -381,6 +381,48 @@ def check_review(engine: Path, work: Path) -> None:
                 process.wait()
 
 
+def check_blocked_stderr(engine: Path, work: Path) -> None:
+    """가득 찬 stderr pipe에서도 반복 중단 신호가 프로세스를 끝내는지 확인한다."""
+    fifo = work / "blocked-stderr.graph.json"
+    os.mkfifo(fifo)
+    read_error, write_error = os.pipe()
+    process = None
+    writer = -1
+    try:
+        os.set_blocking(write_error, False)
+        try:
+            while True:
+                os.write(write_error, b"x" * 4096)
+        except BlockingIOError:
+            os.set_blocking(write_error, True)
+        process = subprocess.Popen(
+            [str(engine), "impact", ROOT, "--graph", str(fifo)],
+            stdout=subprocess.PIPE,
+            stderr=write_error,
+        )
+        writer = open_fifo_writer(process, fifo)
+        end = deadline()
+        # 안내를 읽을 수 없으므로 종료를 관측할 때까지 신호를 보낸다.
+        # 이 대기는 일정 시간 뒤 완료됐다고 추정하는 동기화가 아니다.
+        while process.poll() is None and time.monotonic() < end:
+            try:
+                os.kill(process.pid, signal.SIGINT)
+            except ProcessLookupError:
+                break
+            wait_slice(end)
+        if process.poll() is None:
+            fail("interrupts were blocked by a full stderr pipe")
+        reap(process, 130)
+    finally:
+        if writer >= 0:
+            os.close(writer)
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
+        os.close(read_error)
+        os.close(write_error)
+
+
 def dense_graph() -> dict[str, Any]:
     """MCP worker가 취소 통지를 읽기 전에 끝나지 않도록 중간 규모 graph를 만든다."""
     count = 18_000
@@ -642,6 +684,7 @@ def main() -> int:
             check_review(engine, work)
             check_second_interrupt(engine, work)
             check_closed_stderr(engine, work)
+            check_blocked_stderr(engine, work)
             check_mcp(engine, work)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"cancellation process regression failed: {error}", file=sys.stderr)

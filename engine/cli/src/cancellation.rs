@@ -15,19 +15,29 @@ pub(crate) fn install() -> Result<&'static AtomicBool> {
             // 두 번째 요청은 로딩·출력처럼 협력적으로 멈출 수 없는 단계도 끝낸다.
             std::process::exit(130);
         }
-        // 안내 출력 실패로 신호 처리 스레드가 panic하면 다음 Ctrl+C도 처리하지
-        // 못한다. stderr가 끊긴 경우에는 명시적인 취소 종료 코드로 끝낸다.
-        if writeln!(
-            std::io::stderr(),
-            "Cancellation requested; press Ctrl+C again to exit immediately."
-        )
-        .is_err()
+        // stderr가 가득 차도 두 번째 신호를 처리해야 하므로 안내 쓰기를
+        // 신호 스레드에서 분리한다. 첫 신호에서 한 번만 생성하며 종료 시 정리된다.
+        if std::thread::Builder::new()
+            .name("cancel-notice".into())
+            .spawn(write_notice)
+            .is_err()
         {
             std::process::exit(130);
         }
     })
     .context("could not install Ctrl+C handling; check process signal support and retry")?;
     Ok(&REQUESTED)
+}
+
+fn write_notice() {
+    if writeln!(
+        std::io::stderr(),
+        "Cancellation requested; press Ctrl+C again to exit immediately."
+    )
+    .is_err()
+    {
+        std::process::exit(130);
+    }
 }
 
 /// 출력·입력 오류와 취소가 경합해도 호출자가 중단을 정상 완료로 오독하지 않게 한다.
