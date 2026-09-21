@@ -1,0 +1,480 @@
+{
+  "cases": [
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "album_id": [
+          "dbo.Album.AlbumId"
+        ],
+        "album_title": [
+          "dbo.Album.Title"
+        ],
+        "artist_name": [
+          "dbo.Artist.Name"
+        ]
+      },
+      "name": "album_artist",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Album",
+        "dbo.Album.AlbumId",
+        "dbo.Album.ArtistId",
+        "dbo.Album.Title",
+        "dbo.Artist",
+        "dbo.Artist.ArtistId",
+        "dbo.Artist.Name"
+      ],
+      "reason": "Projects album and artist columns; both join keys are reads.",
+      "sql": "SELECT a.AlbumId AS album_id, a.Title AS album_title, r.Name AS artist_name FROM Album a JOIN Artist r ON r.ArtistId = a.ArtistId",
+      "state": "complete",
+      "tags": [
+        "join"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "country": [
+          "dbo.Customer.Country"
+        ],
+        "invoice_count": [
+          "dbo.Invoice.InvoiceId"
+        ],
+        "revenue": [
+          "dbo.Invoice.Total"
+        ]
+      },
+      "name": "country_revenue",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Customer",
+        "dbo.Customer.Country",
+        "dbo.Customer.CustomerId",
+        "dbo.Invoice",
+        "dbo.Invoice.CustomerId",
+        "dbo.Invoice.InvoiceId",
+        "dbo.Invoice.Total"
+      ],
+      "reason": "Grouping and HAVING do not turn join keys into output value sources.",
+      "sql": "SELECT c.Country AS country, SUM(i.Total) AS revenue, COUNT(i.InvoiceId) AS invoice_count FROM Customer c LEFT JOIN Invoice i ON i.CustomerId = c.CustomerId GROUP BY c.Country HAVING SUM(i.Total) > 0",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "outer-join",
+        "having"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "customer_id": [
+          "dbo.Customer.CustomerId"
+        ],
+        "last_invoice": [
+          "dbo.Invoice.InvoiceDate"
+        ]
+      },
+      "name": "correlated_latest",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Customer",
+        "dbo.Customer.CustomerId",
+        "dbo.Invoice",
+        "dbo.Invoice.CustomerId",
+        "dbo.Invoice.InvoiceDate"
+      ],
+      "reason": "The correlation key is read while the scalar aggregate receives invoice dates.",
+      "sql": "SELECT c.CustomerId AS customer_id, (SELECT MAX(i.InvoiceDate) FROM Invoice i WHERE i.CustomerId = c.CustomerId) AS last_invoice FROM Customer c",
+      "state": "complete",
+      "tags": [
+        "correlated-subquery"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "running_price": [
+          "dbo.Track.GenreId",
+          "dbo.Track.TrackId",
+          "dbo.Track.UnitPrice"
+        ],
+        "track_id": [
+          "dbo.Track.TrackId"
+        ]
+      },
+      "name": "cte_window",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Track",
+        "dbo.Track.GenreId",
+        "dbo.Track.Milliseconds",
+        "dbo.Track.TrackId",
+        "dbo.Track.UnitPrice"
+      ],
+      "reason": "Window value sources include partition and ordering keys under the project lineage policy.",
+      "sql": "WITH priced AS (SELECT TrackId, GenreId, UnitPrice FROM Track WHERE Milliseconds > 60000) SELECT TrackId AS track_id, SUM(UnitPrice) OVER (PARTITION BY GenreId ORDER BY TrackId ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_price FROM priced",
+      "state": "complete",
+      "tags": [
+        "cte",
+        "window",
+        "frame"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "customer_id": [
+          "dbo.Customer.CustomerId"
+        ],
+        "display_name": [
+          "dbo.Customer.Company",
+          "dbo.Customer.FirstName"
+        ],
+        "market": [
+          "dbo.Customer.City",
+          "dbo.Customer.Country"
+        ]
+      },
+      "name": "case_label",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Customer",
+        "dbo.Customer.City",
+        "dbo.Customer.Company",
+        "dbo.Customer.Country",
+        "dbo.Customer.CustomerId",
+        "dbo.Customer.Email",
+        "dbo.Customer.FirstName"
+      ],
+      "reason": "CASE conditions contribute to the CASE result; the separate email filter remains a read only.",
+      "sql": "SELECT CustomerId AS customer_id, COALESCE(Company, FirstName) AS display_name, CASE WHEN Country = 'USA' THEN City ELSE Country END AS market FROM Customer WHERE Email IS NOT NULL",
+      "state": "complete",
+      "tags": [
+        "case",
+        "coalesce",
+        "filter"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "contact_id": [
+          "dbo.Customer.CustomerId",
+          "dbo.Employee.EmployeeId"
+        ],
+        "display_name": [
+          "dbo.Customer.FirstName",
+          "dbo.Employee.FirstName"
+        ]
+      },
+      "name": "union_contacts",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Customer",
+        "dbo.Customer.CustomerId",
+        "dbo.Customer.FirstName",
+        "dbo.Employee",
+        "dbo.Employee.EmployeeId",
+        "dbo.Employee.FirstName"
+      ],
+      "reason": "Both branches can supply output values.",
+      "sql": "SELECT CustomerId AS contact_id, FirstName AS display_name FROM Customer UNION ALL SELECT EmployeeId, FirstName FROM Employee",
+      "state": "complete",
+      "tags": [
+        "union-all"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "country": [
+          "dbo.Customer.Country",
+          "dbo.Invoice.BillingCountry"
+        ]
+      },
+      "name": "intersect_countries",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Customer",
+        "dbo.Customer.Country",
+        "dbo.Invoice",
+        "dbo.Invoice.BillingCountry"
+      ],
+      "reason": "Both branches are value sources under the documented INTERSECT policy.",
+      "sql": "SELECT Country AS country FROM Customer INTERSECT SELECT BillingCountry FROM Invoice",
+      "state": "complete",
+      "tags": [
+        "intersect"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "country": [
+          "dbo.Customer.Country"
+        ]
+      },
+      "name": "except_countries",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Customer",
+        "dbo.Customer.Country",
+        "dbo.Invoice",
+        "dbo.Invoice.BillingCountry"
+      ],
+      "reason": "The right side filters membership but supplies no output value under the documented EXCEPT/MINUS policy.",
+      "sql": "SELECT Country AS country FROM Customer EXCEPT SELECT BillingCountry FROM Invoice",
+      "state": "complete",
+      "tags": [
+        "except"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "track_id": [
+          "dbo.Track.TrackId"
+        ],
+        "track_name": [
+          "dbo.Track.Name"
+        ]
+      },
+      "name": "derived_projection",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Track",
+        "dbo.Track.Name",
+        "dbo.Track.TrackId",
+        "dbo.Track.UnitPrice"
+      ],
+      "reason": "Derived aliases retain physical source columns; the price predicate is read only.",
+      "sql": "SELECT p.TrackId AS track_id, p.Name AS track_name FROM (SELECT TrackId, Name, UnitPrice FROM Track) p WHERE p.UnitPrice >= 1",
+      "state": "complete",
+      "tags": [
+        "derived-table"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "customer_id": [
+          "dbo.Customer.CustomerId"
+        ],
+        "last_name": [
+          "dbo.Customer.LastName"
+        ]
+      },
+      "name": "exists_invoice",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Customer",
+        "dbo.Customer.CustomerId",
+        "dbo.Customer.LastName",
+        "dbo.Invoice",
+        "dbo.Invoice.CustomerId",
+        "dbo.Invoice.Total"
+      ],
+      "reason": "EXISTS reads invoice keys and totals without adding them to projected customer values.",
+      "sql": "SELECT c.CustomerId AS customer_id, c.LastName AS last_name FROM Customer c WHERE EXISTS (SELECT 1 FROM Invoice i WHERE i.CustomerId = c.CustomerId AND i.Total > 10)",
+      "state": "complete",
+      "tags": [
+        "exists",
+        "correlation"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "label": [
+          "dbo.Track.Name"
+        ],
+        "track_key": [
+          "dbo.Track.TrackId"
+        ]
+      },
+      "name": "quoted_projection",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Track",
+        "dbo.Track.Name",
+        "dbo.Track.TrackId",
+        "dbo.Track.UnitPrice"
+      ],
+      "reason": "Quoted identifiers and aliases retain exact output names; predicate-only columns remain reads.",
+      "sql": "SELECT \"TrackId\" AS \"track_key\", \"Name\" AS \"label\" FROM \"Track\" WHERE \"UnitPrice\" > 0",
+      "state": "complete",
+      "tags": [
+        "quoted-identifiers"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "price_rank": [
+          "dbo.Track.GenreId",
+          "dbo.Track.TrackId",
+          "dbo.Track.UnitPrice"
+        ],
+        "track_id": [
+          "dbo.Track.TrackId"
+        ]
+      },
+      "name": "ranked_tracks",
+      "read_scope": "column",
+      "reads": [
+        "dbo.Track",
+        "dbo.Track.GenreId",
+        "dbo.Track.TrackId",
+        "dbo.Track.UnitPrice"
+      ],
+      "reason": "Ranking depends on partition and ordering keys even though it has no value argument.",
+      "sql": "SELECT TrackId AS track_id, ROW_NUMBER() OVER (PARTITION BY GenreId ORDER BY UnitPrice DESC, TrackId) AS price_rank FROM Track",
+      "state": "complete",
+      "tags": [
+        "window",
+        "ranking"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "procedure",
+      "lineage": {},
+      "name": "rename_genre",
+      "read_scope": "object",
+      "reads": [],
+      "reason": "Changes one genre using input parameters; the write target is not separately counted as a relation read.",
+      "sql": "CREATE PROCEDURE dbo.acc_rename_genre @genre_id INT, @genre_name NVARCHAR(120) AS BEGIN SET NOCOUNT ON; UPDATE Genre SET Name = @genre_name WHERE GenreId = @genre_id; END",
+      "state": "complete",
+      "tags": [
+        "procedure",
+        "procedural"
+      ],
+      "writes": [
+        "dbo.Genre"
+      ]
+    },
+    {
+      "calls": [],
+      "kind": "procedure",
+      "lineage": {},
+      "name": "copy_genres",
+      "read_scope": "object",
+      "reads": [
+        "dbo.Genre"
+      ],
+      "reason": "INSERT SELECT reads the public table and writes the audit fixture.",
+      "sql": "CREATE PROCEDURE dbo.acc_copy_genres AS BEGIN SET NOCOUNT ON; INSERT INTO ACC_GENRE_AUDIT (GenreId, GenreName) SELECT GenreId, Name FROM Genre WHERE GenreId >= 9000; END",
+      "state": "complete",
+      "tags": [
+        "procedure",
+        "procedural"
+      ],
+      "writes": [
+        "dbo.ACC_GENRE_AUDIT"
+      ]
+    },
+    {
+      "calls": [],
+      "kind": "function",
+      "lineage": {},
+      "name": "genre_count",
+      "read_scope": "object",
+      "reads": [
+        "dbo.Genre"
+      ],
+      "reason": "The function counts public genre rows; it has no writes or user-routine calls.",
+      "sql": "CREATE FUNCTION dbo.acc_genre_count() RETURNS INT AS BEGIN RETURN (SELECT COUNT(GenreId) FROM Genre); END",
+      "state": "complete",
+      "tags": [
+        "function",
+        "procedural"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [
+        "dbo.acc_genre_count"
+      ],
+      "kind": "procedure",
+      "lineage": {},
+      "name": "call_count",
+      "read_scope": "object",
+      "reads": [],
+      "reason": "Direct facts contain the function call and log write, not the function's transitive Genre read.",
+      "sql": "CREATE PROCEDURE dbo.acc_call_count AS BEGIN SET NOCOUNT ON; DECLARE @n INT; SET @n = dbo.acc_genre_count(); INSERT INTO ACC_GENRE_COUNT_LOG (ObservedCount) VALUES (@n); END",
+      "state": "complete",
+      "tags": [
+        "procedure",
+        "procedural"
+      ],
+      "writes": [
+        "dbo.ACC_GENRE_COUNT_LOG"
+      ]
+    },
+    {
+      "calls": [],
+      "kind": "trigger",
+      "lineage": {},
+      "name": "genre_insert",
+      "parent": "Genre",
+      "read_scope": "object",
+      "reads": [],
+      "reason": "inserted is a transition relation, not a physical catalog object; the trigger writes the audit table.",
+      "sql": "CREATE TRIGGER dbo.acc_genre_insert ON dbo.Genre AFTER INSERT AS BEGIN SET NOCOUNT ON; INSERT INTO ACC_GENRE_AUDIT (GenreId, GenreName) SELECT GenreId, Name FROM inserted; END",
+      "state": "complete",
+      "tags": [
+        "trigger",
+        "procedural"
+      ],
+      "writes": [
+        "dbo.ACC_GENRE_AUDIT"
+      ]
+    },
+    {
+      "calls": [],
+      "kind": "trigger",
+      "lineage": {},
+      "name": "genre_update",
+      "parent": "Genre",
+      "read_scope": "object",
+      "reads": [],
+      "reason": "inserted/deleted are transition relations; the audit receives old and new row values.",
+      "sql": "CREATE TRIGGER dbo.acc_genre_update ON dbo.Genre AFTER UPDATE AS BEGIN SET NOCOUNT ON; INSERT INTO ACC_GENRE_CHANGES (GenreId, OldName, NewName) SELECT n.GenreId, o.Name, n.Name FROM inserted n JOIN deleted o ON o.GenreId = n.GenreId; END",
+      "state": "complete",
+      "tags": [
+        "trigger",
+        "procedural"
+      ],
+      "writes": [
+        "dbo.ACC_GENRE_CHANGES"
+      ]
+    }
+  ],
+  "dialect": "sqlserver",
+  "reference_policy": "Manually reviewed direct reads/value-lineage for views; direct object reads/writes/calls and firing owner for routines/triggers. Routine column reads and row-value lineage are outside the scored scope. Transition tables and local variables are not physical catalog objects.",
+  "schema": "dbo"
+}
