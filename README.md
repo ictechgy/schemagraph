@@ -24,7 +24,7 @@ against database dependency records and independently reviewed SQL cases.
 Install the CLI with Rust and Cargo:
 
 ```sh
-cargo install schemagraph-cli --version 0.4.1 --locked
+cargo install schemagraph-cli --version 0.4.2 --locked
 ```
 
 ### Build from source
@@ -112,7 +112,7 @@ prints its report but exits with code **1** when it finds cycles,
 candidates, violations, or differences, respectively. `query` and `impact`
 also exit **1** when a name cannot be resolved. Usage and engine errors exit
 **2**. Use `schemagraph <command> --help` for all options.
-Source builds after v0.4.1 add cooperative Ctrl+C and MCP request cancellation;
+Version 0.4.2 adds cooperative Ctrl+C and MCP request cancellation;
 see [the cancellation contract](ANALYSIS.md#trace-a-dependency).
 
 `scan --inferred` adds optional naming-based guesses for undeclared `*_id`

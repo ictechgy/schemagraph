@@ -162,6 +162,7 @@ jobs:
           "$cli" --version
           "$cli" --help >/dev/null
           "$go_probe" --help >/dev/null
+          python3 Scripts/verify-cancellation.py --engine "$cli"
 
           fixture="$RUNNER_TEMP/release-smoke.db"
           python3 - "$fixture" <<'PY'

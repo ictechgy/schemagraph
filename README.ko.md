@@ -21,7 +21,7 @@ JSON을 출력하며, Mermaid·Graphviz DOT와 오프라인 HTML 탐색기도 �
 Rust와 Cargo로 CLI를 설치합니다.
 
 ```sh
-cargo install schemagraph-cli --version 0.4.1 --locked
+cargo install schemagraph-cli --version 0.4.2 --locked
 ```
 
 ### 소스에서 빌드
@@ -108,7 +108,7 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 각각 순환·후보·규칙 위반·차이를 발견하면 종료 코드 **1**을 반환합니다.
 `query`와 `impact`도 이름을 해석하지 못하면 **1**을 반환합니다. 사용법·엔진
 오류는 **2**입니다. 전체 옵션은 `schemagraph <command> --help`로 확인합니다.
-v0.4.1 이후 소스 빌드의 Ctrl+C·MCP 요청 취소 동작은 영어 정본인
+v0.4.2의 Ctrl+C·MCP 요청 취소 동작은 영어 정본인
 [취소 계약](ANALYSIS.md#trace-a-dependency)을 참고하세요.
 
 `scan --inferred`는 선언되지 않은 `*_id` 참조를 이름 규칙으로 추정해 추가합니다.
