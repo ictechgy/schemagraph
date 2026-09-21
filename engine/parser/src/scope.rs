@@ -11,14 +11,23 @@ use schemagraph_core::{
 use schemagraph_source::document::{CatalogDocument, ObjectDoc};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
-    Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias, TableFactor,
-    TableWithJoins, Visit, Visitor, WildcardAdditionalOptions,
+    Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, Query,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias,
+    TableFactor, TableWithJoins, Visit, Visitor, WildcardAdditionalOptions, WindowType,
 };
 use sqlparser::dialect::{Dialect, GenericDialect};
 
 type Sources = BTreeSet<VertexId>;
 type Ctes = BTreeMap<String, Relation>;
+type NamedWindows = BTreeMap<String, NamedWindowExpr>;
+
+#[derive(Clone, Copy)]
+enum UsingPreservation {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
 
 #[derive(Clone, Default)]
 struct Column {
@@ -40,6 +49,7 @@ struct Scope {
     relations: Vec<Relation>,
     columns: Vec<Column>,
     outer: Option<Rc<Scope>>,
+    named_windows: NamedWindows,
 }
 
 impl Scope {
@@ -97,6 +107,7 @@ struct Binder<'a, 'd> {
     calls: BTreeMap<VertexId, BTreeSet<Option<SourceLocation>>>,
     diagnostics: Vec<Diagnostic>,
     depth: usize,
+    window_expansions: usize,
 }
 
 /// 입력 원문과 parser 버전으로 근거를 재확인할 때 쓸 해시다.
@@ -151,6 +162,16 @@ fn column_name(dialect: &str, ident: &Ident) -> String {
 
 fn location(item: &impl Spanned) -> Option<SourceLocation> {
     let span = item.span();
+    (span.start.line > 0 && span.end.line > 0).then_some(SourceLocation {
+        line: span.start.line,
+        column: span.start.column,
+        end_line: span.end.line,
+        end_column: span.end.column,
+    })
+}
+
+fn ident_location(ident: &Ident) -> Option<SourceLocation> {
+    let span = ident.span;
     (span.start.line > 0 && span.end.line > 0).then_some(SourceLocation {
         line: span.start.line,
         column: span.start.column,
@@ -282,13 +303,20 @@ impl Binder<'_, '_> {
         }
         let (result, scope) = self.set(&query.body, &ctes, outer);
         if let Some(order) = &query.order_by {
-            self.visit(order, &scope, &ctes, "ordering", &result.columns);
+            self.visit(
+                order,
+                &scope,
+                &ctes,
+                "ordering",
+                &result.columns,
+                &scope.named_windows,
+            );
         }
         if let Some(limit) = &query.limit_clause {
-            self.visit(limit, &scope, &ctes, "limit", &[]);
+            self.visit(limit, &scope, &ctes, "limit", &[], &scope.named_windows);
         }
         if let Some(fetch) = &query.fetch {
-            self.visit(fetch, &scope, &ctes, "limit", &[]);
+            self.visit(fetch, &scope, &ctes, "limit", &[], &scope.named_windows);
         }
         if !query.pipe_operators.is_empty() || query.for_clause.is_some() {
             self.note(
@@ -365,6 +393,7 @@ impl Binder<'_, '_> {
                             ctes,
                             "projection",
                             &[],
+                            &BTreeMap::new(),
                         ));
                     }
                 }
@@ -409,7 +438,10 @@ impl Binder<'_, '_> {
         for from in &select.from {
             self.join(from, &mut scope, ctes);
         }
+        let named_windows = self.named_windows(select);
+        scope.named_windows = named_windows.clone();
         let scope = Rc::new(scope);
+        self.analyze_named_windows(&named_windows, &scope, ctes);
         let mut columns = Vec::new();
         for item in &select.projection {
             match item {
@@ -428,7 +460,7 @@ impl Binder<'_, '_> {
                         },
                     };
                     let before = self.diagnostics.len();
-                    let sources = self.visit(expr, &scope, ctes, "projection", &[]);
+                    let sources = self.visit(expr, &scope, ctes, "projection", &[], &named_windows);
                     columns.push(Column {
                         name: alias,
                         sources,
@@ -478,7 +510,7 @@ impl Binder<'_, '_> {
             }
         }
         for predicate in [&select.selection, &select.prewhere].into_iter().flatten() {
-            self.visit(predicate, &scope, ctes, "predicate", &[]);
+            self.visit(predicate, &scope, ctes, "predicate", &[], &named_windows);
         }
         if let Some(having) = &select.having {
             let aliases = if matches!(self.catalog.dialect, "mysql" | "mariadb") {
@@ -486,24 +518,51 @@ impl Binder<'_, '_> {
             } else {
                 &[]
             };
-            self.visit(having, &scope, ctes, "predicate", aliases);
+            self.visit(having, &scope, ctes, "predicate", aliases, &named_windows);
         }
         if let Some(qualify) = &select.qualify {
-            self.visit(qualify, &scope, ctes, "predicate", &columns);
+            self.visit(qualify, &scope, ctes, "predicate", &columns, &named_windows);
         }
         if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
             for expr in exprs {
-                self.visit(expr, &scope, ctes, "grouping", &columns);
+                self.visit(expr, &scope, ctes, "grouping", &columns, &named_windows);
             }
         }
         // PostgreSQL DISTINCT ON의 bare identifier도 ORDER BY와 같은 출력
         // alias 우선 규칙을 따른다. 입력 relation을 먼저 보면 orders.id를
         // 잘못 읽어 amount AS id의 의미가 오염된다.
-        self.visit(&select.distinct, &scope, ctes, "ordering", &columns);
-        self.visit(&select.named_window, &scope, ctes, "window", &[]);
-        self.visit(&select.cluster_by, &scope, ctes, "ordering", &[]);
-        self.visit(&select.distribute_by, &scope, ctes, "ordering", &[]);
-        self.visit(&select.sort_by, &scope, ctes, "ordering", &[]);
+        self.visit(
+            &select.distinct,
+            &scope,
+            ctes,
+            "ordering",
+            &columns,
+            &named_windows,
+        );
+        self.visit(
+            &select.cluster_by,
+            &scope,
+            ctes,
+            "ordering",
+            &[],
+            &named_windows,
+        );
+        self.visit(
+            &select.distribute_by,
+            &scope,
+            ctes,
+            "ordering",
+            &[],
+            &named_windows,
+        );
+        self.visit(
+            &select.sort_by,
+            &scope,
+            ctes,
+            "ordering",
+            &[],
+            &named_windows,
+        );
         if select.connect_by.is_some()
             || !select.lateral_views.is_empty()
             || select.exclude.is_some()
@@ -524,6 +583,112 @@ impl Binder<'_, '_> {
             },
             scope,
         )
+    }
+
+    fn named_windows(&mut self, select: &Select) -> NamedWindows {
+        let mut windows = NamedWindows::new();
+        for definition in &select.named_window {
+            let key = name(self.catalog.dialect, &definition.0);
+            if windows.insert(key.clone(), definition.1.clone()).is_some() {
+                self.note(
+                    "SG_WINDOW_DUPLICATE",
+                    format!("named window '{key}' is defined more than once"),
+                    location(definition),
+                );
+            }
+        }
+        windows
+    }
+
+    fn analyze_named_windows(&mut self, windows: &NamedWindows, scope: &Rc<Scope>, ctes: &Ctes) {
+        for (key, expression) in windows {
+            let mut stack = vec![key.clone()];
+            self.named_window_expression_sources(expression, windows, scope, ctes, &mut stack);
+        }
+    }
+
+    fn named_window_expression_sources(
+        &mut self,
+        expression: &NamedWindowExpr,
+        windows: &NamedWindows,
+        scope: &Rc<Scope>,
+        ctes: &Ctes,
+        stack: &mut Vec<String>,
+    ) -> Sources {
+        match expression {
+            NamedWindowExpr::NamedWindow(parent) => {
+                self.named_window_sources(parent, windows, scope, ctes, stack)
+            }
+            NamedWindowExpr::WindowSpec(spec) => {
+                let mut sources = Sources::new();
+                if let Some(parent) = &spec.window_name {
+                    sources.extend(self.named_window_sources(parent, windows, scope, ctes, stack));
+                }
+                sources.extend(self.visit_with_window_stack(
+                    spec,
+                    scope,
+                    ctes,
+                    "window",
+                    &[],
+                    windows,
+                    stack,
+                ));
+                sources
+            }
+        }
+    }
+
+    fn named_window_sources(
+        &mut self,
+        reference: &Ident,
+        windows: &NamedWindows,
+        scope: &Rc<Scope>,
+        ctes: &Ctes,
+        stack: &mut Vec<String>,
+    ) -> Sources {
+        // 깊이만 제한하면 잘못된 정의가 부모 창을 여러 번 참조할 때 지수적으로
+        // 재방문할 수 있다. 몸체 전체의 확장 횟수도 제한하고 불완전함을 남긴다.
+        if self.window_expansions >= 4096 {
+            if self.window_expansions == 4096 {
+                self.note(
+                    "SG_WINDOW_BUDGET",
+                    "named window expansion exceeds the 4096-reference analysis limit".into(),
+                    ident_location(reference),
+                );
+                self.window_expansions += 1;
+            }
+            return Sources::new();
+        }
+        self.window_expansions += 1;
+        let key = name(self.catalog.dialect, reference);
+        if stack.iter().any(|item| item == &key) {
+            self.note(
+                "SG_WINDOW_CYCLE",
+                format!("named window inheritance cycle includes '{key}'"),
+                ident_location(reference),
+            );
+            return Sources::new();
+        }
+        if stack.len() >= 64 {
+            self.note(
+                "SG_WINDOW_DEPTH",
+                "named window inheritance exceeds the 64-window analysis limit".into(),
+                ident_location(reference),
+            );
+            return Sources::new();
+        }
+        let Some(expression) = windows.get(&key) else {
+            self.note(
+                "SG_WINDOW_UNKNOWN",
+                format!("named window '{key}' is not defined in this query"),
+                ident_location(reference),
+            );
+            return Sources::new();
+        };
+        stack.push(key);
+        let sources = self.named_window_expression_sources(expression, windows, scope, ctes, stack);
+        stack.pop();
+        sources
     }
 
     fn wildcard(
@@ -597,18 +762,26 @@ impl Binder<'_, '_> {
                     .collect(),
                 _ => Vec::new(),
             };
+            let preservation = Self::using_preservation(&join.join_operator);
             if keys.is_empty() {
                 group.columns.extend(right.columns);
                 group.relations.extend(right.relations);
             } else {
-                self.using(&mut group, right, &keys);
+                self.using(&mut group, right, &keys, preservation);
             }
             if let Some(JoinConstraint::On(expr)) = constraint {
                 let mut on_scope = scope.clone();
                 for r in &group.relations {
                     on_scope.add(r.clone());
                 }
-                self.visit(expr, &Rc::new(on_scope), ctes, "join", &[]);
+                self.visit(
+                    expr,
+                    &Rc::new(on_scope),
+                    ctes,
+                    "join",
+                    &[],
+                    &BTreeMap::new(),
+                );
             }
             if let JoinOperator::AsOf {
                 match_condition, ..
@@ -618,7 +791,14 @@ impl Binder<'_, '_> {
                 for r in &group.relations {
                     on_scope.add(r.clone());
                 }
-                self.visit(match_condition, &Rc::new(on_scope), ctes, "join", &[]);
+                self.visit(
+                    match_condition,
+                    &Rc::new(on_scope),
+                    ctes,
+                    "join",
+                    &[],
+                    &BTreeMap::new(),
+                );
             }
             if matches!(
                 join.join_operator,
@@ -661,16 +841,31 @@ impl Binder<'_, '_> {
         }
     }
 
-    fn using(&mut self, scope: &mut Scope, right: Scope, keys: &[String]) {
+    fn using(
+        &mut self,
+        scope: &mut Scope,
+        right: Scope,
+        keys: &[String],
+        preservation: UsingPreservation,
+    ) {
         let mut merged = Vec::new();
         for key in keys {
             let left: Vec<_> = scope.columns.iter().filter(|c| &c.name == key).collect();
             let rhs: Vec<_> = right.columns.iter().filter(|c| &c.name == key).collect();
             if left.len() == 1 && rhs.len() == 1 {
-                let mut col = left[0].clone();
-                col.sources.extend(rhs[0].sources.clone());
-                col.unknown |= rhs[0].unknown;
-                for id in &col.sources {
+                let col = match preservation {
+                    UsingPreservation::Left => left[0].clone(),
+                    UsingPreservation::Right => rhs[0].clone(),
+                    UsingPreservation::Inner | UsingPreservation::Full => {
+                        let mut col = left[0].clone();
+                        col.sources.extend(rhs[0].sources.clone());
+                        col.unknown |= rhs[0].unknown;
+                        col
+                    }
+                };
+                let mut reads = left[0].sources.clone();
+                reads.extend(rhs[0].sources.clone());
+                for id in &reads {
                     self.read(id.clone(), "join", None);
                 }
                 merged.push(col);
@@ -707,6 +902,15 @@ impl Binder<'_, '_> {
                 .cloned(),
         );
         scope.relations.extend(right.relations);
+    }
+
+    fn using_preservation(join: &JoinOperator) -> UsingPreservation {
+        match join {
+            JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => UsingPreservation::Left,
+            JoinOperator::Right(_) | JoinOperator::RightOuter(_) => UsingPreservation::Right,
+            JoinOperator::FullOuter(_) => UsingPreservation::Full,
+            _ => UsingPreservation::Inner,
+        }
     }
 
     fn parts(&self, object: &ObjectName) -> Vec<String> {
@@ -1000,6 +1204,20 @@ impl Binder<'_, '_> {
         ctes: &Ctes,
         role: &str,
         aliases: &[Column],
+        windows: &NamedWindows,
+    ) -> Sources {
+        self.visit_with_window_stack(node, scope, ctes, role, aliases, windows, &mut Vec::new())
+    }
+
+    fn visit_with_window_stack<T: Visit>(
+        &mut self,
+        node: &T,
+        scope: &Rc<Scope>,
+        ctes: &Ctes,
+        role: &str,
+        aliases: &[Column],
+        windows: &NamedWindows,
+        window_stack: &mut Vec<String>,
     ) -> Sources {
         let mut visitor = ExprVisitor {
             binder: self,
@@ -1007,6 +1225,8 @@ impl Binder<'_, '_> {
             ctes,
             role,
             aliases,
+            windows,
+            window_stack,
             queries: 0,
             expression_depth: 0,
             sources: Sources::new(),
@@ -1022,6 +1242,8 @@ struct ExprVisitor<'a, 'b, 'c, 'd> {
     ctes: &'c Ctes,
     role: &'c str,
     aliases: &'c [Column],
+    windows: &'c NamedWindows,
+    window_stack: &'c mut Vec<String>,
     queries: usize,
     expression_depth: usize,
     sources: Sources,
@@ -1052,6 +1274,34 @@ impl Visitor for ExprVisitor<'_, '_, '_, '_> {
         self.expression_depth += 1;
         if let Expr::Function(function) = expr {
             self.binder.call(&function.name, location(expr));
+            if let Some(over) = &function.over {
+                let sources = match over {
+                    WindowType::NamedWindow(reference) => self.binder.named_window_sources(
+                        reference,
+                        self.windows,
+                        &self.scope,
+                        self.ctes,
+                        self.window_stack,
+                    ),
+                    WindowType::WindowSpec(spec) => spec
+                        .window_name
+                        .as_ref()
+                        .map(|reference| {
+                            self.binder.named_window_sources(
+                                reference,
+                                self.windows,
+                                &self.scope,
+                                self.ctes,
+                                self.window_stack,
+                            )
+                        })
+                        .unwrap_or_default(),
+                };
+                for id in &sources {
+                    self.binder.read(id.clone(), self.role, location(expr));
+                }
+                self.sources.extend(sources);
+            }
         }
         let ids = match expr {
             Expr::Identifier(id) => std::slice::from_ref(id),
@@ -1132,6 +1382,7 @@ pub(crate) fn enrich_view(
         calls: BTreeMap::new(),
         diagnostics: Vec::new(),
         depth: 0,
+        window_expansions: 0,
     };
     let mut outputs = Vec::new();
     match parsed {
@@ -1231,7 +1482,7 @@ pub(crate) fn enrich_view(
                 | "SG_SCOPE_DEPTH"
                 | "SG_VIEW_STATEMENT"
                 | "SG_JOIN_PROJECTION"
-        )
+        ) || d.code.starts_with("SG_WINDOW_")
     });
     if width_matches && output_shape_known {
         for (column, output) in columns.into_iter().zip(outputs) {
