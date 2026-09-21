@@ -47,9 +47,12 @@ pub fn paths(
     from: &VertexId,
     to: &VertexId,
     options: SearchOptions,
-    cancelled: Option<&AtomicBool>,
+    cancel: Option<&AtomicBool>,
 ) -> PathReport {
     let mut reasons = BTreeSet::new();
+    if cancelled(cancel) {
+        reasons.insert("cancelled");
+    }
     let mut distance = BTreeMap::new();
     let mut parents: BTreeMap<VertexId, BTreeSet<VertexId>> = BTreeMap::new();
     let mut queue = VecDeque::new();
@@ -64,8 +67,8 @@ pub fn paths(
             edges: vec![],
             visited: 0,
             examined_edges: 0,
-            truncated: false,
-            truncation_reasons: vec![],
+            truncated: !reasons.is_empty(),
+            truncation_reasons: reasons.into_iter().map(str::to_owned).collect(),
             limitations: vec!["path endpoints must exist in the graph".into()],
         };
     }
@@ -79,7 +82,7 @@ pub fn paths(
         target_depth = Some(0);
     }
     'search: while let Some(id) = queue.pop_front() {
-        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        if cancelled(cancel) {
             reasons.insert("cancelled");
             break;
         }
@@ -92,18 +95,44 @@ pub fn paths(
         } else {
             graph.outgoing(&id)
         };
-        let mut edges: Vec<_> = edges.iter().filter(|e| e.kind.is_dependency()).collect();
+        let mut dependency_edges = Vec::new();
+        for edge in edges {
+            if cancelled(cancel) {
+                reasons.insert("cancelled");
+                break 'search;
+            }
+            if edge.kind.is_dependency() {
+                dependency_edges.push(edge);
+            }
+        }
+        let mut edges = dependency_edges;
         edges.sort_by(|a, b| (&a.from, &a.to, a.kind).cmp(&(&b.from, &b.to, b.kind)));
+        if cancelled(cancel) {
+            reasons.insert("cancelled");
+            break;
+        }
         if depth >= options.max_depth {
-            if edges
-                .iter()
-                .any(|e| !distance.contains_key(if options.reverse { &e.from } else { &e.to }))
-            {
-                reasons.insert("depth-limit");
+            for edge in &edges {
+                if cancelled(cancel) {
+                    reasons.insert("cancelled");
+                    break 'search;
+                }
+                if !distance.contains_key(if options.reverse {
+                    &edge.from
+                } else {
+                    &edge.to
+                }) {
+                    reasons.insert("depth-limit");
+                    break;
+                }
             }
             continue;
         }
         for edge in edges {
+            if cancelled(cancel) {
+                reasons.insert("cancelled");
+                break 'search;
+            }
             if examined >= options.max_edges {
                 reasons.insert("edge-limit");
                 break 'search;
@@ -137,8 +166,8 @@ pub fn paths(
     let mut found = Vec::new();
     if distance.contains_key(to) {
         let mut pending = vec![vec![to.clone()]];
-        while let Some(path) = pending.pop() {
-            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        'enumerate: while let Some(path) = pending.pop() {
+            if cancelled(cancel) {
                 reasons.insert("cancelled");
                 break;
             }
@@ -152,6 +181,10 @@ pub fn paths(
             } else if let Some(predecessors) = parents.get(last) {
                 // 경로 복원의 펼침 순서도 id 순으로 고정한다.
                 for predecessor in predecessors.iter().rev() {
+                    if cancelled(cancel) {
+                        reasons.insert("cancelled");
+                        break 'enumerate;
+                    }
                     let mut next = path.clone();
                     next.push(predecessor.clone());
                     pending.push(next);
@@ -160,25 +193,38 @@ pub fn paths(
         }
     }
     found.sort();
+    if cancelled(cancel) {
+        reasons.insert("cancelled");
+    }
     let mut used = BTreeMap::new();
-    for path in &found {
+    let mut complete_paths = Vec::new();
+    'evidence: for path in found {
+        let mut path_edges = BTreeMap::new();
         for pair in path.windows(2) {
             let (a, b) = if options.reverse {
                 (&pair[1], &pair[0])
             } else {
                 (&pair[0], &pair[1])
             };
-            for edge in graph
-                .outgoing(a)
-                .iter()
-                .filter(|e| &e.to == b && e.kind.is_dependency())
-            {
-                used.insert(
-                    (edge.from.clone(), edge.to.clone(), edge.kind),
-                    edge.clone(),
-                );
+            for edge in graph.outgoing(a) {
+                if cancelled(cancel) {
+                    reasons.insert("cancelled");
+                    break 'evidence;
+                }
+                if &edge.to == b && edge.kind.is_dependency() {
+                    path_edges.insert(
+                        (edge.from.clone(), edge.to.clone(), edge.kind),
+                        edge.clone(),
+                    );
+                }
             }
         }
+        used.extend(path_edges);
+        complete_paths.push(path);
+    }
+    found = complete_paths;
+    if cancelled(cancel) {
+        reasons.insert("cancelled");
     }
     PathReport {
         from: from.clone(),
@@ -192,6 +238,10 @@ pub fn paths(
         truncation_reasons: reasons.into_iter().map(str::to_owned).collect(),
         limitations: graph.limitations().to_vec(),
     }
+}
+
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 /// 하나의 근거에 여러 SQL 위치나 카탈로그 출처가 있을 수 있다.
@@ -269,6 +319,8 @@ mod tests {
             ("b", "d", EdgeKind::Reads),
             ("c", "d", EdgeKind::Reads),
             ("d", "a", EdgeKind::Reads),
+            ("a", "b", EdgeKind::Contains),
+            ("a", "b", EdgeKind::Inferred),
         ] {
             g.add_edge(Edge {
                 from: VertexId::object("s", a),
@@ -291,6 +343,7 @@ mod tests {
         );
         assert_eq!(report.paths.len(), 2);
         assert_eq!(report.edges.len(), 5);
+        assert!(report.edges.iter().all(|edge| edge.kind.is_dependency()));
         assert!(!report.truncated);
         assert_eq!(
             report.paths[0]
@@ -333,6 +386,28 @@ mod tests {
         let flag = AtomicBool::new(true);
         let cancelled = paths(&g, &from, &to, SearchOptions::default(), Some(&flag));
         assert_eq!(cancelled.truncation_reasons, vec!["cancelled"]);
+        assert!(cancelled.paths.is_empty());
+        assert!(cancelled.edges.is_empty());
+
+        let same = paths(&g, &from, &from, SearchOptions::default(), None);
+        assert_eq!(same.paths, vec![vec![from.clone()]]);
+        assert!(same.edges.is_empty());
+        assert!(!same.truncated);
+
+        let cancelled_same = paths(&g, &from, &from, SearchOptions::default(), Some(&flag));
+        assert!(cancelled_same.paths.is_empty());
+        assert!(cancelled_same.edges.is_empty());
+        assert_eq!(cancelled_same.truncation_reasons, vec!["cancelled"]);
+
+        let cancelled_missing = paths(
+            &g,
+            &VertexId::object("s", "missing"),
+            &to,
+            SearchOptions::default(),
+            Some(&flag),
+        );
+        assert_eq!(cancelled_missing.truncation_reasons, vec!["cancelled"]);
+        assert!(cancelled_missing.truncated);
     }
     #[test]
     fn reverse_direction_keeps_original_edge_direction() {
