@@ -4,12 +4,31 @@
 
 ## 지금 상태
 
-- 2026-09-21: **v0.4.2 릴리스 준비 중** (`feature/release-v0.4.2`).
-  사용자가 취소 지원의 공개 릴리스를 요청했다. Rust 6개 crate·CLI/Go 바이너리·
-  JVM 프로브와 Pages/Central Maven을 기존 통일 버전 규칙에 따라 0.4.2로 맞춘다.
-  런타임 기능은 아래 검증된 취소 지원이며, 이번에는 버전·설치 문서를 갱신하고
-  릴리스 Linux/macOS 바이너리에도 실제 취소 프로세스 검사를 적용한다.
-  CI 후 소스·태그를 고정하고 공개 설치·서명·체크섬을 확인한 뒤 임시 산출물을 정리한다.
+- 2026-09-21: **v0.4.2 취소 지원 공개 배포·설치 검증 완료**.
+  [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.2) ·
+  [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.4.2) ·
+  [Maven Central](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.4.2).
+  사용자가 공개 릴리스를 요청했고 [PR #7](https://github.com/ictechgy/schemagraph/pull/7)을
+  병합했다. 태그·릴리스 소스·6개 crate의 내장 소스 커밋은
+  `8a50062a3e952fea8f2f95469d2e827f787bc474`다. 버전·설치 문서를 0.4.2로 맞췄다.
+  - [254개 Rust 테스트·전체 DB CI](https://github.com/ictechgy/schemagraph/actions/runs/35562530085),
+    [Db2·Informix](https://github.com/ictechgy/schemagraph/actions/runs/35562530080),
+    [Linux/macOS 최적화 바이너리의 실제 취소 검사·배포](https://github.com/ictechgy/schemagraph/actions/runs/35562532399)를 통과했다.
+    태그 push가 만든 중복 IBM 작업은 같은 소스의 main 검사와 겹쳐 취소했다.
+  - [Pages Maven](https://github.com/ictechgy/schemagraph/actions/runs/35562530023)과
+    [Central](https://github.com/ictechgy/schemagraph/actions/runs/35562686580)에 게시했다.
+    Central deployment `a48dcd67-436c-464c-a4cb-5bc81f3d3f77`은 PUBLISHED다.
+    기존 서명키·토큰 설정을 재사용했으며 비밀키 백업은 읽거나 바꾸지 않았다.
+  - 6개 crate의 레지스트리 체크섬·로컬 게시 바이트·소스 커밋이 일치한다.
+    crates.io 별도 설치본에서 취소·CLI 회귀·정확도 전체를 통과했다.
+    Central 5개 payload의 체크섬·PGP 서명·Pages 바이트가 일치하고, all JAR은
+    GitHub 릴리스와도 같다. Linux/macOS 공개 압축파일의 체크섬을 확인했다.
+    빈 Gradle 캐시의 Central-only 소비자가 H2 테이블·컬럼·PK를 실제 프로브로 읽었다.
+    공개 macOS CLI·Go·JAR로 catalog 전송·51개 뷰 정확도·취소 검사를 재실행했다.
+  - 사용이 끝난 게시용 빌드 2,350,280,704 bytes는 휴지통으로 옮겼다.
+    임시 DB·다운로드·검증용 공개키 keyring·소비자는 검사 후 자동 정리한다.
+    근거는 저장소 밖 `~/Library/Application Support/schemagraph/verification/v0.4.2-20260921`에
+    보관한다. 이후 완료 기록만 갱신할 때는 위 실행 검증을 재사용한다.
 
 - 2026-09-21: **CLI·MCP 요청 취소 구현·검증 완료** (`feature/request-cancellation`).
   사용자가 다음 과제 중 1번인 실행 중 요청 취소를 승인했다. 이번 범위는
@@ -18,7 +37,7 @@
   MCP는 입력과 계산을 분리하고 bounded queue·요청별 토큰을 사용하며,
   취소된 요청의 응답은 보내지 않는다. 기존 분석 API는 유지하고 취소 가능한
   review 진입점을 추가한다. core 의존성은 그대로이며 ctrlc는 CLI에만 추가한다.
-  v0.4.1 이후 소스 기능으로 문서화한다. 아직 새 릴리스는 만들지 않았다.
+  당시에는 v0.4.1 이후 소스 기능으로 문서화했으며, 위 v0.4.2에 포함해 배포했다.
   - 로컬 Rust 254개 테스트, FIFO로 동기화한 실제 Ctrl+C·두 번째 중단·닫힌/가득 찬 stderr,
     SIGINT 무시를 상속한 실행, MCP 취소 후 재사용·EOF drain을 통과했다.
     실행 중인 worker의 토큰 전달과 입력이 열린 채 발생한 출력 오류 반환도 검사한다.
@@ -570,8 +589,8 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 요청한 성능·메모리 개선, Db2·Informix 특화 지원, 공개 Maven 배포를 완료했다.
 추가 요청된 Maven Central 게시도 실제 익명 설치까지 검증했다.
 공개 정확도 평가 후속과 v0.4.1 배포·설치 검증도 완료했다. 서명키와 토큰은
-다음 릴리스에서도 기존 설정을 재사용한다. CLI/MCP 요청 취소는 소스 구현·검증을
-완료했으며 새 공개 릴리스에는 아직 포함되지 않았다. 후속 과제는 취소 기능 배포,
+다음 릴리스에서도 기존 설정을 재사용한다. CLI/MCP 요청 취소도 v0.4.2 배포와 공개
+설치본 검증까지 완료했다. 승인된 릴리스 작업에 미완료 항목은 없다. 선택적 후속 과제는
 다른 DB·실사용 SQL 표본 확대, 대규모 그래프의 메모리·탐색 성능 검증이다.
 
 ## 의도적으로 남긴 경계
