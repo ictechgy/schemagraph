@@ -4,7 +4,7 @@
 
 ## 지금 상태
 
-- 2026-09-21: **공개 PostgreSQL·SQLite 정확도 평가와 발견한 파서 오류 수정**
+- 2026-09-21: **공개 PostgreSQL·SQLite 정확도 평가와 발견한 파서 오류 수정 완료**
   (`feature/accuracy-corpus`, 런타임 수정 `ad0e720`). 사용자가 공개 샘플 사용과
   불필요 산출물 정리를 요청했다. [ACCURACY.md](ACCURACY.md)가 영어 정본이다.
   - Pagila v3.1.0·Chinook v1.4.5의 commit·SHA-256·라이선스를 고정했다.
@@ -21,11 +21,20 @@
     61/66·오탐 5·누락 5였다. 독립 기대값을 쓰며 상대 도구 출력은 정답이 아니다.
     비교기 범위·UNKNOWN 타입·LATERAL 미해석 출처와 표본 편향을 문서화했다.
     원본 Pagila 뷰 3개는 custom aggregate 미수집으로 여전히 partial이다.
-  - 로컬 Rust 244개 테스트와 공개 코퍼스 strict 검사를 통과했다.
-    CI에도 공개 코퍼스 검사를 추가했다. 통합 CI·PR 반영은 진행 중이다.
+  - 로컬 Rust 244개 테스트·공개 코퍼스 strict·기존 버전의 strict 실패를 확인했다.
+    [PR #3](https://github.com/ictechgy/schemagraph/pull/3)의 검사 소스는 `e1a6452`이며,
+    [일반 CI·전체 DB fixture](https://github.com/ictechgy/schemagraph/actions/runs/35550571482),
+    [Db2·Informix](https://github.com/ictechgy/schemagraph/actions/runs/35550571493),
+    [Linux·macOS·JVM 빌드 및 실행](https://github.com/ictechgy/schemagraph/actions/runs/35550571497)을
+    통과했다. CI의 정확도 report도 내려받아 66·144·202개 기대 간선 일치를 확인했다.
+    push/PR 중복 실행 중 취소된 push 작업은 실패 검증으로 세지 않는다.
     임시 DB·그래프는 검사 종료 시 자동 정리하고, 중복 빌드 디렉터리 4개
     (4,256,976,896 bytes)는 `~/.Trash/schemagraph-duplicate-builds-*`로 옮겼다.
     휴지통을 비우기 전까지 디스크 여유 공간이 늘었다고 해석하면 안 된다.
+    평가 원본 다운로드·비교 가상환경·중복 로그 약 22MB도 별도 휴지통 폴더로 옮겼다.
+    전체 비교 결과·Rust 테스트 기록·CI 검증 요약 3개는 저장소 밖
+    `~/Library/Application Support/schemagraph/verification/accuracy-20260921`에 보관했다.
+    이 완료 기록만 갱신할 때는 위 검사 소스와의 동일성을 확인하고 실행 검증을 재사용한다.
 
 - 2026-09-21: **v0.4.0 경쟁 조사 후속 구현·공개 배포 완료**.
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.0) ·
