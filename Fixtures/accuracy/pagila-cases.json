@@ -1,0 +1,263 @@
+{
+  "cases": [
+    {
+      "name": "left_using",
+      "sql": "SELECT customer_id AS id FROM rental LEFT JOIN customer USING (customer_id)",
+      "reads": [
+        "public.customer",
+        "public.customer.customer_id",
+        "public.rental",
+        "public.rental.customer_id"
+      ],
+      "lineage": {
+        "id": [
+          "public.rental.customer_id"
+        ]
+      },
+      "tags": [
+        "outer-join",
+        "using"
+      ],
+      "state": "complete",
+      "reason": "The merged key is the preserved side, including unmatched rows; the other key is a join dependency only."
+    },
+    {
+      "name": "left_on",
+      "sql": "SELECT rental.customer_id AS id FROM rental LEFT JOIN customer ON rental.customer_id=customer.customer_id",
+      "reads": [
+        "public.customer",
+        "public.customer.customer_id",
+        "public.rental",
+        "public.rental.customer_id"
+      ],
+      "lineage": {
+        "id": [
+          "public.rental.customer_id"
+        ]
+      },
+      "tags": [
+        "outer-join",
+        "explicit-key"
+      ],
+      "state": "complete",
+      "reason": "Equivalent explicit ON form of the USING query."
+    },
+    {
+      "name": "right_using",
+      "sql": "SELECT customer_id AS id FROM rental RIGHT JOIN customer USING (customer_id)",
+      "reads": [
+        "public.customer",
+        "public.customer.customer_id",
+        "public.rental",
+        "public.rental.customer_id"
+      ],
+      "lineage": {
+        "id": [
+          "public.customer.customer_id"
+        ]
+      },
+      "tags": [
+        "outer-join",
+        "using"
+      ],
+      "state": "complete",
+      "reason": "The merged key is the preserved side, including unmatched rows; the other key is a join dependency only."
+    },
+    {
+      "name": "right_on",
+      "sql": "SELECT customer.customer_id AS id FROM rental RIGHT JOIN customer ON rental.customer_id=customer.customer_id",
+      "reads": [
+        "public.customer",
+        "public.customer.customer_id",
+        "public.rental",
+        "public.rental.customer_id"
+      ],
+      "lineage": {
+        "id": [
+          "public.customer.customer_id"
+        ]
+      },
+      "tags": [
+        "outer-join",
+        "explicit-key"
+      ],
+      "state": "complete",
+      "reason": "Equivalent explicit ON form of the USING query."
+    },
+    {
+      "name": "full_using",
+      "sql": "SELECT customer_id AS id FROM rental FULL JOIN customer USING (customer_id)",
+      "reads": [
+        "public.customer",
+        "public.customer.customer_id",
+        "public.rental",
+        "public.rental.customer_id"
+      ],
+      "lineage": {
+        "id": [
+          "public.customer.customer_id",
+          "public.rental.customer_id"
+        ]
+      },
+      "tags": [
+        "outer-join",
+        "using"
+      ],
+      "state": "complete",
+      "reason": "A FULL JOIN merged key coalesces both physical input keys."
+    },
+    {
+      "name": "full_coalesce",
+      "sql": "SELECT coalesce(rental.customer_id,customer.customer_id) AS id FROM rental FULL JOIN customer ON rental.customer_id=customer.customer_id",
+      "reads": [
+        "public.customer",
+        "public.customer.customer_id",
+        "public.rental",
+        "public.rental.customer_id"
+      ],
+      "lineage": {
+        "id": [
+          "public.customer.customer_id",
+          "public.rental.customer_id"
+        ]
+      },
+      "tags": [
+        "outer-join",
+        "explicit-key"
+      ],
+      "state": "complete",
+      "reason": "Explicit coalesce is equivalent to the FULL JOIN USING output."
+    },
+    {
+      "name": "window_inline",
+      "sql": "SELECT row_number() OVER (PARTITION BY customer_id ORDER BY payment_date) AS position FROM payment",
+      "reads": [
+        "public.payment",
+        "public.payment.customer_id",
+        "public.payment.payment_date"
+      ],
+      "lineage": {
+        "position": [
+          "public.payment.customer_id",
+          "public.payment.payment_date"
+        ]
+      },
+      "tags": [
+        "window",
+        "inline"
+      ],
+      "state": "complete",
+      "reason": "Partition and ordering keys determine each row number."
+    },
+    {
+      "name": "window_named",
+      "sql": "SELECT row_number() OVER ranking AS position FROM payment WINDOW ranking AS (PARTITION BY customer_id ORDER BY payment_date)",
+      "reads": [
+        "public.payment",
+        "public.payment.customer_id",
+        "public.payment.payment_date"
+      ],
+      "lineage": {
+        "position": [
+          "public.payment.customer_id",
+          "public.payment.payment_date"
+        ]
+      },
+      "tags": [
+        "window",
+        "named"
+      ],
+      "state": "complete",
+      "reason": "Naming the same window must not change its input dependencies or value lineage."
+    },
+    {
+      "name": "window_inherited",
+      "sql": "SELECT row_number() OVER ranking AS position FROM payment WINDOW base AS (PARTITION BY customer_id), ranking AS (base ORDER BY payment_date)",
+      "reads": [
+        "public.payment",
+        "public.payment.customer_id",
+        "public.payment.payment_date"
+      ],
+      "lineage": {
+        "position": [
+          "public.payment.customer_id",
+          "public.payment.payment_date"
+        ]
+      },
+      "tags": [
+        "window",
+        "inherited"
+      ],
+      "state": "complete",
+      "reason": "A derived window uses its parent partition and its own ordering keys."
+    },
+    {
+      "name": "window_unused",
+      "sql": "SELECT amount AS total FROM payment WINDOW unused AS (PARTITION BY customer_id ORDER BY payment_date)",
+      "reads": [
+        "public.payment",
+        "public.payment.amount",
+        "public.payment.customer_id",
+        "public.payment.payment_date"
+      ],
+      "lineage": {
+        "total": [
+          "public.payment.amount"
+        ]
+      },
+      "tags": [
+        "window",
+        "unused"
+      ],
+      "state": "complete",
+      "reason": "An unused window declaration must not flow into an unrelated output value; its declared references still belong to the view."
+    },
+    {
+      "name": "group_alias_collision",
+      "sql": "SELECT customer_id AS amount FROM payment GROUP BY amount, customer_id ORDER BY amount",
+      "reads": [
+        "public.payment",
+        "public.payment.amount",
+        "public.payment.customer_id"
+      ],
+      "lineage": {
+        "amount": [
+          "public.payment.customer_id"
+        ]
+      },
+      "tags": [
+        "grouping",
+        "alias-shadow"
+      ],
+      "state": "complete",
+      "reason": "GROUP BY resolves an input column before an output alias; ORDER BY resolves the output alias first."
+    },
+    {
+      "name": "latest_payment_lateral",
+      "sql": "SELECT c.customer_id AS customer, latest.total FROM customer c LEFT JOIN LATERAL (SELECT p.amount AS total FROM payment p WHERE p.customer_id=c.customer_id ORDER BY p.payment_date DESC LIMIT 1) latest ON true",
+      "reads": [
+        "public.customer",
+        "public.customer.customer_id",
+        "public.payment",
+        "public.payment.amount",
+        "public.payment.customer_id",
+        "public.payment.payment_date"
+      ],
+      "lineage": {
+        "customer": [
+          "public.customer.customer_id"
+        ],
+        "total": [
+          "public.payment.amount"
+        ]
+      },
+      "tags": [
+        "lateral",
+        "correlated",
+        "ordering"
+      ],
+      "state": "complete",
+      "reason": "The latest amount is a value source; customer matching and ordering are reads only for that output."
+    }
+  ]
+}

@@ -32,6 +32,10 @@ fn object(name: &str, names: &[&str]) -> ObjectDoc {
 }
 
 fn scan(sql: &str, outputs: &[&str]) -> Graph {
+    scan_with_dialect(sql, outputs, "postgres")
+}
+
+fn scan_with_dialect(sql: &str, outputs: &[&str], dialect: &str) -> Graph {
     let mut view = object("v", outputs);
     view.kind = "view".into();
     view.body = Some(sql.into());
@@ -39,7 +43,7 @@ fn scan(sql: &str, outputs: &[&str]) -> Graph {
         context: None,
         dependencies: Vec::new(),
         version: 1,
-        dialect: "postgres".into(),
+        dialect: dialect.into(),
         reader: "fixture".into(),
         limitations: vec![],
         schemas: vec![SchemaDoc {
@@ -77,6 +81,13 @@ fn complete(g: &Graph) {
         "{:?}",
         g.limitations()
     );
+}
+
+fn has_diagnostic(g: &Graph, code: &str) -> bool {
+    g.analysis()
+        .values()
+        .flat_map(|analysis| &analysis.diagnostics)
+        .any(|diagnostic| diagnostic.code == code)
 }
 
 #[test]
@@ -267,6 +278,114 @@ fn plain_left_and_explicit_inner_join_conditions_are_reads_not_value_lineage() {
 }
 
 #[test]
+fn outer_join_using_lineage_follows_the_preserved_side() {
+    for (join, source) in [
+        ("LEFT JOIN", "s.orders.id"),
+        ("RIGHT JOIN", "s.customers.id"),
+        ("FULL JOIN", "both"),
+    ] {
+        let graph = scan(
+            &format!(
+                "SELECT id AS merged, o.id AS left_id, c.id AS right_id FROM orders o {join} customers c USING(id)"
+            ),
+            &["merged", "left_id", "right_id"],
+        );
+        complete(&graph);
+        assert!(
+            edge(&graph, "s.v.merged", "s.orders.id", EdgeKind::DerivesFrom)
+                == (source != "s.customers.id")
+        );
+        assert!(
+            edge(
+                &graph,
+                "s.v.merged",
+                "s.customers.id",
+                EdgeKind::DerivesFrom
+            ) == (source != "s.orders.id")
+        );
+        assert!(edge(
+            &graph,
+            "s.v.left_id",
+            "s.orders.id",
+            EdgeKind::DerivesFrom
+        ));
+        assert!(edge(
+            &graph,
+            "s.v.right_id",
+            "s.customers.id",
+            EdgeKind::DerivesFrom
+        ));
+        assert!(edge(&graph, "s.v", "s.orders.id", EdgeKind::Reads));
+        assert!(edge(&graph, "s.v", "s.customers.id", EdgeKind::Reads));
+    }
+}
+
+#[test]
+fn natural_outer_join_using_lineage_follows_the_preserved_side() {
+    for (join, source) in [
+        ("LEFT JOIN", "s.orders.id"),
+        ("RIGHT JOIN", "s.customers.id"),
+        ("FULL JOIN", "both"),
+    ] {
+        let graph = scan(
+            &format!("SELECT id AS merged FROM orders o NATURAL {join} customers c"),
+            &["merged"],
+        );
+        complete(&graph);
+        assert!(
+            edge(&graph, "s.v.merged", "s.orders.id", EdgeKind::DerivesFrom)
+                == (source != "s.customers.id")
+        );
+        assert!(
+            edge(
+                &graph,
+                "s.v.merged",
+                "s.customers.id",
+                EdgeKind::DerivesFrom
+            ) == (source != "s.orders.id")
+        );
+        assert!(edge(&graph, "s.v", "s.orders.id", EdgeKind::Reads));
+        assert!(edge(&graph, "s.v", "s.customers.id", EdgeKind::Reads));
+    }
+}
+
+#[test]
+fn sqlite_outer_join_using_keeps_joined_column_order() {
+    for (join, source) in [
+        ("LEFT JOIN", "s.orders.id"),
+        ("RIGHT JOIN", "s.customers.id"),
+        ("FULL JOIN", "both"),
+    ] {
+        let graph = scan_with_dialect(
+            &format!("SELECT * FROM orders o {join} customers c USING(id)"),
+            &["id", "customer_id", "amount", "name"],
+            "sqlite",
+        );
+        complete(&graph);
+        assert!(
+            edge(&graph, "s.v.id", "s.orders.id", EdgeKind::DerivesFrom)
+                == (source != "s.customers.id")
+        );
+        assert!(
+            edge(&graph, "s.v.id", "s.customers.id", EdgeKind::DerivesFrom)
+                == (source != "s.orders.id")
+        );
+        assert!(edge(
+            &graph,
+            "s.v.customer_id",
+            "s.orders.customer_id",
+            EdgeKind::DerivesFrom
+        ));
+        assert!(edge(
+            &graph,
+            "s.v.name",
+            "s.customers.name",
+            EdgeKind::DerivesFrom
+        ));
+    }
+}
+
+#[test]
 fn grouping_having_window_and_ordering_are_analyzed() {
     let g=scan("SELECT customer_id AS c,SUM(amount) AS total FROM orders GROUP BY customer_id HAVING SUM(amount)>0 ORDER BY total",&["c","total"]);
     complete(&g);
@@ -287,6 +406,222 @@ fn grouping_having_window_and_ordering_are_analyzed() {
         "s.v",
         "s.orders.customer_id",
         EdgeKind::Reads
+    ));
+}
+
+#[test]
+fn named_and_inherited_windows_match_inline_lineage() {
+    let inline = scan(
+        "SELECT ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY amount) AS position FROM orders",
+        &["position"],
+    );
+    let named = scan(
+        "SELECT ROW_NUMBER() OVER ranking AS position FROM orders WINDOW ranking AS (PARTITION BY customer_id ORDER BY amount)",
+        &["position"],
+    );
+    let inherited = scan(
+        "SELECT ROW_NUMBER() OVER ranking AS position FROM orders WINDOW base AS (PARTITION BY customer_id), ranking AS (base ORDER BY amount)",
+        &["position"],
+    );
+    for graph in [&inline, &named, &inherited] {
+        complete(graph);
+        assert!(edge(
+            graph,
+            "s.v.position",
+            "s.orders.customer_id",
+            EdgeKind::DerivesFrom
+        ));
+        assert!(edge(
+            graph,
+            "s.v.position",
+            "s.orders.amount",
+            EdgeKind::DerivesFrom
+        ));
+        assert!(edge(graph, "s.v", "s.orders.customer_id", EdgeKind::Reads));
+        assert!(edge(graph, "s.v", "s.orders.amount", EdgeKind::Reads));
+    }
+}
+
+#[test]
+fn named_windows_are_query_local_and_unused_definitions_do_not_contaminate_values() {
+    let unused = scan(
+        "SELECT amount AS total FROM orders WINDOW unused AS (PARTITION BY customer_id ORDER BY id)",
+        &["total"],
+    );
+    complete(&unused);
+    assert!(edge(
+        &unused,
+        "s.v.total",
+        "s.orders.amount",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &unused,
+        "s.v",
+        "s.orders.customer_id",
+        EdgeKind::Reads
+    ));
+    assert!(edge(&unused, "s.v", "s.orders.id", EdgeKind::Reads));
+
+    let shadowed = scan(
+        "SELECT (SELECT ROW_NUMBER() OVER ranking FROM orders inner_orders WINDOW ranking AS (PARTITION BY amount)) AS position FROM orders outer_orders WINDOW ranking AS (PARTITION BY customer_id)",
+        &["position"],
+    );
+    complete(&shadowed);
+    assert!(edge(
+        &shadowed,
+        "s.v.position",
+        "s.orders.amount",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!edge(
+        &shadowed,
+        "s.v.position",
+        "s.orders.customer_id",
+        EdgeKind::DerivesFrom
+    ));
+
+    let leaked = scan(
+        "SELECT (SELECT ROW_NUMBER() OVER ranking FROM orders inner_orders) AS position FROM orders outer_orders WINDOW ranking AS (PARTITION BY customer_id)",
+        &["position"],
+    );
+    assert_eq!(
+        leaked.analysis()[&VertexId::from_raw("s.v")].state,
+        AnalysisState::Partial
+    );
+    assert!(has_diagnostic(&leaked, "SG_WINDOW_UNKNOWN"));
+}
+
+#[test]
+fn invalid_named_windows_are_partial_without_guessing_sources() {
+    let unknown = scan(
+        "SELECT ROW_NUMBER() OVER missing AS position FROM orders",
+        &["position"],
+    );
+    assert_eq!(
+        unknown.analysis()[&VertexId::from_raw("s.v")].state,
+        AnalysisState::Partial
+    );
+    assert!(has_diagnostic(&unknown, "SG_WINDOW_UNKNOWN"));
+
+    let cycle = scan(
+        "SELECT ROW_NUMBER() OVER first_window AS position FROM orders WINDOW first_window AS (second_window), second_window AS (first_window)",
+        &["position"],
+    );
+    assert_eq!(
+        cycle.analysis()[&VertexId::from_raw("s.v")].state,
+        AnalysisState::Partial
+    );
+    assert!(has_diagnostic(&cycle, "SG_WINDOW_CYCLE"));
+
+    let definitions = (0..=64)
+        .map(|index| {
+            if index == 64 {
+                format!("w{index} AS (PARTITION BY id)")
+            } else {
+                format!("w{index} AS (w{})", index + 1)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let depth = scan(
+        &format!("SELECT ROW_NUMBER() OVER w0 AS position FROM orders WINDOW {definitions}"),
+        &["position"],
+    );
+    assert_eq!(
+        depth.analysis()[&VertexId::from_raw("s.v")].state,
+        AnalysisState::Partial
+    );
+    assert!(has_diagnostic(&depth, "SG_WINDOW_DEPTH"));
+}
+
+#[test]
+fn recursive_window_expressions_are_bounded_and_partial() {
+    let graph = scan(
+        "SELECT ROW_NUMBER() OVER recursive_window AS position FROM orders WINDOW recursive_window AS (PARTITION BY ROW_NUMBER() OVER recursive_window)",
+        &["position"],
+    );
+    assert_eq!(
+        graph.analysis()[&VertexId::from_raw("s.v")].state,
+        AnalysisState::Partial
+    );
+    assert!(has_diagnostic(&graph, "SG_WINDOW_CYCLE"));
+    assert!(!edge(
+        &graph,
+        "s.v.position",
+        "s.orders.customer_id",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn branching_named_windows_have_a_shared_expansion_budget() {
+    let mut definitions = vec!["w0 AS (PARTITION BY customer_id)".to_owned()];
+    for index in 1..24 {
+        let parent = index - 1;
+        definitions.push(format!(
+            "w{index} AS (PARTITION BY ROW_NUMBER() OVER w{parent} + ROW_NUMBER() OVER w{parent})"
+        ));
+    }
+    let graph = scan(
+        &format!(
+            "SELECT ROW_NUMBER() OVER w23 AS position FROM orders WINDOW {}",
+            definitions.join(", ")
+        ),
+        &["position"],
+    );
+    assert_eq!(
+        graph.analysis()[&VertexId::from_raw("s.v")].state,
+        AnalysisState::Partial
+    );
+    assert!(has_diagnostic(&graph, "SG_WINDOW_BUDGET"));
+    assert!(!edge(
+        &graph,
+        "s.v.position",
+        "s.orders.customer_id",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn named_window_diagnostics_taint_projection_lineage() {
+    let duplicate = scan(
+        "SELECT ROW_NUMBER() OVER ranking AS position FROM orders WINDOW ranking AS (PARTITION BY customer_id), ranking AS (PARTITION BY amount)",
+        &["position"],
+    );
+    assert_eq!(
+        duplicate.analysis()[&VertexId::from_raw("s.v")].state,
+        AnalysisState::Partial
+    );
+    assert!(has_diagnostic(&duplicate, "SG_WINDOW_DUPLICATE"));
+    assert!(!edge(
+        &duplicate,
+        "s.v.position",
+        "s.orders.customer_id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!edge(
+        &duplicate,
+        "s.v.position",
+        "s.orders.amount",
+        EdgeKind::DerivesFrom
+    ));
+
+    let unknown = scan(
+        "SELECT ROW_NUMBER() OVER missing AS position FROM orders",
+        &["position"],
+    );
+    let diagnostic = unknown.analysis()[&VertexId::from_raw("s.v")]
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "SG_WINDOW_UNKNOWN")
+        .expect("unknown window diagnostic");
+    assert!(diagnostic.location.is_some());
+    assert!(!edge(
+        &unknown,
+        "s.v.position",
+        "s.orders.customer_id",
+        EdgeKind::DerivesFrom
     ));
 }
 

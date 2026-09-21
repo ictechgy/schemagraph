@@ -72,12 +72,20 @@ jobs:
             cmp "engine/source/src/sql/catalog-$dialect.sql" "probe-go/sql/catalog-$dialect.sql"
           done
           python3 -m venv "$RUNNER_TEMP/jsonschema-venv"
-          "$RUNNER_TEMP/jsonschema-venv/bin/pip" install --disable-pip-version-check --no-input 'jsonschema==4.23.0'
+          "$RUNNER_TEMP/jsonschema-venv/bin/pip" install --disable-pip-version-check --no-input 'jsonschema==4.23.0' 'sqlglot==30.18.0'
           "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-contracts.py \
             --engine engine/target/debug/schemagraph
           python3 Scripts/verify-competitive.py --engine engine/target/debug/schemagraph
           python3 Scripts/verify-html.py --engine engine/target/debug/schemagraph \
             --screenshot "$RUNNER_TEMP/html-smoke.png"
+
+      - name: Measure public schema accuracy against independent references
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+        run: |
+          "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-accuracy.py \
+            --engine engine/target/debug/schemagraph --sqlglot --strict \
+            --output "$RUNNER_TEMP/accuracy.json"
 
       - name: Check bundled documents and licenses
         run: |
@@ -171,5 +179,6 @@ jobs:
           path: |
             ${{ runner.temp }}/fixture-artifacts/*.graph.json
             ${{ runner.temp }}/html-smoke.png
+            ${{ runner.temp }}/accuracy.json
           if-no-files-found: ignore
           retention-days: 7

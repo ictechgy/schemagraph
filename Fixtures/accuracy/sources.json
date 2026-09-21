@@ -1,0 +1,28 @@
+{
+  "datasets": [
+    {
+      "commit": "fef9675714cfba1756df4719b5e36075a7ddf90e",
+      "file": "pagila/schema.sql",
+      "license_file": "pagila/LICENSE.txt",
+      "license_sha256": "516e7dac679ac1eeb62d5614b01c4e7318154e9a147377d6264954215997ff38",
+      "name": "pagila",
+      "release": "pagila-v3.1.0",
+      "sha256": "8ce358e4c8014087b85296694a0893887bd7a4190e3ce407f2721b86b98e5707",
+      "transformation": "none; schema only, no data dump",
+      "upstream_sha256": "8ce358e4c8014087b85296694a0893887bd7a4190e3ce407f2721b86b98e5707",
+      "url": "https://raw.githubusercontent.com/devrimgunduz/pagila/fef9675714cfba1756df4719b5e36075a7ddf90e/pagila-schema.sql"
+    },
+    {
+      "commit": "4a944a942426e1f3263fe539155fb7ef92b04b4a",
+      "file": "chinook/schema.sql",
+      "license_file": "chinook/LICENSE.md",
+      "license_sha256": "5064d720db431474b0a0b0cef9d2b5e362b6c6f80602b35c6443b07cbc979f77",
+      "name": "chinook",
+      "release": "v1.4.5",
+      "sha256": "a664abb61eedc9d99a3f4492e3be62e18b08231ed37cb7bd7442b8ae92fbc7b4",
+      "transformation": "strip UTF-8 BOM; normalize CRLF to LF; retain the prefix before Populate Tables; no INSERT statements",
+      "upstream_sha256": "fdcb271b3e9c840216b09168752bddca973ed3917b40e49b603b15831114aea1",
+      "url": "https://raw.githubusercontent.com/lerocha/chinook-database/4a944a942426e1f3263fe539155fb7ef92b04b4a/ChinookDatabase/DataSources/Chinook_Sqlite.sql"
+    }
+  ]
+}

@@ -16,6 +16,8 @@ as Mermaid, Graphviz DOT, and a standalone offline HTML explorer.
 Column lineage, structured diagnostics, evidence paths, retention policies, and
 catalog change reviews are described in [the analysis guide](ANALYSIS.md).
 See [installation and CI examples](INSTALLATION.md) for release artifacts.
+The [accuracy corpus](ACCURACY.md) checks public PostgreSQL/SQLite schemas
+against database dependency records and independently reviewed SQL cases.
 
 ## Quick start
 

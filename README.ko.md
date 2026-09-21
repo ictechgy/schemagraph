@@ -13,6 +13,8 @@ schemagraph는 데이터베이스 스키마의 의존성 그래프를 만들어 
 JSON을 출력하며, Mermaid·Graphviz DOT와 오프라인 HTML 탐색기도 지원합니다.
 컬럼 계보·진단·경로·보존 정책·변경 검토의 상세 사용법은 영어 정본인
 [분석 가이드](ANALYSIS.md), 설치와 CI 예제는 [설치 안내](INSTALLATION.md)를 참고하세요.
+[정확도 평가](ACCURACY.md)는 공개 PostgreSQL·SQLite 스키마를 DB의 참조 기록과
+독립적으로 검토한 SQL 기대값에 대조합니다.
 
 ## 빠른 시작
 

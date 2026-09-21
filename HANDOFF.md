@@ -4,6 +4,38 @@
 
 ## 지금 상태
 
+- 2026-09-21: **공개 PostgreSQL·SQLite 정확도 평가와 발견한 파서 오류 수정 완료**
+  (`feature/accuracy-corpus`, 런타임 수정 `ad0e720`). 사용자가 공개 샘플 사용과
+  불필요 산출물 정리를 요청했다. [ACCURACY.md](ACCURACY.md)가 영어 정본이다.
+  - Pagila v3.1.0·Chinook v1.4.5의 commit·SHA-256·라이선스를 고정했다.
+    데이터 행은 보관하지 않으며 수동 검토 SQL 27개와 원본 뷰 8개를 실DB에 적용한다.
+    수동 읽기 144개·값 계보 66개와 PostgreSQL 카탈로그 참조 202개를 별도로 대조한다.
+    DB가 USING 구문을 재작성해 오류를 숨기지 않도록, 작성한 사례는 실제 DB 출력
+    컬럼과 원래 SQL을 조합한 동일 document를 공개 0.4.0·수정본·SQLGlot에 준다.
+  - LEFT/RIGHT USING·NATURAL의 보존 측 값 계보, 이름 있는/상속된 WINDOW의
+    partition/order 계보를 수정했다. 양쪽 조인 키의 읽기 의존성은 유지한다.
+    잘못된 윈도 정의·순환·깊이·전체 확장 한계는 진단하고 출력 계보를 생략한다.
+    소스 빌드는 아직 0.4.0으로 표시되며 공개 0.4.0 바이너리는 바뀌지 않았다.
+  - 값 계보는 기존 62/66 정답·오탐 4·누락 4에서 66/66·오탐/누락 0으로,
+    잘못된 complete 사례는 6→0으로 바뀌었다. SQLGlot 30.18.0의 선택적 비교기는
+    61/66·오탐 5·누락 5였다. 독립 기대값을 쓰며 상대 도구 출력은 정답이 아니다.
+    비교기 범위·UNKNOWN 타입·LATERAL 미해석 출처와 표본 편향을 문서화했다.
+    원본 Pagila 뷰 3개는 custom aggregate 미수집으로 여전히 partial이다.
+  - 로컬 Rust 244개 테스트·공개 코퍼스 strict·기존 버전의 strict 실패를 확인했다.
+    [PR #3](https://github.com/ictechgy/schemagraph/pull/3)의 검사 소스는 `e1a6452`이며,
+    [일반 CI·전체 DB fixture](https://github.com/ictechgy/schemagraph/actions/runs/35550571482),
+    [Db2·Informix](https://github.com/ictechgy/schemagraph/actions/runs/35550571493),
+    [Linux·macOS·JVM 빌드 및 실행](https://github.com/ictechgy/schemagraph/actions/runs/35550571497)을
+    통과했다. CI의 정확도 report도 내려받아 66·144·202개 기대 간선 일치를 확인했다.
+    push/PR 중복 실행 중 취소된 push 작업은 실패 검증으로 세지 않는다.
+    임시 DB·그래프는 검사 종료 시 자동 정리하고, 중복 빌드 디렉터리 4개
+    (4,256,976,896 bytes)는 `~/.Trash/schemagraph-duplicate-builds-*`로 옮겼다.
+    휴지통을 비우기 전까지 디스크 여유 공간이 늘었다고 해석하면 안 된다.
+    평가 원본 다운로드·비교 가상환경·중복 로그 약 22MB도 별도 휴지통 폴더로 옮겼다.
+    전체 비교 결과·Rust 테스트 기록·CI 검증 요약 3개는 저장소 밖
+    `~/Library/Application Support/schemagraph/verification/accuracy-20260921`에 보관했다.
+    이 완료 기록만 갱신할 때는 위 검사 소스와의 동일성을 확인하고 실행 검증을 재사용한다.
+
 - 2026-09-21: **v0.4.0 경쟁 조사 후속 구현·공개 배포 완료**.
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.0) ·
   [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.4.0) ·
@@ -461,7 +493,8 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 
 요청한 성능·메모리 개선, Db2·Informix 특화 지원, 공개 Maven 배포를 완료했다.
 추가 요청된 Maven Central 게시도 실제 익명 설치까지 검증했다.
-필수 후속 작업은 없다. 서명키와 토큰은 다음 릴리스에서도 기존 설정을 재사용한다.
+공개 정확도 평가 후속은 위 최신 기록을 참고한다. 서명키와 토큰은 다음 릴리스에서도
+기존 설정을 재사용한다. 이번 파서 수정은 공개 0.4.0 이후 변경이며 새 릴리스는 아직 없다.
 
 ## 의도적으로 남긴 경계
 
