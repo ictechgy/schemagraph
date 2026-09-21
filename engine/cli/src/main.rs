@@ -4,6 +4,7 @@
 //! - 0: 성공 (또는 보고할 것이 없음)
 //! - 1: 질의가 발견을 보고함(--strict 시) 또는 대상을 못 찾음(notFound)
 //! - 2: 사용법·엔진 오류 (잘못된 URL, 파일 없음, 파싱 불가)
+//! - 130: Ctrl+C로 질의·경로·검토 작업을 취소함
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -16,6 +17,7 @@ use std::io::{BufReader, BufWriter, Seek, Write};
 use std::path::PathBuf;
 
 mod cache;
+mod cancellation;
 mod mcp;
 mod merge;
 mod policy;
@@ -295,7 +297,7 @@ async fn main() {
             2
         }
     };
-    std::process::exit(code);
+    std::process::exit(cancellation::exit_code(code));
 }
 
 async fn run(cli: Cli) -> Result<i32> {
@@ -416,7 +418,7 @@ async fn run(cli: Cli) -> Result<i32> {
         ),
         Command::Serve { graph } => {
             let graph = load_graph(&graph)?;
-            mcp::serve(&graph, std::io::stdin().lock(), std::io::stdout().lock())?;
+            mcp::serve(&graph, BufReader::new(std::io::stdin()), std::io::stdout())?;
             Ok(0)
         }
         Command::Merge { documents, output } => {
@@ -636,6 +638,7 @@ fn query(
     max_visited: usize,
     max_examined_edges: usize,
 ) -> Result<i32> {
+    let cancel = cancellation::install()?;
     let graph = load_graph(path)?;
     match analysis::resolve(&graph, name) {
         Resolve::Found(id) => {
@@ -643,8 +646,10 @@ fn query(
                 max_visited,
                 max_examined_edges,
             };
-            let dependents = analysis::budget::walk(&graph, &id, depth, max, true, budget, None);
-            let dependencies = analysis::budget::walk(&graph, &id, depth, max, false, budget, None);
+            let dependents =
+                analysis::budget::walk(&graph, &id, depth, max, true, budget, Some(cancel));
+            let dependencies =
+                analysis::budget::walk(&graph, &id, depth, max, false, budget, Some(cancel));
             let mut self_edges: Vec<_> = graph
                 .outgoing(&id)
                 .iter()
@@ -682,6 +687,7 @@ fn impact(
     max_visited: usize,
     max_examined_edges: usize,
 ) -> Result<i32> {
+    let cancel = cancellation::install()?;
     let graph = load_graph(path)?;
     match analysis::resolve(&graph, name) {
         Resolve::Found(id) => {
@@ -695,7 +701,7 @@ fn impact(
                     max_visited,
                     max_examined_edges,
                 },
-                None,
+                Some(cancel),
             );
             let value = export::budgeted_impact_to_value(
                 graph
@@ -790,6 +796,7 @@ fn path_report(
     to: &str,
     options: analysis::paths::SearchOptions,
 ) -> Result<i32> {
+    let cancel = cancellation::install()?;
     let graph = load_graph(path)?;
     let mut endpoints = Vec::new();
     for name in [from, to] {
@@ -808,7 +815,8 @@ fn path_report(
             }
         }
     }
-    let report = analysis::paths::paths(&graph, &endpoints[0], &endpoints[1], options, None);
+    let report =
+        analysis::paths::paths(&graph, &endpoints[0], &endpoints[1], options, Some(cancel));
     println!(
         "{}",
         serde_json::to_string_pretty(&export::explain::path_value(&report))?
