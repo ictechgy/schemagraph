@@ -10,8 +10,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-schemagraph-core = { path = "../core", version = "0.4.0" }
-schemagraph-source = { path = "../source", version = "0.4.0" }
+schemagraph-core = { path = "../core", version = "0.4.1" }
+schemagraph-source = { path = "../source", version = "0.4.1" }
 sqlparser = { version = "0.58", features = ["visitor"] }
 sha2 = "0.10.9"
 

@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--site-dir", type=pathlib.Path)
     parser.add_argument("--group", default="io.github.ictechgy")
     parser.add_argument("--artifact", default="schemagraph-probe")
-    parser.add_argument("--version", default="0.4.0")
+    parser.add_argument("--version", default="0.4.1")
     parser.add_argument(
         "--existing-base-url",
         default="https://ictechgy.github.io/schemagraph/maven/",
