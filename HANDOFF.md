@@ -4,7 +4,13 @@
 
 ## 지금 상태
 
-- 2026-09-21: **v0.4.1 준비 — PostgreSQL 집계·추가 정확도 검증·공개 배포 진행 중**.
+- 2026-09-21: **v0.4.1 — PostgreSQL 집계·추가 정확도 검증·공개 배포 완료**.
+  [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.1) ·
+  [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.4.1) ·
+  [Maven Central](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.4.1).
+  [PR #4](https://github.com/ictechgy/schemagraph/pull/4)를 병합했으며,
+  릴리스 소스·태그·6개 crate의 내장 소스 커밋은
+  `0b0b106d7a99d19ddb0fad0f45020a9163c67084`다.
   사용자가 집계 수집 보강 → 별도 표본 검증 → v0.4.1 배포를 승인했다.
   `feature/postgres-aggregates-v0.4.1`에서 네이티브·Go·JDBC의 집계/window 수집을
   기존 function kind로 맞추고 선택적 pg_depend에서 집계→사용자 support 함수 참조를
@@ -20,7 +26,24 @@
     [ACCURACY.md](ACCURACY.md)에 첫 결과·변경 후 결과·SQLGlot 비교를 분리했다.
   - 로컬 Rust 246개 테스트, aggregate 실제 실행·overload 오귀속 방지,
     named 인자/window 수집, native/Go/JDBC catalog v1/v2 JSON/NDJSON을 통과했다.
-    CI·배포·공개 소비자 검증은 다음 단계다. 시크릿/서명키 설정은 그대로 재사용한다.
+    [릴리스 소스 CI](https://github.com/ictechgy/schemagraph/actions/runs/35554495537)·
+    [IBM 실DB](https://github.com/ictechgy/schemagraph/actions/runs/35554495623)도 통과했다.
+  - [Linux/macOS 바이너리·독립 JAR](https://github.com/ictechgy/schemagraph/actions/runs/35554497467),
+    [Pages Maven](https://github.com/ictechgy/schemagraph/actions/runs/35554495606),
+    [Central 게시](https://github.com/ictechgy/schemagraph/actions/runs/35554646611)를 완료했다.
+    Central deployment `1efbd3e6-6243-4d31-be63-18d46cc3c0e1`은 PUBLISHED다.
+    6개 crate의 레지스트리 체크섬·로컬 게시 바이트·소스 커밋이 일치한다.
+    crates.io 별도 설치본으로 정확도 전체·CLI 회귀를 통과했다.
+    Central의 5개 payload는 체크섬·기존 PGP 키 서명·Pages 바이트가 일치하고,
+    all JAR은 GitHub 릴리스와도 같다. 빈 Gradle 캐시의 Central-only 소비자가
+    실제 프로브로 H2 테이블·컬럼·PK를 수집했다. 공개 macOS CLI·Go와 Central JAR로
+    aggregate fixture의 모든 전송 조합 및 정확도 전체를 재검증했다.
+  - 임시 DB·다운로드·소비자·공개키 검증용 keyring은 검사 후 자동 정리했다.
+    게시용 중복 빌드와 비교 도구 2,214,993,920 bytes는 휴지통으로 옮겼다.
+    원래 서명키·토큰 설정은 재사용했으며 비밀키 백업을 읽거나 바꾸지 않았다.
+    첫 평가·최종 비교·체크섬·소비자·검증 근거는 저장소 밖
+    `~/Library/Application Support/schemagraph/verification/v0.4.1-20260921`에 보관했다.
+    이 뒤의 완료 기록은 문서만 바꾸고 위 실행 검증을 재사용한다.
 
 - 2026-09-21: **공개 PostgreSQL·SQLite 정확도 평가와 발견한 파서 오류 수정 완료**
   (`feature/accuracy-corpus`, 런타임 수정 `ad0e720`). 사용자가 공개 샘플 사용과
@@ -511,8 +534,9 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 
 요청한 성능·메모리 개선, Db2·Informix 특화 지원, 공개 Maven 배포를 완료했다.
 추가 요청된 Maven Central 게시도 실제 익명 설치까지 검증했다.
-공개 정확도 평가 후속은 위 최신 기록을 참고한다. 서명키와 토큰은 다음 릴리스에서도
-기존 설정을 재사용한다. 이번 파서 수정은 공개 0.4.0 이후 변경이며 새 릴리스는 아직 없다.
+공개 정확도 평가 후속과 v0.4.1 배포·설치 검증도 완료했다. 서명키와 토큰은
+다음 릴리스에서도 기존 설정을 재사용한다. 선택적 다음 과제는 CLI/MCP의 실행 중
+요청 취소, 다른 DB·실사용 SQL 표본 확대다. 이번 승인 범위에 미완료 배포는 없다.
 
 ## 의도적으로 남긴 경계
 
