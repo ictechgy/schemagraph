@@ -4,6 +4,28 @@
 
 ## 지금 상태
 
+- 2026-09-21: **MySQL·MariaDB 공개 표본 정확도 평가·CI 추가**
+  (`feature/mysql-accuracy`). v0.4.2 이후 사용자가 승인한 후속 평가다.
+  Chinook v1.4.5 MySQL DDL·라이선스·체크섬과 공식 DB 이미지 digest를 고정했다.
+  별도로 작성한 SQL 16개는 두 DB에서 유효성을 확인하고, 엔진 출력 확인 전에
+  `8df2996`에서 기대값을 고정했다. MariaDB가 거부한 ROW_NUMBER 프레임은
+  SQL 검증 단계에서 분리했으며, 기대 의존성은 바꾸지 않았다.
+  - 공개 v0.4.2 첫 평가에서 MySQL 8.4.11·MariaDB 11.4.13 모두 원본/DB 정규화
+    SQL 각각 값 계보 53개·읽기 91개가 일치했다. 오탐·누락·잘못된 complete·
+    유령 정점은 0이다. 같은 16개 SQL의 반복 검증이며 엔진 수정은 없었다.
+    MySQL의 VIEW_TABLE_USAGE 관계 참조 26개도 일치했다. MariaDB에는 해당
+    테이블이 없음을 확인하고 미검증 범위로 기록한다.
+  - SQLGlot 30.18.0 비교기는 원본 SQL 47/53·오탐 3·누락 6이었다. DB 정규화
+    SQL에서는 MySQL 49/53·오탐 1·누락 4, MariaDB 53/53·오탐 1·누락 0이다.
+    MySQL dialect·UNKNOWN 타입을 쓰는 어댑터 범위와 EXCEPT 값 계보 정책 등
+    차이를 [ACCURACY.md](ACCURACY.md)에 명시했다. 제품 전체 정확도 순위가 아니다.
+  - `Scripts/verify-mysql-accuracy.py`는 DB를 순차 실행하고 메모리를 1GiB로
+    제한한다. 전용 label이 있는 컨테이너만 정리하며 타 프로젝트 DB는 건드리지 않는다.
+    틀린 기대값의 strict 실패·잘못된 SQL의 분석 전 차단·실패 뒤 정리를 검증했다.
+    actionlint·Python 구문·문서 참조·원본 체크섬을 확인했다. CI가 두 DB를 검사하고
+    `mysql-accuracy.json`을 기존 정확도 report와 함께 보관하도록 추가했다.
+    이번 변경은 평가·CI·문서이며 공개 v0.4.2 런타임 바이트를 바꾸지 않는다.
+
 - 2026-09-21: **v0.4.2 취소 지원 공개 배포·설치 검증 완료**.
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.2) ·
   [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.4.2) ·
@@ -590,8 +612,9 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 추가 요청된 Maven Central 게시도 실제 익명 설치까지 검증했다.
 공개 정확도 평가 후속과 v0.4.1 배포·설치 검증도 완료했다. 서명키와 토큰은
 다음 릴리스에서도 기존 설정을 재사용한다. CLI/MCP 요청 취소도 v0.4.2 배포와 공개
-설치본 검증까지 완료했다. 승인된 릴리스 작업에 미완료 항목은 없다. 선택적 후속 과제는
-다른 DB·실사용 SQL 표본 확대, 대규모 그래프의 메모리·탐색 성능 검증이다.
+설치본 검증까지 완료했다. 승인된 릴리스 작업에 미완료 항목은 없다. 이후 승인된
+MySQL·MariaDB 공개 표본 평가도 위와 같이 추가했다. 선택적 후속 과제는 나머지 DB·
+실사용 SQL 표본 확대, 대규모 그래프의 메모리·탐색 성능 검증이다.
 
 ## 의도적으로 남긴 경계
 

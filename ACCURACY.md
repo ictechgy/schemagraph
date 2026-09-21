@@ -11,15 +11,18 @@ SQLGlot comparison.
   `pagila-v3.1.0`: the complete schema dump, including eight original views and
   materialized views. This version works with the PostgreSQL 16 fixture tools.
 - [Chinook](https://github.com/lerocha/chinook-database/tree/4a944a942426e1f3263fe539155fb7ef92b04b4a),
-  `v1.4.5`: SQLite DDL and indexes. Row inserts are omitted, the UTF-8 BOM is
-  removed, and line endings are normalized.
+  `v1.4.5`: SQLite and MySQL DDL and indexes. Row inserts are omitted, the UTF-8
+  BOM is removed, and line endings are normalized. The MySQL copy also omits
+  database creation, deletion, and selection statements; the runner owns a fresh
+  `chinook` database.
 
 Pinned commits, upstream URLs, transformations, and SHA-256 digests are in
 [sources.json](Fixtures/accuracy/sources.json). Upstream license notices are
-preserved beside each schema. Tests verify the checked-in schema digests and
-perform no downloads.
+preserved beside each schema. Tests verify the checked-in schema digests; no
+schema downloads are needed. The MySQL/MariaDB runner pulls pinned official
+Docker images if they are not already cached.
 
-There are two reference methods:
+There are three reference methods:
 
 1. PostgreSQL's `pg_depend` records independently check direct relation and
    column reads for every view in the corpus. Routine calls, types, and
@@ -27,8 +30,15 @@ There are two reference methods:
    do not describe which output column receives a value.
 2. Reviewed reporting queries have explicit read sets and output-column source
    sets in [Chinook cases](Fixtures/accuracy/chinook-cases.json) and
-   [Pagila cases](Fixtures/accuracy/pagila-cases.json). Join/filter/group/order
-   references remain reads even when they are not output value sources.
+   [Pagila cases](Fixtures/accuracy/pagila-cases.json), plus the separate
+   [MySQL/MariaDB cases](Fixtures/accuracy/chinook-mysql-cases.json).
+   Join/filter/group/order references remain reads even when they are not output
+   value sources.
+3. MySQL's [`INFORMATION_SCHEMA.VIEW_TABLE_USAGE`](https://dev.mysql.com/doc/refman/8.4/en/information-schema-view-table-usage-table.html)
+   independently checks relation reads, queried as the temporary database
+   administrator to avoid privilege filtering. It supplies neither column reads
+   nor output lineage. The runner checks whether the table exists and records its
+   absence on MariaDB 11.4.13; it does not count that as an empty reference set.
 
 Every reviewed query is accepted by its actual database as a view. For these
 queries, the database supplies the output-column metadata and the original SQL
@@ -151,6 +161,60 @@ See [the catalog contract](CATALOG.md) for JDBC identity compatibility details a
 [PostgreSQL's aggregate catalog](https://www.postgresql.org/docs/16/catalog-pg-aggregate.html)
 for the underlying support-function metadata.
 
+## MySQL and MariaDB validation
+
+Sixteen additional queries were written against the pinned Chinook MySQL schema,
+accepted by both databases, and frozen at
+[`8df2996`](https://github.com/ictechgy/schemagraph/commit/8df2996)
+before any analyzer output was inspected. Database validation caught one SQL
+portability issue: MariaDB rejected a frame on `ROW_NUMBER`. The final query uses
+an unframed named window for ranking and a framed named window for `AVG`; its
+expected dependencies did not change. This was a fixture correction before
+evaluation, not an engine defect.
+
+On 2026-09-21, the published **schemagraph-cli 0.4.2** passed all 16 cases on both
+MySQL 8.4.11 and MariaDB 11.4.13. Each database is scored twice: once with the
+original SQL and once with its native catalog definitions. All four runs matched
+53 value-lineage pairs and 91 reviewed reads, with no unexpected edges, missing
+edges, incorrect analysis states, or phantom endpoints. MySQL's independent
+catalog reference also matched all 26 relation reads in each mode. These are
+repeated checks of the same 16 definitions, not 64 distinct queries; overlapping
+read categories are not added together. No engine changes were needed.
+
+The cases cover mixed-case quoted columns and aliases, aggregate aliases,
+`IF`/`IFNULL`/`CASE`, correlated queries, chained CTEs, derived wildcards,
+ordered `GROUP_CONCAT`, set operations, outer `USING`/`NATURAL` joins, and named
+and inline windows. They do not cover stored routines, triggers, dynamic SQL,
+other SQL modes, `lower_case_table_names` settings, or production distributions.
+They now form a regression set, not a general product-accuracy estimate.
+
+The optional SQLGlot 30.18.0 adapter produced these value-lineage results on the
+same catalog inventory and SQL:
+
+| Input | Correct pairs | Unexpected | Missing |
+| --- | ---: | ---: | ---: |
+| Original SQL, either server | 47/53 | 3 | 6 |
+| MySQL native definitions | 49/53 | 1 | 4 |
+| MariaDB native definitions | 53/53 | 1 | 0 |
+
+The adapter uses SQLGlot's MySQL dialect for both servers and passes `UNKNOWN`
+types. Differences include unresolved mixed-case quoted columns, named-window
+sources, merged outer-join keys, and the project's left-only value-source policy
+for `EXCEPT`. The different native-definition scores show why server-normalized
+SQL is scored separately. The reports retain adapter errors. These numbers
+compare this API adapter and the project's lineage policy; they are not a product
+ranking.
+
+[`mysql-environments.json`](Fixtures/accuracy/mysql-environments.json) pins
+official image digests and the explicit SQL mode
+`ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION`. Reports record
+the server version, SQL mode, `lower_case_table_names` (0 in these runs), database
+character set, image identity, case digest, and executable identity. The runner
+starts the two databases sequentially, each with a 1 GiB memory cap and a random
+loopback port. It uses no existing database or mounted host directory and checks
+its ownership label before removing its containers and anonymous volumes.
+Only the requested report persists after successful or failed checks.
+
 ## Reproduce
 
 ```sh
@@ -169,6 +233,24 @@ versions and SHA-256 digests.
 Use `--suite regression` (the default) or `--suite validation` to score the cohorts
 separately. `--suite all` is used in CI.
 
+With Docker running, evaluate MySQL and MariaDB separately from the PostgreSQL/
+SQLite runner:
+
+```sh
+python3 Scripts/verify-mysql-accuracy.py \
+  --engine engine/target/debug/schemagraph --strict \
+  --output engine/target/accuracy/mysql-current.json
+```
+
+Use `--database mysql` or `--database mariadb` to select one server. `--validate-only`
+requires no analyzer and rejects SQL that the selected database does not accept.
+`--baseline /path/to/schemagraph-0.4.2` scores a second parser against the same
+current collector catalog. `--strict` fails on database validation, reviewed
+read/lineage or analysis-state mismatches, phantom endpoints, and available
+catalog-reference mismatches. Missing Docker or a failed database startup fails
+the command. CI runs both servers and preserves `mysql-accuracy.json` alongside
+the existing PostgreSQL/SQLite report.
+
 To compare the supported value-lineage cases using SQLGlot's documented
 [lineage API](https://sqlglot.com/sqlglot/lineage.html):
 
@@ -183,3 +265,6 @@ engine/target/accuracy/tools/bin/python Scripts/verify-accuracy.py \
 SQLGlot is a development comparison dependency. It is not part of the Rust
 engine or either probe. The corpus has no row data, so it does not verify
 data-dependent dynamic SQL or runtime query performance.
+The same comparison environment can run `Scripts/verify-mysql-accuracy.py`
+with `--sqlglot`; comparator differences do not change the independent expected
+facts or fail the schemagraph regression gate.

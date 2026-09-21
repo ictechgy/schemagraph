@@ -88,6 +88,12 @@ jobs:
             --engine engine/target/debug/schemagraph --sqlglot --suite all --strict \
             --output "$RUNNER_TEMP/accuracy.json"
 
+      - name: Measure MySQL and MariaDB public schema accuracy
+        run: |
+          "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-mysql-accuracy.py \
+            --engine engine/target/debug/schemagraph --sqlglot --strict \
+            --output "$RUNNER_TEMP/mysql-accuracy.json"
+
       - name: Check bundled documents and licenses
         run: |
           cmp skills/schemagraph/SKILL.md engine/cli/SKILL.md
@@ -181,5 +187,6 @@ jobs:
             ${{ runner.temp }}/fixture-artifacts/*.graph.json
             ${{ runner.temp }}/html-smoke.png
             ${{ runner.temp }}/accuracy.json
+            ${{ runner.temp }}/mysql-accuracy.json
           if-no-files-found: ignore
           retention-days: 7
