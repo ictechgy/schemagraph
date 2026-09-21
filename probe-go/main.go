@@ -194,6 +194,7 @@ func ns(s sql.NullString) *string {
 func main() {
 	var (
 		rawURL              = flag.String("url", "", "sqlite:, postgres://, mysql://, oracle://, sqlserver://")
+		urlEnv              = flag.String("url-env", "", "environment variable containing the complete database URL")
 		schemaArg           = flag.String("schema", "", "comma-separated schema allowlist (default: non-system schemas)")
 		output              = flag.String("o", "catalog.json", "output path ('-' for stdout)")
 		format              = flag.String("format", "json", "json | ndjson")
@@ -211,8 +212,9 @@ func main() {
 	if sourceIDProvided && !validSourceID(*sourceID) {
 		fatal("invalid source label", fmt.Errorf("use a logical label, not a connection URL"))
 	}
-	if *rawURL == "" {
-		fatal("connection URL is required", fmt.Errorf("set --url to a supported database URL"))
+	connectionURL, err := resolveConnectionURL(*rawURL, *urlEnv, os.LookupEnv)
+	if err != nil {
+		fatal("invalid connection URL input", err)
 	}
 	if err := validateDocumentVersion(*wireVersion); err != nil {
 		fatal("invalid document version", err)
@@ -220,7 +222,7 @@ func main() {
 	if *format != "json" && *format != "ndjson" {
 		fatal("invalid output format", fmt.Errorf("choose json or ndjson"))
 	}
-	spec, err := parseConnection(*rawURL)
+	spec, err := parseConnection(connectionURL)
 	if err != nil {
 		fatal("invalid connection settings", err)
 	}
