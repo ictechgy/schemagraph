@@ -24,7 +24,7 @@ against database dependency records and independently reviewed SQL cases.
 Install the CLI with Rust and Cargo:
 
 ```sh
-cargo install schemagraph-cli --version 0.4.0 --locked
+cargo install schemagraph-cli --version 0.4.1 --locked
 ```
 
 ### Build from source

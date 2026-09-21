@@ -1,0 +1,269 @@
+{
+  "cases": [
+    {
+      "lineage": {
+        "billed_tracks": [
+          "main.InvoiceLine.TrackId"
+        ],
+        "bulk_revenue": [
+          "main.InvoiceLine.Quantity",
+          "main.InvoiceLine.UnitPrice"
+        ],
+        "country": [
+          "main.Customer.Country"
+        ],
+        "customer_id": [
+          "main.Invoice.CustomerId"
+        ]
+      },
+      "name": "chinook_validation_nested_invoice_lines",
+      "reads": [
+        "main.Customer",
+        "main.Customer.Country",
+        "main.Customer.CustomerId",
+        "main.Invoice",
+        "main.Invoice.CustomerId",
+        "main.Invoice.InvoiceId",
+        "main.InvoiceLine",
+        "main.InvoiceLine.InvoiceId",
+        "main.InvoiceLine.Quantity",
+        "main.InvoiceLine.TrackId",
+        "main.InvoiceLine.UnitPrice"
+      ],
+      "reason": "Carries invoice lines through two CTE and derived-table scopes before grouping customer totals; join, grouping, filter, and aggregate inputs remain reads.",
+      "sql": "WITH invoice_lines AS (SELECT il.InvoiceId AS invoice_id, il.TrackId AS track_id, CASE WHEN il.Quantity >= 2 THEN il.UnitPrice * il.Quantity ELSE 0 END AS billed_amount FROM InvoiceLine AS il), customer_lines AS (SELECT i.CustomerId AS customer_id, c.Country AS country, l.track_id, l.billed_amount FROM Invoice AS i JOIN invoice_lines AS l ON l.invoice_id = i.InvoiceId JOIN Customer AS c ON c.CustomerId = i.CustomerId) SELECT customer_id, country, SUM(billed_amount) AS bulk_revenue, COUNT(track_id) AS billed_tracks FROM (SELECT customer_id, country, track_id, billed_amount FROM customer_lines) AS report GROUP BY customer_id, country HAVING SUM(billed_amount) > 0 ORDER BY bulk_revenue DESC, country",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "cte",
+        "derived",
+        "nested"
+      ]
+    },
+    {
+      "lineage": {
+        "billing_status": [
+          "main.Invoice.InvoiceId"
+        ],
+        "customer_id": [
+          "main.Customer.CustomerId"
+        ],
+        "display_name": [
+          "main.Customer.Company",
+          "main.Customer.FirstName",
+          "main.Customer.LastName"
+        ]
+      },
+      "name": "chinook_validation_customer_labels",
+      "reads": [
+        "main.Customer",
+        "main.Customer.Company",
+        "main.Customer.Country",
+        "main.Customer.CustomerId",
+        "main.Customer.FirstName",
+        "main.Customer.LastName",
+        "main.Invoice",
+        "main.Invoice.CustomerId",
+        "main.Invoice.InvoiceId"
+      ],
+      "reason": "Builds a display label with COALESCE and classifies left-joined customers with CASE while preserving join and filter columns as reads.",
+      "sql": "SELECT c.CustomerId AS customer_id, COALESCE(c.Company, c.FirstName || ' ' || c.LastName) AS display_name, CASE WHEN i.InvoiceId IS NULL THEN 'none' ELSE 'invoiced' END AS billing_status FROM Customer AS c LEFT JOIN Invoice AS i ON i.CustomerId = c.CustomerId WHERE c.Country IS NOT NULL ORDER BY display_name",
+      "state": "complete",
+      "tags": [
+        "case",
+        "coalesce",
+        "join",
+        "outer-join"
+      ]
+    },
+    {
+      "lineage": {
+        "track_id": [
+          "main.PlaylistTrack.TrackId",
+          "main.Track.TrackId"
+        ]
+      },
+      "name": "chinook_validation_intersect_playlist_tracks",
+      "reads": [
+        "main.PlaylistTrack",
+        "main.PlaylistTrack.TrackId",
+        "main.Track",
+        "main.Track.GenreId",
+        "main.Track.TrackId"
+      ],
+      "reason": "Intersects genre-selected catalog tracks with playlist membership, so both set-operation output sources and the genre predicate are dependencies.",
+      "sql": "SELECT t.TrackId AS track_id FROM Track AS t WHERE t.GenreId IN (1, 3, 13) INTERSECT SELECT pt.TrackId AS track_id FROM PlaylistTrack AS pt",
+      "state": "complete",
+      "tags": [
+        "intersect",
+        "set-operation"
+      ]
+    },
+    {
+      "lineage": {
+        "genre_name": [
+          "main.Genre.Name"
+        ],
+        "media_type": [
+          "main.MediaType.Name"
+        ],
+        "premium_value": [
+          "main.Track.UnitPrice"
+        ],
+        "track_count": [
+          "main.Track.TrackId"
+        ]
+      },
+      "name": "chinook_validation_genre_media_summary",
+      "reads": [
+        "main.Genre",
+        "main.Genre.GenreId",
+        "main.Genre.Name",
+        "main.MediaType",
+        "main.MediaType.MediaTypeId",
+        "main.MediaType.Name",
+        "main.Track",
+        "main.Track.GenreId",
+        "main.Track.MediaTypeId",
+        "main.Track.TrackId",
+        "main.Track.UnitPrice"
+      ],
+      "reason": "Groups tracks by genre and media type, retaining both join and group keys as reads while exposing count and conditional price lineage.",
+      "sql": "SELECT g.Name AS genre_name, m.Name AS media_type, COUNT(t.TrackId) AS track_count, SUM(CASE WHEN t.UnitPrice >= 1.00 THEN t.UnitPrice ELSE 0 END) AS premium_value FROM Track AS t JOIN Genre AS g ON g.GenreId = t.GenreId JOIN MediaType AS m ON m.MediaTypeId = t.MediaTypeId GROUP BY g.GenreId, g.Name, m.MediaTypeId, m.Name HAVING COUNT(t.TrackId) > 0 ORDER BY premium_value DESC, genre_name",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "case",
+        "grouping",
+        "join"
+      ]
+    },
+    {
+      "lineage": {
+        "album_count": [],
+        "artist_id": [
+          "main.Artist.ArtistId"
+        ],
+        "artist_name": [
+          "main.Artist.Name"
+        ],
+        "max_track_ms": [
+          "main.Track.Milliseconds"
+        ]
+      },
+      "name": "chinook_validation_artist_rollup",
+      "reads": [
+        "main.Album",
+        "main.Album.AlbumId",
+        "main.Album.ArtistId",
+        "main.Artist",
+        "main.Artist.ArtistId",
+        "main.Artist.Name",
+        "main.Track",
+        "main.Track.AlbumId",
+        "main.Track.Milliseconds"
+      ],
+      "reason": "Uses correlated scalar subqueries for album existence, album count, and maximum track duration; COUNT(*) has no value source while the maximum carries track duration lineage.",
+      "sql": "SELECT a.ArtistId AS artist_id, a.Name AS artist_name, (SELECT COUNT(*) FROM Album AS al WHERE al.ArtistId = a.ArtistId) AS album_count, (SELECT COALESCE(MAX(t.Milliseconds), 0) FROM Album AS al JOIN Track AS t ON t.AlbumId = al.AlbumId WHERE al.ArtistId = a.ArtistId) AS max_track_ms FROM Artist AS a WHERE EXISTS (SELECT 1 FROM Album AS al WHERE al.ArtistId = a.ArtistId) ORDER BY max_track_ms DESC, artist_name",
+      "state": "complete",
+      "tags": [
+        "correlated",
+        "scalar",
+        "subquery"
+      ]
+    },
+    {
+      "lineage": {
+        "duration_rank": [
+          "main.Track.GenreId",
+          "main.Track.Milliseconds"
+        ],
+        "genre_id": [
+          "main.Track.GenreId"
+        ],
+        "track_name": [
+          "main.Track.Name"
+        ]
+      },
+      "name": "chinook_validation_genre_duration_rank",
+      "reads": [
+        "main.Track",
+        "main.Track.GenreId",
+        "main.Track.Milliseconds",
+        "main.Track.Name",
+        "main.Track.UnitPrice"
+      ],
+      "reason": "Ranks tracks within each genre; the window partition and ordering columns are value lineage, and the price predicate remains a read dependency.",
+      "sql": "SELECT t.GenreId AS genre_id, t.Name AS track_name, ROW_NUMBER() OVER (PARTITION BY t.GenreId ORDER BY t.Milliseconds DESC) AS duration_rank FROM Track AS t WHERE t.UnitPrice >= 0.99 ORDER BY t.GenreId, duration_rank",
+      "state": "complete",
+      "tags": [
+        "filter",
+        "window"
+      ]
+    },
+    {
+      "lineage": {
+        "customer_id": [
+          "main.Customer.CustomerId"
+        ],
+        "segment": [
+          "main.Invoice.Total"
+        ],
+        "total_spend": [
+          "main.Invoice.Total"
+        ]
+      },
+      "name": "chinook_validation_customer_spend_segment",
+      "reads": [
+        "main.Customer",
+        "main.Customer.CustomerId",
+        "main.Customer.Email",
+        "main.Invoice",
+        "main.Invoice.CustomerId",
+        "main.Invoice.Total"
+      ],
+      "reason": "Aggregates invoices in a CTE and labels left-joined customers with COALESCE and CASE; invoice totals feed both the amount and segment lineage.",
+      "sql": "WITH customer_spend AS (SELECT i.CustomerId AS customer_id, SUM(i.Total) AS total_spend FROM Invoice AS i GROUP BY i.CustomerId) SELECT c.CustomerId AS customer_id, COALESCE(s.total_spend, 0) AS total_spend, CASE WHEN s.total_spend IS NULL THEN 'new' WHEN s.total_spend >= 100 THEN 'vip' ELSE 'standard' END AS segment FROM Customer AS c LEFT JOIN customer_spend AS s ON s.customer_id = c.CustomerId WHERE c.Email IS NOT NULL ORDER BY total_spend DESC",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "case",
+        "coalesce",
+        "cte",
+        "outer-join"
+      ]
+    },
+    {
+      "lineage": {
+        "manager_name": [
+          "main.Employee.FirstName",
+          "main.Employee.LastName"
+        ],
+        "role": [
+          "main.Employee.ReportsTo"
+        ],
+        "staff_id": [
+          "main.Employee.EmployeeId"
+        ]
+      },
+      "name": "chinook_validation_employee_manager_status",
+      "reads": [
+        "main.Employee",
+        "main.Employee.EmployeeId",
+        "main.Employee.FirstName",
+        "main.Employee.HireDate",
+        "main.Employee.LastName",
+        "main.Employee.ReportsTo"
+      ],
+      "reason": "Left-joins each employee to an optional manager and derives both a fallback manager label and a role from nullable reporting metadata.",
+      "sql": "SELECT e.EmployeeId AS staff_id, COALESCE(m.FirstName || ' ' || m.LastName, 'Unassigned') AS manager_name, CASE WHEN e.ReportsTo IS NULL THEN 'leader' ELSE 'staff' END AS role FROM Employee AS e LEFT JOIN Employee AS m ON m.EmployeeId = e.ReportsTo WHERE e.HireDate IS NOT NULL ORDER BY manager_name, staff_id",
+      "state": "complete",
+      "tags": [
+        "case",
+        "coalesce",
+        "outer-join",
+        "self-join"
+      ]
+    }
+  ]
+}

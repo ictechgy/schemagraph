@@ -4,6 +4,24 @@
 
 ## 지금 상태
 
+- 2026-09-21: **v0.4.1 준비 — PostgreSQL 집계·추가 정확도 검증·공개 배포 진행 중**.
+  사용자가 집계 수집 보강 → 별도 표본 검증 → v0.4.1 배포를 승인했다.
+  `feature/postgres-aggregates-v0.4.1`에서 네이티브·Go·JDBC의 집계/window 수집을
+  기존 function kind로 맞추고 선택적 pg_depend에서 집계→사용자 support 함수 참조를
+  보존한다. aggregate에는 SQL 몸체를 합성하지 않으며 body analysis는 unsupported다.
+  JVM의 PG routine identity는 서버 시그니처를 사용해 named/INOUT 인자가 있는 과거
+  JVM snapshot의 ID가 달라질 수 있다. [CATALOG.md](CATALOG.md)에 명시했다.
+  - 새 SQL 16개는 엔진 출력을 보기 전에 `469910a`에서 고정했다. 첫 값 계보는
+    62/64·오탐 0·누락 2였고, INTERSECT 오른쪽 출처 누락을 고쳐 64/64가 됐다.
+    기대값은 변경하지 않았다. 인용된 소문자 PG builtin을 잘못 미해석 처리하던
+    문제도 재현·수정했다. 원본 Pagila 뷰 3개의 partial 호출 진단이 해소됐다.
+  - 합계 SQL 43개와 원본 뷰 8개에서 계보 130개·수동 읽기 273개·PG 참조 269개가
+    일치한다. 새 표본은 수정에 사용됐으므로 마지막 100%를 holdout 추정치로 부르지 않는다.
+    [ACCURACY.md](ACCURACY.md)에 첫 결과·변경 후 결과·SQLGlot 비교를 분리했다.
+  - 로컬 Rust 246개 테스트, aggregate 실제 실행·overload 오귀속 방지,
+    named 인자/window 수집, native/Go/JDBC catalog v1/v2 JSON/NDJSON을 통과했다.
+    CI·배포·공개 소비자 검증은 다음 단계다. 시크릿/서명키 설정은 그대로 재사용한다.
+
 - 2026-09-21: **공개 PostgreSQL·SQLite 정확도 평가와 발견한 파서 오류 수정 완료**
   (`feature/accuracy-corpus`, 런타임 수정 `ad0e720`). 사용자가 공개 샘플 사용과
   불필요 산출물 정리를 요청했다. [ACCURACY.md](ACCURACY.md)가 영어 정본이다.

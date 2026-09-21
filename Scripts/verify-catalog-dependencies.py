@@ -322,6 +322,23 @@ CREATE TABLE app.customers(id integer primary key, name text not null);
 CREATE TABLE app.orders(id integer primary key, customer_id integer not null references app.customers(id));
 CREATE VIEW app.order_view AS SELECT o.id, c.name FROM app.orders o JOIN app.customers c ON c.id=o.customer_id;
 CREATE OR REPLACE FUNCTION app.customer_name(integer) RETURNS text LANGUAGE sql AS $$ SELECT name FROM app.customers WHERE id=$1 $$;
+CREATE FUNCTION app.sum_state(bigint, integer) RETURNS bigint LANGUAGE sql AS $$ SELECT coalesce($1,0)+coalesce($2,0) $$;
+CREATE FUNCTION app.sum_state(bigint, bigint) RETURNS bigint LANGUAGE sql AS $$ SELECT coalesce($1,0)+coalesce($2,0) $$;
+CREATE FUNCTION app.sum_final(bigint) RETURNS bigint LANGUAGE sql AS $$ SELECT $1 $$;
+CREATE FUNCTION app.sum_combine(bigint, bigint) RETURNS bigint LANGUAGE sql AS $$ SELECT coalesce($1,0)+coalesce($2,0) $$;
+CREATE AGGREGATE app.collected_sum(integer) (SFUNC=app.sum_state, STYPE=bigint, FINALFUNC=app.sum_final, COMBINEFUNC=app.sum_combine, INITCOND='0');
+CREATE AGGREGATE app.overloaded_sum(integer) (SFUNC=app.sum_state, STYPE=bigint, INITCOND='0');
+CREATE AGGREGATE app.overloaded_sum(bigint) (SFUNC=app.sum_state, STYPE=bigint, INITCOND='0');
+CREATE VIEW app.order_sum AS SELECT app.collected_sum(customer_id) AS total FROM app.orders;
+CREATE VIEW app.overloaded_order_sum AS SELECT app.overloaded_sum(customer_id) AS total FROM app.orders;
+CREATE FUNCTION app.named_identity(input_value integer) RETURNS integer LANGUAGE sql AS $$ SELECT input_value $$;
+CREATE FUNCTION app.row_counter() RETURNS bigint AS 'window_row_number' LANGUAGE internal WINDOW;
+CREATE VIEW app.order_position AS SELECT id, app.row_counter() OVER (ORDER BY id) AS position FROM app.orders;
+DO $$ BEGIN
+  IF (SELECT app.collected_sum(value) FROM (VALUES (2),(3)) AS input(value)) IS DISTINCT FROM 5 THEN
+    RAISE EXCEPTION 'aggregate fixture did not execute correctly';
+  END IF;
+END $$;
 """
 
 
@@ -336,6 +353,11 @@ def check_postgres(engine: Path, url: str, work: Path, go_probe: Path | None, jd
         raise RuntimeError("native PostgreSQL returned no catalog dependency rows")
     assert_expected_postgres_dependencies(native_dependencies, "native PostgreSQL")
     assert_graph(load_json(native_graph), dependencies=True, label="native PostgreSQL")
+    assert_postgres_aggregates(load_json(native_graph), "native PostgreSQL")
+    aggregates = [routine for schema in native_value['schemas'] for routine in schema['routines']
+                  if routine['name'] in ('collected_sum', 'overloaded_sum')]
+    if len(aggregates) != 3 or any(routine.get('body') is not None for routine in aggregates):
+        raise RuntimeError('native PostgreSQL must preserve three aggregate identities without invented SQL bodies')
     print(f"native PostgreSQL catalog-dependencies: verified {len(native_dependencies)} dependency rows")
 
     # DB가 제공한 외부 database identity는 같은 로컬 이름에 연결되지 않아야 한다.
@@ -378,6 +400,7 @@ def check_postgres(engine: Path, url: str, work: Path, go_probe: Path | None, jd
                 run(args, label=f"{producer} PostgreSQL v{version}/{output_format}")
                 deps = check_document(engine, document, output_format, graph, expected_dependencies=True, label=f"{producer} PostgreSQL v{version}/{output_format}")
                 assert_expected_postgres_dependencies(deps, f"{producer} PostgreSQL v{version}/{output_format}")
+                assert_postgres_aggregates(load_json(graph), f"{producer} PostgreSQL v{version}/{output_format}")
                 if deps != sorted(native_dependencies, key=dependency_key):
                     print(f"NOTICE {producer} PostgreSQL v{version}/{output_format}: dependency rows differ from native catalog (raw catalog ordering/identity varies)")
         print(f"{producer} PostgreSQL catalog-dependencies v1/v2 JSON/NDJSON: verified")
@@ -386,12 +409,53 @@ def check_postgres(engine: Path, url: str, work: Path, go_probe: Path | None, jd
 def assert_expected_postgres_dependencies(dependencies: list[dict], label: str) -> None:
     """fixture가 요구하는 실제 dependency pair와 시스템 스키마 누락을 확인한다."""
     pairs = {(item.get("source", {}).get("name"), item.get("target", {}).get("name")) for item in dependencies}
-    required = {("order_view", "customers"), ("order_view", "orders")}
+    required = {("order_view", "customers"), ("order_view", "orders"),
+                ("order_sum", "collected_sum"), ("collected_sum", "sum_state"),
+                ("collected_sum", "sum_final"), ("collected_sum", "sum_combine")}
     missing = sorted(required - pairs)
     if missing:
         raise RuntimeError(f"{label}: required dependency pairs missing: {missing}")
     if any(item.get("target", {}).get("schema") in {"pg_catalog", "information_schema"} for item in dependencies):
         raise RuntimeError(f"{label}: system-schema dependency leaked into fixture output")
+
+
+def assert_postgres_aggregates(graph: dict, label: str) -> None:
+    """집계 호출과 실제 support 함수 참조를 확인하고 overload 오귀속을 막는다."""
+    edges = {(edge['from'], edge['to'], edge['kind']) for edge in graph['edges']}
+    required = {
+        ('app.order_sum', 'app.collected_sum(integer)', 'calls'),
+        ('app.order_sum', 'app.collected_sum(integer)', 'depends-on'),
+        ('app.collected_sum(integer)', 'app.sum_state(bigint, integer)', 'depends-on'),
+        ('app.collected_sum(integer)', 'app.sum_final(bigint)', 'depends-on'),
+        ('app.collected_sum(integer)', 'app.sum_combine(bigint, bigint)', 'depends-on'),
+        ('app.overloaded_order_sum', 'app.overloaded_sum(integer)', 'depends-on'),
+        ('app.overloaded_sum(integer)', 'app.sum_state(bigint, integer)', 'depends-on'),
+        ('app.overloaded_sum(bigint)', 'app.sum_state(bigint, bigint)', 'depends-on'),
+        ('app.order_position', 'app.row_counter', 'calls'),
+        ('app.order_position', 'app.row_counter', 'depends-on'),
+    }
+    if required - edges:
+        raise RuntimeError(f'{label}: aggregate references missing: {sorted(required - edges)}')
+    forbidden = {
+        ('app.overloaded_order_sum', 'app.overloaded_sum(bigint)', 'depends-on'),
+        ('app.overloaded_sum(integer)', 'app.sum_state(bigint, bigint)', 'depends-on'),
+        ('app.overloaded_order_sum', 'app.overloaded_sum(integer)', 'calls'),
+        ('app.overloaded_order_sum', 'app.overloaded_sum(bigint)', 'calls'),
+    }
+    if forbidden & edges:
+        raise RuntimeError(f'{label}: aggregate overload was guessed: {sorted(forbidden & edges)}')
+    states = {item['id']: item for item in graph['analysis']}
+    vertices = {v['id']:v for v in graph['vertices']}
+    if vertices.get('app.named_identity(input_value integer)',{}).get('kind') != 'function':
+        raise RuntimeError(f'{label}: PostgreSQL named identity arguments were not preserved')
+    if vertices.get('app.row_counter',{}).get('kind') != 'function':
+        raise RuntimeError(f'{label}: window routine was not collected as a function')
+    if states['app.order_sum']['state'] != 'complete':
+        raise RuntimeError(f'{label}: unique aggregate call was not resolved')
+    if states['app.overloaded_order_sum']['state'] != 'partial':
+        raise RuntimeError(f'{label}: ambiguous body call was incorrectly reported complete')
+    if states['app.collected_sum(integer)']['state'] != 'unsupported':
+        raise RuntimeError(f'{label}: aggregate SQL body analysis must not claim complete')
 
 
 def probe_remote_database(

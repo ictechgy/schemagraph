@@ -618,34 +618,65 @@ class Extractor(
                 triggers.getOrPut(key) { mutableListOf() } +=
                     TriggerDoc(rs.getString(3), rs.getString(4))
             }
-            bestEffort("routines",
-                "SELECT ROUTINE_SCHEMA, ROUTINE_NAME, SPECIFIC_NAME, ROUTINE_TYPE, " +
-                    "ROUTINE_DEFINITION, EXTERNAL_LANGUAGE FROM INFORMATION_SCHEMA.ROUTINES " +
-                    "WHERE ROUTINE_SCHEMA = $sq") { rs ->
-                // PG의 집계 함수는 ROUTINE_TYPE이 NULL이다 — null-safe로 받지
-                // 않으면 NPE가 나서 이후 행 전부의 수확이 끊긴다.
-                val rtype = rs.getString(4) ?: return@bestEffort
-                routines += Triple(
-                    rs.getString(1),
-                    rs.getString(3),
-                    RoutineDoc(
-                        name = rs.getString(2),
-                        kind = when (rtype.uppercase()) {
-                            "PROCEDURE" -> "procedure"
-                            else -> "function"
-                        },
-                        language = rs.getString(6)?.lowercase(),
-                        body = rs.getString(5),
-                    ),
-                )
-            }
-            bestEffort("routine parameters",
-                "SELECT SPECIFIC_SCHEMA, SPECIFIC_NAME, DATA_TYPE, ORDINAL_POSITION " +
-                    "FROM INFORMATION_SCHEMA.PARAMETERS WHERE PARAMETER_MODE = 'IN' " +
-                    "AND SPECIFIC_SCHEMA = $sq " +
-                    "ORDER BY ORDINAL_POSITION") { rs ->
-                val key = rs.getString(1) to rs.getString(2)
-                params.merge(key, rs.getString(3).lowercase()) { a, b -> "$a, $b" }
+            if (dialect == "postgres") {
+                // PostgreSQL INFORMATION_SCHEMA는 집계 시그니처를 생략하고
+                // ROUTINE_TYPE을 NULL로 돌려줄 수 있다. pg_proc가 종류·언어·
+                // 오버로드 식별자·identity-argument 시그니처의 권위 있는 원천이다.
+                bestEffort("routines",
+                    "SELECT n.nspname, p.oid, p.proname, p.prokind::text, l.lanname, " +
+                        "pg_get_function_identity_arguments(p.oid), " +
+                        "CASE WHEN p.prokind = 'a' THEN NULL ELSE pg_get_functiondef(p.oid) END " +
+                        "FROM pg_proc p " +
+                        "JOIN pg_namespace n ON n.oid = p.pronamespace " +
+                        "JOIN pg_language l ON l.oid = p.prolang " +
+                        "WHERE n.nspname = $sq AND p.prokind IN ('f', 'p', 'a', 'w') " +
+                        "ORDER BY p.proname, pg_get_function_identity_arguments(p.oid), p.oid") { rs ->
+                    val name = rs.getString(3)
+                    val kind = when (rs.getString(4)) {
+                        "f", "a", "w" -> "function"
+                        "p" -> "procedure"
+                        else -> return@bestEffort
+                    }
+                    routines += Triple(
+                        rs.getString(1),
+                        "${name}_${rs.getLong(2)}",
+                        RoutineDoc(
+                            name = name,
+                            kind = kind,
+                            language = rs.getString(5),
+                            signature = rs.getString(6),
+                            body = rs.getString(7),
+                        ),
+                    )
+                }
+            } else {
+                bestEffort("routines",
+                    "SELECT ROUTINE_SCHEMA, ROUTINE_NAME, SPECIFIC_NAME, ROUTINE_TYPE, " +
+                        "ROUTINE_DEFINITION, EXTERNAL_LANGUAGE FROM INFORMATION_SCHEMA.ROUTINES " +
+                        "WHERE ROUTINE_SCHEMA = $sq") { rs ->
+                    val rtype = rs.getString(4) ?: return@bestEffort
+                    routines += Triple(
+                        rs.getString(1),
+                        rs.getString(3),
+                        RoutineDoc(
+                            name = rs.getString(2),
+                            kind = when (rtype.uppercase()) {
+                                "PROCEDURE" -> "procedure"
+                                else -> "function"
+                            },
+                            language = rs.getString(6)?.lowercase(),
+                            body = rs.getString(5),
+                        ),
+                    )
+                }
+                bestEffort("routine parameters",
+                    "SELECT SPECIFIC_SCHEMA, SPECIFIC_NAME, DATA_TYPE, ORDINAL_POSITION " +
+                        "FROM INFORMATION_SCHEMA.PARAMETERS WHERE PARAMETER_MODE = 'IN' " +
+                        "AND SPECIFIC_SCHEMA = $sq " +
+                        "ORDER BY ORDINAL_POSITION") { rs ->
+                    val key = rs.getString(1) to rs.getString(2)
+                    params.merge(key, rs.getString(3).lowercase()) { a, b -> "$a, $b" }
+                }
             }
             }
         }
@@ -679,7 +710,7 @@ class Extractor(
                 !isSystem(it) && (schemaFilter.isEmpty() || it in schemaFilter)
             }
         if (dialect != "sqlite" && dialect != "sqlserver" && dialect != "oracle" &&
-            dialect != "db2" && dialect != "informix") {
+            dialect != "db2" && dialect != "informix" && dialect != "postgres") {
             runCatching {
                 meta.getFunctions(null, null, null).use { rs ->
                     while (rs.next()) {

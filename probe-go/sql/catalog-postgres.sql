@@ -29,7 +29,7 @@ SELECT * FROM (
     JOIN pg_namespace sn ON sn.oid=s.relnamespace
     JOIN pg_proc p ON d.refclassid='pg_proc'::regclass AND d.refobjid=p.oid
     JOIN pg_namespace pn ON pn.oid=p.pronamespace
-    WHERE s.relkind IN ('v','m') AND p.prokind IN ('f','p') AND d.deptype='n'
+    WHERE s.relkind IN ('v','m') AND p.prokind IN ('f','p','a','w') AND d.deptype='n'
       AND pn.nspname NOT IN ('pg_catalog','information_schema')
     UNION ALL
     SELECT sn.nspname, s.proname,
@@ -46,6 +46,18 @@ SELECT * FROM (
     LEFT JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=d.refobjsubid AND d.refobjsubid>0
     WHERE s.prokind IN ('f','p') AND t.relkind IN ('r','p','f','v','m','S')
       AND d.deptype='n' AND tn.nspname NOT IN ('pg_catalog','information_schema')
+    UNION ALL
+    SELECT sn.nspname, s.proname, 'function',
+           pg_get_function_identity_arguments(s.oid), tn.nspname, t.proname,
+           CASE t.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END,
+           pg_get_function_identity_arguments(t.oid), NULL::text, NULL::text, d.deptype::text
+    FROM pg_depend d
+    JOIN pg_proc s ON d.classid='pg_proc'::regclass AND d.objid=s.oid
+    JOIN pg_namespace sn ON sn.oid=s.pronamespace
+    JOIN pg_proc t ON d.refclassid='pg_proc'::regclass AND d.refobjid=t.oid
+    JOIN pg_namespace tn ON tn.oid=t.pronamespace
+    WHERE s.prokind='a' AND t.prokind IN ('f','p','a','w') AND d.deptype='n'
+      AND tn.nspname NOT IN ('pg_catalog','information_schema')
 ) dependencies
 WHERE source_schema=:schema
 ORDER BY source_name, source_kind, source_signature, target_schema, target_name, target_member

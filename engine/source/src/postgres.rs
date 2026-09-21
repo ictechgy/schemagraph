@@ -560,7 +560,7 @@ async fn read_triggers(
         .collect())
 }
 
-/// function/procedure 몸체 — aggregate·window 함수는 제외한다.
+/// 집계도 호출 대상이므로 보존하되, 존재하지 않는 SQL 몸체를 합성하지 않는다.
 async fn read_routines(
     pool: &PgPool,
     schema: &str,
@@ -569,7 +569,7 @@ async fn read_routines(
     let rows = sqlx::query(
         "SELECT p.proname, l.lanname, p.prokind::text AS prokind, \
                 pg_get_function_identity_arguments(p.oid) AS sig, \
-                CASE WHEN p.prokind IN ('f','p') THEN pg_get_functiondef(p.oid) ELSE NULL END AS def \
+                CASE WHEN p.prokind IN ('f','p','w') THEN pg_get_functiondef(p.oid) ELSE NULL END AS def \
          FROM pg_proc p \
          JOIN pg_namespace n ON n.oid = p.pronamespace \
          JOIN pg_language l ON l.oid = p.prolang \
@@ -585,7 +585,7 @@ async fn read_routines(
     for r in &rows {
         let prokind = r.get::<String, _>("prokind");
         let kind = match prokind.as_str() {
-            "f" => "function",
+            "f" | "a" | "w" => "function",
             "p" => "procedure",
             _ => {
                 skipped += 1;
@@ -605,7 +605,7 @@ async fn read_routines(
     }
     if skipped > 0 {
         limitations.push(format!(
-            "{schema}: aggregate/window 함수 {skipped}개는 routine이 아니라 수집하지 않음"
+            "{schema}: {skipped} routines have unknown PostgreSQL prokind values; definitions were not collected"
         ));
     }
     Ok(routines)

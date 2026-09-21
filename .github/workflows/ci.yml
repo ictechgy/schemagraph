@@ -84,7 +84,7 @@ jobs:
           PGBIN: /usr/lib/postgresql/16/bin
         run: |
           "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-accuracy.py \
-            --engine engine/target/debug/schemagraph --sqlglot --strict \
+            --engine engine/target/debug/schemagraph --sqlglot --suite all --strict \
             --output "$RUNNER_TEMP/accuracy.json"
 
       - name: Check bundled documents and licenses

@@ -63,15 +63,15 @@ dump's `OWNER TO postgres` assignments with the fixture role. User PostgreSQL
 service/password settings are excluded. Temporary databases and graphs are
 removed even after a failed check; only the requested report remains.
 
-## Measured results
+## Original regression results
 
 Measured on 2026-09-21 with PostgreSQL 16.13 and SQLite 3.53.4: 15 reviewed
 Chinook queries, 12 reviewed Pagila queries, and eight upstream Pagila views
 (35 distinct view definitions). The fixed engine is the source build at
 [`ad0e720`](https://github.com/ictechgy/schemagraph/commit/ad0e720ce73e118e1f975149be7af025eb127bd6),
-compared with the published `schemagraph-cli 0.4.0`. The source build still
-reports version `0.4.0`; executable hashes in the report distinguish the builds.
-These fixes are not included in the published 0.4.0 binaries.
+compared with the published `schemagraph-cli 0.4.0`. That source build reported
+version `0.4.0`; executable hashes distinguish it from the published binary.
+Version 0.4.1 includes these fixes.
 
 The 27 reviewed queries specify 66 expected output-column/source-column pairs:
 
@@ -104,12 +104,52 @@ named windows, and a correlated `LATERAL` query with unresolved leaves. API
 coverage, the adapter, and differences in what counts as a value source can all
 affect the comparison. Read-dependency coverage is not scored for SQLGlot here.
 
-Three original Pagila views (`actor_info`, `film_list`, and
-`nicer_but_slower_film_list`) still report `partial` with `SG_CALL_UNRESOLVED`
-because the collector does not expose their custom aggregate `public.group_concat`
-as a callable routine. Their direct read dependencies match the database. This
-remaining collection gap, other dialects, and production query distributions are
-outside the 100% result above.
+At this stage, three original Pagila views (`actor_info`, `film_list`, and
+`nicer_but_slower_film_list`) reported `partial` with `SG_CALL_UNRESOLVED`.
+Their direct read dependencies matched the database, but the collector omitted
+the custom aggregate `public.group_concat`. The final view also contained a
+quoted lowercase `"substring"` call that required a parser correction.
+
+## 0.4.1 validation
+
+Sixteen additional queries (eight per database) were written and database-checked
+without inspecting analyzer output, then frozen at
+[`469910a`](https://github.com/ictechgy/schemagraph/commit/469910abd790fc6d55f7c76d1d1b94e458713932)
+before their first engine run. Their first result was 62/64 correct value-lineage
+pairs, with two missing pairs and no unexpected pairs; all 129 read dependencies
+matched. Both mismatches involved `INTERSECT`, whose right-side value sources
+were omitted. The expected facts were unchanged when the parser was fixed.
+Both branches now contribute value sources, while `EXCEPT` retains only the
+left branch's value sources and reads both branches. This is the project's
+explicit lineage policy for the [set-operation semantics](https://www.postgresql.org/docs/16/queries-union.html).
+
+After the fix, all 16 cases match (64 lineage pairs). They now form a regression
+set too; the final 100% result is not an untouched holdout estimate.
+The original 27-query regression set and the new validation cohort stay separate
+in reports. Together with eight upstream views, they cover 51 view definitions:
+
+| Analyzer, on the current collector's catalog | Correct pairs | Unexpected | Missing | Precision | Recall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| schemagraph 0.4.0 parser | 124 | 4 | 6 | 96.88% | 95.38% |
+| schemagraph 0.4.1 | 130 | 0 | 0 | 100% | 100% |
+| SQLGlot 30.18.0 adapter | 125 | 5 | 5 | 96.15% | 96.15% |
+
+The current engine also matches 273 reviewed reads and 269 PostgreSQL catalog
+reads across 28 views. These overlapping categories are scored separately.
+The baseline parser comparison uses the **current collector's inventory**,
+including aggregate identities; it does not score the old collector's omissions.
+
+Native, Go, and JDBC collectors now preserve PostgreSQL aggregate/window
+identities and server signatures. The three original views above resolve their
+calls and report `complete`. The aggregate itself has no collected SQL body and
+continues to report `unsupported` body analysis; its SQL definition is never
+invented. With `--catalog-dependencies`, raw `pg_depend` references preserve
+aggregate dependencies on user-defined transition, final, and combine functions.
+The integration fixture executes an aggregate, checks required and forbidden
+overload references, and exercises both probes' v1/v2 JSON/NDJSON transport.
+See [the catalog contract](CATALOG.md) for JDBC identity compatibility details and
+[PostgreSQL's aggregate catalog](https://www.postgresql.org/docs/16/catalog-pg-aggregate.html)
+for the underlying support-function metadata.
 
 ## Reproduce
 
@@ -118,7 +158,7 @@ cargo build --manifest-path engine/Cargo.toml --locked
 python3 Scripts/verify-accuracy.py \
   --engine engine/target/debug/schemagraph \
   --pg-bin /opt/homebrew/opt/postgresql@16/bin \
-  --strict --output engine/target/accuracy/current.json
+  --suite all --strict --output engine/target/accuracy/current.json
 ```
 
 On Linux, use the installed PostgreSQL binary directory, for example
@@ -126,6 +166,8 @@ On Linux, use the installed PostgreSQL binary directory, for example
 skipping a database. `--baseline /path/to/schemagraph-0.4.0` compares the same
 frozen catalog with the published baseline; the report includes executable
 versions and SHA-256 digests.
+Use `--suite regression` (the default) or `--suite validation` to score the cohorts
+separately. `--suite all` is used in CI.
 
 To compare the supported value-lineage cases using SQLGlot's documented
 [lineage API](https://sqlglot.com/sqlglot/lineage.html):
@@ -135,7 +177,7 @@ python3 -m venv engine/target/accuracy/tools
 engine/target/accuracy/tools/bin/pip install 'sqlglot==30.18.0'
 engine/target/accuracy/tools/bin/python Scripts/verify-accuracy.py \
   --engine engine/target/debug/schemagraph --sqlglot \
-  --strict --output engine/target/accuracy/comparison.json
+  --suite all --strict --output engine/target/accuracy/comparison.json
 ```
 
 SQLGlot is a development comparison dependency. It is not part of the Rust

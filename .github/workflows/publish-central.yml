@@ -6,7 +6,7 @@ on:
       version:
         description: Existing release version to publish from its Git tag
         required: true
-        default: "0.4.0"
+        default: "0.4.1"
       publish:
         description: Publish after validation (false leaves a validated deployment)
         type: boolean
@@ -48,7 +48,7 @@ jobs:
           CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
         run: |
           [[ "$PROBE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "error: version must be an existing stable release, such as 0.4.0" >&2
+            echo "error: version must be an existing stable release, such as 0.4.1" >&2
             exit 2
           }
           for name in MAVEN_SIGNING_KEY MAVEN_SIGNING_PASSWORD CENTRAL_TOKEN_USERNAME CENTRAL_TOKEN_PASSWORD; do
