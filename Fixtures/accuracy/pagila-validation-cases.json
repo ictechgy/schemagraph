@@ -1,0 +1,285 @@
+{
+  "cases": [
+    {
+      "lineage": {
+        "customer_id": [
+          "public.customer.customer_id"
+        ],
+        "customer_name": [
+          "public.customer.first_name",
+          "public.customer.last_name"
+        ],
+        "latest_rental": [
+          "public.rental.rental_date"
+        ],
+        "rental_count": [
+          "public.rental.rental_id"
+        ]
+      },
+      "name": "pagila_validation_nested_customer_activity",
+      "reads": [
+        "public.customer",
+        "public.customer.customer_id",
+        "public.customer.first_name",
+        "public.customer.last_name",
+        "public.rental",
+        "public.rental.customer_id",
+        "public.rental.rental_date",
+        "public.rental.rental_id"
+      ],
+      "reason": "Aggregates rentals in a CTE, projects them through a derived report relation, and orders by the derived latest date while retaining the customer join and filter dependencies.",
+      "sql": "WITH customer_rentals AS (SELECT r.customer_id, COUNT(r.rental_id) AS rental_count, MAX(r.rental_date) AS latest_rental FROM rental AS r GROUP BY r.customer_id) SELECT report.customer_id, report.first_name || ' ' || report.last_name AS customer_name, report.rental_count, report.latest_rental FROM (SELECT c.customer_id, c.first_name, c.last_name, cr.rental_count, cr.latest_rental FROM customer AS c JOIN customer_rentals AS cr ON cr.customer_id = c.customer_id) AS report WHERE report.rental_count > 0 ORDER BY report.latest_rental DESC",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "cte",
+        "derived",
+        "nested"
+      ]
+    },
+    {
+      "lineage": {
+        "audience": [
+          "public.film.rating"
+        ],
+        "film_id": [
+          "public.film.film_id"
+        ],
+        "title": [
+          "public.film.title"
+        ]
+      },
+      "name": "pagila_validation_film_audience",
+      "reads": [
+        "public.film",
+        "public.film.film_id",
+        "public.film.length",
+        "public.film.rating",
+        "public.film.title"
+      ],
+      "reason": "Uses COALESCE for a length predicate and CASE over the film rating to produce an audience label without dropping the source rating lineage.",
+      "sql": "SELECT f.film_id, COALESCE(f.title, '(untitled)') AS title, CASE WHEN f.rating IN ('PG', 'PG-13') THEN 'teen' WHEN f.rating IS NULL THEN 'unrated' ELSE 'other' END AS audience FROM film AS f WHERE COALESCE(f.length, 0) > 90 ORDER BY audience, title",
+      "state": "complete",
+      "tags": [
+        "case",
+        "coalesce",
+        "filter"
+      ]
+    },
+    {
+      "lineage": {
+        "person_id": [
+          "public.actor.actor_id",
+          "public.staff.staff_id"
+        ]
+      },
+      "name": "pagila_validation_actor_staff_overlap",
+      "reads": [
+        "public.actor",
+        "public.actor.actor_id",
+        "public.actor.last_name",
+        "public.staff",
+        "public.staff.active",
+        "public.staff.staff_id"
+      ],
+      "reason": "Intersects actors whose last names begin with A and active staff IDs, preserving both branch IDs as value sources and branch predicates as reads.",
+      "sql": "SELECT a.actor_id AS person_id FROM actor AS a WHERE a.last_name LIKE 'A%' INTERSECT SELECT s.staff_id AS person_id FROM staff AS s WHERE s.active IS TRUE",
+      "state": "complete",
+      "tags": [
+        "intersect",
+        "set-operation"
+      ]
+    },
+    {
+      "lineage": {
+        "city_name": [
+          "public.city.city"
+        ],
+        "country_name": [
+          "public.country.country"
+        ],
+        "customer_count": [
+          "public.customer.customer_id"
+        ],
+        "store_count": [
+          "public.store.store_id"
+        ]
+      },
+      "name": "pagila_validation_city_customer_summary",
+      "reads": [
+        "public.address",
+        "public.address.address_id",
+        "public.address.city_id",
+        "public.city",
+        "public.city.city",
+        "public.city.city_id",
+        "public.city.country_id",
+        "public.country",
+        "public.country.country",
+        "public.country.country_id",
+        "public.customer",
+        "public.customer.address_id",
+        "public.customer.customer_id",
+        "public.store",
+        "public.store.address_id",
+        "public.store.store_id"
+      ],
+      "reason": "Rolls up customers and stores by city and country through address joins; all join and grouping keys remain read dependencies while counts retain their counted IDs.",
+      "sql": "SELECT co.country AS country_name, ci.city AS city_name, COUNT(c.customer_id) AS customer_count, COUNT(DISTINCT s.store_id) AS store_count FROM country AS co JOIN city AS ci ON ci.country_id = co.country_id JOIN address AS ad ON ad.city_id = ci.city_id LEFT JOIN customer AS c ON c.address_id = ad.address_id LEFT JOIN store AS s ON s.address_id = ad.address_id GROUP BY co.country_id, co.country, ci.city_id, ci.city HAVING COUNT(c.customer_id) > 0 ORDER BY customer_count DESC, country_name, city_name",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "grouping",
+        "join",
+        "outer-join"
+      ]
+    },
+    {
+      "lineage": {
+        "film_id": [
+          "public.film.film_id"
+        ],
+        "inventory_count": [],
+        "language_avg_rate": [
+          "public.film.rental_rate"
+        ],
+        "title": [
+          "public.film.title"
+        ]
+      },
+      "name": "pagila_validation_film_inventory_language",
+      "reads": [
+        "public.film",
+        "public.film.film_id",
+        "public.film.language_id",
+        "public.film.rental_rate",
+        "public.film.title",
+        "public.film_actor",
+        "public.film_actor.film_id",
+        "public.inventory",
+        "public.inventory.film_id"
+      ],
+      "reason": "Combines correlated inventory and language-rate subqueries with an existence filter over film actors; COUNT(*) is source-free while the average keeps rental-rate lineage.",
+      "sql": "SELECT f.film_id, f.title, (SELECT COUNT(*) FROM inventory AS i WHERE i.film_id = f.film_id) AS inventory_count, (SELECT COALESCE(AVG(f2.rental_rate), 0) FROM film AS f2 WHERE f2.language_id = f.language_id) AS language_avg_rate FROM film AS f WHERE EXISTS (SELECT 1 FROM film_actor AS fa WHERE fa.film_id = f.film_id) ORDER BY language_avg_rate DESC, title",
+      "state": "complete",
+      "tags": [
+        "correlated",
+        "scalar",
+        "subquery"
+      ]
+    },
+    {
+      "lineage": {
+        "amount": [
+          "public.payment.amount"
+        ],
+        "customer_id": [
+          "public.payment.customer_id"
+        ],
+        "payment_date": [
+          "public.payment.payment_date"
+        ],
+        "payment_id": [
+          "public.payment.payment_id"
+        ],
+        "running_total": [
+          "public.payment.amount",
+          "public.payment.customer_id",
+          "public.payment.payment_date",
+          "public.payment.payment_id"
+        ]
+      },
+      "name": "pagila_validation_payment_running_total",
+      "reads": [
+        "public.payment",
+        "public.payment.amount",
+        "public.payment.customer_id",
+        "public.payment.payment_date",
+        "public.payment.payment_id"
+      ],
+      "reason": "Computes a per-customer running payment total; the window partition and both ordering keys are value lineage, while the amount predicate remains a read.",
+      "sql": "SELECT p.payment_id, p.customer_id, p.payment_date, p.amount, SUM(p.amount) OVER (PARTITION BY p.customer_id ORDER BY p.payment_date, p.payment_id) AS running_total FROM payment AS p WHERE p.amount > 0 ORDER BY p.customer_id, p.payment_date, p.payment_id",
+      "state": "complete",
+      "tags": [
+        "filter",
+        "window"
+      ]
+    },
+    {
+      "lineage": {
+        "actor_names": [
+          "public.actor.last_name"
+        ],
+        "film_id": [
+          "public.film.film_id"
+        ],
+        "title": [
+          "public.film.title"
+        ]
+      },
+      "name": "pagila_validation_film_actor_concat",
+      "reads": [
+        "public.actor",
+        "public.actor.actor_id",
+        "public.actor.last_name",
+        "public.film",
+        "public.film.film_id",
+        "public.film.title",
+        "public.film_actor",
+        "public.film_actor.actor_id",
+        "public.film_actor.film_id"
+      ],
+      "reason": "Uses Pagila's custom group_concat aggregate over actor names after joining film membership, so the aggregate argument supplies actor-name lineage and membership keys remain reads.",
+      "sql": "SELECT f.film_id, f.title, public.group_concat(a.last_name) AS actor_names FROM film AS f JOIN film_actor AS fa ON fa.film_id = f.film_id JOIN actor AS a ON a.actor_id = fa.actor_id GROUP BY f.film_id, f.title HAVING COUNT(fa.actor_id) > 0 ORDER BY title",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "custom-aggregate",
+        "grouping",
+        "join"
+      ]
+    },
+    {
+      "lineage": {
+        "payment_count": [
+          "public.payment.payment_id"
+        ],
+        "staff_id": [
+          "public.staff.staff_id"
+        ],
+        "staff_name": [
+          "public.staff.first_name",
+          "public.staff.last_name"
+        ],
+        "status": [
+          "public.payment.payment_id"
+        ],
+        "total_amount": [
+          "public.payment.amount"
+        ]
+      },
+      "name": "pagila_validation_staff_payment_status",
+      "reads": [
+        "public.payment",
+        "public.payment.amount",
+        "public.payment.payment_id",
+        "public.payment.staff_id",
+        "public.staff",
+        "public.staff.active",
+        "public.staff.first_name",
+        "public.staff.last_name",
+        "public.staff.staff_id"
+      ],
+      "reason": "Aggregates payments per staff member, then uses a left join with COALESCE and CASE so payment totals, counts, and status retain their aggregate source columns.",
+      "sql": "WITH staff_payments AS (SELECT p.staff_id, SUM(p.amount) AS total_amount, COUNT(p.payment_id) AS payment_count FROM payment AS p GROUP BY p.staff_id) SELECT s.staff_id, s.first_name || ' ' || s.last_name AS staff_name, COALESCE(sp.total_amount, 0) AS total_amount, COALESCE(sp.payment_count, 0) AS payment_count, CASE WHEN sp.payment_count IS NULL THEN 'none' ELSE 'active' END AS status FROM staff AS s LEFT JOIN staff_payments AS sp ON sp.staff_id = s.staff_id WHERE s.active IS TRUE ORDER BY total_amount DESC, staff_name",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "case",
+        "coalesce",
+        "cte",
+        "outer-join"
+      ]
+    }
+  ]
+}
