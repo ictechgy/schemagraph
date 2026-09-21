@@ -4,7 +4,7 @@
 
 ## 지금 상태
 
-- 2026-09-21: **CLI·MCP 요청 취소 구현 진행 중** (`feature/request-cancellation`).
+- 2026-09-21: **CLI·MCP 요청 취소 구현·검증 완료** (`feature/request-cancellation`).
   사용자가 다음 과제 중 1번인 실행 중 요청 취소를 승인했다. 이번 범위는
   CLI `query`·`impact`·`path`·`review`의 Ctrl+C와 MCP 요청별 취소다.
   첫 Ctrl+C는 탐색 토큰을 켜고 종료 코드 130, 두 번째는 즉시 종료한다.
@@ -23,7 +23,14 @@
     로딩·정렬·출력 I/O는 첫 신호가 선점하지 않으며 두 번째 Ctrl+C로 강제 종료한다.
     취소 안내는 첫 신호에서 한 번만 생성되는 별도 출력 스레드로 보내, stderr
     역압력이 신호 처리 자체를 막지 않게 한다. 이 스레드도 프로세스 종료 시 정리된다.
-  CI·PR 반영 결과는 완료 시 이 항목에 갱신한다.
+  - [PR #6](https://github.com/ictechgy/schemagraph/pull/6)의 검사 소스는
+    `1434d3475ea37e44c04b7808177d929e3fd4a5d1`이다.
+    [취소·전체 패키징·실DB CI](https://github.com/ictechgy/schemagraph/actions/runs/35559247831),
+    [Db2·Informix](https://github.com/ictechgy/schemagraph/actions/runs/35559247977),
+    [Linux/macOS·JVM 바이너리 검사](https://github.com/ictechgy/schemagraph/actions/runs/35559247832)를
+    모두 통과했다. core에는 외부 의존성이 없다. 검증 근거는 저장소 밖
+    `~/Library/Application Support/schemagraph/verification/cancellation-20260921`에 보관한다.
+    이 완료 기록만 바꿀 때는 위 소스와의 동일성을 확인하고 검증을 재사용한다.
 
 - 2026-09-21: **v0.4.1 — PostgreSQL 집계·추가 정확도 검증·공개 배포 완료**.
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.1) ·
@@ -556,8 +563,9 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 요청한 성능·메모리 개선, Db2·Informix 특화 지원, 공개 Maven 배포를 완료했다.
 추가 요청된 Maven Central 게시도 실제 익명 설치까지 검증했다.
 공개 정확도 평가 후속과 v0.4.1 배포·설치 검증도 완료했다. 서명키와 토큰은
-다음 릴리스에서도 기존 설정을 재사용한다. 선택적 다음 과제는 CLI/MCP의 실행 중
-요청 취소, 다른 DB·실사용 SQL 표본 확대다. 이번 승인 범위에 미완료 배포는 없다.
+다음 릴리스에서도 기존 설정을 재사용한다. CLI/MCP 요청 취소는 소스 구현·검증을
+완료했으며 새 공개 릴리스에는 아직 포함되지 않았다. 후속 과제는 취소 기능 배포,
+다른 DB·실사용 SQL 표본 확대, 대규모 그래프의 메모리·탐색 성능 검증이다.
 
 ## 의도적으로 남긴 경계
 
