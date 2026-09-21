@@ -222,10 +222,13 @@ impl Binder<'_, '_> {
             .catalog
             .routines
             .contains(&(schema.clone(), routine.clone()));
-        // Quoted PostgreSQL identifiers are case-sensitive names, even when
-        // their folded spelling matches a builtin such as "SUM".
+        // PostgreSQL의 "substring"은 같은 소문자 내장 함수지만 "SUBSTRING"은
+        // 다른 식별자다. 인용 이름을 대소문자 무시로 접어 내장 함수로 숨기지 않는다.
+        let builtin_spelling = !quoted_name
+            || (matches!(self.catalog.dialect, "postgres" | "postgresql")
+                && routine == routine.to_ascii_lowercase());
         if !known
-            && !quoted_name
+            && builtin_spelling
             && super::is_builtin_function(&routine)
             && (parts.len() == 1
                 || matches!(schema.as_str(), "pg_catalog" | "SYS" | "SYSIBM" | "SYSFUN"))
@@ -360,7 +363,12 @@ impl Binder<'_, '_> {
                     left.unknown = true;
                 }
                 for (l, r) in left.columns.iter_mut().zip(right.columns) {
-                    if matches!(op, sqlparser::ast::SetOperator::Union) {
+                    // INTERSECT는 양쪽에 공통인 값을 반환하므로 양쪽 출처를
+                    // 보존한다. EXCEPT의 오른쪽은 행을 제외하는 읽기 조건이다.
+                    if matches!(
+                        op,
+                        sqlparser::ast::SetOperator::Union | sqlparser::ast::SetOperator::Intersect
+                    ) {
                         l.sources.extend(r.sources);
                     }
                     l.unknown |= r.unknown;

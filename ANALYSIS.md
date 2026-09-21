@@ -22,6 +22,11 @@ lineage between columns; `reads` also includes columns used only in filters or
 joins. `depends-on` preserves a database catalog dependency without claiming it
 is a read, write, or call.
 
+Value lineage includes both branches of `UNION` and `INTERSECT`. For `EXCEPT`,
+the right branch determines which rows are excluded and contributes read
+dependencies, while values retain their left-branch sources. Window partition
+and order expressions contribute to the corresponding window output's lineage.
+
 Check `complete`, `truncated`, `truncationReasons`, and `limitations` before
 treating a missing result as evidence. `--max` limits displayed results after
 traversal. The separate vertex and edge budgets can stop traversal itself.

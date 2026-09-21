@@ -201,6 +201,25 @@ fn inner_alias_does_not_resolve_an_unknown_outer_column() {
 }
 
 #[test]
+fn intersect_preserves_both_value_sources() {
+    let graph = scan(
+        "SELECT customer_id AS id FROM orders INTERSECT SELECT id FROM customers",
+        &["id"],
+    );
+    complete(&graph);
+    for source in ["s.orders.customer_id", "s.customers.id"] {
+        assert!(edge(&graph, "s.v", source, EdgeKind::Reads));
+        assert!(edge(&graph, "s.v.id", source, EdgeKind::DerivesFrom));
+    }
+    assert!(!edge(
+        &graph,
+        "s.v.id",
+        "s.orders.id",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
 fn union_collects_both_values_but_except_rhs_only_affects_rows() {
     let union = scan(
         "SELECT id FROM orders UNION ALL SELECT id FROM customers",
@@ -383,6 +402,31 @@ fn sqlite_outer_join_using_keeps_joined_column_order() {
             EdgeKind::DerivesFrom
         ));
     }
+}
+
+#[test]
+fn postgres_quoted_builtin_names_preserve_case() {
+    let lower = scan(
+        "SELECT upper(\"substring\"(name, 1, 1)) AS initial FROM customers",
+        &["initial"],
+    );
+    complete(&lower);
+    assert!(edge(
+        &lower,
+        "s.v.initial",
+        "s.customers.name",
+        EdgeKind::DerivesFrom
+    ));
+
+    let upper = scan(
+        "SELECT \"SUBSTRING\"(name, 1, 1) AS initial FROM customers",
+        &["initial"],
+    );
+    assert_eq!(
+        upper.analysis()[&VertexId::from_raw("s.v")].state,
+        AnalysisState::Partial
+    );
+    assert!(has_diagnostic(&upper, "SG_CALL_UNRESOLVED"));
 }
 
 #[test]
