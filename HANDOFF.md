@@ -4,7 +4,7 @@
 
 ## 지금 상태
 
-- 2026-09-22: **MySQL·MariaDB fixture 기동 경합 재현·로컬 수정 검증 완료**
+- 2026-09-22: **MySQL·MariaDB fixture 기동 경합 수정·PR 전체 CI 검증 완료**
   (`fix/mysql-fixture-readiness`). 아래 main CI 실패의 준비 완료 오판을 실제
   MySQL 8.4·MariaDB 11.4에서 확인했다. 초기화 스크립트를 잠시 대기시킨 상태에서
   기존 admin ping과 소켓 `sgfix` 쿼리는 모두 성공하지만 TCP 연결은 실패한다.
@@ -19,9 +19,17 @@
     실행해 SQLite·PostgreSQL·MySQL·MariaDB PFS OFF/ON의 native golden 및
     Go v1/v2 JSON/NDJSON 패리티 5개를 검증했다(건너뜀 0).
     Rust workspace 오프라인 빌드·셸/Python 구문·workflow YAML 로딩도 통과했다.
-  - 회귀 검사를 CI에 연결했다. **수정본 원격 CI·main 반영은 아직 미완료**다.
-    사용자가 원격 브랜치 push·PR·전체 CI 실행을 승인했다. 로컬 검증을 아래
-    실패한 main 실행의 복구로 간주하지 않는다. 재현 코드·서버 로그·검증 요약은
+  - [PR #10](https://github.com/ictechgy/schemagraph/pull/10)의 검사 소스는
+    `20b398086682deefd2639e24647dda5b5cfa999f`다.
+    [전체 CI](https://github.com/ictechgy/schemagraph/actions/runs/35635144433)에서
+    Rust 254개 테스트·새 회귀 검사·공개 정확도 평가·패키징·JDBC/Go·Maven 소비자·
+    전체 DB fixture를 통과했다. 로그의 `verify-fixtures: OK`, 생산자 전송 조합
+    14개, 건너뜀 0을 확인했다. 같은 소스의 중복 push 실행은 저장소 동시 실행
+    설정으로 취소됐으며 실패 검증으로 세지 않는다. 이후 완료 기록만 바꾸면
+    위 소스와 실행 코드의 동일성을 확인하고 이 검증을 재사용한다.
+  - **main 반영과 main CI 확인은 아직 미완료**다. 이번 승인 범위는 commit·push·
+    PR·전체 CI 실행이며 PR은 열린 상태다. PR 검사 성공을 아래 실패한 main 실행의
+    복구로 간주하지 않는다. 재현 코드·서버 로그·검증 요약은
     저장소 밖 `~/Library/Application Support/schemagraph/verification/ci-readiness-20260922`에
     보관했다. 소유한 임시 DB는 정리했다.
 
@@ -664,12 +672,12 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 설치본 검증까지 완료했다. 승인된 릴리스 작업에 미완료 항목은 없다. 이후 승인된
 MySQL·MariaDB 공개 표본 평가도 main에 반영했다. 다만 **main CI 복구는 남아 있다.**
 
-1. `fix/mysql-fixture-readiness`의 로컬 수정·검증을 원격 브랜치와 PR에 반영하고
-   전체 CI를 실행한다. 사용자가 push·PR·전체 CI 실행을 승인했다.
-   기동 오판 재현·TCP 대기·timeout/종료 실패 처리와 실제 두 DB 검증은 완료했다.
-2. 수정본 CI 통과 후 main에 반영하고 main 실행도 확인한다. 실패 실행과 수정 후
-   성공 실행을 구분해 기록한다. 로컬 영향 구간 검증이나 재실행 성공만으로
-   main CI가 복구됐다고 기록하지 않는다.
+1. 전체 CI를 통과한 [PR #10](https://github.com/ictechgy/schemagraph/pull/10)의
+   main 반영을 진행한다. 현재 승인된 commit·push·PR·CI 작업은 완료했고,
+   병합은 아직 수행하지 않았다. 기동 오판 재현·TCP 대기·timeout/종료 실패 처리와
+   실제 두 DB 검증 및 전체 CI 근거는 위 2026-09-22 기록을 따른다.
+2. 병합 후 main 실행도 확인한다. 실패 실행과 수정 후 성공 실행을 구분해 기록한다.
+   PR 검사 성공만으로 main CI가 복구됐다고 기록하지 않는다.
 
 CI 복구 후 선택적 과제는 SQL Server·Oracle 등 나머지 DB의 공개 표본과 저장
 프로시저·트리거 사례 확대, 단일 대형 스키마·밀집 그래프의 메모리·반복 조회·취소
