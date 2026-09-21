@@ -40,12 +40,20 @@ def verify_sources():
     return manifest
 
 
-def cases(name):
-    path = CORPUS/f'{name}-cases.json'
-    result = read_json(path)['cases']
+def cases(name, suite):
+    result = []
+    for cohort in ('regression', 'validation'):
+        if suite not in ('all', cohort):
+            continue
+        suffix = '' if cohort == 'regression' else '-validation'
+        path = CORPUS/f'{name}{suffix}-cases.json'
+        cohort_cases = read_json(path)['cases']
+        if not cohort_cases:
+            raise RuntimeError(f'{path.name} has no cases')
+        result.extend(dict(case, cohort=cohort) for case in cohort_cases)
     names = [case['name'] for case in result]
     if not names or len(names)!=len(set(names)) or any(not re.fullmatch(r'[a-z][a-z0-9_]*',name) for name in names):
-        raise RuntimeError(f'{path.name} needs nonempty, unique SQL-safe case names')
+        raise RuntimeError(f'{name}/{suite} needs nonempty, unique SQL-safe case names')
     return result
 
 
@@ -85,7 +93,7 @@ def postgres(work, bindir):
 def scan(engine, url, directory, label, baseline, authored, env=None):
     document = directory/f'{label}.catalog.json'
     initial = directory/f'{label}.initial.graph.json'
-    collector = baseline or engine
+    collector = engine
     run([collector, 'scan', url, '--emit-document', document, '-o', initial],env=env)
     # DB는 USING 등을 명시적 컬럼 표현식으로 다시 출력하기도 한다. 검토 사례는
     # DB가 확인한 컬럼 모양과 원래 SQL을 조합해 두 분석기에 동일한 입력을 준다.
@@ -130,7 +138,7 @@ def inspect_case(graph, subject, case):
     expected = {(output, source) for output, sources in case['lineage'].items() for source in sources}
     analysis = next((item for item in graph.get('analysis', []) if item['id']==subject), None)
     state = analysis['state'] if analysis else 'unavailable'
-    return {'subject': subject, 'tags': case['tags'], 'reads': score({(item,) for item in case['reads']}, reads),
+    return {'subject': subject, 'cohort': case['cohort'], 'tags': case['tags'], 'reads': score({(item,) for item in case['reads']}, reads),
             'lineage': score(expected, lineage), 'state': state, 'expected_state': case['state'],
             'diagnostics': analysis.get('diagnostics', []) if analysis else []}
 
@@ -181,6 +189,9 @@ def corpus_report(graph, authored, schema, catalog=None):
             'authored_cases':checked, 'postgres_catalog_reads':reference,'view_analysis':view_analysis,
             'summary':{'manual_reads':totals([c['reads'] for c in checked]),
                        'manual_lineage':totals([c['lineage'] for c in checked]),
+                       'cohorts':{cohort:{kind:totals([c[kind] for c in checked if c['cohort']==cohort])
+                                          for kind in ('reads','lineage')}
+                                  for cohort in sorted({c['cohort'] for c in checked})},
                        'catalog_reads':totals(reference),'false_complete_cases':false_complete}}
 
 
@@ -208,17 +219,23 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--strict',action='store_true')
     parser.add_argument('--sqlglot',action='store_true',help='also measure the pinned optional SQLGlot development adapter')
+    parser.add_argument('--suite',choices=('regression','validation','all'),default='regression',
+                        help='keep the original regression cases separate from the additional validation cohort')
     args = parser.parse_args()
     manifest = verify_sources()
     result = {'report_version':1,'sources':manifest['datasets'], 'results':{},'engines':{},
-              'method':'DB-validated original SQL replay for reviewed cases; native definitions for upstream views; fixed catalog shared by both engine versions and SQLGlot'}
+              'suite':args.suite, 'collector':'current',
+              'method':'DB-validated original SQL replay for reviewed cases; native definitions for upstream views; current collector catalog shared by both parser versions and SQLGlot'}
     for label,engine in [('current',args.engine),('baseline',args.baseline)]:
         if engine:
             result['engines'][label]={'version':run([engine,'--version']).strip(),'sha256':hashlib.sha256(engine.read_bytes()).hexdigest()}
-    result['cases_sha256']={name:hashlib.sha256((CORPUS/f'{name}-cases.json').read_bytes()).hexdigest() for name in ('chinook','pagila')}
+    case_paths=[CORPUS/f'{name}{suffix}-cases.json' for name in ('chinook','pagila')
+                for cohort,suffix in [('regression',''),('validation','-validation')]
+                if args.suite in ('all',cohort)]
+    result['cases_sha256']={path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in case_paths}
     with tempfile.TemporaryDirectory(prefix='schemagraph-accuracy-') as directory:
         work = Path(directory)
-        sqlite_cases = cases('chinook')
+        sqlite_cases = cases('chinook',args.suite)
         database = work/'chinook.db'
         connection = sqlite3.connect(database)
         try:
@@ -238,22 +255,43 @@ def main():
             applied = work/'pagila.sql'
             applied.write_text((CORPUS/'pagila/schema.sql').read_text().replace(' OWNER TO postgres;', ' OWNER TO corpus;'))
             run(psql+['-qf',applied],env=env)
-            pg_cases = cases('pagila')
+            pg_cases = cases('pagila',args.suite)
             for case in pg_cases:
                 run(psql+['-qc','CREATE VIEW public.acc_'+case['name']+' AS '+case['sql']],env=env)
             reference = catalog_reference(psql,env)
             result['postgres_version'] = run(psql+['-Atc','SHOW server_version'],env=env).strip()
             graphs, document = scan(args.engine,url,work,'pagila',args.baseline,pg_cases,env)
             result['results']['pagila'] = {name:corpus_report(graph,pg_cases,'public',reference) for name,graph in graphs.items()}
+            result['pagila_aggregate_failures'] = check_pagila_aggregate(graphs['current'],document)
             if args.sqlglot:
                 result['results']['pagila']['sqlglot']=compare_sqlglot(document,pg_cases,'postgres','public')
     failures = {name:failing(corpus['current']) for name,corpus in result['results'].items()}
+    failures['pagila'].extend(result['pagila_aggregate_failures'])
     result['failures'] = failures
     args.output.parent.mkdir(parents=True,exist_ok=True)
     args.output.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
     for name,corpus in result['results'].items():
         print(f"{name}: {len(corpus['current']['authored_cases'])} reviewed cases, {len(corpus['current']['postgres_catalog_reads'])} DB view definitions, {len(failures[name])} failing checks")
     return 1 if args.strict and any(failures.values()) else 0
+
+
+def check_pagila_aggregate(graph, document):
+    """실제 공개 집계 호출의 복구와 없는 SQL 몸체의 비합성을 검증한다."""
+    problems = []
+    target = 'public.group_concat(text)'
+    routines = [r for s in document['schemas'] if s['name']=='public'
+                for r in s['routines'] if r['name']=='group_concat']
+    if len(routines)!=1 or routines[0]['kind']!='function' or routines[0].get('body') is not None:
+        problems.append('Pagila aggregate identity/body metadata')
+    states = {a['id']:a['state'] for a in graph.get('analysis',[])}
+    edges = {(e['from'],e['to'],e['kind']) for e in graph['edges']}
+    for name in ('actor_info','film_list','nicer_but_slower_film_list'):
+        subject = 'public.'+name
+        if (subject,target,'calls') not in edges or states.get(subject)!='complete':
+            problems.append(subject+': aggregate call resolution')
+    if states.get(target)!='unsupported':
+        problems.append('Pagila aggregate must not claim SQL body analysis')
+    return problems
 
 
 def compare_sqlglot(document, authored, dialect, schema):
