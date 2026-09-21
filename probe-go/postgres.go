@@ -303,12 +303,13 @@ func (h *harvester) postgresRoutines(schema string) []RoutineDoc {
 	routines := []RoutineDoc{}
 	h.pgRows("routines", `
 		SELECT p.proname, l.lanname, p.prokind::text,
-		       pg_get_function_identity_arguments(p.oid), pg_get_functiondef(p.oid)
+		       pg_get_function_identity_arguments(p.oid),
+		       CASE WHEN p.prokind = 'a' THEN NULL ELSE pg_get_functiondef(p.oid) END
 		FROM pg_proc p
 		JOIN pg_namespace ns ON ns.oid = p.pronamespace
 		JOIN pg_language l ON l.oid = p.prolang
-		WHERE ns.nspname = $1 AND p.prokind IN ('f', 'p')
-		ORDER BY p.proname, pg_get_function_identity_arguments(p.oid)`, []any{schema}, func(rows *sql.Rows) error {
+		WHERE ns.nspname = $1 AND p.prokind IN ('f', 'p', 'a', 'w')
+		ORDER BY p.proname, pg_get_function_identity_arguments(p.oid), p.oid`, []any{schema}, func(rows *sql.Rows) error {
 		var name, language, prokind, signature string
 		var body sql.NullString
 		if err := rows.Scan(&name, &language, &prokind, &signature, &body); err != nil {
@@ -316,7 +317,7 @@ func (h *harvester) postgresRoutines(schema string) []RoutineDoc {
 		}
 		kind := ""
 		switch prokind {
-		case "f":
+		case "f", "a", "w":
 			kind = "function"
 		case "p":
 			kind = "procedure"

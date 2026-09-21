@@ -21,6 +21,18 @@ The producer name identifies the extraction path, such as `native-sqlx`,
 `probe-jdbc`, or `probe-go`. It does not identify credentials or a database
 connection.
 
+PostgreSQL aggregates and window functions use the existing `function` routine
+kind, with the server's identity-argument signature. Aggregate SQL bodies are
+absent: `pg_get_functiondef` cannot return an aggregate definition, and producers
+do not synthesize one. With `--catalog-dependencies`, aggregate references to
+user-defined support functions are collected from `pg_depend`; the engine keeps
+them as `depends-on` facts. Aggregate body analysis remains unavailable even
+when its callers can be resolved.
+
+Since 0.4.1, JDBC uses the same PostgreSQL routine identity arguments as the
+native and Go collectors. Named or INOUT arguments can therefore change routine
+IDs relative to older JDBC snapshots that used only input type names.
+
 The known required features are:
 
 - `package-members-v1` — routine records use `member_of` for package members.
