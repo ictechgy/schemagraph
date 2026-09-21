@@ -217,6 +217,39 @@ Only the requested report persists after successful or failed checks.
 
 ## Reproduce
 
+### Prepared SQL Server and Oracle cohort
+
+The source tree now includes 18 independently authored cases per database in
+[SQL Server cases](Fixtures/accuracy/chinook-sqlserver-cases.json) and
+[Oracle cases](Fixtures/accuracy/chinook-oracle-cases.json): 12 views, four
+routines, and two triggers. Their initial expected facts were committed at
+`8e53c4f` before any analyzer run on these cases. This cohort has **not yet been
+validated on actual SQL Server/Oracle**, and no accuracy percentage is claimed.
+The native upstream DDL, license/checksum entries, and pinned database image
+manifest still need to be added before the new workflow can run.
+
+The prepared evaluator first checks view binding, stored-object compilation,
+and the actual insert/update/copy/count effects of synthetic Genre rows. It
+then scores the DB definitions and authored original SQL separately, using both
+Go and JDBC collectors. Views have complete reviewed relation/column read and
+value-source sets; routines/triggers score direct object reads, writes, calls,
+and firing owners. Routine column lineage and data-dependent dynamic SQL are
+outside this cohort's scored scope. `--cases` is a variant of this fixed runtime
+cohort, not a generic replacement schema; its six Genre modules and expected
+runtime effects must remain present. Overrides are identified separately in
+report provenance.
+
+The new runner is `Scripts/verify-sqlserver-oracle-accuracy.py`. Its helper and
+evaluator tests run locally without these servers. Its real-DB workflow is
+prepared at `.github/workflows/sqlserver-oracle-accuracy.yml`; SQL Server needs
+an actual Linux x86_64 server, not an Azure SQL Edge substitution. The runner
+uses the source Go probe's unreleased `--url-env` option and the JDBC probe's
+existing `SG_DB_PASSWORD` input so temporary passwords do not enter argv.
+Optional artifacts contain guarded catalog/graph files only. Missing image or
+source files are an unmet prerequisite, not an empty successful evaluation.
+
+### Existing evaluated cohorts
+
 ```sh
 cargo build --manifest-path engine/Cargo.toml --locked
 python3 Scripts/verify-accuracy.py \
