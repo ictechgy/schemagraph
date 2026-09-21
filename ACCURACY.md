@@ -201,8 +201,9 @@ The adapter uses SQLGlot's MySQL dialect for both servers and passes `UNKNOWN`
 types. Differences include unresolved mixed-case quoted columns, named-window
 sources, merged outer-join keys, and the project's left-only value-source policy
 for `EXCEPT`. The different native-definition scores show why server-normalized
-SQL is scored separately. The reports retain adapter errors. These numbers compare this API
-adapter and the project's lineage policy; they are not a product ranking.
+SQL is scored separately. The reports retain adapter errors. These numbers
+compare this API adapter and the project's lineage policy; they are not a product
+ranking.
 
 [`mysql-environments.json`](Fixtures/accuracy/mysql-environments.json) pins
 official image digests and the explicit SQL mode

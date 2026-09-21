@@ -199,7 +199,8 @@ def analyze(engine, baseline, url, work, cases, reference, sqlglot):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description='Validate pinned Chinook SQL on disposable MySQL/MariaDB servers and score independent references.')
     parser.add_argument('--engine',type=Path)
     parser.add_argument('--baseline',type=Path)
     parser.add_argument('--database',choices=('mysql','mariadb','all'),default='all')
