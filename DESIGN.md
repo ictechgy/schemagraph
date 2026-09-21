@@ -153,6 +153,10 @@ DB에는 `main()`이 없다. 다른 객체가 참조하지 않는 테이블이 �
 - **`truncated`는 결과 제한과 탐색 중단을 구분한다.** 결과 개수만 잘린 경우에도
   `truncated`를 싣고, depth·visited·examined edge 예산으로 탐색을 끝낸 경우에는
   `truncationReasons`와 `complete=false`를 함께 보고한다.
+- **취소는 관계 부재의 증거가 아니다.** 취소를 관측한 탐색에는 `cancelled` 이유를
+  남기고, 경로의 근거가 덜 수집됐으면 그 경로를 출력하지 않는다. CLI의 협력적
+  Ctrl+C는 종료 코드 130, MCP 취소는 해당 요청의 응답 생략으로 전달한다.
+  요청별 토큰은 재사용하지 않으며 완료와 취소의 경합을 다른 요청에 전파하지 않는다.
 - **HTML은 오프라인 산출물이다.** `graph --format html`은 외부 asset·network를
   사용하지 않고, 첫 화면에는 전체 그래프를 그리지 않는다. 선택된 정점의 직접
   이웃만 제한해 표시하며 이름·근거·origin은 DOM `textContent`로 출력한다.

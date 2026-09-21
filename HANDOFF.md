@@ -4,6 +4,25 @@
 
 ## 지금 상태
 
+- 2026-09-21: **CLI·MCP 요청 취소 구현 진행 중** (`feature/request-cancellation`).
+  사용자가 다음 과제 중 1번인 실행 중 요청 취소를 승인했다. 이번 범위는
+  CLI `query`·`impact`·`path`·`review`의 Ctrl+C와 MCP 요청별 취소다.
+  첫 Ctrl+C는 탐색 토큰을 켜고 종료 코드 130, 두 번째는 즉시 종료한다.
+  MCP는 입력과 계산을 분리하고 bounded queue·요청별 토큰을 사용하며,
+  취소된 요청의 응답은 보내지 않는다. 기존 분석 API는 유지하고 취소 가능한
+  review 진입점을 추가한다. core 의존성은 그대로이며 ctrlc는 CLI에만 추가한다.
+  v0.4.1 이후 소스 기능으로 문서화한다. 아직 새 릴리스는 만들지 않았다.
+  - 로컬 Rust 254개 테스트, FIFO로 동기화한 실제 Ctrl+C·두 번째 중단·닫힌 stderr,
+    SIGINT 무시를 상속한 실행, MCP 취소 후 재사용·EOF drain을 통과했다.
+    실행 중인 worker의 토큰 전달과 입력이 열린 채 발생한 출력 오류 반환도 검사한다.
+    공개 v0.4.1을 음성 대조군으로 실행해 취소 미지원 동작을 새 검사가 잡는지 확인했다.
+    기존 CLI 회귀·JSON 계약·actionlint·core 외부 의존성 0도 확인했다.
+  - 입력은 소유권이 있는 별도 reader에서 제한된 이벤트 큐로 전달한다. 치명적 I/O
+    오류 때 막힌 stdin read는 안전하게 분리하고 CLI 프로세스 종료가 정리한다.
+    계산 worker는 항상 join한다. 정상 EOF는 수락한 요청을 처리한 뒤 종료한다.
+    로딩·정렬·출력 I/O는 첫 신호가 선점하지 않으며 두 번째 Ctrl+C로 강제 종료한다.
+  CI·PR 반영 결과는 완료 시 이 항목에 갱신한다.
+
 - 2026-09-21: **v0.4.1 — PostgreSQL 집계·추가 정확도 검증·공개 배포 완료**.
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.1) ·
   [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.4.1) ·
