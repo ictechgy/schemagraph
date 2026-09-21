@@ -23,6 +23,18 @@
       "transformation": "strip UTF-8 BOM; normalize CRLF to LF; retain the prefix before Populate Tables; no INSERT statements",
       "upstream_sha256": "fdcb271b3e9c840216b09168752bddca973ed3917b40e49b603b15831114aea1",
       "url": "https://raw.githubusercontent.com/lerocha/chinook-database/4a944a942426e1f3263fe539155fb7ef92b04b4a/ChinookDatabase/DataSources/Chinook_Sqlite.sql"
+    },
+    {
+      "commit": "4a944a942426e1f3263fe539155fb7ef92b04b4a",
+      "file": "chinook-mysql/schema.sql",
+      "license_file": "chinook-mysql/LICENSE.md",
+      "license_sha256": "5064d720db431474b0a0b0cef9d2b5e362b6c6f80602b35c6443b07cbc979f77",
+      "name": "chinook-mysql",
+      "release": "v1.4.5",
+      "sha256": "79fb94a11439adec4909d1b129c25fb6fed2e20411c85f93c55d7f2fed00f837",
+      "transformation": "strip UTF-8 BOM; normalize CRLF to LF; retain schema before Populate Tables; remove DROP DATABASE, CREATE DATABASE, and USE statements so the runner selects its owned database; no INSERT statements",
+      "upstream_sha256": "02a1835417c3ea19bff64e1d1f22be738ce51b3f88b0473c24eebff9a3ccde4b",
+      "url": "https://raw.githubusercontent.com/lerocha/chinook-database/4a944a942426e1f3263fe539155fb7ef92b04b4a/ChinookDatabase/DataSources/Chinook_MySql.sql"
     }
   ]
 }

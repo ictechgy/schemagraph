@@ -1,0 +1,16 @@
+{
+  "engines": {
+    "mariadb": {
+      "client": "mariadb",
+      "image": "mariadb@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b",
+      "tag": "mariadb:11.4"
+    },
+    "mysql": {
+      "client": "mysql",
+      "image": "mysql@sha256:85b9bf2e29cf836ecb8c2a15a935d4ba0c606631dff1dd79531a11983c638f2a",
+      "tag": "mysql:8.4"
+    }
+  },
+  "schema": "chinook",
+  "sql_mode": "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"
+}

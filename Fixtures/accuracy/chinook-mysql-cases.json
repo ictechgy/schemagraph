@@ -1,0 +1,482 @@
+{
+  "cases": [
+    {
+      "lineage": {
+        "Name": [
+          "chinook.Track.Milliseconds"
+        ],
+        "genre_name": [
+          "chinook.Genre.Name"
+        ],
+        "track_count": [
+          "chinook.Track.TrackId"
+        ]
+      },
+      "name": "mysql_aggregate_alias_collision",
+      "reads": [
+        "chinook.Genre",
+        "chinook.Genre.GenreId",
+        "chinook.Genre.Name",
+        "chinook.Track",
+        "chinook.Track.GenreId",
+        "chinook.Track.Milliseconds",
+        "chinook.Track.TrackId"
+      ],
+      "reason": "Uses aggregate aliases in HAVING and ORDER BY while deliberately reusing the physical column name Name as an output alias; grouped and joined columns remain reads.",
+      "sql": "SELECT g.Name AS genre_name, COUNT(t.TrackId) AS track_count, SUM(t.Milliseconds) AS Name FROM Genre AS g LEFT JOIN Track AS t ON t.GenreId = g.GenreId GROUP BY g.Name HAVING track_count > 0 ORDER BY Name DESC",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "alias-collision",
+        "grouping",
+        "having",
+        "order"
+      ]
+    },
+    {
+      "lineage": {
+        "country": [
+          "chinook.Customer.Country"
+        ],
+        "invoice_count": [
+          "chinook.Invoice.InvoiceId"
+        ],
+        "revenue": [
+          "chinook.Invoice.Total"
+        ]
+      },
+      "name": "mysql_aggregate_aliases",
+      "reads": [
+        "chinook.Customer",
+        "chinook.Customer.Country",
+        "chinook.Customer.CustomerId",
+        "chinook.Invoice",
+        "chinook.Invoice.CustomerId",
+        "chinook.Invoice.InvoiceId",
+        "chinook.Invoice.Total"
+      ],
+      "reason": "Groups invoice counts and revenue by country and reuses both aggregate aliases in HAVING and ORDER BY.",
+      "sql": "SELECT c.Country AS country, COUNT(i.InvoiceId) AS invoice_count, SUM(i.Total) AS revenue FROM Customer AS c JOIN Invoice AS i ON i.CustomerId = c.CustomerId GROUP BY c.Country HAVING revenue > 0 ORDER BY revenue DESC, invoice_count DESC",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "alias",
+        "grouping",
+        "having",
+        "join",
+        "order"
+      ]
+    },
+    {
+      "lineage": {
+        "customer_id": [
+          "chinook.Customer.CustomerId"
+        ],
+        "display_name": [
+          "chinook.Customer.Company",
+          "chinook.Customer.FirstName",
+          "chinook.Customer.LastName"
+        ],
+        "market": [
+          "chinook.Customer.Country"
+        ],
+        "support_status": [
+          "chinook.Customer.SupportRepId"
+        ]
+      },
+      "name": "mysql_case_if_ifnull",
+      "reads": [
+        "chinook.Customer",
+        "chinook.Customer.Company",
+        "chinook.Customer.Country",
+        "chinook.Customer.CustomerId",
+        "chinook.Customer.Email",
+        "chinook.Customer.FirstName",
+        "chinook.Customer.LastName",
+        "chinook.Customer.SupportRepId"
+      ],
+      "reason": "Builds customer labels with IFNULL and CONCAT, classifies countries with IF and support assignment with CASE, and filters on email presence.",
+      "sql": "SELECT c.CustomerId AS customer_id, IFNULL(c.Company, CONCAT(c.FirstName, ' ', c.LastName)) AS display_name, IF(c.Country = 'USA', 'domestic', 'foreign') AS market, CASE WHEN c.SupportRepId IS NULL THEN 'unassigned' ELSE 'assigned' END AS support_status FROM Customer AS c WHERE c.Email IS NOT NULL ORDER BY display_name",
+      "state": "complete",
+      "tags": [
+        "case",
+        "filter",
+        "functions",
+        "if",
+        "ifnull"
+      ]
+    },
+    {
+      "lineage": {
+        "track_id": [
+          "chinook.Track.TrackId"
+        ],
+        "track_name": [
+          "chinook.Track.Name"
+        ]
+      },
+      "name": "mysql_casefold_backticks",
+      "reads": [
+        "chinook.Track",
+        "chinook.Track.Name",
+        "chinook.Track.TrackId",
+        "chinook.Track.UnitPrice"
+      ],
+      "reason": "References a PascalCase table and columns with backticks and deliberately varied column case; MySQL and MariaDB resolve those column identifiers case-insensitively.",
+      "sql": "SELECT `trackid` AS track_id, `NAME` AS track_name FROM `Track` WHERE `UNITPRICE` >= 0.99 ORDER BY `NAME`",
+      "state": "complete",
+      "tags": [
+        "backticks",
+        "case-folding",
+        "filter",
+        "order"
+      ]
+    },
+    {
+      "lineage": {
+        "Track_ID": [
+          "chinook.Track.TrackId"
+        ],
+        "Track_Name": [
+          "chinook.Track.Name"
+        ]
+      },
+      "name": "mysql_casefold_alias",
+      "reads": [
+        "chinook.Track",
+        "chinook.Track.Name",
+        "chinook.Track.TrackId"
+      ],
+      "reason": "Uses mixed-case quoted output aliases and refers to one alias with different case in ORDER BY, exercising case-insensitive alias lookup while preserving the declared output names.",
+      "sql": "SELECT t.TrackId AS `Track_ID`, t.Name AS `Track_Name` FROM `Track` AS t ORDER BY `track_id`",
+      "state": "complete",
+      "tags": [
+        "alias",
+        "backticks",
+        "case-folding",
+        "order"
+      ]
+    },
+    {
+      "lineage": {
+        "customer_id": [
+          "chinook.Customer.CustomerId"
+        ],
+        "max_invoice_total": [
+          "chinook.Invoice.Total"
+        ]
+      },
+      "name": "mysql_correlated_invoice",
+      "reads": [
+        "chinook.Customer",
+        "chinook.Customer.CustomerId",
+        "chinook.Invoice",
+        "chinook.Invoice.CustomerId",
+        "chinook.Invoice.Total"
+      ],
+      "reason": "Combines a correlated scalar maximum with a correlated EXISTS filter; the outer customer key and both invoice predicate/value columns remain dependencies.",
+      "sql": "SELECT c.CustomerId AS customer_id, (SELECT MAX(i.Total) FROM Invoice AS i WHERE i.CustomerId = c.CustomerId) AS max_invoice_total FROM Customer AS c WHERE EXISTS (SELECT 1 FROM Invoice AS i2 WHERE i2.CustomerId = c.CustomerId AND i2.Total >= 20) ORDER BY max_invoice_total DESC",
+      "state": "complete",
+      "tags": [
+        "correlated",
+        "exists",
+        "scalar",
+        "subquery"
+      ]
+    },
+    {
+      "lineage": {
+        "invoice_id": [
+          "chinook.Invoice.InvoiceId"
+        ],
+        "total_amount": [
+          "chinook.InvoiceLine.Quantity",
+          "chinook.InvoiceLine.UnitPrice"
+        ]
+      },
+      "name": "mysql_cte_alias_chain",
+      "reads": [
+        "chinook.Invoice",
+        "chinook.Invoice.InvoiceId",
+        "chinook.InvoiceLine",
+        "chinook.InvoiceLine.InvoiceId",
+        "chinook.InvoiceLine.Quantity",
+        "chinook.InvoiceLine.UnitPrice"
+      ],
+      "reason": "Carries line values through two CTE scopes before joining invoice totals back to invoice headers; CTE join and filter aliases remain reads.",
+      "sql": "WITH line_values AS (SELECT il.InvoiceId AS invoice_id, il.Quantity * il.UnitPrice AS amount FROM InvoiceLine AS il), totals AS (SELECT invoice_id, SUM(amount) AS total_amount FROM line_values GROUP BY invoice_id) SELECT i.InvoiceId AS invoice_id, totals.total_amount AS total_amount FROM Invoice AS i JOIN totals ON totals.invoice_id = i.InvoiceId WHERE totals.total_amount > 0 ORDER BY total_amount DESC",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "cte",
+        "join",
+        "nested"
+      ]
+    },
+    {
+      "lineage": {
+        "amount": [
+          "chinook.Invoice.Total"
+        ],
+        "sale_id": [
+          "chinook.Invoice.InvoiceId"
+        ]
+      },
+      "name": "mysql_derived_alias_star",
+      "reads": [
+        "chinook.Invoice",
+        "chinook.Invoice.InvoiceId",
+        "chinook.Invoice.Total"
+      ],
+      "reason": "Expands a derived-table wildcard using its output aliases, keeping the aliases as view columns and retaining the inner filter dependency.",
+      "sql": "SELECT report.* FROM (SELECT InvoiceId AS sale_id, Total AS amount FROM Invoice WHERE Total > 0) AS report ORDER BY report.amount DESC",
+      "state": "complete",
+      "tags": [
+        "alias",
+        "derived",
+        "filter",
+        "wildcard"
+      ]
+    },
+    {
+      "lineage": {
+        "customer_id": [
+          "chinook.Customer.CustomerId"
+        ]
+      },
+      "name": "mysql_except_lineage",
+      "reads": [
+        "chinook.Customer",
+        "chinook.Customer.CustomerId",
+        "chinook.Invoice",
+        "chinook.Invoice.CustomerId"
+      ],
+      "reason": "Subtracts customers that have invoices; the right branch contributes membership reads while EXCEPT output values retain only the left branch source.",
+      "sql": "SELECT c.CustomerId AS customer_id FROM Customer AS c EXCEPT SELECT i.CustomerId FROM Invoice AS i",
+      "state": "complete",
+      "tags": [
+        "except",
+        "set-operation"
+      ]
+    },
+    {
+      "lineage": {
+        "album_id": [
+          "chinook.Album.AlbumId"
+        ],
+        "track_names": [
+          "chinook.Track.Name",
+          "chinook.Track.TrackId"
+        ]
+      },
+      "name": "mysql_group_concat_order",
+      "reads": [
+        "chinook.Album",
+        "chinook.Album.AlbumId",
+        "chinook.Track",
+        "chinook.Track.AlbumId",
+        "chinook.Track.Name",
+        "chinook.Track.TrackId"
+      ],
+      "reason": "Concatenates album tracks in TrackId order; both the concatenated names and ordering keys influence the output while HAVING keeps the count input as a read.",
+      "sql": "SELECT a.AlbumId AS album_id, GROUP_CONCAT(t.Name ORDER BY t.TrackId SEPARATOR '; ') AS track_names FROM Album AS a LEFT JOIN Track AS t ON t.AlbumId = a.AlbumId GROUP BY a.AlbumId HAVING COUNT(t.TrackId) > 0 ORDER BY album_id",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "group-concat",
+        "join",
+        "order"
+      ]
+    },
+    {
+      "lineage": {
+        "track_id": [
+          "chinook.PlaylistTrack.TrackId",
+          "chinook.Track.TrackId"
+        ]
+      },
+      "name": "mysql_intersect_lineage",
+      "reads": [
+        "chinook.PlaylistTrack",
+        "chinook.PlaylistTrack.TrackId",
+        "chinook.Track",
+        "chinook.Track.GenreId",
+        "chinook.Track.TrackId"
+      ],
+      "reason": "Intersects genre-selected tracks with playlist membership, so both branches contribute output value sources and the genre predicate remains a read.",
+      "sql": "SELECT t.TrackId AS track_id FROM Track AS t WHERE t.GenreId IN (1, 3, 13) INTERSECT SELECT pt.TrackId AS track_id FROM PlaylistTrack AS pt",
+      "state": "complete",
+      "tags": [
+        "intersect",
+        "set-operation"
+      ]
+    },
+    {
+      "lineage": {
+        "BillingAddress": [
+          "chinook.Invoice.BillingAddress"
+        ],
+        "BillingCity": [
+          "chinook.Invoice.BillingCity"
+        ],
+        "BillingCountry": [
+          "chinook.Invoice.BillingCountry"
+        ],
+        "BillingPostalCode": [
+          "chinook.Invoice.BillingPostalCode"
+        ],
+        "BillingState": [
+          "chinook.Invoice.BillingState"
+        ],
+        "CustomerId": [
+          "chinook.Invoice.CustomerId"
+        ],
+        "InvoiceDate": [
+          "chinook.Invoice.InvoiceDate"
+        ],
+        "InvoiceId": [
+          "chinook.Invoice.InvoiceId"
+        ],
+        "Total": [
+          "chinook.Invoice.Total"
+        ]
+      },
+      "name": "mysql_natural_left_star",
+      "reads": [
+        "chinook.Customer",
+        "chinook.Customer.CustomerId",
+        "chinook.Invoice",
+        "chinook.Invoice.BillingAddress",
+        "chinook.Invoice.BillingCity",
+        "chinook.Invoice.BillingCountry",
+        "chinook.Invoice.BillingPostalCode",
+        "chinook.Invoice.BillingState",
+        "chinook.Invoice.CustomerId",
+        "chinook.Invoice.InvoiceDate",
+        "chinook.Invoice.InvoiceId",
+        "chinook.Invoice.Total"
+      ],
+      "reason": "Expands the preserved Invoice side of a NATURAL LEFT JOIN; the merged CustomerId remains a read from both relations while the wildcard values come from Invoice.",
+      "sql": "SELECT i.* FROM Invoice AS i NATURAL LEFT JOIN Customer AS c WHERE i.Total > 0 ORDER BY i.InvoiceId",
+      "state": "complete",
+      "tags": [
+        "natural",
+        "outer-join",
+        "wildcard"
+      ]
+    },
+    {
+      "lineage": {
+        "genre_position": [
+          "chinook.Track.GenreId",
+          "chinook.Track.Milliseconds"
+        ],
+        "running_price": [
+          "chinook.Track.GenreId",
+          "chinook.Track.Milliseconds",
+          "chinook.Track.UnitPrice"
+        ],
+        "track_id": [
+          "chinook.Track.TrackId"
+        ]
+      },
+      "name": "mysql_named_window_frame",
+      "reads": [
+        "chinook.Track",
+        "chinook.Track.GenreId",
+        "chinook.Track.Milliseconds",
+        "chinook.Track.TrackId",
+        "chinook.Track.UnitPrice"
+      ],
+      "reason": "Resolves named partition/order windows for row numbering and a framed running average; ranking has no frame because MariaDB rejects it, and partition/order expressions are value sources for each output.",
+      "sql": "SELECT t.TrackId AS track_id, ROW_NUMBER() OVER genre_rank AS genre_position, AVG(t.UnitPrice) OVER genre_window AS running_price FROM Track AS t WINDOW genre_rank AS (PARTITION BY t.GenreId ORDER BY t.Milliseconds DESC), genre_window AS (PARTITION BY t.GenreId ORDER BY t.Milliseconds DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)",
+      "state": "complete",
+      "tags": [
+        "frame",
+        "named-window",
+        "window"
+      ]
+    },
+    {
+      "lineage": {
+        "customer_id": [
+          "chinook.Customer.CustomerId"
+        ],
+        "email": [
+          "chinook.Customer.Email"
+        ]
+      },
+      "name": "mysql_right_using_key",
+      "reads": [
+        "chinook.Customer",
+        "chinook.Customer.CustomerId",
+        "chinook.Customer.Email",
+        "chinook.Invoice",
+        "chinook.Invoice.CustomerId"
+      ],
+      "reason": "RIGHT JOIN USING preserves the Customer key on the right side; both key columns remain join reads and the email filter is a read-only dependency.",
+      "sql": "SELECT CustomerId AS customer_id, c.Email AS email FROM Invoice AS i RIGHT JOIN Customer AS c USING (CustomerId) WHERE c.Email IS NOT NULL ORDER BY customer_id",
+      "state": "complete",
+      "tags": [
+        "outer-join",
+        "right-join",
+        "using"
+      ]
+    },
+    {
+      "lineage": {
+        "track_id": [
+          "chinook.InvoiceLine.TrackId",
+          "chinook.PlaylistTrack.TrackId"
+        ]
+      },
+      "name": "mysql_union_lineage",
+      "reads": [
+        "chinook.InvoiceLine",
+        "chinook.InvoiceLine.Quantity",
+        "chinook.InvoiceLine.TrackId",
+        "chinook.PlaylistTrack",
+        "chinook.PlaylistTrack.TrackId"
+      ],
+      "reason": "Unions playlist membership with invoice lines meeting a quantity threshold, preserving both branch sources for the shared track_id output.",
+      "sql": "SELECT pt.TrackId AS track_id FROM PlaylistTrack AS pt UNION SELECT il.TrackId AS track_id FROM InvoiceLine AS il WHERE il.Quantity > 1",
+      "state": "complete",
+      "tags": [
+        "set-operation",
+        "union"
+      ]
+    },
+    {
+      "lineage": {
+        "rolling_ms": [
+          "chinook.Track.GenreId",
+          "chinook.Track.Milliseconds",
+          "chinook.Track.TrackId"
+        ],
+        "track_id": [
+          "chinook.Track.TrackId"
+        ],
+        "track_name": [
+          "chinook.Track.Name"
+        ]
+      },
+      "name": "mysql_window_frame",
+      "reads": [
+        "chinook.Track",
+        "chinook.Track.GenreId",
+        "chinook.Track.Milliseconds",
+        "chinook.Track.Name",
+        "chinook.Track.TrackId",
+        "chinook.Track.UnitPrice"
+      ],
+      "reason": "Computes a three-row rolling duration per genre, so the window partition and order columns contribute to output lineage while the price predicate remains a read.",
+      "sql": "SELECT t.TrackId AS track_id, t.Name AS track_name, SUM(t.Milliseconds) OVER (PARTITION BY t.GenreId ORDER BY t.TrackId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS rolling_ms FROM Track AS t WHERE t.UnitPrice >= 0.99 ORDER BY track_id",
+      "state": "complete",
+      "tags": [
+        "filter",
+        "frame",
+        "window"
+      ]
+    }
+  ]
+}
