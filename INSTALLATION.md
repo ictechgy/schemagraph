@@ -65,10 +65,10 @@ whose driver is not bundled, pass a compatible driver with `--driver` and add
 `--driver-class` when service discovery does not find it. Do not put passwords
 in shell history; the probe accepts `SG_DB_PASSWORD` for the password.
 
-The Go probe's unreleased source builds add `--url-env NAME` for reading a
+The Go probe supports `--url-env NAME` from version 0.4.3 for reading a
 complete URL from an exported environment variable without placing it in process
 arguments. It is mutually exclusive with `--url`, and missing/empty variables
-fail. The published 0.4.2 Go artifact does not include this option yet.
+fail.
 
 ## Reviewing a catalog change in CI
 

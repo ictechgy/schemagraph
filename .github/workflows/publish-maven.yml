@@ -13,7 +13,7 @@ on:
       version:
         description: Maven version to publish to Pages
         required: true
-        default: "0.4.2"
+        default: "0.4.3"
 
 permissions:
   contents: read
@@ -35,7 +35,7 @@ jobs:
       contents: read
       pages: read
     env:
-      PROBE_VERSION: ${{ inputs.version || '0.4.2' }}
+      PROBE_VERSION: ${{ inputs.version || '0.4.3' }}
       PROBE_GROUP: io.github.ictechgy
       PROBE_ARTIFACT: schemagraph-probe
       MAVEN_PAGES_URL: https://ictechgy.github.io/schemagraph/maven/

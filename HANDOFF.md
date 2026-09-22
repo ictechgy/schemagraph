@@ -4,6 +4,21 @@
 
 ## 지금 상태
 
+- 2026-09-22: **v0.4.3 공개 배포 진행 중** (`feature/release-v0.4.3`).
+  사용자가 새 버전 배포를 승인했다. GitHub CLI/Go/JDBC 바이너리, crates.io의
+  6개 crate, Maven Pages·Central을 동일 릴리스 소스에서 게시하고 공개 설치본을
+  검증한다. 기존 서명·인증 설정을 재사용하며 비밀키 백업은 읽거나 바꾸지 않는다.
+  - 포함 변경: Go `--url-env`, Oracle 무인덱스 배열 계약, SQL Server trigger 전이
+    관계 수정과 실DB 정확도·규모 검증. 이전 0.4.2 산출물은 불변으로 보존한다.
+  - PR #11은 `e2c393ae64d35ef8553473bf58d3a4ef7e1ea15a`로 병합됐다.
+    [main 전체 CI](https://github.com/ictechgy/schemagraph/actions/runs/35683269532),
+    [실DB 정확도](https://github.com/ictechgy/schemagraph/actions/runs/35683269577),
+    [IBM 회귀](https://github.com/ictechgy/schemagraph/actions/runs/35683269543)는 통과했다.
+  - 새 버전 metadata·설치 문서·배포 바이너리의 URL 환경 변수 검사를 준비하고,
+    릴리스 소스 CI와 패키징 dry-run 후 게시한다. 게시·공개 설치 검증 완료 전에는
+    완료로 기록하지 않는다. 근거는 저장소 밖
+    `~/Library/Application Support/schemagraph/verification/v0.4.3-20260922`에 보관한다.
+
 - 2026-09-22: **PR #11 리뷰 완료·머지 승인**.
   사용자가 리뷰 후 머지를 승인했다. 최종 구현 `de8d6d9`를 재검토했고 머지를
   막을 결함은 없었다. SQL Server trigger 전이 관계의 적용 범위, Oracle 빈 배열
@@ -761,12 +776,11 @@ MySQL·MariaDB 공개 표본 평가와 PR #10의 main CI 복구도 완료했다.
    SQLite 수집을 측정했다. 독립 검증·재현 명령·측정 경계는 PERFORMANCE.md에
    있다. 하드웨어 성능 수치를 CI 통과 기준으로 만들지 않는다.
 
-추가 구현 미완료 항목은 없다. 현재 feature 브랜치의 검증 소스는 `da16411`이며,
-후속 완료 기록은 문서 변경이다. PR #11의 리뷰와 머지는 사용자가 승인했으며,
-최종 상태는 위 PR 링크를 따른다. 공개 릴리스는 별도 요청을 따른다.
+추가 구현 미완료 항목은 없다. PR #11의 병합·main CI 검증까지 완료했으며,
+현재는 사용자가 승인한 v0.4.3의 공개 배포와 설치 검증을 진행한다.
 
 후속 검증에 필요한 Go `--url-env`, Oracle 무인덱스 문서 계약 수정, SQL Server
-trigger 전이 관계 수정은 모두 미배포 소스 변경이다. 공개 배포는 요청받지 않았으며 기존 0.4.2를 재게시하지 않는다.
+trigger 전이 관계 수정은 v0.4.3 배포 대상이다. 기존 0.4.2를 재게시하지 않는다.
 
 ## 의도적으로 남긴 경계
 
