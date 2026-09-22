@@ -28,7 +28,7 @@ its separate baseline are described in [DML-ACCURACY.md](DML-ACCURACY.md).
 
 ## Restricted PostgreSQL collection
 
-The current source adds a real PostgreSQL 16.13 test with a login role declared
+Version 0.5.0 adds a real PostgreSQL 16.13 test with a login role declared
 `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT`. The known schema has two tables,
 one view, one SQL function, six columns, and one foreign key.
 
@@ -69,7 +69,7 @@ Released archives target Linux x86_64 and macOS arm64; the JVM probe requires
 Java 17. Windows, Linux arm64 release archives, and additional warehouse
 dialects have no new release support claim here.
 
-The current source includes a [consumer Action](REVIEW-ACTION.md) and a Docker
+Version 0.5.0 includes a [consumer Action](REVIEW-ACTION.md) and a Docker
 build. The Dockerfile pins the official Rust and Debian image manifests and
 runs the CLI as UID/GID 65532. It contains the Rust engine; JDBC and Go collection
 remain separate producer choices. No container image is published by this

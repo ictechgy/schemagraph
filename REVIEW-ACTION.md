@@ -1,7 +1,7 @@
 # Review policy and GitHub Action
 
-These features are available from the current source branch. The published
-v0.4.3 CLI does not include policy, baseline, waiver, or SARIF support.
+Policy, baseline, expiring waiver, SARIF, and the consumer Action are available
+from version 0.5.0. The 0.4.3 CLI does not include these options.
 
 `review` compares two collected catalog documents and traces dependents in the
 previous snapshot. It does not execute migrations or infer that an unreachable
@@ -68,8 +68,9 @@ Neither a baseline nor a waiver makes incomplete evidence complete.
 
 ## Consumer workflow
 
-Pin a reviewed commit containing `action.yml`; v0.4.3 does not contain it.
-Replace `REVIEWED_COMMIT_SHA` below with that full commit SHA.
+Use the v0.5.0 Action or pin a reviewed full commit containing `action.yml`;
+v0.4.3 does not contain it.
+For an immutable source pin, replace `v0.5.0` below with its verified full commit SHA.
 
 ```yaml
 permissions:
@@ -84,7 +85,7 @@ jobs:
           persist-credentials: false
       # Produce before.json and after.json using your existing collection job.
       - id: schema
-        uses: ictechgy/schemagraph@REVIEWED_COMMIT_SHA
+        uses: ictechgy/schemagraph@v0.5.0
         with:
           before: snapshots/before.json
           after: snapshots/after.json

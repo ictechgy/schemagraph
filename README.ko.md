@@ -21,7 +21,7 @@ JSON을 출력하며, Mermaid·Graphviz DOT와 오프라인 HTML 탐색기도 �
 Rust와 Cargo로 CLI를 설치합니다.
 
 ```sh
-cargo install schemagraph-cli --version 0.4.3 --locked
+cargo install schemagraph-cli --version 0.5.0 --locked
 ```
 
 ### 소스에서 빌드

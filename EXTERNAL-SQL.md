@@ -1,6 +1,6 @@
 # External SQL imports
 
-External SQL import is an unreleased source feature. It adds offline query
+External SQL import is available from version 0.5.0. It adds offline query
 records to an existing catalog document as RoutineDoc records with
 kind: "query" and leaves SQL interpretation to the Rust parser.
 
@@ -15,7 +15,6 @@ schemagraph import <catalog> --format query-log --input queries.jsonl \
   --output imported.json --report import-report.json
 ~~~
 
-The exact command flags are source feature flags and may change before release.
 The catalog must carry an explicit collection context with a nonempty
 source_id, database, and collected schema. An imported database or schema
 outside that context fails the import and leaves the input document untouched.

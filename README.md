@@ -16,7 +16,7 @@ as Mermaid, Graphviz DOT, and a standalone offline HTML explorer.
 Column lineage, structured diagnostics, evidence paths, retention policies, and
 catalog change reviews are described in [the analysis guide](ANALYSIS.md).
 See [installation and CI examples](INSTALLATION.md) for release artifacts.
-For current-source additions, see [review policies and the Action](REVIEW-ACTION.md),
+For features introduced in v0.5.0, see [review policies and the Action](REVIEW-ACTION.md),
 [external SQL imports](EXTERNAL-SQL.md), and the [verified support matrix](SUPPORT-MATRIX.md).
 The [accuracy corpus](ACCURACY.md) checks public PostgreSQL, SQLite, MySQL, and
 MariaDB schemas against independently reviewed SQL cases and available database
@@ -27,7 +27,7 @@ dependency records.
 Install the CLI with Rust and Cargo:
 
 ```sh
-cargo install schemagraph-cli --version 0.4.3 --locked
+cargo install schemagraph-cli --version 0.5.0 --locked
 ```
 
 ### Build from source
