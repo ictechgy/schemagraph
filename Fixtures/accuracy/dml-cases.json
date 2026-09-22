@@ -1,0 +1,388 @@
+{
+  "version": 1,
+  "name": "authored-dml",
+  "description": "Small authored DML corpus. Facts are reviewed independently from every analyzer output.",
+  "schemas": {
+    "sqlite": "main",
+    "postgres": "public",
+    "sqlserver": "dbo",
+    "oracle": "DMLACC"
+  },
+  "procedure_wrappers": {
+    "postgres": "CREATE OR REPLACE FUNCTION {schema}.{name}() RETURNS void LANGUAGE SQL AS $$ {body} $$",
+    "sqlserver": "CREATE OR ALTER PROCEDURE {schema}.{name} AS BEGIN {body} END",
+    "oracle": "CREATE OR REPLACE PROCEDURE {schema}.{name} AS BEGIN {body}; END;"
+  },
+  "subject_contract": {
+    "sql_file_source_template": "dml/{name}.sql",
+    "sql_file_dialects": ["sqlite"],
+    "standalone_wrapper_modes": ["standalone_ddl", "standalone_ddl_sequence"],
+    "dialects": {
+      "sqlite": {"kind": "query"},
+      "postgres": {"kind": "function"},
+      "sqlserver": {"kind": "procedure"},
+      "oracle": {"kind": "procedure"}
+    }
+  },
+  "relations": {
+    "source": {
+      "name": "dml_source",
+      "ids": {
+        "sqlite": "main.dml_source",
+        "postgres": "public.dml_source",
+        "sqlserver": "dbo.dml_source",
+        "oracle": "DMLACC.DML_SOURCE"
+      },
+      "columns": ["source_id", "amount", "active", "note", "group_id"]
+    },
+    "extra": {
+      "name": "dml_source_extra",
+      "ids": {
+        "sqlite": "main.dml_source_extra",
+        "postgres": "public.dml_source_extra",
+        "sqlserver": "dbo.dml_source_extra",
+        "oracle": "DMLACC.DML_SOURCE_EXTRA"
+      },
+      "columns": ["source_id", "multiplier", "label"]
+    },
+    "target": {
+      "name": "dml_target",
+      "ids": {
+        "sqlite": "main.dml_target",
+        "postgres": "public.dml_target",
+        "sqlserver": "dbo.dml_target",
+        "oracle": "DMLACC.DML_TARGET"
+      },
+      "columns": ["target_id", "target_value", "target_note", "group_id", "last_writer"]
+    },
+    "delta": {
+      "name": "dml_update_delta",
+      "ids": {
+        "sqlite": "main.dml_update_delta",
+        "postgres": "public.dml_update_delta",
+        "sqlserver": "dbo.dml_update_delta",
+        "oracle": "DMLACC.DML_UPDATE_DELTA"
+      },
+      "columns": ["target_id", "bump", "replacement_note", "active"]
+    },
+    "merge_source": {
+      "name": "dml_merge_source",
+      "ids": {
+        "sqlite": "main.dml_merge_source",
+        "postgres": "public.dml_merge_source",
+        "sqlserver": "dbo.dml_merge_source",
+        "oracle": "DMLACC.DML_MERGE_SOURCE"
+      },
+      "columns": ["target_id", "target_value", "target_note"]
+    },
+    "snapshot": {
+      "name": "dml_snapshot",
+      "ids": {
+        "sqlite": "main.dml_snapshot",
+        "postgres": "public.dml_snapshot",
+        "sqlserver": "dbo.dml_snapshot",
+        "oracle": "DMLACC.DML_SNAPSHOT"
+      },
+      "columns": ["snapshot_id", "snapshot_value", "snapshot_note"]
+    },
+    "snapshot_joined": {
+      "name": "dml_snapshot_joined",
+      "ids": {
+        "sqlite": "main.dml_snapshot_joined",
+        "postgres": "public.dml_snapshot_joined",
+        "sqlserver": "dbo.dml_snapshot_joined",
+        "oracle": "DMLACC.DML_SNAPSHOT_JOINED"
+      },
+      "columns": ["snapshot_id", "snapshot_value", "snapshot_label"]
+    },
+    "temp_stage": {
+      "name": "dml_temp_stage",
+      "temporary": true,
+      "logical_only": true,
+      "columns": ["staged_id", "staged_value"]
+    },
+    "temp_delta": {
+      "name": "dml_temp_delta",
+      "temporary": true,
+      "logical_only": true,
+      "columns": ["target_id", "bump"]
+    }
+  },
+  "sqlite_setup": [
+    "CREATE TABLE dml_source (source_id INTEGER PRIMARY KEY, amount INTEGER NOT NULL, active INTEGER NOT NULL, note TEXT, group_id INTEGER NOT NULL)",
+    "CREATE TABLE dml_source_extra (source_id INTEGER PRIMARY KEY, multiplier INTEGER NOT NULL, label TEXT NOT NULL)",
+    "CREATE TABLE dml_target (target_id INTEGER PRIMARY KEY, target_value INTEGER, target_note TEXT, group_id INTEGER, last_writer TEXT)",
+    "CREATE TABLE dml_update_delta (target_id INTEGER PRIMARY KEY, bump INTEGER NOT NULL, replacement_note TEXT, active INTEGER NOT NULL)",
+    "CREATE TABLE dml_merge_source (target_id INTEGER PRIMARY KEY, target_value INTEGER NOT NULL, target_note TEXT NOT NULL)",
+    "INSERT INTO dml_source VALUES (1, 5, 1, 'low', 10), (2, 12, 1, 'mid', 10), (3, 20, 0, 'off', 20), (4, 30, 1, 'high', 20), (5, 8, 1, NULL, 30)",
+    "INSERT INTO dml_source_extra VALUES (1, 2, 'alpha'), (2, 3, 'beta'), (4, 4, 'delta'), (5, 5, 'epsilon')",
+    "INSERT INTO dml_target VALUES (1, 100, 'one', 10, 'seed'), (2, 200, 'two', 10, 'seed'), (3, 300, 'three', 20, 'seed'), (10, 1000, 'ten', 10, 'seed'), (20, 2000, 'twenty', 20, 'seed'), (30, 3000, 'thirty', 30, 'seed')",
+    "INSERT INTO dml_update_delta VALUES (10, 7, 'ten+', 1), (20, -20, 'twenty+', 1), (30, 100, 'thirty+', 0)",
+    "INSERT INTO dml_merge_source VALUES (20, 222, 'merge-existing'), (40, 444, 'merge-new')"
+  ],
+  "cases": [
+    {
+      "name": "insert_select_permuted",
+      "kind": "procedure",
+      "state": "complete",
+      "tags": ["insert-select", "column-permutation", "expression", "filter"],
+      "body": "INSERT INTO dml_target (target_note, target_id, target_value, last_writer) SELECT s.note, s.source_id + 100, s.amount * 2, 'insert_permuted' FROM dml_source AS s WHERE s.active = 1 AND s.amount >= 10",
+      "sql_overrides": {
+        "sqlserver": "INSERT INTO dbo.dml_target (target_note, target_id, target_value, last_writer) SELECT s.note, s.source_id + 100, s.amount * 2, 'insert_permuted' FROM dbo.dml_source AS s WHERE s.active = 1 AND s.amount >= 10",
+        "oracle": "INSERT INTO DMLACC.DML_TARGET (TARGET_NOTE, TARGET_ID, TARGET_VALUE, LAST_WRITER) SELECT s.NOTE, s.SOURCE_ID + 100, s.AMOUNT * 2, 'insert_permuted' FROM DMLACC.DML_SOURCE s WHERE s.ACTIVE = 1 AND s.AMOUNT >= 10"
+      },
+      "reads": {"objects": ["source"], "columns": ["source.source_id", "source.amount", "source.active", "source.note"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_id", "target.target_value", "target.target_note", "target.last_writer"]},
+      "lineage": {"target.target_id": ["source.source_id"], "target.target_value": ["source.amount"], "target.target_note": ["source.note"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, target_note, last_writer FROM dml_target WHERE last_writer = 'insert_permuted' ORDER BY target_id", "rows": [[102, 24, "mid", "insert_permuted"], [104, 60, "high", "insert_permuted"]]}}
+    },
+    {
+      "name": "insert_select_joined",
+      "kind": "procedure",
+      "state": "complete",
+      "tags": ["insert-select", "join", "expression", "filter"],
+      "body": "INSERT INTO dml_target (target_id, target_value, group_id, last_writer) SELECT s.source_id + 200, s.amount + x.multiplier, s.group_id, 'insert_joined' FROM dml_source AS s JOIN dml_source_extra AS x ON x.source_id = s.source_id WHERE s.active = 1 AND x.multiplier >= 3",
+      "sql_overrides": {
+        "sqlserver": "INSERT INTO dbo.dml_target (target_id, target_value, group_id, last_writer) SELECT s.source_id + 200, s.amount + x.multiplier, s.group_id, 'insert_joined' FROM dbo.dml_source AS s JOIN dbo.dml_source_extra AS x ON x.source_id = s.source_id WHERE s.active = 1 AND x.multiplier >= 3",
+        "oracle": "INSERT INTO DMLACC.DML_TARGET (TARGET_ID, TARGET_VALUE, GROUP_ID, LAST_WRITER) SELECT s.SOURCE_ID + 200, s.AMOUNT + x.MULTIPLIER, s.GROUP_ID, 'insert_joined' FROM DMLACC.DML_SOURCE s JOIN DMLACC.DML_SOURCE_EXTRA x ON x.SOURCE_ID = s.SOURCE_ID WHERE s.ACTIVE = 1 AND x.MULTIPLIER >= 3"
+      },
+      "reads": {"objects": ["source", "extra"], "columns": ["source.source_id", "source.amount", "source.active", "source.group_id", "extra.source_id", "extra.multiplier"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_id", "target.target_value", "target.group_id", "target.last_writer"]},
+      "lineage": {"target.target_id": ["source.source_id"], "target.target_value": ["source.amount", "extra.multiplier"], "target.group_id": ["source.group_id"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, group_id, last_writer FROM dml_target WHERE last_writer = 'insert_joined' ORDER BY target_id", "rows": [[202, 15, 10, "insert_joined"], [204, 34, 20, "insert_joined"], [205, 13, 30, "insert_joined"]]}}
+    },
+    {
+      "name": "insert_select_constant",
+      "kind": "procedure",
+      "state": "complete",
+      "tags": ["insert-select", "constant", "filter"],
+      "body": "INSERT INTO dml_target (target_id, target_value, target_note, last_writer) SELECT s.source_id + 300, 0, 'constant', 'insert_constant' FROM dml_source AS s WHERE s.amount < 10",
+      "sql_overrides": {
+        "sqlserver": "INSERT INTO dbo.dml_target (target_id, target_value, target_note, last_writer) SELECT s.source_id + 300, 0, 'constant', 'insert_constant' FROM dbo.dml_source AS s WHERE s.amount < 10",
+        "oracle": "INSERT INTO DMLACC.DML_TARGET (TARGET_ID, TARGET_VALUE, TARGET_NOTE, LAST_WRITER) SELECT s.SOURCE_ID + 300, 0, 'constant', 'insert_constant' FROM DMLACC.DML_SOURCE s WHERE s.AMOUNT < 10"
+      },
+      "reads": {"objects": ["source"], "columns": ["source.source_id", "source.amount"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_id", "target.target_value", "target.target_note", "target.last_writer"]},
+      "lineage": {"target.target_id": ["source.source_id"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, target_note, last_writer FROM dml_target WHERE last_writer = 'insert_constant' ORDER BY target_id", "rows": [[301, 0, "constant", "insert_constant"], [305, 0, "constant", "insert_constant"]]}}
+    },
+    {
+      "name": "insert_values_source_free",
+      "kind": "procedure",
+      "state": "complete",
+      "tags": ["insert-values", "source-free"],
+      "body": "INSERT INTO dml_target (target_id, target_value, target_note, last_writer) VALUES (99, 999, 'literal', 'insert_values')",
+      "sql_overrides": {
+        "sqlserver": "INSERT INTO dbo.dml_target (target_id, target_value, target_note, last_writer) VALUES (99, 999, 'literal', 'insert_values')",
+        "oracle": "INSERT INTO DMLACC.DML_TARGET (TARGET_ID, TARGET_VALUE, TARGET_NOTE, LAST_WRITER) VALUES (99, 999, 'literal', 'insert_values')"
+      },
+      "reads": {"objects": [], "columns": []},
+      "writes": {"objects": ["target"], "columns": ["target.target_id", "target.target_value", "target.target_note", "target.last_writer"]},
+      "lineage": {},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, target_note, last_writer FROM dml_target WHERE target_id = 99", "rows": [[99, 999, "literal", "insert_values"]]}}
+    },
+    {
+      "name": "ctas_filtered",
+      "kind": "procedure",
+      "state": "complete",
+      "wrapper_mode": "standalone_ddl",
+      "tags": ["ctas", "create-table-as", "filter"],
+      "body": "CREATE TABLE dml_snapshot AS SELECT s.source_id AS snapshot_id, s.amount * 10 AS snapshot_value, s.note AS snapshot_note FROM dml_source AS s WHERE s.active = 1",
+      "sql_overrides": {
+        "postgres": "CREATE TABLE public.dml_snapshot AS SELECT s.source_id AS snapshot_id, s.amount * 10 AS snapshot_value, s.note AS snapshot_note FROM public.dml_source AS s WHERE s.active = 1",
+        "sqlserver": "SELECT s.source_id AS snapshot_id, s.amount * 10 AS snapshot_value, s.note AS snapshot_note INTO dbo.dml_snapshot FROM dbo.dml_source AS s WHERE s.active = 1",
+        "oracle": "CREATE TABLE DMLACC.DML_SNAPSHOT AS SELECT s.SOURCE_ID AS SNAPSHOT_ID, s.AMOUNT * 10 AS SNAPSHOT_VALUE, s.NOTE AS SNAPSHOT_NOTE FROM DMLACC.DML_SOURCE s WHERE s.ACTIVE = 1"
+      },
+      "reads": {"objects": ["source"], "columns": ["source.source_id", "source.amount", "source.note", "source.active"]},
+      "writes": {"objects": ["snapshot"], "columns": ["snapshot.snapshot_id", "snapshot.snapshot_value", "snapshot.snapshot_note"]},
+      "lineage": {"snapshot.snapshot_id": ["source.source_id"], "snapshot.snapshot_value": ["source.amount"], "snapshot.snapshot_note": ["source.note"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT snapshot_id, snapshot_value, snapshot_note FROM dml_snapshot ORDER BY snapshot_id", "rows": [[1, 50, "low"], [2, 120, "mid"], [4, 300, "high"], [5, 80, null]]}}
+    },
+    {
+      "name": "ctas_joined",
+      "kind": "procedure",
+      "state": "complete",
+      "wrapper_mode": "standalone_ddl",
+      "tags": ["ctas", "join", "expression"],
+      "body": "CREATE TABLE dml_snapshot_joined AS SELECT s.source_id AS snapshot_id, s.amount * x.multiplier AS snapshot_value, x.label AS snapshot_label FROM dml_source AS s JOIN dml_source_extra AS x ON x.source_id = s.source_id WHERE s.active = 1",
+      "sql_overrides": {
+        "postgres": "CREATE TABLE public.dml_snapshot_joined AS SELECT s.source_id AS snapshot_id, s.amount * x.multiplier AS snapshot_value, x.label AS snapshot_label FROM public.dml_source AS s JOIN public.dml_source_extra AS x ON x.source_id = s.source_id WHERE s.active = 1",
+        "sqlserver": "SELECT s.source_id AS snapshot_id, s.amount * x.multiplier AS snapshot_value, x.label AS snapshot_label INTO dbo.dml_snapshot_joined FROM dbo.dml_source AS s JOIN dbo.dml_source_extra AS x ON x.source_id = s.source_id WHERE s.active = 1",
+        "oracle": "CREATE TABLE DMLACC.DML_SNAPSHOT_JOINED AS SELECT s.SOURCE_ID AS SNAPSHOT_ID, s.AMOUNT * x.MULTIPLIER AS SNAPSHOT_VALUE, x.LABEL AS SNAPSHOT_LABEL FROM DMLACC.DML_SOURCE s JOIN DMLACC.DML_SOURCE_EXTRA x ON x.SOURCE_ID = s.SOURCE_ID WHERE s.ACTIVE = 1"
+      },
+      "reads": {"objects": ["source", "extra"], "columns": ["source.source_id", "source.amount", "source.active", "extra.source_id", "extra.multiplier", "extra.label"]},
+      "writes": {"objects": ["snapshot_joined"], "columns": ["snapshot_joined.snapshot_id", "snapshot_joined.snapshot_value", "snapshot_joined.snapshot_label"]},
+      "lineage": {"snapshot_joined.snapshot_id": ["source.source_id"], "snapshot_joined.snapshot_value": ["source.amount", "extra.multiplier"], "snapshot_joined.snapshot_label": ["extra.label"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT snapshot_id, snapshot_value, snapshot_label FROM dml_snapshot_joined ORDER BY snapshot_id", "rows": [[1, 10, "alpha"], [2, 36, "beta"], [4, 120, "delta"], [5, 40, "epsilon"]]}}
+    },
+    {
+      "name": "update_from_delta",
+      "kind": "procedure",
+      "state": "partial",
+      "fact_state": "complete",
+      "analysis_limitations": ["SG_TEMPORAL_SELF_LINEAGE"],
+      "tags": ["update-from", "self-read", "expression"],
+      "body": "UPDATE dml_target AS t SET target_value = t.target_value + d.bump, last_writer = 'update_delta' FROM dml_update_delta AS d WHERE d.target_id = t.target_id AND d.active = 1",
+      "sql_overrides": {
+        "sqlserver": "UPDATE t SET target_value = t.target_value + d.bump, last_writer = 'update_delta' FROM dbo.dml_target AS t JOIN dbo.dml_update_delta AS d ON d.target_id = t.target_id WHERE d.active = 1",
+        "oracle": "UPDATE DMLACC.DML_TARGET t SET (TARGET_VALUE, LAST_WRITER) = (SELECT t.TARGET_VALUE + d.BUMP, 'update_delta' FROM DMLACC.DML_UPDATE_DELTA d WHERE d.TARGET_ID = t.TARGET_ID AND d.ACTIVE = 1) WHERE EXISTS (SELECT 1 FROM DMLACC.DML_UPDATE_DELTA d WHERE d.TARGET_ID = t.TARGET_ID AND d.ACTIVE = 1)"
+      },
+      "reads": {"objects": ["delta"], "columns": ["target.target_id", "target.target_value", "delta.target_id", "delta.bump", "delta.active"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_value", "target.last_writer"]},
+      "lineage": {"target.target_value": ["target.target_value", "delta.bump"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, last_writer FROM dml_target WHERE target_id IN (10, 20, 30) ORDER BY target_id", "rows": [[10, 1007, "update_delta"], [20, 1980, "update_delta"], [30, 3000, "seed"]]}}
+    },
+    {
+      "name": "update_from_note",
+      "kind": "procedure",
+      "state": "complete",
+      "tags": ["update-from", "filter", "null-filter"],
+      "body": "UPDATE dml_target AS t SET target_note = d.replacement_note, last_writer = 'update_note' FROM dml_update_delta AS d WHERE d.target_id = t.target_id AND d.active = 1 AND d.replacement_note IS NOT NULL",
+      "sql_overrides": {
+        "sqlserver": "UPDATE t SET target_note = d.replacement_note, last_writer = 'update_note' FROM dbo.dml_target AS t JOIN dbo.dml_update_delta AS d ON d.target_id = t.target_id WHERE d.active = 1 AND d.replacement_note IS NOT NULL",
+        "oracle": "UPDATE DMLACC.DML_TARGET t SET (TARGET_NOTE, LAST_WRITER) = (SELECT d.REPLACEMENT_NOTE, 'update_note' FROM DMLACC.DML_UPDATE_DELTA d WHERE d.TARGET_ID = t.TARGET_ID AND d.ACTIVE = 1 AND d.REPLACEMENT_NOTE IS NOT NULL) WHERE EXISTS (SELECT 1 FROM DMLACC.DML_UPDATE_DELTA d WHERE d.TARGET_ID = t.TARGET_ID AND d.ACTIVE = 1 AND d.REPLACEMENT_NOTE IS NOT NULL)"
+      },
+      "reads": {"objects": ["delta"], "columns": ["target.target_id", "delta.target_id", "delta.active", "delta.replacement_note"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_note", "target.last_writer"]},
+      "lineage": {"target.target_note": ["delta.replacement_note"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_note, last_writer FROM dml_target WHERE target_id IN (10, 20, 30) ORDER BY target_id", "rows": [[10, "ten+", "update_note"], [20, "twenty+", "update_note"], [30, "thirty", "seed"]]}}
+    },
+    {
+      "name": "update_correlated",
+      "kind": "procedure",
+      "state": "complete",
+      "tags": ["update", "correlated-subquery", "exists"],
+      "body": "UPDATE dml_target SET target_value = (SELECT s.amount FROM dml_source AS s WHERE s.source_id = dml_target.target_id), last_writer = 'update_correlated' WHERE EXISTS (SELECT 1 FROM dml_source AS s WHERE s.source_id = dml_target.target_id AND s.active = 1)",
+      "sql_overrides": {
+        "sqlserver": "UPDATE t SET target_value = (SELECT s.amount FROM dbo.dml_source AS s WHERE s.source_id = t.target_id), last_writer = 'update_correlated' FROM dbo.dml_target AS t WHERE EXISTS (SELECT 1 FROM dbo.dml_source AS s WHERE s.source_id = t.target_id AND s.active = 1)",
+        "oracle": "UPDATE DMLACC.DML_TARGET t SET (TARGET_VALUE, LAST_WRITER) = (SELECT s.AMOUNT, 'update_correlated' FROM DMLACC.DML_SOURCE s WHERE s.SOURCE_ID = t.TARGET_ID) WHERE EXISTS (SELECT 1 FROM DMLACC.DML_SOURCE s WHERE s.SOURCE_ID = t.TARGET_ID AND s.ACTIVE = 1)"
+      },
+      "reads": {"objects": ["source"], "columns": ["target.target_id", "source.source_id", "source.amount", "source.active"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_value", "target.last_writer"]},
+      "lineage": {"target.target_value": ["source.amount"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, last_writer FROM dml_target WHERE target_id IN (1, 2, 3) ORDER BY target_id", "rows": [[1, 5, "update_correlated"], [2, 12, "update_correlated"], [3, 300, "seed"]]}}
+    },
+    {
+      "name": "merge_upsert",
+      "kind": "procedure",
+      "state": "complete",
+      "tags": ["merge", "upsert", "conditional-writer"],
+      "supported_dialects": ["postgres", "sqlserver", "oracle"],
+      "body": "MERGE INTO dml_target AS t USING dml_merge_source AS s ON (t.target_id = s.target_id) WHEN MATCHED THEN UPDATE SET target_value = s.target_value, target_note = s.target_note, last_writer = 'merge_upsert' WHEN NOT MATCHED THEN INSERT (target_id, target_value, target_note, last_writer) VALUES (s.target_id, s.target_value, s.target_note, 'merge_upsert')",
+      "sql_overrides": {
+        "postgres": "MERGE INTO public.dml_target AS t USING public.dml_merge_source AS s ON (t.target_id = s.target_id) WHEN MATCHED THEN UPDATE SET target_value = s.target_value, target_note = s.target_note, last_writer = 'merge_upsert' WHEN NOT MATCHED THEN INSERT (target_id, target_value, target_note, last_writer) VALUES (s.target_id, s.target_value, s.target_note, 'merge_upsert')",
+        "sqlserver": "MERGE dbo.dml_target AS t USING dbo.dml_merge_source AS s ON t.target_id = s.target_id WHEN MATCHED THEN UPDATE SET target_value = s.target_value, target_note = s.target_note, last_writer = 'merge_upsert' WHEN NOT MATCHED BY TARGET THEN INSERT (target_id, target_value, target_note, last_writer) VALUES (s.target_id, s.target_value, s.target_note, 'merge_upsert');",
+        "oracle": "MERGE INTO DMLACC.DML_TARGET t USING DMLACC.DML_MERGE_SOURCE s ON (t.TARGET_ID = s.TARGET_ID) WHEN MATCHED THEN UPDATE SET t.TARGET_VALUE = s.TARGET_VALUE, t.TARGET_NOTE = s.TARGET_NOTE, t.LAST_WRITER = 'merge_upsert' WHEN NOT MATCHED THEN INSERT (TARGET_ID, TARGET_VALUE, TARGET_NOTE, LAST_WRITER) VALUES (s.TARGET_ID, s.TARGET_VALUE, s.TARGET_NOTE, 'merge_upsert')"
+      },
+      "reads": {"objects": ["merge_source"], "columns": ["target.target_id", "merge_source.target_id", "merge_source.target_value", "merge_source.target_note"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_id", "target.target_value", "target.target_note", "target.last_writer"]},
+      "lineage": {"target.target_id": ["merge_source.target_id"], "target.target_value": ["merge_source.target_value"], "target.target_note": ["merge_source.target_note"]},
+      "runtime": {
+        "sqlite": {"supported": false, "reason": "SQLite has no MERGE statement; SQL Server, Oracle, and PostgreSQL variants are validated in their native environments."},
+        "postgres": {"supported": true, "query": "SELECT target_id, target_value, target_note, last_writer FROM dml_target WHERE target_id IN (20, 40) ORDER BY target_id", "rows": [[20, 222, "merge-existing", "merge_upsert"], [40, 444, "merge-new", "merge_upsert"]]}
+      }
+    },
+    {
+      "name": "temp_chain_insert",
+      "kind": "procedure",
+      "state": "complete",
+      "wrapper_mode": "standalone_ddl_sequence",
+      "tags": ["temporary-table", "sequential", "insert-select"],
+      "body": "CREATE TEMP TABLE dml_temp_stage AS SELECT s.source_id + 400 AS staged_id, s.amount * 3 AS staged_value FROM dml_source AS s WHERE s.active = 1; INSERT INTO dml_target (target_id, target_value, last_writer) SELECT staged_id, staged_value, 'temp_insert' FROM dml_temp_stage",
+      "sql_overrides": {
+        "postgres": "CREATE TEMP TABLE dml_temp_stage AS SELECT s.source_id + 400 AS staged_id, s.amount * 3 AS staged_value FROM public.dml_source AS s WHERE s.active = 1; INSERT INTO public.dml_target (target_id, target_value, last_writer) SELECT staged_id, staged_value, 'temp_insert' FROM dml_temp_stage",
+        "sqlserver": "SELECT s.source_id + 400 AS staged_id, s.amount * 3 AS staged_value INTO #dml_temp_stage FROM dbo.dml_source AS s WHERE s.active = 1; INSERT INTO dbo.dml_target (target_id, target_value, last_writer) SELECT staged_id, staged_value, 'temp_insert' FROM #dml_temp_stage;",
+        "oracle": "CREATE GLOBAL TEMPORARY TABLE DMLACC.DML_TEMP_STAGE ON COMMIT PRESERVE ROWS AS SELECT s.SOURCE_ID + 400 AS STAGED_ID, s.AMOUNT * 3 AS STAGED_VALUE FROM DMLACC.DML_SOURCE s WHERE s.ACTIVE = 1; INSERT INTO DMLACC.DML_TARGET (TARGET_ID, TARGET_VALUE, LAST_WRITER) SELECT STAGED_ID, STAGED_VALUE, 'temp_insert' FROM DMLACC.DML_TEMP_STAGE"
+      },
+      "reads": {"objects": ["source"], "columns": ["source.source_id", "source.amount", "source.active"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_id", "target.target_value", "target.last_writer"]},
+      "intermediate_writes": {"objects": ["temp_stage"], "columns": ["temp_stage.staged_id", "temp_stage.staged_value"]},
+      "lineage": {"target.target_id": ["source.source_id"], "target.target_value": ["source.amount"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, last_writer FROM dml_target WHERE last_writer = 'temp_insert' ORDER BY target_id", "rows": [[401, 15, "temp_insert"], [402, 36, "temp_insert"], [404, 90, "temp_insert"], [405, 24, "temp_insert"]]}}
+    },
+    {
+      "name": "temp_chain_update",
+      "kind": "procedure",
+      "state": "partial",
+      "wrapper_mode": "standalone_ddl_sequence",
+      "fact_state": "complete",
+      "analysis_limitations": ["SG_TEMPORAL_SELF_LINEAGE"],
+      "tags": ["temporary-table", "sequential", "update-from"],
+      "body": "CREATE TEMP TABLE dml_temp_delta AS SELECT target_id, bump + 5 AS bump FROM dml_update_delta WHERE active = 1; UPDATE dml_target AS t SET target_value = t.target_value + d.bump, last_writer = 'temp_update' FROM dml_temp_delta AS d WHERE d.target_id = t.target_id",
+      "sql_overrides": {
+        "postgres": "CREATE TEMP TABLE dml_temp_delta AS SELECT target_id, bump + 5 AS bump FROM public.dml_update_delta WHERE active = 1; UPDATE public.dml_target AS t SET target_value = t.target_value + d.bump, last_writer = 'temp_update' FROM dml_temp_delta AS d WHERE d.target_id = t.target_id",
+        "sqlserver": "SELECT target_id, bump + 5 AS bump INTO #dml_temp_delta FROM dbo.dml_update_delta WHERE active = 1; UPDATE t SET target_value = t.target_value + d.bump, last_writer = 'temp_update' FROM dbo.dml_target AS t JOIN #dml_temp_delta AS d ON d.target_id = t.target_id;",
+        "oracle": "CREATE GLOBAL TEMPORARY TABLE DMLACC.DML_TEMP_DELTA ON COMMIT PRESERVE ROWS AS SELECT TARGET_ID, BUMP + 5 AS BUMP FROM DMLACC.DML_UPDATE_DELTA WHERE ACTIVE = 1; UPDATE DMLACC.DML_TARGET t SET (TARGET_VALUE, LAST_WRITER) = (SELECT t.TARGET_VALUE + d.BUMP, 'temp_update' FROM DMLACC.DML_TEMP_DELTA d WHERE d.TARGET_ID = t.TARGET_ID) WHERE EXISTS (SELECT 1 FROM DMLACC.DML_TEMP_DELTA d WHERE d.TARGET_ID = t.TARGET_ID)"
+      },
+      "reads": {"objects": ["delta"], "columns": ["target.target_id", "target.target_value", "delta.target_id", "delta.bump", "delta.active"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_value", "target.last_writer"]},
+      "intermediate_writes": {"objects": ["temp_delta"], "columns": ["temp_delta.target_id", "temp_delta.bump"]},
+      "lineage": {"target.target_value": ["target.target_value", "delta.bump"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, last_writer FROM dml_target WHERE target_id IN (10, 20, 30) ORDER BY target_id", "rows": [[10, 1012, "temp_update"], [20, 1985, "temp_update"], [30, 3000, "seed"]]}}
+    },
+    {
+      "name": "repeated_writer_sequence",
+      "kind": "procedure",
+      "state": "partial",
+      "fact_state": "complete",
+      "analysis_limitations": ["SG_TEMPORAL_SELF_LINEAGE"],
+      "tags": ["repeated-writer", "sequential", "insert", "update"],
+      "body": "INSERT INTO dml_target (target_id, target_value, target_note, last_writer) SELECT s.source_id + 500, s.amount, s.note, 'repeated_insert' FROM dml_source AS s WHERE s.source_id = 1; UPDATE dml_target SET target_value = target_value + 1, last_writer = 'repeated_update' WHERE target_id = 501",
+      "sql_overrides": {
+        "sqlserver": "INSERT INTO dbo.dml_target (target_id, target_value, target_note, last_writer) SELECT s.source_id + 500, s.amount, s.note, 'repeated_insert' FROM dbo.dml_source AS s WHERE s.source_id = 1; UPDATE dbo.dml_target SET target_value = target_value + 1, last_writer = 'repeated_update' WHERE target_id = 501;",
+        "oracle": "INSERT INTO DMLACC.DML_TARGET (TARGET_ID, TARGET_VALUE, TARGET_NOTE, LAST_WRITER) SELECT s.SOURCE_ID + 500, s.AMOUNT, s.NOTE, 'repeated_insert' FROM DMLACC.DML_SOURCE s WHERE s.SOURCE_ID = 1; UPDATE DMLACC.DML_TARGET SET TARGET_VALUE = TARGET_VALUE + 1, LAST_WRITER = 'repeated_update' WHERE TARGET_ID = 501"
+      },
+      "reads": {"objects": ["source"], "columns": ["source.source_id", "source.amount", "source.note", "target.target_id", "target.target_value"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_id", "target.target_value", "target.target_note", "target.last_writer"]},
+      "lineage": {"target.target_id": ["source.source_id"], "target.target_value": ["source.amount", "target.target_value"], "target.target_note": ["source.note"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, target_note, last_writer FROM dml_target WHERE target_id = 501", "rows": [[501, 6, "low", "repeated_update"]]}}
+    },
+    {
+      "name": "insert_select_union",
+      "kind": "procedure",
+      "state": "complete",
+      "tags": ["insert-select", "union-all", "multiple-sources"],
+      "body": "INSERT INTO dml_target (target_id, target_value, target_note, last_writer) SELECT s.source_id + 600, s.amount, s.note, 'union_insert' FROM dml_source AS s WHERE s.active = 1 UNION ALL SELECT x.source_id + 700, x.multiplier, x.label, 'union_insert' FROM dml_source_extra AS x WHERE x.multiplier >= 4",
+      "sql_overrides": {
+        "sqlserver": "INSERT INTO dbo.dml_target (target_id, target_value, target_note, last_writer) SELECT s.source_id + 600, s.amount, s.note, 'union_insert' FROM dbo.dml_source AS s WHERE s.active = 1 UNION ALL SELECT x.source_id + 700, x.multiplier, x.label, 'union_insert' FROM dbo.dml_source_extra AS x WHERE x.multiplier >= 4;",
+        "oracle": "INSERT INTO DMLACC.DML_TARGET (TARGET_ID, TARGET_VALUE, TARGET_NOTE, LAST_WRITER) SELECT s.SOURCE_ID + 600, s.AMOUNT, s.NOTE, 'union_insert' FROM DMLACC.DML_SOURCE s WHERE s.ACTIVE = 1 UNION ALL SELECT x.SOURCE_ID + 700, x.MULTIPLIER, x.LABEL, 'union_insert' FROM DMLACC.DML_SOURCE_EXTRA x WHERE x.MULTIPLIER >= 4"
+      },
+      "reads": {"objects": ["source", "extra"], "columns": ["source.source_id", "source.amount", "source.active", "source.note", "extra.source_id", "extra.multiplier", "extra.label"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_id", "target.target_value", "target.target_note", "target.last_writer"]},
+      "lineage": {"target.target_id": ["source.source_id", "extra.source_id"], "target.target_value": ["source.amount", "extra.multiplier"], "target.target_note": ["source.note", "extra.label"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, target_note, last_writer FROM dml_target WHERE last_writer = 'union_insert' ORDER BY target_id", "rows": [[601, 5, "low", "union_insert"], [602, 12, "mid", "union_insert"], [604, 30, "high", "union_insert"], [605, 8, null, "union_insert"], [704, 4, "delta", "union_insert"], [705, 5, "epsilon", "union_insert"]]}}
+    },
+    {
+      "name": "update_multi_column",
+      "kind": "procedure",
+      "state": "partial",
+      "fact_state": "complete",
+      "analysis_limitations": ["SG_TEMPORAL_SELF_LINEAGE"],
+      "tags": ["update-from", "multi-column", "expression"],
+      "body": "UPDATE dml_target AS t SET target_value = t.target_value + s.amount, target_note = s.note, last_writer = 'update_multi' FROM dml_source AS s WHERE s.source_id = t.target_id AND s.active = 1",
+      "sql_overrides": {
+        "sqlserver": "UPDATE t SET target_value = t.target_value + s.amount, target_note = s.note, last_writer = 'update_multi' FROM dbo.dml_target AS t JOIN dbo.dml_source AS s ON s.source_id = t.target_id WHERE s.active = 1",
+        "oracle": "UPDATE DMLACC.DML_TARGET t SET (TARGET_VALUE, TARGET_NOTE, LAST_WRITER) = (SELECT t.TARGET_VALUE + s.AMOUNT, s.NOTE, 'update_multi' FROM DMLACC.DML_SOURCE s WHERE s.SOURCE_ID = t.TARGET_ID AND s.ACTIVE = 1) WHERE EXISTS (SELECT 1 FROM DMLACC.DML_SOURCE s WHERE s.SOURCE_ID = t.TARGET_ID AND s.ACTIVE = 1)"
+      },
+      "reads": {"objects": ["source"], "columns": ["target.target_id", "target.target_value", "source.source_id", "source.amount", "source.note", "source.active"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_value", "target.target_note", "target.last_writer"]},
+      "lineage": {"target.target_value": ["target.target_value", "source.amount"], "target.target_note": ["source.note"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, target_note, last_writer FROM dml_target WHERE target_id IN (1, 2) ORDER BY target_id", "rows": [[1, 105, "low", "update_multi"], [2, 212, "mid", "update_multi"]]}}
+    },
+    {
+      "name": "insert_select_coalesce",
+      "kind": "procedure",
+      "state": "complete",
+      "tags": ["insert-select", "null-expression", "coalesce"],
+      "body": "INSERT INTO dml_target (target_id, target_value, target_note, last_writer) SELECT s.source_id + 800, s.amount, COALESCE(s.note, 'missing'), 'coalesce_insert' FROM dml_source AS s WHERE s.active = 1",
+      "sql_overrides": {
+        "sqlserver": "INSERT INTO dbo.dml_target (target_id, target_value, target_note, last_writer) SELECT s.source_id + 800, s.amount, COALESCE(s.note, 'missing'), 'coalesce_insert' FROM dbo.dml_source AS s WHERE s.active = 1",
+        "oracle": "INSERT INTO DMLACC.DML_TARGET (TARGET_ID, TARGET_VALUE, TARGET_NOTE, LAST_WRITER) SELECT s.SOURCE_ID + 800, s.AMOUNT, COALESCE(s.NOTE, 'missing'), 'coalesce_insert' FROM DMLACC.DML_SOURCE s WHERE s.ACTIVE = 1"
+      },
+      "reads": {"objects": ["source"], "columns": ["source.source_id", "source.amount", "source.note", "source.active"]},
+      "writes": {"objects": ["target"], "columns": ["target.target_id", "target.target_value", "target.target_note", "target.last_writer"]},
+      "lineage": {"target.target_id": ["source.source_id"], "target.target_value": ["source.amount"], "target.target_note": ["source.note"]},
+      "runtime": {"sqlite": {"supported": true, "query": "SELECT target_id, target_value, target_note, last_writer FROM dml_target WHERE last_writer = 'coalesce_insert' ORDER BY target_id", "rows": [[801, 5, "low", "coalesce_insert"], [802, 12, "mid", "coalesce_insert"], [804, 30, "high", "coalesce_insert"], [805, 8, "missing", "coalesce_insert"]]}}
+    }
+  ]
+}

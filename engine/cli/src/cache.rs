@@ -12,7 +12,7 @@ use schemagraph_core::{
     AnalysisState, Diagnostic, Edge, EdgeKind, Evidence, EvidenceLayer, ObjectAnalysis, Origin,
     SourceLocation, VertexId,
 };
-use schemagraph_parser::{BodyCache, BodyResult};
+use schemagraph_parser::{BodyCache, BodyResult, CacheContext};
 use schemagraph_source::document::{
     CatalogDependency, CatalogDocument, CollectionContext, ColumnDoc, ConstraintDoc, ObjectDoc,
     RoutineDoc, SchemaDoc,
@@ -20,7 +20,7 @@ use schemagraph_source::document::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_FORMAT_VERSION: u32 = 2;
 const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const CACHE_SUFFIX: &str = ".json";
@@ -38,6 +38,7 @@ pub(crate) struct CacheStats {
 pub(crate) struct DiskBodyCache {
     directory: PathBuf,
     namespace: String,
+    scoped_namespace: String,
     stats: CacheStats,
 }
 
@@ -55,9 +56,11 @@ impl DiskBodyCache {
     ) -> io::Result<Self> {
         fs::create_dir_all(directory)?;
         let namespace = namespace_hash(document, executable_hash)?;
+        let scoped_namespace = scoped_namespace_hash(document, executable_hash)?;
         Ok(Self {
             directory: directory.to_owned(),
             namespace,
+            scoped_namespace,
             stats: CacheStats::default(),
         })
     }
@@ -66,8 +69,15 @@ impl DiskBodyCache {
         self.stats
     }
 
-    fn load_entry(&mut self, owner: &VertexId, body: &str) -> Option<BodyResult> {
-        let key = body_key(&self.namespace, owner, body);
+    fn load_entry(
+        &mut self,
+        owner: &VertexId,
+        body: &str,
+        context: Option<&CacheContext>,
+    ) -> Option<BodyResult> {
+        let key = context
+            .map(|context| scoped_body_key(&self.scoped_namespace, owner, body, context))
+            .unwrap_or_else(|| body_key(&self.namespace, owner, body));
         let path = self.entry_path(&key);
         let bytes = match read_bounded(&path) {
             Ok(Some(bytes)) => bytes,
@@ -119,6 +129,12 @@ impl DiskBodyCache {
             self.stats.misses += 1;
             return None;
         }
+        if let Some(context) = context {
+            if entry.payload.footprint.as_deref() != Some(context.fingerprint.as_str()) {
+                self.stats.misses += 1;
+                return None;
+            }
+        }
         match entry.payload.result.into_result(owner, &expected_body_hash) {
             Ok(result) => {
                 self.stats.hits += 1;
@@ -132,8 +148,16 @@ impl DiskBodyCache {
         }
     }
 
-    fn store_entry(&mut self, owner: &VertexId, body: &str, result: &BodyResult) {
-        let key = body_key(&self.namespace, owner, body);
+    fn store_entry(
+        &mut self,
+        owner: &VertexId,
+        body: &str,
+        result: &BodyResult,
+        context: Option<&CacheContext>,
+    ) {
+        let key = context
+            .map(|context| scoped_body_key(&self.scoped_namespace, owner, body, context))
+            .unwrap_or_else(|| body_key(&self.namespace, owner, body));
         if result.edges.iter().any(|edge| {
             edge.evidence
                 .iter()
@@ -148,6 +172,7 @@ impl DiskBodyCache {
             key: key.clone(),
             owner: owner.as_str().to_owned(),
             body_hash: body_hash(body),
+            footprint: context.map(|context| context.fingerprint.clone()),
             result: BodyResultDoc::from_result(result),
         };
         let checksum = match serialized_hash(&payload) {
@@ -218,11 +243,42 @@ impl DiskBodyCache {
 
 impl BodyCache for DiskBodyCache {
     fn load(&mut self, owner: &VertexId, body: &str) -> Option<BodyResult> {
-        self.load_entry(owner, body)
+        self.load_entry(owner, body, None)
     }
 
     fn store(&mut self, owner: &VertexId, body: &str, result: &BodyResult) {
-        self.store_entry(owner, body, result)
+        self.store_entry(owner, body, result, None)
+    }
+
+    fn load_scoped(
+        &mut self,
+        owner: &VertexId,
+        body: &str,
+        context: &CacheContext,
+    ) -> Option<BodyResult> {
+        if !context.trusted {
+            return self.load_entry(owner, body, None);
+        }
+        self.load_entry(owner, body, Some(context))
+    }
+
+    fn store_scoped(
+        &mut self,
+        owner: &VertexId,
+        body: &str,
+        result: &BodyResult,
+        context: &CacheContext,
+    ) {
+        if !context.trusted {
+            self.store_entry(owner, body, result, None);
+            return;
+        }
+        self.store_entry(owner, body, result, Some(context))
+    }
+
+    fn record_restore_failure(&mut self) {
+        self.stats.hits = self.stats.hits.saturating_sub(1);
+        self.stats.misses += 1;
     }
 }
 
@@ -238,6 +294,8 @@ struct CachePayload {
     key: String,
     owner: String,
     body_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    footprint: Option<String>,
     result: BodyResultDoc,
 }
 
@@ -356,7 +414,7 @@ impl BodyResultDoc {
         }
     }
 
-    fn into_result(self, _owner: &VertexId, body_hash: &str) -> Result<BodyResult, String> {
+    fn into_result(self, owner: &VertexId, body_hash: &str) -> Result<BodyResult, String> {
         let edges: Vec<Edge> = self
             .edges
             .into_iter()
@@ -395,6 +453,7 @@ impl BodyResultDoc {
         }
         let analysis = self.analysis.into_analysis(body_hash)?;
         Ok(BodyResult {
+            owner: owner.clone(),
             edges,
             origins,
             analysis,
@@ -653,6 +712,25 @@ fn body_key(namespace: &str, owner: &VertexId, body: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn scoped_body_key(
+    namespace: &str,
+    owner: &VertexId,
+    body: &str,
+    context: &CacheContext,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(owner.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(body.as_bytes());
+    hasher.update([0]);
+    hasher.update(context.fingerprint.as_bytes());
+    hasher.update([0]);
+    hasher.update([u8::from(context.trusted)]);
+    format!("{:x}", hasher.finalize())
+}
+
 fn namespace_hash(document: &CatalogDocument, executable_hash: &str) -> io::Result<String> {
     serialized_hash(&NamespaceInput {
         cache_format: CACHE_FORMAT_VERSION,
@@ -660,6 +738,27 @@ fn namespace_hash(document: &CatalogDocument, executable_hash: &str) -> io::Resu
         executable_hash,
         document: structural_document(document),
     })
+}
+
+fn scoped_namespace_hash(document: &CatalogDocument, executable_hash: &str) -> io::Result<String> {
+    serialized_hash(&ScopedNamespaceInput {
+        cache_format: CACHE_FORMAT_VERSION,
+        graph_version: schemagraph_export::GRAPH_VERSION,
+        executable_hash,
+        dialect: &document.dialect,
+        reader: &document.reader,
+        context: document.context.as_ref(),
+    })
+}
+
+#[derive(Serialize)]
+struct ScopedNamespaceInput<'a> {
+    cache_format: u32,
+    graph_version: u32,
+    executable_hash: &'a str,
+    dialect: &'a str,
+    reader: &'a str,
+    context: Option<&'a CollectionContext>,
 }
 
 #[derive(Serialize)]
@@ -960,6 +1059,7 @@ mod tests {
         let hash = body_hash(body);
         let target = VertexId::from_raw(target);
         BodyResult {
+            owner: owner.clone(),
             edges: vec![Edge {
                 from: owner.clone(),
                 to: target.clone(),
@@ -1023,6 +1123,80 @@ mod tests {
         assert_eq!(loaded.analysis, parser_result.analysis);
         assert_eq!(reader.stats().hits, 1);
         assert_eq!(reader.stats().misses, 0);
+    }
+
+    #[test]
+    fn scoped_footprint_survives_unrelated_document_shape_change() {
+        let directory = tempdir().unwrap();
+        let owner = VertexId::object("public", "view");
+        let body = "SELECT id FROM orders";
+        let context = CacheContext {
+            fingerprint: "orders-shape-v1".into(),
+            trusted: true,
+        };
+        let mut writer = cache(directory.path(), &document("postgres", "orders"), "exe-a");
+        writer.store_scoped(
+            &owner,
+            body,
+            &result(&owner, body, "public.orders"),
+            &context,
+        );
+        // scoped namespace에는 전역 수집 문맥만 두고, 관계 모양은 몸체별
+        // footprint가 확인하므로 무관한 테이블 추가는 hit를 유지한다.
+        let mut reader = cache(
+            directory.path(),
+            &document("postgres", "customers"),
+            "exe-a",
+        );
+        assert!(reader.load_scoped(&owner, body, &context).is_some());
+        assert_eq!(reader.stats().hits, 1);
+        assert_eq!(reader.stats().misses, 0);
+    }
+
+    #[test]
+    fn scoped_footprint_change_is_a_real_miss() {
+        let directory = tempdir().unwrap();
+        let doc = document("postgres", "orders");
+        let owner = VertexId::object("public", "view");
+        let body = "SELECT id FROM orders";
+        let first = CacheContext {
+            fingerprint: "orders-shape-v1".into(),
+            trusted: true,
+        };
+        let changed = CacheContext {
+            fingerprint: "orders-shape-v2".into(),
+            trusted: true,
+        };
+        let mut writer = cache(directory.path(), &doc, "exe-a");
+        writer.store_scoped(&owner, body, &result(&owner, body, "public.orders"), &first);
+        let mut reader = cache(directory.path(), &doc, "exe-a");
+        assert!(reader.load_scoped(&owner, body, &changed).is_none());
+        assert_eq!(reader.stats().hits, 0);
+        assert_eq!(reader.stats().misses, 1);
+    }
+
+    #[test]
+    fn untrusted_scoped_context_uses_the_full_document_namespace() {
+        let directory = tempdir().unwrap();
+        let doc = document("postgres", "orders");
+        let owner = VertexId::object("public", "view");
+        let body = "SELECT id FROM orders";
+        let context = CacheContext::conservative("fallback");
+        let mut body_cache = cache(directory.path(), &doc, "exe-a");
+        body_cache.store_scoped(
+            &owner,
+            body,
+            &result(&owner, body, "public.orders"),
+            &context,
+        );
+        assert!(body_cache.load_scoped(&owner, body, &context).is_some());
+        assert_eq!(body_cache.stats().hits, 1);
+        assert_eq!(body_cache.stats().misses, 0);
+
+        let changed = document("postgres", "customers");
+        let mut changed_cache = cache(directory.path(), &changed, "exe-a");
+        assert!(changed_cache.load_scoped(&owner, body, &context).is_none());
+        assert_eq!(changed_cache.stats().misses, 1);
     }
 
     #[test]

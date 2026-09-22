@@ -16,17 +16,37 @@
     },
     {
       "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
-      "diagnostics": [],
+      "diagnostics": [
+        {
+          "code": "SG_TEMPORAL_SELF_LINEAGE",
+          "message": "sgfix.customers.name reads its previous value; self DerivesFrom edge omitted"
+        }
+      ],
       "id": "sgfix.orders.trg_orders_touch",
       "scope": "object-dependencies",
-      "state": "complete"
+      "state": "partial"
     },
     {
       "body_hash": "sha256:eb48c5efdd2dd49021f5d1eb4388119216d71301d9b753e8bcf064b7dad5a945",
-      "diagnostics": [],
+      "diagnostics": [
+        {
+          "code": "SG_COLUMN_UNRESOLVED",
+          "location": {
+            "column": 45,
+            "end_column": 48,
+            "end_line": 1,
+            "line": 1
+          },
+          "message": "column 'cid' cannot be resolved in its SQL scope"
+        },
+        {
+          "code": "SG_TEMPORAL_SELF_LINEAGE",
+          "message": "sgfix.customers.name reads its previous value; self DerivesFrom edge omitted"
+        }
+      ],
       "id": "sgfix.touch_customer(int%2811%29)",
       "scope": "object-dependencies",
-      "state": "complete"
+      "state": "partial"
     }
   ],
   "edges": [
@@ -537,6 +557,39 @@
     {
       "evidence": [
         {
+          "detail": "sgfix.orders.trg_orders_touch Reads sgfix.customers.id (predicate)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "reads",
+      "to": "sgfix.customers.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.orders.trg_orders_touch Reads sgfix.customers.name (value)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "reads",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.orders.trg_orders_touch Writes sgfix.customers.name (write)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "writes",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "evidence": [
+        {
           "detail": "trigger trg_orders_touch on orders",
           "layer": "catalog"
         }
@@ -547,6 +600,10 @@
     },
     {
       "evidence": [
+        {
+          "detail": "sgfix.orders.trg_orders_touch Reads sgfix.orders.customer_id (predicate)",
+          "layer": "body-parse"
+        },
         {
           "detail": "trigger sgfix.orders.trg_orders_touch reads NEW/OLD.customer_id on orders",
           "layer": "body-parse"
@@ -621,6 +678,39 @@
       "from": "sgfix.touch_customer(int%2811%29)",
       "kind": "writes",
       "to": "sgfix.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.touch_customer(int%2811%29) Reads sgfix.customers.id (predicate)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.touch_customer(int%2811%29)",
+      "kind": "reads",
+      "to": "sgfix.customers.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.touch_customer(int%2811%29) Reads sgfix.customers.name (value)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.touch_customer(int%2811%29)",
+      "kind": "reads",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "sgfix.touch_customer(int%2811%29) Writes sgfix.customers.name (write)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "sgfix.touch_customer(int%2811%29)",
+      "kind": "writes",
+      "to": "sgfix.customers.name"
     }
   ],
   "limitations": [
@@ -782,6 +872,55 @@
       "from": "sgfix.orders.trg_orders_touch",
       "kind": "reads",
       "role": "body-dependency",
+      "to": "sgfix.customers.id"
+    },
+    {
+      "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "dml-owner:sgfix.orders.trg_orders_touch:predicate",
+      "to": "sgfix.customers.id"
+    },
+    {
+      "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "dml-owner:sgfix.orders.trg_orders_touch:value",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "writes",
+      "role": "dml-owner:sgfix.orders.trg_orders_touch:write",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "sgfix.orders.customer_id"
+    },
+    {
+      "body_hash": "sha256:f5acdd4ac2750a975c0a8ce667f8820bd164a75079f8d9d2226cc094f7eec602",
+      "from": "sgfix.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "dml-owner:sgfix.orders.trg_orders_touch:predicate",
       "to": "sgfix.orders.customer_id"
     },
     {
@@ -790,6 +929,60 @@
       "kind": "writes",
       "role": "body-dependency",
       "to": "sgfix.customers"
+    },
+    {
+      "body_hash": "sha256:eb48c5efdd2dd49021f5d1eb4388119216d71301d9b753e8bcf064b7dad5a945",
+      "from": "sgfix.touch_customer(int%2811%29)",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "sgfix.customers.id"
+    },
+    {
+      "body_hash": "sha256:eb48c5efdd2dd49021f5d1eb4388119216d71301d9b753e8bcf064b7dad5a945",
+      "from": "sgfix.touch_customer(int%2811%29)",
+      "kind": "reads",
+      "location": {
+        "column": 40,
+        "end_column": 42,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "dml-owner:sgfix.touch_customer(int%2811%29):predicate",
+      "to": "sgfix.customers.id"
+    },
+    {
+      "body_hash": "sha256:eb48c5efdd2dd49021f5d1eb4388119216d71301d9b753e8bcf064b7dad5a945",
+      "from": "sgfix.touch_customer(int%2811%29)",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "body_hash": "sha256:eb48c5efdd2dd49021f5d1eb4388119216d71301d9b753e8bcf064b7dad5a945",
+      "from": "sgfix.touch_customer(int%2811%29)",
+      "kind": "reads",
+      "location": {
+        "column": 29,
+        "end_column": 33,
+        "end_line": 1,
+        "line": 1
+      },
+      "role": "dml-owner:sgfix.touch_customer(int%2811%29):value",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "body_hash": "sha256:eb48c5efdd2dd49021f5d1eb4388119216d71301d9b753e8bcf064b7dad5a945",
+      "from": "sgfix.touch_customer(int%2811%29)",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "sgfix.customers.name"
+    },
+    {
+      "body_hash": "sha256:eb48c5efdd2dd49021f5d1eb4388119216d71301d9b753e8bcf064b7dad5a945",
+      "from": "sgfix.touch_customer(int%2811%29)",
+      "kind": "writes",
+      "role": "dml-owner:sgfix.touch_customer(int%2811%29):write",
+      "to": "sgfix.customers.name"
     }
   ],
   "schema_metadata": {

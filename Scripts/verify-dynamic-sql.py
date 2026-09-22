@@ -33,12 +33,13 @@ def check(graph, dialect):
         ("writes", concat, customers),
         ("writes", reassign, orders),
     }
-    complete = [touch, concat, reassign]
+    complete = [touch, reassign]
+    temporal = [concat]
     if dialect == "postgres":
         formatted = fixture_id(graph, "dynamic_format")
         rows = fixture_id(graph, "dynamic_rows")
         complete.append(rows)
-        complete.append(formatted)
+        temporal.append(formatted)
         want.update({
             ("writes", formatted, customers),
             ("reads", rows, customers),
@@ -60,6 +61,13 @@ def check(graph, dialect):
     assert any(cleanup in note for note in notes), "Unresolved SQL was not reported"
     assert any(branch in note for note in notes), "Branch-dependent SQL was not reported"
     assert not any(owner in note for owner in complete for note in notes), notes
+    analysis = {item['id']: item for item in graph.get('analysis', [])}
+    for owner in temporal:
+        record = analysis.get(owner, {})
+        assert record.get('state') == 'partial', 'Self-updates must disclose temporal lineage limits'
+        assert {note['code'] for note in record.get('diagnostics', [])} == {'SG_TEMPORAL_SELF_LINEAGE'}, record
+        assert not any(kind == 'derives-from' and source == target
+                       for kind, source, target in edges), 'Temporal values must not invent a schema self-cycle'
 
     if dialect == "oracle":
         package_member_ids = {

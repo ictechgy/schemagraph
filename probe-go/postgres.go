@@ -32,12 +32,52 @@ func (h *harvester) postgresSchema(schema string) SchemaDoc {
 		obj.Indexes = h.postgresIndexes(schema, obj.Name)
 		obj.Triggers = h.postgresTriggers(schema, obj.Name)
 	}
+	h.postgresVisibility(schema, objects)
 	h.postgresObjectUsage(schema, objects)
 	routines := h.postgresRoutines(schema)
 	h.postgresRoutineUsage(schema, routines)
 	sd := SchemaDoc{Name: schema, Objects: objects, Routines: routines}
 	normalizeSchema(&sd)
 	return sd
+}
+
+// 권한 필터로 사라진 카탈로그 행 수를 독립 pg_catalog 목록과 대조한다.
+func (h *harvester) postgresVisibility(schema string, objects []ObjectDoc) {
+	raw, err := catalogQueries.ReadFile("sql/visibility-postgres.sql")
+	if err != nil {
+		h.catalogIncomplete = true
+		h.limitations = append(h.limitations, "bundled PostgreSQL visibility query is missing; rebuild the probe")
+		return
+	}
+	known := make(map[string]map[string]bool, len(objects))
+	for _, object := range objects {
+		columns := map[string]bool{}
+		for _, column := range object.Columns {
+			columns[column.Name] = true
+		}
+		known[object.Name] = columns
+	}
+	missingRelations := map[string]bool{}
+	missingColumns := 0
+	h.pgRows("catalog visibility", strings.ReplaceAll(string(raw), ":schema", "$1"), []any{schema}, func(rows *sql.Rows) error {
+		var relation string
+		var column sql.NullString
+		if err := rows.Scan(&relation, &column); err != nil {
+			return err
+		}
+		columns, found := known[relation]
+		if !found {
+			missingRelations[relation] = true
+		}
+		if column.Valid && !columns[column.String] {
+			missingColumns++
+		}
+		return nil
+	})
+	if len(missingRelations) > 0 || missingColumns > 0 {
+		h.catalogIncomplete = true
+		h.limitations = append(h.limitations, fmt.Sprintf("%s: catalog visibility check found %d uncollected relations and %d uncollected columns; verify metadata permissions and reader coverage", schema, len(missingRelations), missingColumns))
+	}
 }
 
 func (h *harvester) streamPostgres(stream *ndjsonStreamWriter) error {
@@ -86,6 +126,16 @@ func (h *harvester) postgresSchemas() []string {
 	if err := rows.Err(); err != nil {
 		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("schemas unavailable — %s", oneLine(err.Error())))
+	}
+	found := map[string]bool{}
+	for _, schema := range out {
+		found[schema] = true
+	}
+	for schema := range h.schemaFilter {
+		if !found[schema] {
+			h.catalogIncomplete = true
+			h.limitations = append(h.limitations, fmt.Sprintf("requested schema '%s' was not collected; verify existence and metadata permissions", schema))
+		}
 	}
 	return out
 }

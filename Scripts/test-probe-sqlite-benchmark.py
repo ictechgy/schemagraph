@@ -23,6 +23,18 @@ def catalog():
 class ProbeBenchmarkTests(unittest.TestCase):
     """양쪽 전송이 같은 오답을 내는 경우도 검증기가 거부해야 한다."""
 
+    def test_jdbc_collection_uses_actual_sqlite_driver_and_same_wire_contract(self):
+        command = CHECK.collector_command(None, Path('/probe/probe.jar'), Path('/java/bin/java'),
+                                          Path('/tmp/with space.db'), 'ndjson', Path('/tmp/catalog'))
+        self.assertEqual(command, ['/java/bin/java', '-jar', '/probe/probe.jar', '--url',
+                                  'jdbc:sqlite:/tmp/with space.db', '--document-version', '2',
+                                  '--format', 'ndjson', '-o', '/tmp/catalog'])
+
+    def test_go_collection_keeps_native_url(self):
+        command = CHECK.collector_command(Path('/probe/go'), None, None, Path('/tmp/db'),
+                                          'json', Path('/tmp/catalog'))
+        self.assertEqual(command[:3], ['/probe/go', '--url', 'sqlite:/tmp/db'])
+
     def test_catalog_pk_loss_is_rejected(self):
         with tempfile.TemporaryDirectory(prefix='sg-probe-benchmark-test-') as directory:
             path = Path(directory) / 'catalog.json'

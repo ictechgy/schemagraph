@@ -9,6 +9,7 @@ pub mod dependencies;
 pub mod diff;
 pub mod document;
 pub mod graph;
+pub mod imports;
 pub mod mysql;
 pub mod ndjson;
 pub mod postgres;

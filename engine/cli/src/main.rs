@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 mod cache;
 mod cancellation;
+mod import;
 mod mcp;
 mod merge;
 mod policy;
@@ -36,6 +37,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Attach offline dbt compiled SQL or observed queries to a catalog document.
+    Import {
+        catalog: PathBuf,
+        #[arg(long, value_enum)]
+        format: ImportFormat,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+        /// Root directory for validating dbt source and compiled SQL paths.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        #[arg(long, default_value_t = 67_108_864, value_parser = clap::value_parser!(u64).range(1..=536_870_912))]
+        max_input_bytes: u64,
+        #[arg(long, default_value_t = 100_000, value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
+        max_rows: u32,
+        #[arg(long, default_value_t = 8_388_608, value_parser = clap::value_parser!(u64).range(1..=67_108_864))]
+        max_sql_bytes: u64,
+        #[arg(long, default_value_t = 67_108_864, value_parser = clap::value_parser!(u64).range(1..=536_870_912))]
+        max_total_sql_bytes: u64,
+    },
     /// Read a database catalog and write the dependency graph (the artifact).
     Scan {
         /// Connection URL: sqlite:PATH, postgres://…, mysql://… — omit with --document.
@@ -203,6 +227,18 @@ enum Command {
         strict: bool,
         #[arg(long)]
         require_complete: bool,
+        /// Apply a versioned review policy without changing graph facts.
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Mark previously reviewed finding fingerprints as existing.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Evaluate expiring waivers at this explicit YYYY-MM-DD date.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Write a baseline only for a complete, comparable review.
+        #[arg(long)]
+        write_baseline: Option<PathBuf>,
         #[arg(long, default_value_t = 256)]
         max_changes: usize,
         #[arg(long, default_value_t = 1024)]
@@ -267,6 +303,13 @@ enum GraphFormat {
 enum ReviewFormat {
     Json,
     Markdown,
+    Sarif,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ImportFormat {
+    Dbt,
+    QueryLog,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -302,6 +345,39 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<i32> {
     match cli.command {
+        Command::Import {
+            catalog,
+            format,
+            input,
+            output,
+            report,
+            project_root,
+            max_input_bytes,
+            max_rows,
+            max_sql_bytes,
+            max_total_sql_bytes,
+        } => {
+            let kind = match format {
+                ImportFormat::Dbt => source::imports::ImportKind::DbtManifest,
+                ImportFormat::QueryLog => source::imports::ImportKind::QueryLogJsonl,
+            };
+            import::run(
+                &catalog,
+                &input,
+                &output,
+                &report,
+                kind,
+                project_root.as_deref(),
+                source::codec::LATEST_DOCUMENT_VERSION,
+                source::imports::ImportLimits {
+                    max_input_bytes,
+                    max_rows: max_rows as usize,
+                    max_sql_bytes,
+                    max_total_sql_bytes,
+                    ..Default::default()
+                },
+            )
+        }
         Command::Scan {
             url,
             output,
@@ -398,24 +474,36 @@ async fn run(cli: Cli) -> Result<i32> {
             after,
             strict,
             require_complete,
+            policy,
+            baseline,
+            as_of,
+            write_baseline,
             max_changes,
             max_impacted,
             max_visited,
             max_examined_edges,
             format,
-        } => review::run(
-            &before,
-            &after,
+        } => review::run_with_options(review::ReviewOptions {
+            before: &before,
+            after: &after,
             strict,
             require_complete,
             max_changes,
             max_impacted,
-            analysis::budget::Budget {
+            budget: analysis::budget::Budget {
                 max_visited,
                 max_examined_edges,
             },
-            matches!(format, ReviewFormat::Markdown),
-        ),
+            format: match format {
+                ReviewFormat::Json => review::ReviewOutputFormat::Json,
+                ReviewFormat::Markdown => review::ReviewOutputFormat::Markdown,
+                ReviewFormat::Sarif => review::ReviewOutputFormat::Sarif,
+            },
+            policy: policy.as_deref(),
+            baseline: baseline.as_deref(),
+            as_of: as_of.as_deref(),
+            write_baseline: write_baseline.as_deref(),
+        }),
         Command::Serve { graph } => {
             let graph = load_graph(&graph)?;
             mcp::serve(&graph, BufReader::new(std::io::stdin()), std::io::stdout())?;

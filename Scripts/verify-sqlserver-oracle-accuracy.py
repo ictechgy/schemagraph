@@ -258,14 +258,23 @@ def inspect_case(graph, case, definition, vertices):
                if e['kind'] == 'derives-from' and e['from'].startswith(subject + '.')}
     expected_lineage = {(output, source) for output, sources in case['lineage'].items() for source in sources}
     analysis = next((item for item in graph.get('analysis', []) if item['id'] == subject), {})
+    column_writes = {e['to'] for e in edges if e['kind'] == 'writes'
+                     and vertices.get(e['to'], {}).get('kind') == 'column'}
+    writes = {e['to'] for e in edges if e['kind'] == 'writes'
+              and (case['read_scope'] != 'object' or e['to'] not in column_writes)}
     result = {'subject': subject, 'kind': case['kind'], 'read_scope': case['read_scope'],
               'state': analysis.get('state', 'unavailable'), 'expected_state': case['state'],
               'diagnostics': analysis.get('diagnostics', []),
               'reads': ACCURACY.score(set(case['reads']), reads),
-              'writes': ACCURACY.score(set(case['writes']), {e['to'] for e in edges if e['kind'] == 'writes'}),
+              'writes': ACCURACY.score(set(case['writes']), writes),
               'calls': ACCURACY.score(set(case['calls']), {call_name(e['to'], vertices) for e in edges if e['kind'] == 'calls'})}
     if case['kind'] == 'view':
         result['lineage'] = ACCURACY.score(expected_lineage, lineage)
+    else:
+        # 기존 코퍼스의 절차형 기대값은 객체 단위다. 새 컬럼 사실은 새 DML
+        # 코퍼스에서 평가하며 이 점수의 오탐/정답으로 섞지 않는다.
+        result['write_scope'] = 'object'
+        result['column_writes_unscored'] = sorted(column_writes)
     if case['kind'] == 'trigger':
         result['fires'] = ACCURACY.score({definition['schema'] + '.' + case['parent']},
                                         {e['to'] for e in edges if e['kind'] == 'fires'})

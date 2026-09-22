@@ -1,17 +1,10 @@
 name: Publish Maven repository to GitHub Pages
 
 on:
-  push:
-    branches: ["main"]
-    paths:
-      - ".github/workflows/publish-maven.yml"
-      - "MAVEN.md"
-      - "Scripts/build-maven-site.py"
-      - "probe/**"
   workflow_dispatch:
     inputs:
       version:
-        description: Maven version to publish to Pages
+        description: Existing release version to publish from its Git tag
         required: true
         default: "0.4.3"
 
@@ -45,6 +38,20 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate the selected release version
+        run: |
+          [[ "$PROBE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo 'error: select an existing stable release version'
+            exit 2
+          }
+
+      - name: Check out the released probe source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v${{ inputs.version }}
+          path: release
+          persist-credentials: false
+
       - name: Set up Java
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
@@ -61,11 +68,11 @@ jobs:
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
       - name: Record reproducible source timestamp
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+        run: echo "SOURCE_DATE_EPOCH=$(git -C release log -1 --format=%ct)" >> "$GITHUB_ENV"
 
       - name: Publish probe to an isolated Maven repository
         run: |
-          gradle -p probe publishMavenJavaPublicationToLocalStagingRepository \
+          gradle -p release/probe publishMavenJavaPublicationToLocalStagingRepository \
             -PprobeGroup="$PROBE_GROUP" \
             -PprobeVersion="$PROBE_VERSION" \
             -PprobeRepositoryDir="$RUNNER_TEMP/probe-maven" \

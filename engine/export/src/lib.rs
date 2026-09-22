@@ -19,6 +19,7 @@ pub mod html;
 pub mod lint;
 pub mod mermaid;
 pub mod review;
+pub mod sarif;
 pub mod schema_metadata;
 pub mod stream;
 

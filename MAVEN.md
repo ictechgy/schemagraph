@@ -53,8 +53,10 @@ dependencies {
 ```
 
 `.github/workflows/publish-maven.yml` builds the Maven Repository Layout under
-`site/maven/` and deploys it with GitHub Pages Actions on `main` pushes or a
-manual version selection. It fetches existing public Pages metadata and
+`site/maven/` and deploys it with GitHub Pages Actions after an explicit manual
+version selection. It builds `probe` from the matching `vVERSION` release tag;
+ordinary merges do not publish unreleased source under an existing version.
+It fetches existing public Pages metadata and
 artifacts before merging the current version, so previously released versions
 remain available without committing binary jars to Git. It also uploads a
 versioned repository zip as a workflow artifact for diagnosis.

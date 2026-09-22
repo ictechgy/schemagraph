@@ -260,21 +260,30 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
 - **P6 로컬 통합 경로**: `--sql-dir`는 수집된 단일 schema에 상대 SQL 파일을
   `query_<hex-relative-path>` routine으로 추가한다. 파일 원문은 parser 입력으로만
   쓰고, query는 애플리케이션 사용 root라는 사실만 보존한다. `--cache-dir`는
-  실행 파일 fingerprint·graph version·몸체를 제외한 전체 카탈로그 구조·context·
-  dependencies를 namespace로 삼고, 몸체별 parser 효과만 checksum된 private entry로
-  저장한다. cache 오류는 분석 실패가 아니라 stderr 경고와 miss다.
+  실행 파일 fingerprint·graph version·context를 호환성 경계로 삼고,
+  실제 해석에 필요한 관계·컬럼 구조·routine 후보의 footprint가 같을 때
+  몸체별 효과를 재사용한다. 확실한 footprint가 없는 몸체는 전체 카탈로그 구조
+  namespace로 폴백한다. 같은 owner의 Writes로 뒷받침되는 DML DerivesFrom만
+  외부 컬럼 효과로 복원하며, 원문·현재 usage는 cache하지 않는다.
+  cache 오류는 분석 실패가 아니라 stderr 경고와 miss다. 전체 catalog/graph의
+  구성·메모리 보유는 매번 수행한다.
   `merge`는 각 document의 명시적 `context.source_id`를 `source::id` namespace로
   보존하고, 외부 dependency 대상이 하나로 결정될 때만 `depends-on`을 만든다.
   여러 후보·미수집 대상은 간선을 만들지 않고 limitation으로 남긴다.
 
 ## 경쟁 대비 위치
 
-| 툴 | 그들의 끝 | 우리가 더 가는 곳 |
-|----|-----------|-------------------|
-| SchemaCrawler | 다이어그램 + lint + grep | 판정 질의·몸체 간선·에이전트 계약 |
-| tbls | 문서 + CI lint | 그래프 질의·impact·통계 증거 |
-| Azimutt | GUI 탐색 + 추정 간선 | CLI 판정·판정/추정 간선 분리 |
-| DataGrip/DBeaver | IDE ERD | headless·CI·에이전트 소비 |
+의존성 분석·MCP·snapshot·lint는 여러 도구가 제공한다. 기능의 존재만으로
+경쟁 제품의 한계를 단정하지 않고, 실제 수집·해석 범위와 검증 근거를 비교한다.
+현재 비교와 후속 완료 조건은 [COMPETITIVE-ANALYSIS.md](COMPETITIVE-ANALYSIS.md)에 있다.
+
+| 비교 대상 | 겹치는 주요 범위 | 검증할 가치 |
+| --- | --- | --- |
+| SchemaCrawler | 카탈로그·view/routine 참조·lint·snapshot·MCP | 같은 입력에서의 해석 정확도와 근거·한계 계약 |
+| tbls | 문서·schema diff·CI lint·설치 도구 | 변경 검토와 CI 소비자 경험 |
+| Atlas / Flyway | migration 검사·정책·변경 보고 | 전후 카탈로그와 영향 근거를 이용한 검토 연계 |
+| DataHub / dbt | SQL·모델·외부 작업의 계보 | DB 밖 원문과 문맥을 공통 document로 연결 |
+| Azimutt / SQL Dependency Tracker / DB IDE | 객체·경로·의존성 탐색 | 결정적 graph 산출물과 반복 가능한 검토 흐름 |
 
 ## 호환 계약과 확장 경계
 

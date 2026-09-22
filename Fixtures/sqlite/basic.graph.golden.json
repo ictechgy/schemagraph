@@ -9,10 +9,15 @@
     },
     {
       "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
-      "diagnostics": [],
+      "diagnostics": [
+        {
+          "code": "SG_TEMPORAL_SELF_LINEAGE",
+          "message": "main.customers.name reads its previous value; self DerivesFrom edge omitted"
+        }
+      ],
       "id": "main.orders.trg_orders_touch",
       "scope": "object-dependencies",
-      "state": "complete"
+      "state": "partial"
     }
   ],
   "edges": [
@@ -477,6 +482,39 @@
     {
       "evidence": [
         {
+          "detail": "main.orders.trg_orders_touch Reads main.customers.id (predicate)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "to": "main.customers.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "main.orders.trg_orders_touch Reads main.customers.name (value)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "to": "main.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "main.orders.trg_orders_touch Writes main.customers.name (write)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.orders.trg_orders_touch",
+      "kind": "writes",
+      "to": "main.customers.name"
+    },
+    {
+      "evidence": [
+        {
           "detail": "trigger trg_orders_touch on orders",
           "layer": "catalog"
         }
@@ -487,6 +525,10 @@
     },
     {
       "evidence": [
+        {
+          "detail": "main.orders.trg_orders_touch Reads main.orders.customer_id (predicate)",
+          "layer": "body-parse"
+        },
         {
           "detail": "trigger main.orders.trg_orders_touch reads NEW/OLD.customer_id on orders",
           "layer": "body-parse"
@@ -698,6 +740,55 @@
       "from": "main.orders.trg_orders_touch",
       "kind": "reads",
       "role": "body-dependency",
+      "to": "main.customers.id"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "dml-owner:main.orders.trg_orders_touch:predicate",
+      "to": "main.customers.id"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "main.customers.name"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "dml-owner:main.orders.trg_orders_touch:value",
+      "to": "main.customers.name"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "main.customers.name"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "writes",
+      "role": "dml-owner:main.orders.trg_orders_touch:write",
+      "to": "main.customers.name"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "main.orders.customer_id"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "dml-owner:main.orders.trg_orders_touch:predicate",
       "to": "main.orders.customer_id"
     }
   ],

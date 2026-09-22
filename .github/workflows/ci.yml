@@ -27,7 +27,7 @@ jobs:
   verify:
     name: Build, package, and database fixtures
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Check out source
@@ -69,6 +69,8 @@ jobs:
           python3 Scripts/test-sqlserver-oracle-accuracy.py
           python3 Scripts/test-benchmark-scale.py
           python3 Scripts/test-probe-sqlite-benchmark.py
+          python3 Scripts/test-review-action.py
+          python3 Scripts/test-dml-accuracy.py
 
       - name: Build and test the Rust workspace
         run: |
@@ -80,6 +82,7 @@ jobs:
           for dialect in postgres sqlserver oracle; do
             cmp "engine/source/src/sql/catalog-$dialect.sql" "probe-go/sql/catalog-$dialect.sql"
           done
+          cmp engine/source/src/sql/visibility-postgres.sql probe-go/sql/visibility-postgres.sql
           python3 -m venv "$RUNNER_TEMP/jsonschema-venv"
           "$RUNNER_TEMP/jsonschema-venv/bin/pip" install --disable-pip-version-check --no-input 'jsonschema==4.23.0' 'sqlglot==30.18.0'
           "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-contracts.py \
@@ -88,6 +91,39 @@ jobs:
           python3 Scripts/verify-cancellation.py --engine engine/target/debug/schemagraph
           python3 Scripts/verify-html.py --engine engine/target/debug/schemagraph \
             --screenshot "$RUNNER_TEMP/html-smoke.png"
+          curl --fail --location --retry 3 \
+            https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json \
+            --output "$RUNNER_TEMP/sarif-schema.json"
+          echo "c3b4bb2d6093897483348925aaa73af03b3e3f4bd4ca38cef26dcb4212a2682e  $RUNNER_TEMP/sarif-schema.json" | sha256sum --check
+          "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-review-action.py \
+            --engine engine/target/debug/schemagraph --schema "$RUNNER_TEMP/sarif-schema.json"
+
+      - name: Prepare consumer Action snapshots
+        run: python3 Scripts/verify-review-action.py --prepare .review-action-smoke
+
+      - name: Invoke the consumer Action
+        id: review_action
+        uses: ./
+        continue-on-error: true
+        with:
+          before: .review-action-smoke/before.json
+          after: .review-action-smoke/after.json
+          policy: .review-action-smoke/policy.toml
+          engine-path: engine/target/debug/schemagraph
+
+      - name: Verify the Action exposes findings and artifacts
+        env:
+          REVIEW_CODE: ${{ steps.review_action.outputs.exit-code }}
+          REVIEW_OUTCOME: ${{ steps.review_action.outcome }}
+          REVIEW_JSON: ${{ steps.review_action.outputs.json }}
+          REVIEW_SARIF: ${{ steps.review_action.outputs.sarif }}
+          REVIEW_MARKDOWN: ${{ steps.review_action.outputs.markdown }}
+        run: |
+          test "$REVIEW_CODE" = 1
+          test "$REVIEW_OUTCOME" = failure
+          test -s "$REVIEW_JSON"
+          test -s "$REVIEW_SARIF"
+          test -s "$REVIEW_MARKDOWN"
 
       - name: Measure public schema accuracy against independent references
         env:
@@ -96,6 +132,17 @@ jobs:
           "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-accuracy.py \
             --engine engine/target/debug/schemagraph --sqlglot --suite all --strict \
             --output "$RUNNER_TEMP/accuracy.json"
+
+      - name: Verify real dbt compilation and query-log import
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+          DBT_SEND_ANONYMOUS_USAGE_STATS: 'false'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dbt-venv"
+          "$RUNNER_TEMP/dbt-venv/bin/pip" install --disable-pip-version-check --no-input \
+            'dbt-core==1.12.5' 'dbt-postgres==1.11.0'
+          python3 Scripts/verify-external-imports.py --engine engine/target/debug/schemagraph \
+            --dbt "$RUNNER_TEMP/dbt-venv/bin/dbt" --output "$RUNNER_TEMP/imports-check.json"
 
       - name: Measure MySQL and MariaDB public schema accuracy
         run: |
@@ -177,6 +224,18 @@ jobs:
             --go-probe probe-go/schemagraph-probe-go \
             --jdbc-jar probe/build/libs/schemagraph-probe-all.jar
 
+      - name: Verify restricted PostgreSQL collection and comparison scope
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+        run: |
+          python3 Scripts/verify-collection-scope.py --engine engine/target/debug/schemagraph \
+            --output "$RUNNER_TEMP/scope-native.json"
+          python3 Scripts/verify-collection-scope.py --engine engine/target/debug/schemagraph \
+            --go-probe probe-go/schemagraph-probe-go --output "$RUNNER_TEMP/scope-go.json"
+          python3 Scripts/verify-collection-scope.py --engine engine/target/debug/schemagraph \
+            --jdbc-jar probe/build/libs/schemagraph-probe-all.jar --java "$JAVA_HOME/bin/java" \
+            --output "$RUNNER_TEMP/scope-jdbc.json"
+
       - name: Verify every database fixture
         env:
           SG_MYSQL_JAR: ${{ runner.temp }}/mysql-connector-j.jar
@@ -200,5 +259,23 @@ jobs:
             ${{ runner.temp }}/html-smoke.png
             ${{ runner.temp }}/accuracy.json
             ${{ runner.temp }}/mysql-accuracy.json
+            ${{ runner.temp }}/scope-*.json
+            ${{ runner.temp }}/imports-check.json
           if-no-files-found: ignore
           retention-days: 7
+
+  container:
+    name: Container build and consumer smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: docker build --tag schemagraph:ci .
+      - run: python3 Scripts/verify-container.py --image schemagraph:ci --output "$RUNNER_TEMP/container.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: container-smoke
+          path: ${{ runner.temp }}/container.json
+          if-no-files-found: error

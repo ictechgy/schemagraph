@@ -14,6 +14,7 @@ use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId,
 use schemagraph_source::document::{CatalogDocument, ObjectDoc};
 use sqlparser::ast::{
     visit_expressions, visit_relations, Expr, ObjectName, Statement, TableFactor, TableObject,
+    TableWithJoins, UpdateTableFromKind,
 };
 use sqlparser::dialect::{
     Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
@@ -21,7 +22,7 @@ use sqlparser::dialect::{
 
 mod cache;
 mod constant_sql;
-pub use cache::{BodyCache, BodyResult};
+pub use cache::{BodyCache, BodyResult, CacheContext};
 mod scope;
 #[cfg(test)]
 mod scope_tests;
@@ -68,11 +69,16 @@ pub fn enrich_with_cache(
                 if let Some(owner) =
                     resolve_object(g, &schema.name, &obj.name, kind, &obj.kind, false)
                 {
+                    let context = obj
+                        .body
+                        .as_deref()
+                        .map(|body| scope::cache_context(doc, g, &owner, body));
                     if !cache::reuse(
                         &mut cache,
                         g,
                         &owner,
                         obj.body.as_deref(),
+                        context.as_ref(),
                         &mut notes,
                         &mut enriched,
                     ) {
@@ -92,6 +98,7 @@ pub fn enrich_with_cache(
                             g,
                             &owner,
                             obj.body.as_deref(),
+                            context.as_ref(),
                             &notes[note_start..],
                             enriched - enriched_start,
                         );
@@ -126,14 +133,17 @@ pub fn enrich_with_cache(
                         schemagraph_core::AnalysisState::Unsupported,
                         "SG_BODY_UNAVAILABLE",
                         &["trigger definition was not collected".into()],
+                        &[],
                     );
                     continue;
                 };
+                let context = scope::cache_context(doc, g, &trigger_id, body);
                 if cache::reuse(
                     &mut cache,
                     g,
                     &trigger_id,
                     Some(body),
+                    Some(&context),
                     &mut notes,
                     &mut enriched,
                 ) {
@@ -142,6 +152,7 @@ pub fn enrich_with_cache(
                 let note_start = notes.len();
                 let enriched_start = enriched;
                 let mut state = schemagraph_core::AnalysisState::Complete;
+                let mut record_body_diagnostics = Vec::new();
                 let parsed_body = match doc.dialect.as_str() {
                     "db2" => parse_db2_trigger_body(dialect.as_deref(), body),
                     "informix" => parse_informix_trigger_body(dialect.as_deref(), body),
@@ -152,17 +163,25 @@ pub fn enrich_with_cache(
                     ),
                 };
                 match parsed_body {
-                    Ok(parsed) => {
+                    Ok(mut parsed) => {
                         apply_trigger(
                             g,
+                            &catalog_index,
                             &schema.name,
                             &obj.name,
                             &trigger_id,
-                            &parsed,
+                            &mut parsed,
                             &mut notes,
                             ci,
+                            scope::body_hash(body),
+                            doc.dialect == "sqlserver" || doc.dialect == "mssql",
                         );
+                        if parsed.partial {
+                            state = schemagraph_core::AnalysisState::Partial;
+                        }
+                        let diagnostics = parsed.diagnostics.clone();
                         enriched += 1;
+                        record_body_diagnostics = diagnostics;
                     }
                     Err(msg) => {
                         state = schemagraph_core::AnalysisState::Unsupported;
@@ -176,12 +195,14 @@ pub fn enrich_with_cache(
                     state,
                     "SG_BODY_PARTIAL",
                     &notes[note_start..],
+                    &record_body_diagnostics,
                 );
                 cache::save(
                     &mut cache,
                     g,
                     &trigger_id,
                     Some(body),
+                    Some(&context),
                     &notes[note_start..],
                     enriched - enriched_start,
                 );
@@ -237,10 +258,20 @@ pub fn enrich_with_cache(
                     schemagraph_core::AnalysisState::Unsupported,
                     "SG_BODY_UNAVAILABLE",
                     &["routine definition was not collected".into()],
+                    &[],
                 );
                 continue;
             };
-            if cache::reuse(&mut cache, g, &owner, Some(body), &mut notes, &mut enriched) {
+            let context = scope::cache_context(doc, g, &owner, body);
+            if cache::reuse(
+                &mut cache,
+                g,
+                &owner,
+                Some(body),
+                Some(&context),
+                &mut notes,
+                &mut enriched,
+            ) {
                 continue;
             }
             let note_start = notes.len();
@@ -270,18 +301,33 @@ pub fn enrich_with_cache(
                     g,
                     &owner,
                     Some(body),
+                    Some(&context),
                     &notes[note_start..],
                     enriched - enriched_start,
                 );
                 continue;
             }
             let mut state = schemagraph_core::AnalysisState::Complete;
+            let mut record_body_diagnostics = Vec::new();
             (|| {
                 if matches!(doc.dialect.as_str(), "db2" | "informix")
                     && catalog_routine_language_allowed(&doc.dialect, routine.language.as_deref())
                 {
-                    let (parsed, unextracted) = parse_catalog_routine_body(&doc.dialect, body);
-                    apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                    let (mut parsed, unextracted) = parse_catalog_routine_body(&doc.dialect, body);
+                    let partial = apply_routine(
+                        g,
+                        &catalog_index,
+                        &schema.name,
+                        &owner,
+                        &mut parsed,
+                        &mut notes,
+                        ci,
+                        scope::body_hash(body),
+                    );
+                    if partial {
+                        state = schemagraph_core::AnalysisState::Partial;
+                    }
+                    record_body_diagnostics = parsed.diagnostics.clone();
                     if unextracted > 0 {
                         notes.push(format!(
                         "routine {owner}: body statement(s) {unextracted} could not be extracted"
@@ -303,8 +349,21 @@ pub fn enrich_with_cache(
                     // SQL 언어 함수는 몸체가 그대로 SQL이라 파싱 가능 — 나머지
                     // 언어는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
                     Some("sql") | None => match parse_routine_body(dialect.as_deref(), body) {
-                        Ok(parsed) => {
-                            apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                        Ok(mut parsed) => {
+                            let partial = apply_routine(
+                                g,
+                                &catalog_index,
+                                &schema.name,
+                                &owner,
+                                &mut parsed,
+                                &mut notes,
+                                ci,
+                                scope::body_hash(body),
+                            );
+                            if partial {
+                                state = schemagraph_core::AnalysisState::Partial;
+                            }
+                            record_body_diagnostics = parsed.diagnostics.clone();
                             enriched += 1;
                         }
                         Err(msg) => {
@@ -312,7 +371,7 @@ pub fn enrich_with_cache(
                             // 같은 절차형 구문이 섞이면 sqlparser가 문장 목록째
                             // 거부한다. 문장 추출로 부분 복구해 파싱된 문장의
                             // 간선만 취하고, 미추출은 limitation으로 센다.
-                            let (parsed, unextracted) = parse_procedural_body(
+                            let (mut parsed, unextracted) = parse_procedural_body(
                                 dialect.as_deref(),
                                 body,
                                 constant_sql::dialect(&doc.dialect),
@@ -320,8 +379,21 @@ pub fn enrich_with_cache(
                             );
                             if parsed.has_edges() || unextracted > 0 {
                                 if parsed.has_edges() {
-                                    apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                                    let partial = apply_routine(
+                                        g,
+                                        &catalog_index,
+                                        &schema.name,
+                                        &owner,
+                                        &mut parsed,
+                                        &mut notes,
+                                        ci,
+                                        scope::body_hash(body),
+                                    );
+                                    if partial {
+                                        state = schemagraph_core::AnalysisState::Partial;
+                                    }
                                 }
+                                record_body_diagnostics = parsed.diagnostics.clone();
                                 // 미추출 0건은 완전 복구 — 한계가 아니므로 조용히 둔다.
                                 if unextracted > 0 {
                                     notes.push(format!(
@@ -339,13 +411,26 @@ pub fn enrich_with_cache(
                     // plpgsql·plsql은 문장 단위 추출기로 SQL 문장만 꺼내 파싱한다.
                     // 꺼내지 못한 문장(동적 SQL 등)은 수를 세어 limitation으로 남긴다.
                     Some("plpgsql" | "plsql" | "pl/sql") => {
-                        let (parsed, unextracted) = parse_procedural_body(
+                        let (mut parsed, unextracted) = parse_procedural_body(
                             dialect.as_deref(),
                             body,
                             constant_sql::dialect(&doc.dialect),
                             format_shadowed,
                         );
-                        apply_routine(g, &schema.name, &owner, &parsed, &mut notes, ci);
+                        let partial = apply_routine(
+                            g,
+                            &catalog_index,
+                            &schema.name,
+                            &owner,
+                            &mut parsed,
+                            &mut notes,
+                            ci,
+                            scope::body_hash(body),
+                        );
+                        if partial {
+                            state = schemagraph_core::AnalysisState::Partial;
+                        }
+                        record_body_diagnostics = parsed.diagnostics.clone();
                         // 멤버가 member_of로 나오는 문서에서 패키지 몸체는 스펙이라
                         // 실행 간선이 거의 없다 — 패키지 정점에 간선이 붙는다는 건
                         // 멤버 몸체가 통째로 실린 옛 형식이라는 뜻이라 그때만 알린다.
@@ -376,12 +461,14 @@ pub fn enrich_with_cache(
                 state,
                 "SG_BODY_PARTIAL",
                 &notes[note_start..],
+                &record_body_diagnostics,
             );
             cache::save(
                 &mut cache,
                 g,
                 &owner,
                 Some(body),
+                Some(&context),
                 &notes[note_start..],
                 enriched - enriched_start,
             );
@@ -424,6 +511,7 @@ fn record_body(
     mut state: schemagraph_core::AnalysisState,
     code: &str,
     notes: &[String],
+    structured_diagnostics: &[schemagraph_core::Diagnostic],
 ) {
     use schemagraph_core::{AnalysisState, Diagnostic, ObjectAnalysis, Origin};
     if state == AnalysisState::Complete && !notes.is_empty() {
@@ -457,6 +545,12 @@ fn record_body(
             );
         }
     }
+    let mut diagnostics: Vec<Diagnostic> = structured_diagnostics.to_vec();
+    diagnostics.extend(notes.iter().map(|message| Diagnostic {
+        code: code.into(),
+        message: message.clone(),
+        location: None,
+    }));
     g.set_analysis(
         owner.clone(),
         ObjectAnalysis {
@@ -464,14 +558,7 @@ fn record_body(
             state,
             scope: "object-dependencies".into(),
             body_hash: hash,
-            diagnostics: notes
-                .iter()
-                .map(|message| Diagnostic {
-                    code: code.into(),
-                    message: message.clone(),
-                    location: None,
-                })
-                .collect(),
+            diagnostics,
         },
     );
 }
@@ -628,6 +715,25 @@ struct ParsedTrigger {
     calls: Vec<(Option<String>, String)>,
     /// database qualifier가 있어 local catalog로 귀속하지 않은 관계.
     ignored_relations: BTreeSet<String>,
+    /// database.schema.table 3부분 관계. 적용 시 수집 context.database와
+    /// 일치하는 경우에만 로컬 객체로 해석한다.
+    qualified_reads: Vec<ObjectName>,
+    qualified_writes: Vec<ObjectName>,
+    /// AST로 확인한 DML 문장. 컬럼 효과는 카탈로그 정점이 있는 적용 단계에서
+    /// 해석한다 — 파싱 단계에서 임시·미수집 정점을 만들지 않는다.
+    dml_statements: Vec<Statement>,
+    /// 직선 구간에서 만든 임시 relation 이름. graph 정점으로 만들지 않고
+    /// source column으로 접어야 하므로 객체 수준 missing note에서도 제외한다.
+    local_relations: BTreeSet<(Option<String>, String)>,
+    /// DML 컬럼 계보가 보수적으로 부분 결과임을 알리는 구조화 진단.
+    diagnostics: Vec<schemagraph_core::Diagnostic>,
+    /// routine header나 선언부에서 실제로 선언된 scalar symbol만 보관한다.
+    scalar_symbols: BTreeSet<String>,
+    partial: bool,
+    /// 임시 relation 상태가 모든 문장을 순서대로 관찰했다는 보수적 증명.
+    temp_state_safe: bool,
+    /// AST span이 변환된 조각이 아니라 원문 몸체 좌표를 직접 가리키는가.
+    locations_trusted: bool,
 }
 
 impl ParsedTrigger {
@@ -638,7 +744,10 @@ impl ParsedTrigger {
             && self.reads.is_empty()
             && self.fired_columns.is_empty()
             && self.calls.is_empty()
-            && self.ignored_relations.is_empty())
+            && self.ignored_relations.is_empty()
+            && self.qualified_reads.is_empty()
+            && self.qualified_writes.is_empty()
+            && self.dml_statements.is_empty())
     }
 }
 
@@ -655,6 +764,8 @@ fn parse_trigger_body(
     let dialect = dialect.unwrap_or(&default);
     let calls = extract_execute_targets(body);
     let inner = extract_trigger_inner(body).unwrap_or(body);
+    let locations_trusted =
+        std::ptr::eq(inner.as_ptr(), body.as_ptr()) && inner.len() == body.len();
     let statements = sqlparser::parser::Parser::parse_sql(dialect, inner.trim());
     let mut parsed = ParsedTrigger {
         writes: Vec::new(),
@@ -662,6 +773,15 @@ fn parse_trigger_body(
         fired_columns: Vec::new(),
         calls,
         ignored_relations: BTreeSet::new(),
+        qualified_reads: Vec::new(),
+        qualified_writes: Vec::new(),
+        dml_statements: Vec::new(),
+        local_relations: BTreeSet::new(),
+        diagnostics: Vec::new(),
+        scalar_symbols: BTreeSet::new(),
+        partial: false,
+        temp_state_safe: true,
+        locations_trusted,
     };
     match statements {
         Ok(stmts) if !stmts.is_empty() => {
@@ -677,6 +797,7 @@ fn parse_trigger_body(
             for stmt in &stmts {
                 collect_trigger_stmt(stmt, &mut parsed, sqlserver_trigger);
             }
+            invalidate_temp_state_if_unsafe(&mut parsed, body, 0);
             Ok(parsed)
         }
         // EXECUTE FUNCTION 꼴 trigger는 본문 자체는 못 파지만 호출 대상은
@@ -704,7 +825,16 @@ fn needs_procedural_recovery(body: &str) -> bool {
 /// 꺼내고, 나머지는 trigger와 같은 문장 수집 골격으로 파싱한다.
 fn parse_routine_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedTrigger, String> {
     let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
-    parse_trigger_body(dialect, &inner, false)
+    let transformed =
+        inner.as_ref().len() != body.len() || !std::ptr::eq(inner.as_ref().as_ptr(), body.as_ptr());
+    let mut parsed = parse_trigger_body(dialect, &inner, false)?;
+    parsed
+        .scalar_symbols
+        .extend(routine_parameter_symbols(body));
+    if transformed {
+        parsed.locations_trusted = false;
+    }
+    Ok(parsed)
 }
 
 /// Db2 LUW와 Informix SPL의 catalog text는 `AS` 문자열이 아니라 CREATE
@@ -741,6 +871,15 @@ fn empty_parsed_trigger() -> ParsedTrigger {
         fired_columns: Vec::new(),
         calls: Vec::new(),
         ignored_relations: BTreeSet::new(),
+        qualified_reads: Vec::new(),
+        qualified_writes: Vec::new(),
+        dml_statements: Vec::new(),
+        local_relations: BTreeSet::new(),
+        diagnostics: Vec::new(),
+        scalar_symbols: BTreeSet::new(),
+        partial: false,
+        temp_state_safe: true,
+        locations_trusted: false,
     }
 }
 
@@ -1141,6 +1280,7 @@ struct ExtractionState {
     format_shadowed: bool,
     evaluation_enabled: bool,
     outer_block_seen: bool,
+    declared_symbols: BTreeSet<String>,
 }
 
 impl ExtractionState {
@@ -1153,6 +1293,7 @@ impl ExtractionState {
             format_shadowed,
             evaluation_enabled: true,
             outer_block_seen: false,
+            declared_symbols: BTreeSet::new(),
         }
     }
 
@@ -1206,6 +1347,7 @@ impl ExtractionState {
 
     fn declare(&mut self, name: &str, type_text: &str, expression: Option<&str>) {
         let key = normalize_variable_name(name);
+        self.declared_symbols.insert(key.clone());
         self.variables.remove(&key);
         self.capacities.remove(&key);
         self.unicode_capable.remove(&key);
@@ -1260,9 +1402,17 @@ fn parse_procedural_body(
     text_dialect: constant_sql::TextDialect,
     format_shadowed: bool,
 ) -> (ParsedTrigger, usize) {
-    let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
+    let extracted = extract_as_body(body);
+    let starts_in_declare = extracted
+        .as_ref()
+        .is_some_and(|inner| !starts_with_keyword(skip_ws_comments(inner), "BEGIN"));
+    let inner = extracted.unwrap_or(std::borrow::Cow::Borrowed(body));
     let mut state = ExtractionState::new(text_dialect, format_shadowed);
-    let (stmts, mut unextracted) = extract_procedural_statements(&inner, &mut state);
+    state
+        .declared_symbols
+        .extend(routine_parameter_symbols(body));
+    let (stmts, mut unextracted) =
+        extract_procedural_statements(&inner, &mut state, starts_in_declare);
     let default = GenericDialect {};
     let dialect = dialect.unwrap_or(&default);
     let mut parsed = ParsedTrigger {
@@ -1271,6 +1421,15 @@ fn parse_procedural_body(
         fired_columns: Vec::new(),
         calls: Vec::new(),
         ignored_relations: BTreeSet::new(),
+        qualified_reads: Vec::new(),
+        qualified_writes: Vec::new(),
+        dml_statements: Vec::new(),
+        local_relations: BTreeSet::new(),
+        diagnostics: Vec::new(),
+        scalar_symbols: state.declared_symbols.clone(),
+        partial: false,
+        temp_state_safe: true,
+        locations_trusted: false,
     };
     for stmt in &stmts {
         match sqlparser::parser::Parser::parse_sql(dialect, stmt) {
@@ -1284,7 +1443,42 @@ fn parse_procedural_body(
             Err(_) => unextracted += 1,
         }
     }
+    if ["IF", "ELSIF", "ELSEIF", "WHILE", "FOR", "CASE", "LOOP"]
+        .iter()
+        .any(|keyword| !find_all_keywords(body, keyword).is_empty())
+        && parsed.dml_statements.iter().any(is_column_dml_statement)
+    {
+        parsed.partial = true;
+        parsed.diagnostics.push(schemagraph_core::Diagnostic {
+            code: "SG_DML_CONTROL_FLOW".into(),
+            message: "DML extracted from a control-flow body is analyzed conservatively".into(),
+            location: None,
+        });
+    }
+    invalidate_temp_state_if_unsafe(&mut parsed, body, unextracted);
     (parsed, unextracted)
+}
+
+/// 동적·미추출·DROP 뒤의 임시 relation은 실행 순서를 완전히 복원하지 못하면
+/// 이전 바인딩을 재사용하지 않는다.
+fn invalidate_temp_state_if_unsafe(parsed: &mut ParsedTrigger, body: &str, unextracted: usize) {
+    if parsed.local_relations.is_empty() {
+        return;
+    }
+    let unsafe_state = unextracted > 0
+        || !find_all_keywords(body, "DROP").is_empty()
+        || !find_all_keywords(body, "EXECUTE").is_empty()
+        || !find_all_keywords(body, "EXEC").is_empty();
+    if !unsafe_state {
+        return;
+    }
+    parsed.temp_state_safe = false;
+    parsed.partial = true;
+    parsed.diagnostics.push(schemagraph_core::Diagnostic {
+        code: "SG_DML_TEMP_STATE".into(),
+        message: "temporary relation state crosses dynamic, dropped, or unextracted SQL; local lineage omitted".into(),
+        location: None,
+    });
 }
 
 /// 절차형 몸체(plpgsql·plsql)에서 SQL 문장을 문장 단위로 추출한다.
@@ -1295,12 +1489,16 @@ fn parse_procedural_body(
 /// `:=` 대입·PL/SQL bare 호출은 그에 맞는 SQL로 재작성한다. 꺼내지 못한
 /// 문장(동적 SQL 식, 인식 못 한 구문)은 수를 돌려 limitation으로 남긴다 —
 /// 추측으로 채우지 않는다.
-fn extract_procedural_statements(body: &str, state: &mut ExtractionState) -> (Vec<String>, usize) {
+fn extract_procedural_statements(
+    body: &str,
+    state: &mut ExtractionState,
+    starts_in_declare: bool,
+) -> (Vec<String>, usize) {
     let mut stmts: Vec<String> = Vec::new();
     let mut unextracted = 0usize;
     // DECLARE/IS 섹션 안의 조각은 선언문 — 의존 대상이 아니라 미추출로 세지
     // 않되, DEFAULT/:= 안의 서브쿼리는 추출한다.
-    let mut in_declare = false;
+    let mut in_declare = starts_in_declare;
     for chunk in split_top_level(body) {
         let mut rest = chunk;
         loop {
@@ -2069,7 +2267,7 @@ fn strip_do<'a>(
     };
     match inner {
         Some(b) => {
-            let (mut s, u) = extract_procedural_statements(&b, state);
+            let (mut s, u) = extract_procedural_statements(&b, state, false);
             stmts.append(&mut s);
             *unextracted += u;
         }
@@ -2226,8 +2424,8 @@ fn record_select_assignments(stmt: &str, head: &str, state: &mut ExtractionState
             state.invalidate_variable(&name);
         } else {
             state.assign_from(&name, &expression, &original);
-            // A value may have become unknown due to type/capacity constraints;
-            // leave it unknown instead of restoring an older assignment.
+            // 타입·용량 제약으로 값이 불명확해졌으면 이전 대입값을 되살리지
+            // 않고 불명확 상태를 유지한다.
             if !state.variables.contains_key(&key) {
                 state.invalidate_variable(&name);
             }
@@ -2358,6 +2556,70 @@ fn strip_returning_into(stmt: &str, returning_pos: usize) -> String {
 /// 방언 표기(`@name`)와 관계없이 변수 환경에서 사용할 키를 만든다.
 fn normalize_variable_name(name: &str) -> String {
     name.trim().trim_start_matches('@').to_ascii_lowercase()
+}
+
+/// routine header의 parameter 이름만 수집한다. 몸체에 우연히 등장한 identifier는
+/// symbol로 승격하지 않아 SQL 컬럼 오타를 숨기지 않는다.
+fn routine_parameter_symbols(body: &str) -> BTreeSet<String> {
+    let routine = ["PROCEDURE", "FUNCTION"]
+        .iter()
+        .flat_map(|keyword| {
+            find_all_keywords(body, keyword)
+                .into_iter()
+                .map(move |position| (position, *keyword))
+        })
+        .min_by_key(|(position, _)| *position);
+    let Some((position, keyword)) = routine else {
+        return BTreeSet::new();
+    };
+    let mut tail = skip_ws_comments(&body[position + keyword.len()..]);
+    let name_len = dotted_name_len(tail);
+    if name_len == 0 {
+        return BTreeSet::new();
+    }
+    tail = skip_ws_comments(&tail[name_len..]);
+    if tail.starts_with('(') {
+        let Some(end) = find_parameter_list_end(tail) else {
+            return BTreeSet::new();
+        };
+        let parameters = &tail[1..end - 1];
+        return split_top_level_commas(parameters)
+            .into_iter()
+            .filter_map(variable_name)
+            .map(normalize_variable_name)
+            .filter(|name| !name.is_empty())
+            .collect();
+    }
+
+    let header_end = find_top_level(tail, "AS", true)
+        .into_iter()
+        .chain(find_top_level(tail, "IS", true))
+        .min()
+        .unwrap_or(tail.len());
+    declared_at_names(&tail[..header_end])
+}
+
+fn declared_at_names(text: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut index = 0usize;
+    while index < text.len() {
+        if let Some(end) = quoted_or_comment_end(text, index) {
+            index = end;
+            continue;
+        }
+        if text.as_bytes()[index] == b'@'
+            && text.as_bytes().get(index + 1) != Some(&b'@')
+            && (index == 0 || text.as_bytes()[index - 1] != b'@')
+        {
+            if let Some(name) = variable_name(&text[index..]) {
+                names.insert(normalize_variable_name(name));
+                index += name.len();
+                continue;
+            }
+        }
+        index += 1;
+    }
+    names
 }
 
 /// 대입 왼쪽 또는 선언 시작에서 단순 변수 이름을 꺼낸다. 선언의 나머지
@@ -2504,15 +2766,77 @@ fn is_query_text(s: &str) -> bool {
 
 /// 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
 fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_trigger: bool) {
+    if let Statement::CreateTable(create) = stmt {
+        let local = create.temporary
+            || create
+                .name
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .is_some_and(|ident| ident.value.starts_with('#'));
+        if local {
+            if let Some(target) = relation_name_parts(&create.name) {
+                parsed.local_relations.insert(target);
+            }
+        }
+    }
+    if let Some(into) = select_into(stmt) {
+        let local = into.temporary
+            || into
+                .name
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .is_some_and(|ident| ident.value.starts_with('#'));
+        if local {
+            if let Some(target) = relation_name_parts(&into.name) {
+                parsed.local_relations.insert(target);
+            }
+        }
+    }
+    if matches!(
+        stmt,
+        Statement::If(_) | Statement::While(_) | Statement::Case(_)
+    ) && nested_statements(stmt)
+        .iter()
+        .any(|nested| is_column_dml_statement(nested))
+    {
+        parsed.partial = true;
+        parsed.diagnostics.push(schemagraph_core::Diagnostic {
+            code: "SG_DML_CONTROL_FLOW".into(),
+            message: "DML inside conditional or loop control flow is analyzed conservatively"
+                .into(),
+            location: None,
+        });
+    }
+    if is_column_dml_statement(stmt) && !parsed.dml_statements.contains(stmt) {
+        parsed.dml_statements.push(stmt.clone());
+    }
     // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
     // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
     let write_targets = write_targets(stmt);
+    let qualified_writes = qualified_write_targets(stmt);
+    for target in &qualified_writes {
+        if !parsed.qualified_writes.contains(target) {
+            parsed.qualified_writes.push(target.clone());
+        }
+    }
+    let read_exclusions = read_exclusions(stmt, &write_targets);
     for t in &write_targets {
+        if parsed.local_relations.contains(t) {
+            continue;
+        }
         if !parsed.writes.contains(t) {
             parsed.writes.push(t.clone());
         }
     }
     let _ = visit_relations(stmt, |name| {
+        if name.0.iter().filter_map(|part| part.as_ident()).count() == 3 {
+            if !qualified_writes.contains(name) && !parsed.qualified_reads.contains(name) {
+                parsed.qualified_reads.push(name.clone());
+            }
+            return ControlFlow::<()>::Continue(());
+        }
         let Some(t) = relation_name_parts(name) else {
             parsed.ignored_relations.insert(relation_name_key(name));
             return ControlFlow::<()>::Continue(());
@@ -2522,8 +2846,11 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_
         if sqlserver_trigger && is_sqlserver_transition_relation(&t) {
             return ControlFlow::<()>::Continue(());
         }
+        if parsed.local_relations.contains(&t) {
+            return ControlFlow::<()>::Continue(());
+        }
         // 재귀 방문으로 중첩 문장이 여러 번 오므로 중복을 거른다.
-        if !t.1.is_empty() && !write_targets.contains(&t) && !parsed.reads.contains(&t) {
+        if !t.1.is_empty() && !read_exclusions.contains(&t) && !parsed.reads.contains(&t) {
             parsed.reads.push(t);
         }
         ControlFlow::<()>::Continue(())
@@ -2536,6 +2863,23 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_
                     let col = parts[1].value.clone();
                     if (q == "new" || q == "old") && !parsed.fired_columns.contains(&col) {
                         parsed.fired_columns.push(col);
+                    }
+                }
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                if let (
+                    Expr::Value(value),
+                    [sqlparser::ast::AccessExpr::Dot(Expr::Identifier(column))],
+                ) = (root.as_ref(), access_chain.as_slice())
+                {
+                    if let sqlparser::ast::Value::Placeholder(pseudo) = &value.value {
+                        let pseudo = pseudo.trim_start_matches(':');
+                        if (pseudo.eq_ignore_ascii_case("new")
+                            || pseudo.eq_ignore_ascii_case("old"))
+                            && !parsed.fired_columns.contains(&column.value)
+                        {
+                            parsed.fired_columns.push(column.value.clone());
+                        }
                     }
                 }
             }
@@ -2572,6 +2916,36 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_
     // CALL이 조용히 빠진다. 관계·식 수확은 visitor가 이미 트리 전체를 본다.
     for s in nested_statements(stmt) {
         collect_trigger_stmt(s, parsed, sqlserver_trigger);
+    }
+}
+
+fn is_column_dml_statement(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Insert(_)
+            | Statement::Update { .. }
+            | Statement::Merge { .. }
+            | Statement::CreateTable(sqlparser::ast::CreateTable { query: Some(_), .. })
+    ) || select_into(stmt).is_some()
+}
+
+fn select_into(stmt: &Statement) -> Option<&sqlparser::ast::SelectInto> {
+    let Statement::Query(query) = stmt else {
+        return None;
+    };
+    query_select_into(query)
+}
+
+/// 집합 질의의 목적지는 첫 SELECT에 선언되며 값의 원천은 전체 질의에서 구한다.
+fn query_select_into(query: &sqlparser::ast::Query) -> Option<&sqlparser::ast::SelectInto> {
+    let mut body = query.body.as_ref();
+    loop {
+        match body {
+            sqlparser::ast::SetExpr::Select(select) => return select.into.as_ref(),
+            sqlparser::ast::SetExpr::SetOperation { left, .. } => body = left.as_ref(),
+            sqlparser::ast::SetExpr::Query(query) => body = query.body.as_ref(),
+            _ => return None,
+        }
     }
 }
 
@@ -2674,11 +3048,31 @@ fn nested_statements(stmt: &Statement) -> Vec<&Statement> {
 /// 한 문장의 표면 쓰기 대상 — 중첩 블록은 write_targets가 본다.
 fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
     match stmt {
-        Statement::Update { table, .. } => table_factor_name(&table.relation).into_iter().collect(),
+        Statement::Update { table, from, .. } => {
+            let tables: &[TableWithJoins] = from
+                .as_ref()
+                .map(|from| match from {
+                    UpdateTableFromKind::BeforeSet(tables)
+                    | UpdateTableFromKind::AfterSet(tables) => tables.as_slice(),
+                })
+                .unwrap_or(&[]);
+            promoted_update_target(&table.relation, tables)
+                .or_else(|| table_factor_name(&table.relation))
+                .into_iter()
+                .collect()
+        }
+        Statement::Merge { table, .. } => table_factor_name(table).into_iter().collect(),
         Statement::Insert(insert) => match &insert.table {
             TableObject::TableName(name) => relation_name_parts(name).into_iter().collect(),
             _ => vec![],
         },
+        Statement::CreateTable(create) if create.query.is_some() => {
+            relation_name_parts(&create.name).into_iter().collect()
+        }
+        Statement::Query(_) => select_into(stmt)
+            .and_then(|into| relation_name_parts(&into.name))
+            .into_iter()
+            .collect(),
         Statement::Delete(delete) => {
             if !delete.tables.is_empty() {
                 delete
@@ -2699,6 +3093,131 @@ fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
             }
         }
         _ => vec![],
+    }
+}
+
+fn read_exclusions(
+    stmt: &Statement,
+    write_targets: &[(Option<String>, String)],
+) -> Vec<(Option<String>, String)> {
+    let mut exclusions = write_targets.to_vec();
+    if let Statement::Update { table, .. } = stmt {
+        if let Some(target) = table_factor_name(&table.relation) {
+            if !exclusions.contains(&target) {
+                exclusions.push(target);
+            }
+        }
+    }
+    exclusions
+}
+
+fn promoted_update_target(
+    target: &TableFactor,
+    from: &[TableWithJoins],
+) -> Option<(Option<String>, String)> {
+    let TableFactor::Table {
+        name,
+        alias: None,
+        args: None,
+        ..
+    } = target
+    else {
+        return None;
+    };
+    let [target_name] = name.0.as_slice() else {
+        return None;
+    };
+    let target_name = target_name.as_ident()?.value.as_str();
+    let matches: Vec<_> = from
+        .iter()
+        .filter_map(|table| match &table.relation {
+            factor @ TableFactor::Table {
+                alias: Some(alias),
+                args: None,
+                ..
+            } if alias.name.value.eq_ignore_ascii_case(target_name) => table_factor_name(factor),
+            _ => None,
+        })
+        .collect();
+    match matches.as_slice() {
+        [target] => Some(target.clone()),
+        _ => None,
+    }
+}
+
+fn qualified_write_targets(stmt: &Statement) -> Vec<ObjectName> {
+    let mut names = Vec::new();
+    match stmt {
+        Statement::Update { table, from, .. } => {
+            let tables: &[TableWithJoins] = from
+                .as_ref()
+                .map(|from| match from {
+                    UpdateTableFromKind::BeforeSet(tables)
+                    | UpdateTableFromKind::AfterSet(tables) => tables.as_slice(),
+                })
+                .unwrap_or(&[]);
+            if let Some(target) = promoted_update_factor(&table.relation, tables) {
+                if let TableFactor::Table { name, .. } = target {
+                    names.push(name.clone());
+                }
+            } else if let TableFactor::Table { name, .. } = &table.relation {
+                names.push(name.clone());
+            }
+        }
+        Statement::Merge {
+            table: TableFactor::Table { name, .. },
+            ..
+        } => names.push(name.clone()),
+        Statement::Insert(insert) => {
+            if let TableObject::TableName(name) = &insert.table {
+                names.push(name.clone());
+            }
+        }
+        Statement::CreateTable(create) if create.query.is_some() => names.push(create.name.clone()),
+        Statement::Query(_) => {
+            if let Some(into) = select_into(stmt) {
+                names.push(into.name.clone());
+            }
+        }
+        _ => {}
+    }
+    names
+        .into_iter()
+        .filter(|name| name.0.iter().filter_map(|part| part.as_ident()).count() == 3)
+        .collect()
+}
+
+fn promoted_update_factor<'a>(
+    target: &TableFactor,
+    from: &'a [TableWithJoins],
+) -> Option<&'a TableFactor> {
+    let TableFactor::Table {
+        name,
+        alias: None,
+        args: None,
+        ..
+    } = target
+    else {
+        return None;
+    };
+    let [target_name] = name.0.as_slice() else {
+        return None;
+    };
+    let target_name = target_name.as_ident()?.value.as_str();
+    let matches: Vec<_> = from
+        .iter()
+        .filter_map(|table| match &table.relation {
+            factor @ TableFactor::Table {
+                alias: Some(alias),
+                args: None,
+                ..
+            } if alias.name.value.eq_ignore_ascii_case(target_name) => Some(factor),
+            _ => None,
+        })
+        .collect();
+    match matches.as_slice() {
+        [target] => Some(*target),
+        _ => None,
     }
 }
 
@@ -2836,21 +3355,50 @@ fn resolve_routine(g: &Graph, schema: &str, name: &str, ci: bool) -> RoutineHit 
 /// trigger 파싱 결과를 그래프 간선으로 반영한다 — DML + calls + fired-columns.
 fn apply_trigger(
     g: &mut Graph,
+    catalog: &scope::CatalogIndex<'_>,
     schema: &str,
     owner_table: &str,
     trigger_id: &VertexId,
-    parsed: &ParsedTrigger,
+    parsed: &mut ParsedTrigger,
     notes: &mut Vec<String>,
     ci: bool,
-) {
+    body_hash: String,
+    sqlserver_trigger: bool,
+) -> bool {
     if g.vertex(trigger_id).is_none() {
         notes.push(format!(
             "trigger {trigger_id}의 정점이 카탈로그에 없음 — 간선 생략"
         ));
-        return;
+        return false;
     }
     note_ignored_relations(trigger_id, &parsed.ignored_relations, notes);
-    apply_dml_edges(g, schema, trigger_id, parsed, notes, ci);
+    apply_dml_edges(g, catalog, schema, trigger_id, parsed, notes, ci);
+    let transition = if sqlserver_trigger {
+        Some((owner_table, &["inserted", "deleted"][..]))
+    } else if !parsed.fired_columns.is_empty() {
+        Some((owner_table, &["new", "old"][..]))
+    } else {
+        None
+    };
+    parsed.partial |= scope::apply_dml_column_effects(
+        g,
+        catalog,
+        schema,
+        trigger_id,
+        &parsed.dml_statements,
+        scope::DmlApplyOptions {
+            body_hash: &body_hash,
+            transition,
+            allow_local_temps: !parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "SG_DML_CONTROL_FLOW")
+                && parsed.temp_state_safe,
+            locations_trusted: parsed.locations_trusted,
+            scalar_symbols: &parsed.scalar_symbols,
+        },
+        &mut parsed.diagnostics,
+    );
     apply_call_edges(g, schema, trigger_id, &parsed.calls, notes, ci);
     // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다. 컬럼이 id 충돌로
     // `@column`으로 분리됐을 수 있어 kind-aware 해석자를 쓴다.
@@ -2880,27 +3428,50 @@ fn apply_trigger(
             }],
         });
     }
+    parsed.partial
 }
 
 /// routine 파싱 결과를 그래프 간선으로 반영한다 — trigger와 같은 DML/calls
 /// 규칙이지만 발사 테이블(NEW/OLD)은 없다.
 fn apply_routine(
     g: &mut Graph,
+    catalog: &scope::CatalogIndex<'_>,
     schema: &str,
     owner: &VertexId,
-    parsed: &ParsedTrigger,
+    parsed: &mut ParsedTrigger,
     notes: &mut Vec<String>,
     ci: bool,
-) {
+    body_hash: String,
+) -> bool {
     if g.vertex(owner).is_none() {
         notes.push(format!(
             "routine {owner}의 정점이 카탈로그에 없음 — 간선 생략"
         ));
-        return;
+        return false;
     }
     note_ignored_relations(owner, &parsed.ignored_relations, notes);
-    apply_dml_edges(g, schema, owner, parsed, notes, ci);
+    apply_dml_edges(g, catalog, schema, owner, parsed, notes, ci);
+    parsed.partial |= scope::apply_dml_column_effects(
+        g,
+        catalog,
+        schema,
+        owner,
+        &parsed.dml_statements,
+        scope::DmlApplyOptions {
+            body_hash: &body_hash,
+            transition: None,
+            allow_local_temps: !parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "SG_DML_CONTROL_FLOW")
+                && parsed.temp_state_safe,
+            locations_trusted: parsed.locations_trusted,
+            scalar_symbols: &parsed.scalar_symbols,
+        },
+        &mut parsed.diagnostics,
+    );
     apply_call_edges(g, schema, owner, &parsed.calls, notes, ci);
+    parsed.partial
 }
 
 fn note_ignored_relations(from: &VertexId, relations: &BTreeSet<String>, notes: &mut Vec<String>) {
@@ -2917,9 +3488,10 @@ fn note_ignored_relations(from: &VertexId, relations: &BTreeSet<String>, notes: 
 /// 몸체 문장의 writes/reads 대상을 간선으로 만든다 — trigger와 routine이 공유.
 fn apply_dml_edges(
     g: &mut Graph,
+    catalog: &scope::CatalogIndex<'_>,
     schema: &str,
     from: &VertexId,
-    parsed: &ParsedTrigger,
+    parsed: &mut ParsedTrigger,
     notes: &mut Vec<String>,
     ci: bool,
 ) {
@@ -2928,8 +3500,49 @@ fn apply_dml_edges(
         (EdgeKind::Reads, &parsed.reads),
     ] {
         for (ref_schema, table) in targets {
+            if parsed
+                .local_relations
+                .contains(&(ref_schema.clone(), table.clone()))
+            {
+                continue;
+            }
             let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
             let Some(target) = vertex_hit(g, &VertexId::object(&target_schema, table), ci) else {
+                notes.push(format!(
+                    "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
+                ));
+                continue;
+            };
+            g.add_edge(Edge {
+                from: from.clone(),
+                to: target.clone(),
+                kind,
+                evidence: vec![Evidence {
+                    layer: EvidenceLayer::BodyParse,
+                    detail: format!("{from} {:?} {target}", kind),
+                }],
+            });
+        }
+    }
+    for (kind, targets) in [
+        (EdgeKind::Writes, parsed.qualified_writes.clone()),
+        (EdgeKind::Reads, parsed.qualified_reads.clone()),
+    ] {
+        for name in targets {
+            let (target_schema, table) = match catalog.local_qualified_relation(&name) {
+                Ok(target) => target,
+                Err(message) => {
+                    parsed.partial = true;
+                    notes.push(format!("{from}: {message}"));
+                    parsed.diagnostics.push(schemagraph_core::Diagnostic {
+                        code: "SG_CROSS_DATABASE".into(),
+                        message,
+                        location: None,
+                    });
+                    continue;
+                }
+            };
+            let Some(target) = vertex_hit(g, &VertexId::object(&target_schema, &table), ci) else {
                 notes.push(format!(
                     "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
                 ));
@@ -3113,6 +3726,7 @@ mod tests {
         let mut doc = doc_with_trigger(body);
         doc.dialect = "sqlserver".into();
         doc.schemas[0].name = "dbo".into();
+        doc.schemas[0].objects[0].columns.push(col("name", 3));
         doc
     }
 
@@ -3801,7 +4415,10 @@ mod tests {
                 .collect();
             assert_eq!(
                 targets,
-                BTreeSet::from([(EdgeKind::Writes, "public.orders")])
+                BTreeSet::from([
+                    (EdgeKind::Writes, "public.orders"),
+                    (EdgeKind::Writes, "public.orders.customer_id"),
+                ])
             );
             assert!(
                 notes.iter().any(|note| note.contains("1건 미추출")),

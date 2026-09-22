@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""실제 단일 SQLite 스키마에서 Go 수집 메모리와 전송 사실 보존을 측정한다."""
+"""실제 단일 SQLite 스키마에서 Go/JDBC 수집 메모리와 전송 사실 보존을 측정한다."""
 import argparse
 import importlib.util
 import json
 from pathlib import Path
 import platform
 import sqlite3
+import subprocess
 import sys
 import tempfile
 
@@ -100,21 +101,40 @@ def validate_graph(path, count):
     return {'vertices': len(vertices), 'edges': len(edges), 'primary_keys': len(constraints)}
 
 
+def collector_command(probe, jdbc_jar, java, database, format_name, output):
+    """수집기마다 URL 문법만 다르게 하고 같은 v2 전송 계약을 측정한다."""
+    if jdbc_jar:
+        command = [str(java), '-jar', str(jdbc_jar), '--url', 'jdbc:sqlite:'+str(database)]
+    else:
+        command = [str(probe), '--url', 'sqlite:'+str(database)]
+    return command + ['--document-version', '2', '--format', format_name, '-o', str(output)]
+
+
 def main():
     """수집 프로세스만 계측하고 독립 검증과 입력 생성은 계측 밖에서 수행한다."""
-    parser = argparse.ArgumentParser(description='Measure Go collection on a real, single SQLite schema and validate catalog/graph facts.')
-    parser.add_argument('--probe', type=Path, required=True)
+    parser = argparse.ArgumentParser(description='Measure Go or JDBC collection on a real, single SQLite schema and validate catalog/graph facts.')
+    producer = parser.add_mutually_exclusive_group(required=True)
+    producer.add_argument('--probe', type=Path)
+    producer.add_argument('--jdbc-jar', type=Path)
+    parser.add_argument('--java', type=Path, help='Explicit Java executable for a JDBC run')
     parser.add_argument('--engine', type=Path, required=True)
     parser.add_argument('--objects', type=int, nargs='+', default=[2000, 10000])
     parser.add_argument('--repeat', type=int, default=3)
     parser.add_argument('--timeout', type=int, default=120)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if bool(args.jdbc_jar) != bool(args.java):
+        parser.error('--jdbc-jar and --java must be used together')
     if any(count < 1 or count > 20000 for count in args.objects) or len(set(args.objects)) != len(args.objects) or not 3 <= args.repeat <= 10 or not 1 <= args.timeout <= 600:
         parser.error('objects must be unique and 1..20000; repeat 3..10; timeout 1..600 seconds')
-    report = {'probe_sha256': SCALE.sha256(args.probe), 'engine_sha256': SCALE.sha256(args.engine),
+    artifact = (args.probe or args.jdbc_jar).resolve()
+    report = {'producer': 'jdbc' if args.jdbc_jar else 'go', 'probe_sha256': SCALE.sha256(artifact), 'engine_sha256': SCALE.sha256(args.engine),
               'sqlite_version': sqlite3.sqlite_version, 'platform': platform.platform(),
               'verifier_sha256': SCALE.sha256(Path(__file__)), 'timer_sha256': SCALE.sha256(Path(SCALE.__file__)), 'results': {}}
+    if args.java:
+        version = subprocess.run([str(args.java.resolve()), '-version'], capture_output=True,
+                                 text=True, timeout=15, check=True)
+        report['java_version'] = (version.stdout+version.stderr).strip()
     with tempfile.TemporaryDirectory(prefix='schemagraph-probe-sqlite-benchmark-') as directory:
         for count in sorted(args.objects):
             work = Path(directory) / str(count)
@@ -127,10 +147,13 @@ def main():
                 output = work / f'catalog.{format_name}'
                 samples, runs = [], []
                 for repeat in range(args.repeat):
-                    sample = SCALE.run_measured([str(args.probe.resolve()), '--url', 'sqlite:'+str(database),
-                                                '--document-version', '2', '--format', format_name, '-o', str(output)],
+                    command = collector_command(args.probe.resolve() if args.probe else None,
+                                                artifact if args.jdbc_jar else None,
+                                                args.java.resolve() if args.java else None,
+                                                database, format_name, output)
+                    sample = SCALE.run_measured(command,
                                                timeout=args.timeout, stderr_path=work/'probe.stderr')
-                    SCALE.check_rss(sample, 2048, 'SQLite Go collector')
+                    SCALE.check_rss(sample, 2048, 'SQLite collector')
                     facts = validate_catalog(output, format_name, count)
                     if expected_catalog is None:
                         expected_catalog = facts

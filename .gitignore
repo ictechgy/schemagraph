@@ -31,3 +31,4 @@ __pycache__/
 *.graph.json
 *.catalog.json
 .schemagraph-cache/
+.review-action-smoke/

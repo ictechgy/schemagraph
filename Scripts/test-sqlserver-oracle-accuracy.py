@@ -102,6 +102,20 @@ class AccuracyTests(unittest.TestCase):
         graph['edges'] = []
         self.assertTrue(CHECK.evaluate_graph(graph, cases)['failures'])
 
+    def test_procedural_object_write_score_separates_new_column_facts(self):
+        """기존 객체 기대값은 컬럼 쓰기를 섞지 않고 객체 오탐은 계속 거부한다."""
+        graph, cases = fixture()
+        graph['vertices'][3]['kind'] = 'procedure'
+        cases['cases'] = [dict(name='sample', kind='procedure', read_scope='object',
+                               reads=[], lineage={}, writes=['dbo.Genre'], calls=[], state='complete')]
+        graph['edges'] = [{'from':'dbo.acc_sample', 'kind':'writes', 'to':target}
+                          for target in ('dbo.Genre', 'dbo.Genre.Name')]
+        result = CHECK.evaluate_graph(graph, cases)
+        self.assertEqual(result['failures'], [])
+        self.assertEqual(result['cases'][0]['column_writes_unscored'], ['dbo.Genre.Name'])
+        graph['edges'].append({'from':'dbo.acc_sample', 'kind':'writes', 'to':'dbo.acc_sample'})
+        self.assertTrue(CHECK.evaluate_graph(graph, cases)['failures'])
+
     def test_oracle_catalog_relation_scope_does_not_claim_column_reference_coverage(self):
         """관계만 제공하는 참조에서도 객체를 비교하되 컬럼 간선을 오탐으로 세지 않는다."""
         graph, _cases = fixture()

@@ -173,6 +173,7 @@ class Extractor(
                 usage = usage.tables[schema to raw.name],
             )
         }.sortedBy { it.name }
+        if (dialect == "postgres") checkPostgresVisibility(conn, schema, objects, limitations)
         val routines = routinesOf(schema, bodies, usage)
         if (objects.isEmpty() && routines.isEmpty()) return null
         return SchemaDoc(name = schema, objects = objects, routines = routines)
@@ -195,11 +196,19 @@ class Extractor(
             }.getOrElse { emptyList() }
             return (catalogs + fromTables)
                 .filter { !isSystem(it) && (schemaFilter.isEmpty() || it in schemaFilter) }
-                .distinct().sorted()
+                .distinct().sorted().also(::checkRequestedSchemas)
         }
         return (discovered + fromTables)
             .filter { !isSystem(it) && (schemaFilter.isEmpty() || it in schemaFilter) }
-            .distinct().sorted()
+            .distinct().sorted().also(::checkRequestedSchemas)
+    }
+
+    /** 요청한 스키마가 보이지 않아도 완전한 빈 스냅샷으로 선언하지 않는다. */
+    private fun checkRequestedSchemas(collected: List<String>) {
+        for (schema in schemaFilter.distinct().sorted().filter { it !in collected }) {
+            sessionComplete = false
+            limitations += "requested schema '$schema' was not collected; verify existence and metadata permissions"
+        }
     }
 
     /** 스키마 한정 객체 목록 — 카탈로그가 스키마인 드라이버는 catalog
@@ -606,14 +615,24 @@ class Extractor(
                 }
             }
             else -> {
+            // PostgreSQL 정보 스키마는 비소유자의 정의를 NULL로 숨긴다.
+            // 네이티브 reader와 같은 원본 카탈로그에서 이름·정의를 옮긴다.
+            val viewSql = if (dialect == "postgres")
+                "SELECT schemaname, viewname, definition FROM pg_views WHERE schemaname = $sq " +
+                    "UNION ALL SELECT schemaname, matviewname, definition FROM pg_matviews WHERE schemaname = $sq"
+            else "SELECT TABLE_SCHEMA, TABLE_NAME, VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = $sq"
             bestEffort("views",
-                "SELECT TABLE_SCHEMA, TABLE_NAME, VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS " +
-                    "WHERE TABLE_SCHEMA = $sq") { rs ->
+                viewSql) { rs ->
                 views[rs.getString(1) to rs.getString(2)] = rs.getString(3) ?: return@bestEffort
             }
+            val triggerSql = if (dialect == "postgres")
+                "SELECT n.nspname, c.relname, t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t " +
+                    "JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace " +
+                    "WHERE NOT t.tgisinternal AND n.nspname = $sq"
+            else "SELECT TRIGGER_SCHEMA, EVENT_OBJECT_TABLE, TRIGGER_NAME, ACTION_STATEMENT " +
+                "FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = $sq"
             bestEffort("triggers",
-                "SELECT TRIGGER_SCHEMA, EVENT_OBJECT_TABLE, TRIGGER_NAME, ACTION_STATEMENT " +
-                    "FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = $sq") { rs ->
+                triggerSql) { rs ->
                 val key = rs.getString(1) to rs.getString(2)
                 triggers.getOrPut(key) { mutableListOf() } +=
                     TriggerDoc(rs.getString(3), rs.getString(4))
