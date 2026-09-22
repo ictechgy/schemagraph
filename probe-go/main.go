@@ -426,10 +426,7 @@ func (h *harvester) collectObjects() map[string][]ObjectDoc {
 		}
 		cons := append(append([]ConstraintDoc{}, pks[key]...), fks[key]...)
 		sort.Slice(cons, func(i, j int) bool { return cons[i].Name < cons[j].Name })
-		idx := []IndexDoc{}
-		if r.kind == "table" || r.kind == "materialized-view" {
-			idx = indexes[key]
-		}
+		idx := oracleObjectIndexes(r.kind, indexes[key])
 		if cols == nil {
 			cols = []ColumnDoc{}
 		}
@@ -446,6 +443,17 @@ func (h *harvester) collectObjects() map[string][]ObjectDoc {
 			"카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라")
 	}
 	return out
+}
+
+// Oracle 객체의 인덱스 목록은 없을 때도 JSON 배열이어야 한다.
+func oracleObjectIndexes(kind string, indexes []IndexDoc) []IndexDoc {
+	if kind != "table" && kind != "materialized-view" {
+		return []IndexDoc{}
+	}
+	if indexes == nil {
+		return []IndexDoc{}
+	}
+	return indexes
 }
 
 func (h *harvester) collectColumns() map[string][]ColumnDoc {
