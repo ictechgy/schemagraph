@@ -15,6 +15,27 @@ type connectionSpec struct {
 	driver, dialect, dsn, schema string
 }
 
+// URL을 직접 받거나 환경 변수에서 한 번만 읽어 접속 입력을 확정한다.
+func resolveConnectionURL(rawURL, envName string, lookup func(string) (string, bool)) (string, error) {
+	if rawURL != "" && envName != "" {
+		return "", fmt.Errorf("set only one of --url or --url-env")
+	}
+	if rawURL != "" {
+		return rawURL, nil
+	}
+	if envName == "" {
+		return "", fmt.Errorf("set one of --url or --url-env")
+	}
+	value, ok := lookup(envName)
+	if !ok {
+		return "", fmt.Errorf("environment variable for --url-env is not set")
+	}
+	if value == "" {
+		return "", fmt.Errorf("environment variable for --url-env is empty")
+	}
+	return value, nil
+}
+
 // 접속 문자열을 드라이버 형식으로만 바꾼다. 오류에는 비밀번호가 든 원문을 싣지 않는다.
 func parseConnection(raw string) (connectionSpec, error) {
 	if strings.HasPrefix(raw, "sqlite:") || strings.HasPrefix(raw, "file:") {

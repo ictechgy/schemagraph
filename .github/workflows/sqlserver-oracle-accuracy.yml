@@ -1,0 +1,154 @@
+name: SQL Server and Oracle accuracy
+
+on:
+  push:
+    paths:
+      - ".github/workflows/sqlserver-oracle-accuracy.yml"
+      - "Scripts/AccuracySql.java"
+      - "Scripts/verify-sqlserver-oracle-accuracy.py"
+      - "Scripts/test-sqlserver-oracle-accuracy.py"
+      - "Scripts/test-accuracy-sql.py"
+      - "Scripts/verify-accuracy.py"
+      - "Fixtures/accuracy/**"
+      - "engine/**"
+      - "probe/**"
+      - "probe-go/**"
+  pull_request:
+    paths:
+      - ".github/workflows/sqlserver-oracle-accuracy.yml"
+      - "Scripts/AccuracySql.java"
+      - "Scripts/verify-sqlserver-oracle-accuracy.py"
+      - "Scripts/test-sqlserver-oracle-accuracy.py"
+      - "Scripts/test-accuracy-sql.py"
+      - "Scripts/verify-accuracy.py"
+      - "Fixtures/accuracy/**"
+      - "engine/**"
+      - "probe/**"
+      - "probe-go/**"
+  workflow_dispatch:
+    inputs:
+      validate_only:
+        description: Validate SQL and runtime effects without running an analyzer
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extended-accuracy-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  accuracy:
+    name: Accuracy (${{ matrix.database }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        database: [sqlserver, oracle]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify accuracy evaluator failure paths
+        run: python3 Scripts/test-sqlserver-oracle-accuracy.py
+
+      - name: Install engine build tools
+        if: inputs.validate_only != true
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libsqlite3-dev
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Cache Rust dependencies and builds
+        if: inputs.validate_only != true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            engine/target/debug
+          key: ${{ runner.os }}-rust-workspace-1.96.0-${{ hashFiles('engine/Cargo.lock', 'engine/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-workspace-1.96.0-
+
+      - name: Build engine
+        if: inputs.validate_only != true
+        run: cargo build --manifest-path engine/Cargo.toml --workspace --locked
+
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          gradle-version: "9.6.1"
+          cache-provider: basic
+
+      - name: Build the JDBC probe
+        run: gradle -p probe shadowJar --no-daemon --console=plain
+
+      - name: Verify the JDBC accuracy SQL utility
+        run: python3 Scripts/test-accuracy-sql.py --jdbc-jar probe/build/libs/schemagraph-probe-all.jar
+
+      - name: Download the external Oracle JDBC fixture driver
+        if: matrix.database == 'oracle'
+        run: |
+          curl --fail --location --retry 3 \
+            https://repo.maven.apache.org/maven2/com/oracle/ojdbc/ojdbc8/19.3.0.0/ojdbc8-19.3.0.0.jar \
+            --output "$RUNNER_TEMP/ojdbc8.jar"
+          echo "a66d27a14f3adee484427cc4de008af85a5c3e78e2e3285a4dba1277332978a5  $RUNNER_TEMP/ojdbc8.jar" | sha256sum --check
+
+      - name: Set up Go
+        if: inputs.validate_only != true
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: probe-go/go.mod
+          cache-dependency-path: probe-go/go.sum
+
+      - name: Build the Go probe
+        if: inputs.validate_only != true
+        working-directory: probe-go
+        run: CGO_ENABLED=0 go build -o schemagraph-probe-go .
+
+      - name: Validate actual SQL and score the public corpus
+        env:
+          DATABASE: ${{ matrix.database }}
+          VALIDATE_ONLY: ${{ inputs.validate_only }}
+        run: |
+          args=(--database "$DATABASE" --jdbc-jar probe/build/libs/schemagraph-probe-all.jar
+                --output "$RUNNER_TEMP/$DATABASE-accuracy.json"
+                --artifacts "$RUNNER_TEMP/$DATABASE-accuracy-artifacts")
+          if [ "$DATABASE" = oracle ]; then
+            args+=(--oracle-jar "$RUNNER_TEMP/ojdbc8.jar")
+          fi
+          if [ "$VALIDATE_ONLY" = true ]; then
+            args+=(--validate-only)
+          else
+            args+=(--engine engine/target/debug/schemagraph --go-probe probe-go/schemagraph-probe-go --strict)
+          fi
+          python3 Scripts/verify-sqlserver-oracle-accuracy.py "${args[@]}"
+
+      - name: Preserve accuracy reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.database }}-accuracy
+          path: |
+            ${{ runner.temp }}/${{ matrix.database }}-accuracy.json
+            ${{ runner.temp }}/${{ matrix.database }}-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 14

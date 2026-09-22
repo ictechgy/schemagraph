@@ -158,6 +158,11 @@ schemagraph scan --document catalog.json -o graph.json
 모드로 엽니다. `--schema`, `--format json|ndjson`, `--document-version 1|2`를
 지원합니다.
 
+미배포 소스 빌드는 `--url-env SG_DATABASE_URL`로 export된 환경 변수에서
+전체 URL을 읽을 수도 있습니다. 비밀번호가 포함된 URL을 프로세스 인자에
+넣지 않기 위한 옵션입니다. `--url`과 함께 쓰거나 지정한 변수가 없거나 비어
+있으면 실패합니다. 공개된 0.4.2 Go 바이너리에는 아직 이 옵션이 없습니다.
+
 ### 문서 형식
 
 두 프로브는 기본적으로 JSON을 출력하며 `--format ndjson`도 지원합니다.

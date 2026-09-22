@@ -1,0 +1,480 @@
+{
+  "cases": [
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "ALBUM_ID": [
+          "SGACC.ALBUM.ALBUMID"
+        ],
+        "ALBUM_TITLE": [
+          "SGACC.ALBUM.TITLE"
+        ],
+        "ARTIST_NAME": [
+          "SGACC.ARTIST.NAME"
+        ]
+      },
+      "name": "album_artist",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.ALBUM",
+        "SGACC.ALBUM.ALBUMID",
+        "SGACC.ALBUM.ARTISTID",
+        "SGACC.ALBUM.TITLE",
+        "SGACC.ARTIST",
+        "SGACC.ARTIST.ARTISTID",
+        "SGACC.ARTIST.NAME"
+      ],
+      "reason": "Projects album and artist columns; both join keys are reads.",
+      "sql": "SELECT a.AlbumId AS album_id, a.Title AS album_title, r.Name AS artist_name FROM Album a JOIN Artist r ON r.ArtistId = a.ArtistId",
+      "state": "complete",
+      "tags": [
+        "join"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "COUNTRY": [
+          "SGACC.CUSTOMER.COUNTRY"
+        ],
+        "INVOICE_COUNT": [
+          "SGACC.INVOICE.INVOICEID"
+        ],
+        "REVENUE": [
+          "SGACC.INVOICE.TOTAL"
+        ]
+      },
+      "name": "country_revenue",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.CUSTOMER",
+        "SGACC.CUSTOMER.COUNTRY",
+        "SGACC.CUSTOMER.CUSTOMERID",
+        "SGACC.INVOICE",
+        "SGACC.INVOICE.CUSTOMERID",
+        "SGACC.INVOICE.INVOICEID",
+        "SGACC.INVOICE.TOTAL"
+      ],
+      "reason": "Grouping and HAVING do not turn join keys into output value sources.",
+      "sql": "SELECT c.Country AS country, SUM(i.Total) AS revenue, COUNT(i.InvoiceId) AS invoice_count FROM Customer c LEFT JOIN Invoice i ON i.CustomerId = c.CustomerId GROUP BY c.Country HAVING SUM(i.Total) > 0",
+      "state": "complete",
+      "tags": [
+        "aggregate",
+        "outer-join",
+        "having"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "CUSTOMER_ID": [
+          "SGACC.CUSTOMER.CUSTOMERID"
+        ],
+        "LAST_INVOICE": [
+          "SGACC.INVOICE.INVOICEDATE"
+        ]
+      },
+      "name": "correlated_latest",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.CUSTOMER",
+        "SGACC.CUSTOMER.CUSTOMERID",
+        "SGACC.INVOICE",
+        "SGACC.INVOICE.CUSTOMERID",
+        "SGACC.INVOICE.INVOICEDATE"
+      ],
+      "reason": "The correlation key is read while the scalar aggregate receives invoice dates.",
+      "sql": "SELECT c.CustomerId AS customer_id, (SELECT MAX(i.InvoiceDate) FROM Invoice i WHERE i.CustomerId = c.CustomerId) AS last_invoice FROM Customer c",
+      "state": "complete",
+      "tags": [
+        "correlated-subquery"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "RUNNING_PRICE": [
+          "SGACC.TRACK.GENREID",
+          "SGACC.TRACK.TRACKID",
+          "SGACC.TRACK.UNITPRICE"
+        ],
+        "TRACK_ID": [
+          "SGACC.TRACK.TRACKID"
+        ]
+      },
+      "name": "cte_window",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.TRACK",
+        "SGACC.TRACK.GENREID",
+        "SGACC.TRACK.MILLISECONDS",
+        "SGACC.TRACK.TRACKID",
+        "SGACC.TRACK.UNITPRICE"
+      ],
+      "reason": "Window value sources include partition and ordering keys under the project lineage policy.",
+      "sql": "WITH priced AS (SELECT TrackId, GenreId, UnitPrice FROM Track WHERE Milliseconds > 60000) SELECT TrackId AS track_id, SUM(UnitPrice) OVER (PARTITION BY GenreId ORDER BY TrackId ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_price FROM priced",
+      "state": "complete",
+      "tags": [
+        "cte",
+        "window",
+        "frame"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "CUSTOMER_ID": [
+          "SGACC.CUSTOMER.CUSTOMERID"
+        ],
+        "DISPLAY_NAME": [
+          "SGACC.CUSTOMER.COMPANY",
+          "SGACC.CUSTOMER.FIRSTNAME"
+        ],
+        "MARKET": [
+          "SGACC.CUSTOMER.CITY",
+          "SGACC.CUSTOMER.COUNTRY"
+        ]
+      },
+      "name": "case_label",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.CUSTOMER",
+        "SGACC.CUSTOMER.CITY",
+        "SGACC.CUSTOMER.COMPANY",
+        "SGACC.CUSTOMER.COUNTRY",
+        "SGACC.CUSTOMER.CUSTOMERID",
+        "SGACC.CUSTOMER.EMAIL",
+        "SGACC.CUSTOMER.FIRSTNAME"
+      ],
+      "reason": "CASE conditions contribute to the CASE result; the separate email filter remains a read only.",
+      "sql": "SELECT CustomerId AS customer_id, COALESCE(Company, FirstName) AS display_name, CASE WHEN Country = 'USA' THEN City ELSE Country END AS market FROM Customer WHERE Email IS NOT NULL",
+      "state": "complete",
+      "tags": [
+        "case",
+        "coalesce",
+        "filter"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "CONTACT_ID": [
+          "SGACC.CUSTOMER.CUSTOMERID",
+          "SGACC.EMPLOYEE.EMPLOYEEID"
+        ],
+        "DISPLAY_NAME": [
+          "SGACC.CUSTOMER.FIRSTNAME",
+          "SGACC.EMPLOYEE.FIRSTNAME"
+        ]
+      },
+      "name": "union_contacts",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.CUSTOMER",
+        "SGACC.CUSTOMER.CUSTOMERID",
+        "SGACC.CUSTOMER.FIRSTNAME",
+        "SGACC.EMPLOYEE",
+        "SGACC.EMPLOYEE.EMPLOYEEID",
+        "SGACC.EMPLOYEE.FIRSTNAME"
+      ],
+      "reason": "Both branches can supply output values.",
+      "sql": "SELECT CustomerId AS contact_id, FirstName AS display_name FROM Customer UNION ALL SELECT EmployeeId, FirstName FROM Employee",
+      "state": "complete",
+      "tags": [
+        "union-all"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "COUNTRY": [
+          "SGACC.CUSTOMER.COUNTRY",
+          "SGACC.INVOICE.BILLINGCOUNTRY"
+        ]
+      },
+      "name": "intersect_countries",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.CUSTOMER",
+        "SGACC.CUSTOMER.COUNTRY",
+        "SGACC.INVOICE",
+        "SGACC.INVOICE.BILLINGCOUNTRY"
+      ],
+      "reason": "Both branches are value sources under the documented INTERSECT policy.",
+      "sql": "SELECT Country AS country FROM Customer INTERSECT SELECT BillingCountry FROM Invoice",
+      "state": "complete",
+      "tags": [
+        "intersect"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "COUNTRY": [
+          "SGACC.CUSTOMER.COUNTRY"
+        ]
+      },
+      "name": "except_countries",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.CUSTOMER",
+        "SGACC.CUSTOMER.COUNTRY",
+        "SGACC.INVOICE",
+        "SGACC.INVOICE.BILLINGCOUNTRY"
+      ],
+      "reason": "The right side filters membership but supplies no output value under the documented EXCEPT/MINUS policy.",
+      "sql": "SELECT Country AS country FROM Customer MINUS SELECT BillingCountry FROM Invoice",
+      "state": "complete",
+      "tags": [
+        "except"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "TRACK_ID": [
+          "SGACC.TRACK.TRACKID"
+        ],
+        "TRACK_NAME": [
+          "SGACC.TRACK.NAME"
+        ]
+      },
+      "name": "derived_projection",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.TRACK",
+        "SGACC.TRACK.NAME",
+        "SGACC.TRACK.TRACKID",
+        "SGACC.TRACK.UNITPRICE"
+      ],
+      "reason": "Derived aliases retain physical source columns; the price predicate is read only.",
+      "sql": "SELECT p.TrackId AS track_id, p.Name AS track_name FROM (SELECT TrackId, Name, UnitPrice FROM Track) p WHERE p.UnitPrice >= 1",
+      "state": "complete",
+      "tags": [
+        "derived-table"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "CUSTOMER_ID": [
+          "SGACC.CUSTOMER.CUSTOMERID"
+        ],
+        "LAST_NAME": [
+          "SGACC.CUSTOMER.LASTNAME"
+        ]
+      },
+      "name": "exists_invoice",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.CUSTOMER",
+        "SGACC.CUSTOMER.CUSTOMERID",
+        "SGACC.CUSTOMER.LASTNAME",
+        "SGACC.INVOICE",
+        "SGACC.INVOICE.CUSTOMERID",
+        "SGACC.INVOICE.TOTAL"
+      ],
+      "reason": "EXISTS reads invoice keys and totals without adding them to projected customer values.",
+      "sql": "SELECT c.CustomerId AS customer_id, c.LastName AS last_name FROM Customer c WHERE EXISTS (SELECT 1 FROM Invoice i WHERE i.CustomerId = c.CustomerId AND i.Total > 10)",
+      "state": "complete",
+      "tags": [
+        "exists",
+        "correlation"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "label": [
+          "SGACC.TRACK.NAME"
+        ],
+        "track_key": [
+          "SGACC.TRACK.TRACKID"
+        ]
+      },
+      "name": "quoted_projection",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.TRACK",
+        "SGACC.TRACK.NAME",
+        "SGACC.TRACK.TRACKID",
+        "SGACC.TRACK.UNITPRICE"
+      ],
+      "reason": "Quoted identifiers and aliases retain exact output names; predicate-only columns remain reads.",
+      "sql": "SELECT \"TRACKID\" AS \"track_key\", \"NAME\" AS \"label\" FROM \"TRACK\" WHERE \"UNITPRICE\" > 0",
+      "state": "complete",
+      "tags": [
+        "quoted-identifiers"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "view",
+      "lineage": {
+        "PRICE_RANK": [
+          "SGACC.TRACK.GENREID",
+          "SGACC.TRACK.TRACKID",
+          "SGACC.TRACK.UNITPRICE"
+        ],
+        "TRACK_ID": [
+          "SGACC.TRACK.TRACKID"
+        ]
+      },
+      "name": "ranked_tracks",
+      "read_scope": "column",
+      "reads": [
+        "SGACC.TRACK",
+        "SGACC.TRACK.GENREID",
+        "SGACC.TRACK.TRACKID",
+        "SGACC.TRACK.UNITPRICE"
+      ],
+      "reason": "Ranking depends on partition and ordering keys even though it has no value argument.",
+      "sql": "SELECT TrackId AS track_id, ROW_NUMBER() OVER (PARTITION BY GenreId ORDER BY UnitPrice DESC, TrackId) AS price_rank FROM Track",
+      "state": "complete",
+      "tags": [
+        "window",
+        "ranking"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [],
+      "kind": "procedure",
+      "lineage": {},
+      "name": "rename_genre",
+      "read_scope": "object",
+      "reads": [],
+      "reason": "Changes one genre using input parameters; the write target is not separately counted as a relation read.",
+      "sql": "CREATE OR REPLACE PROCEDURE acc_rename_genre(genre_id IN NUMBER, genre_name IN VARCHAR2) AS BEGIN UPDATE Genre SET Name = genre_name WHERE GenreId = genre_id; END;",
+      "state": "complete",
+      "tags": [
+        "procedure",
+        "procedural"
+      ],
+      "writes": [
+        "SGACC.GENRE"
+      ]
+    },
+    {
+      "calls": [],
+      "kind": "procedure",
+      "lineage": {},
+      "name": "copy_genres",
+      "read_scope": "object",
+      "reads": [
+        "SGACC.GENRE"
+      ],
+      "reason": "INSERT SELECT reads the public table and writes the audit fixture.",
+      "sql": "CREATE OR REPLACE PROCEDURE acc_copy_genres AS BEGIN INSERT INTO ACC_GENRE_AUDIT (GenreId, GenreName) SELECT GenreId, Name FROM Genre WHERE GenreId >= 9000; END;",
+      "state": "complete",
+      "tags": [
+        "procedure",
+        "procedural"
+      ],
+      "writes": [
+        "SGACC.ACC_GENRE_AUDIT"
+      ]
+    },
+    {
+      "calls": [],
+      "kind": "function",
+      "lineage": {},
+      "name": "genre_count",
+      "read_scope": "object",
+      "reads": [
+        "SGACC.GENRE"
+      ],
+      "reason": "SELECT INTO assigns a local variable, not a catalog object; the function reads Genre.",
+      "sql": "CREATE OR REPLACE FUNCTION acc_genre_count RETURN NUMBER AS n NUMBER; BEGIN SELECT COUNT(GenreId) INTO n FROM Genre; RETURN n; END;",
+      "state": "complete",
+      "tags": [
+        "function",
+        "procedural"
+      ],
+      "writes": []
+    },
+    {
+      "calls": [
+        "SGACC.ACC_GENRE_COUNT"
+      ],
+      "kind": "procedure",
+      "lineage": {},
+      "name": "call_count",
+      "read_scope": "object",
+      "reads": [],
+      "reason": "Direct facts contain the function call and log write, not the function's transitive Genre read.",
+      "sql": "CREATE OR REPLACE PROCEDURE acc_call_count AS n NUMBER; BEGIN n := acc_genre_count(); INSERT INTO ACC_GENRE_COUNT_LOG (ObservedCount) VALUES (n); END;",
+      "state": "complete",
+      "tags": [
+        "procedure",
+        "procedural"
+      ],
+      "writes": [
+        "SGACC.ACC_GENRE_COUNT_LOG"
+      ]
+    },
+    {
+      "calls": [],
+      "kind": "trigger",
+      "lineage": {},
+      "name": "genre_insert",
+      "parent": "GENRE",
+      "read_scope": "object",
+      "reads": [],
+      "reason": ":NEW supplies row values and must not become a phantom catalog relation.",
+      "sql": "CREATE OR REPLACE TRIGGER acc_genre_insert AFTER INSERT ON Genre FOR EACH ROW BEGIN INSERT INTO ACC_GENRE_AUDIT (GenreId, GenreName) VALUES (:NEW.GenreId, :NEW.Name); END;",
+      "state": "complete",
+      "tags": [
+        "trigger",
+        "procedural"
+      ],
+      "writes": [
+        "SGACC.ACC_GENRE_AUDIT"
+      ]
+    },
+    {
+      "calls": [],
+      "kind": "trigger",
+      "lineage": {},
+      "name": "genre_update",
+      "parent": "GENRE",
+      "read_scope": "object",
+      "reads": [],
+      "reason": ":OLD and :NEW bind the firing row and must not become phantom catalog relations.",
+      "sql": "CREATE OR REPLACE TRIGGER acc_genre_update AFTER UPDATE ON Genre FOR EACH ROW BEGIN INSERT INTO ACC_GENRE_CHANGES (GenreId, OldName, NewName) VALUES (:NEW.GenreId, :OLD.Name, :NEW.Name); END;",
+      "state": "complete",
+      "tags": [
+        "trigger",
+        "procedural"
+      ],
+      "writes": [
+        "SGACC.ACC_GENRE_CHANGES"
+      ]
+    }
+  ],
+  "dialect": "oracle",
+  "reference_policy": "Manually reviewed direct reads/value-lineage for views; direct object reads/writes/calls and firing owner for routines/triggers. Routine column reads and row-value lineage are outside the scored scope. Transition tables and local variables are not physical catalog objects.",
+  "schema": "SGACC"
+}

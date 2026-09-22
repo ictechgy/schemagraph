@@ -4,7 +4,85 @@
 
 ## 지금 상태
 
-- 2026-09-22: **MySQL·MariaDB fixture 기동 경합 수정·PR 전체 CI 검증 완료**
+- 2026-09-22: **PR #11 리뷰 완료·머지 승인**.
+  사용자가 리뷰 후 머지를 승인했다. 최종 구현 `de8d6d9`를 재검토했고 머지를
+  막을 결함은 없었다. SQL Server trigger 전이 관계의 적용 범위, Oracle 빈 배열
+  계약, 접속 정보 비노출, 평가 실패·정리 경로와 성능 측정 한계를 확인했다.
+  [전체 CI](https://github.com/ictechgy/schemagraph/actions/runs/35682028944),
+  [SQL Server/Oracle 정확도](https://github.com/ictechgy/schemagraph/actions/runs/35682028952),
+  [IBM 회귀](https://github.com/ictechgy/schemagraph/actions/runs/35682028957),
+  [릴리스 빌드·패키징](https://github.com/ictechgy/schemagraph/actions/runs/35682028991)은
+  같은 커밋에서 모두 통과했다. Rust 259개·fixture 패리티 14개·건너뜀 0이다.
+  중복 push 실행 `35682007251`은 PR 실행으로 대체되며 취소됐다.
+  이 완료 기록은 문서만 바꾸므로 검증한 실행 소스와 동일하다. 최종 병합 상태와
+  병합 커밋은 [PR #11](https://github.com/ictechgy/schemagraph/pull/11)을 기준으로
+  확인한다. 공개 릴리스는 이번 요청에 포함되지 않는다.
+
+- 2026-09-22: **문서 정리·SQL Server/Oracle 정확도·규모 검증 완료**
+  (`feature/sqlserver-oracle-scale-validation`).
+  사용자가 문서 정리와 선택 과제 두 건을 승인했다. 기존 Chinook 공개 표본의
+  SQL Server·Oracle DDL을 추가하고, view·저장 루틴·trigger의 독립 기대값을
+  분석 전에 고정해 실제 DB와 대조한다. 대형 단일 스키마·밀집 그래프의 메모리,
+  반복 조회, CLI/MCP 취소 응답 시간도 재현 가능한 도구로 측정한다.
+  - SQL Server·Oracle 각각 뷰 12개·루틴 4개·trigger 2개의 독립 기대값을
+    엔진 실행 전에 `8e53c4f`에서 고정했다. DB별 기대값은 뷰 읽기 63개·값 계보
+    34개이며 실제 정확도 점수가 아니다. `Scripts/verify-sqlserver-oracle-accuracy.py`,
+    `Scripts/AccuracySql.java`, 전용 CI workflow를 준비했다. 평가기 실패 검사
+    19개와 실제 H2의 batch/query·JSON·실패 차단·비밀번호 비노출 검사는 통과했다.
+  - 새 원본 DDL·라이선스·체크섬과 immutable 이미지 manifest를 추가했다.
+    SQL Server는 공식 `mcr.microsoft.com/mssql/server:2022-latest`의 digest,
+    Oracle은 `gvenzl/oracle-free:23.26.3-slim`의 multi-arch digest를 고정했다.
+    DB·사용자 생성/삭제와 데이터 행은 제외하고 11개 공개 테이블의 DDL만 쓴다.
+    SQL Server 16.0.4295.3(x86_64)·Oracle 23.26.3(ARM64)에서 각각 18개 정의와
+    실제 실행 효과를 검증했다. 첫 SQL Server 평가는 의존성은 모두 맞았지만 두
+    trigger가 inserted/deleted를 물리 관계로 찾아 partial이 됐다. trigger에만
+    적용되는 파서 수정과 회귀 테스트를 추가하고 보존한 두 생산자 입력으로 모두
+    통과했다. Oracle 첫 Go 수집은 무인덱스 테이블의 indexes:null로 거부됐다.
+    [] 출력으로 고친 뒤 기존 엔진 그대로 18개 사례·8개 전송 조합을 통과했다.
+    첫 실패와 수정 후 결과는 분리 보존했으며 기대값은 변경하지 않았다.
+    파서·프로브·검증기 수정의 독립 리뷰에서 blocker는 없었다. 새 소스 `da16411`의
+    [실DB 정확도 CI](https://github.com/ictechgy/schemagraph/actions/runs/35681162125),
+    [전체 CI](https://github.com/ictechgy/schemagraph/actions/runs/35681162094),
+    [IBM 회귀 CI](https://github.com/ictechgy/schemagraph/actions/runs/35681162087)는
+    모두 통과했다. Rust 259개 테스트와 전체 fixture의 생산자 패리티 14개를
+    확인했으며 fixture 건너뜀은 0이다. Db2·Informix도 실제 컨테이너 검증을
+    통과했다. 로컬 Oracle report는 `0334de53e54d`, CI report는 SQL Server
+    `6822679d8f39`·Oracle `4488a6bb31af`로 시작한다. 두 DB 모두 원본/DB 저장
+    SQL에서 뷰 읽기 63개·값 계보 34개와 routine/trigger 사실이 모두 맞고,
+    오탐·누락·잘못된 complete·유령 정점은 0이다. DB별 Go/JDBC × v1/v2 ×
+    JSON/NDJSON 8개 조합과 두 생산자의 전체 원본 SQL 그래프도 일치했다.
+    별도 잘못된 Oracle SQL은 ORA-00904로 분석 전에 거부되고, 그래프 미생성과
+    소유 컨테이너 정리까지 확인했다. 이후 문서만 바뀌면 실행 소스의 동일성을
+    확인하고 위 검증을 재사용한다.
+  - 규모 검증은 외부 부하 없는 구간에서 고정 release 바이너리(`c28928ce3ade`,
+    source `8e53c4f`, v0.4.2)로 실행했다. 1만 테이블·8컬럼 문서의 12만 정점·
+    139,997개 간선을 독립 검증했다. JSON/NDJSON peak RSS 중앙값은
+    254.688/171.766 MiB다. 100만 간선 그래프 두 크기에서 CLI·상주 MCP의
+    반복 조회와 정확한 결과를 확인했다. 별도 전체 결과로 2,000개 ID를 검증했다.
+  - 취소 표본은 실제 process CPU가 0.01초 진행한 뒤에만 수용한다. `ping`은
+    입력 스레드가 처리하므로 근거로 쓰지 않고, 계산 작업자를 거치는 없는 이름의
+    `impact` 응답으로 확인한다. MCP 취소→작업자 응답은 중앙값 0.183 ms,
+    CLI 신호→ACK는 0.089 ms, 신호→종료는 0.834508초였다. 각 3회 표본이며
+    내부 탐색만의 시간이나 SLA로 주장하지 않는다. 초기의 입증되지 않은 표본은
+    별도 보관하고 최종 결과로 사용하지 않는다.
+  - 실제 SQLite 2천·1만 테이블의 Go 수집도 3회씩 검증했다. 1만 테이블의
+    JSON/NDJSON peak RSS 중앙값은 80.484/44.828 MiB이며, 두 형식 모두
+    40,001개 정점·40,000개 간선과 PK/컬럼 사실을 보존한다. 자세한 방법·한계·
+    재현 명령은 `PERFORMANCE.md`에 있다. 최종 scale report는 `98549f3ee678`,
+    SQLite report는 `2eaf053fc8f2`로 시작한다. 프로세스 종료 감지는 명목 1 ms
+    polling을 사용하며 이전 20 ms 결과는 구분해서 보관했다.
+  - 검증기의 비밀번호 argv 노출을 막기 위해 Go에 `--url-env NAME`을 추가했다.
+    Go test/vet·CGO 없는 빌드·실제 SQLite의 literal/env 입력 동일성과 거부 경로를
+    확인했다. 바이너리는 `6daea55f8e0b`로 시작한다. 이는 미배포 소스 기능으로,
+    공개 0.4.2 Go 바이너리에는 없음을 README·INSTALLATION에 명시했다.
+  - 사용자가 새 Chinook 자료·공식 문서·DB 이미지·필요한 JDBC 드라이버의
+    외부 접근을 승인했다. 기존 GitHub 작업 권한도 재사용한다. SQL Server는
+    실제 Linux x86_64 CI에서, Oracle은 로컬 ARM64와 CI에서 검증한다.
+    기대값을 엔진 결과에 맞춰 바꾸지 않으며 첫 평가와 수정 후 결과를 구분한다.
+  - 새 근거는 저장소 밖
+    `~/Library/Application Support/schemagraph/verification/followups-20260922`에 보관한다.
+
+- 2026-09-22: **MySQL·MariaDB fixture 기동 경합 수정·main CI 복구 완료**
   (`fix/mysql-fixture-readiness`). 아래 main CI 실패의 준비 완료 오판을 실제
   MySQL 8.4·MariaDB 11.4에서 확인했다. 초기화 스크립트를 잠시 대기시킨 상태에서
   기존 admin ping과 소켓 `sgfix` 쿼리는 모두 성공하지만 TCP 연결은 실패한다.
@@ -27,9 +105,12 @@
     14개, 건너뜀 0을 확인했다. 같은 소스의 중복 push 실행은 저장소 동시 실행
     설정으로 취소됐으며 실패 검증으로 세지 않는다. 이후 완료 기록만 바꾸면
     위 소스와 실행 코드의 동일성을 확인하고 이 검증을 재사용한다.
-  - **main 반영과 main CI 확인은 아직 미완료**다. 이번 승인 범위는 commit·push·
-    PR·전체 CI 실행이며 PR은 열린 상태다. PR 검사 성공을 아래 실패한 main 실행의
-    복구로 간주하지 않는다. 재현 코드·서버 로그·검증 요약은
+  - 사용자가 리뷰 후 머지를 승인했다. 검토 결과 머지를 막을 결함은 없었으며,
+    PR #10을 `1443ff12b1cdedbe7f7fa201d863e8d780d3153b`로 병합했다.
+    병합 트리가 검토한 PR 최종 소스 `d7e0023`과 같음을 확인했다.
+    [병합 후 main CI](https://github.com/ictechgy/schemagraph/actions/runs/35638136052)도
+    전체 성공했으며 fixture 완료·전송 조합 14개·건너뜀 0을 로그에서 확인했다.
+    아래 실패 실행과 구분되는 main CI 복구 근거다. 재현 코드·서버 로그·검증 요약은
     저장소 밖 `~/Library/Application Support/schemagraph/verification/ci-readiness-20260922`에
     보관했다. 소유한 임시 DB는 정리했다.
 
@@ -574,7 +655,8 @@
   0이다** — 성공한 섹션은 무출력이라, 끝부분 출력에 주의가 없는지로
   전 섹션 실행을 확인한다. oracle-free 컨테이너는 무거워 다른 Oracle
   인스턴스와 동시 기동하면 기동 실패로 Oracle 섹션이 건너뛴다 —
-  돌리기 전 `docker ps`로 남은 sg-* 컨테이너를 정리한다.
+  돌리기 전 `docker ps`로 자원 사용을 확인하고, 이번 작업이 만든 label·ID가
+  확인된 임시 컨테이너만 정리한다. 이름 접두어만 보고 다른 DB를 삭제하지 않는다.
 - **프로브에 문서 필드를 추가할 때는 세 경로를 같이 갱신한다** — 수확
   조립, merge() 재조립, NDJSON 라인. Kotlin merge()가 `memberOf`·
   `signature`를 떨궈 JVM 출력에서만 null이 된 적 있다(실검증에서 발견,
@@ -650,7 +732,7 @@
 ## 검증 명령
 
 ```bash
-(cd engine && cargo build --workspace --locked && cargo test --workspace --locked) # 132개 테스트
+(cd engine && cargo build --workspace --locked && cargo test --workspace --locked)
 Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체 DB/전송 조합 검증
 # PG는 initdb로, MySQL·MariaDB·MSSQL·Oracle은 docker로 자동 프로비전한다.
 #   SG_PG_URL=postgres://user@host/db Scripts/verify-fixtures.sh      (폐기용 DB만!)
@@ -670,19 +752,21 @@ Scripts/verify-fixtures.sh                    # 네이티브 + JDBC + Go, 전체
 공개 정확도 평가 후속과 v0.4.1 배포·설치 검증도 완료했다. 서명키와 토큰은
 다음 릴리스에서도 기존 설정을 재사용한다. CLI/MCP 요청 취소도 v0.4.2 배포와 공개
 설치본 검증까지 완료했다. 승인된 릴리스 작업에 미완료 항목은 없다. 이후 승인된
-MySQL·MariaDB 공개 표본 평가도 main에 반영했다. 다만 **main CI 복구는 남아 있다.**
+MySQL·MariaDB 공개 표본 평가와 PR #10의 main CI 복구도 완료했다.
+이후 승인된 문서 정리와 두 후속 과제도 완료했다.
 
-1. 전체 CI를 통과한 [PR #10](https://github.com/ictechgy/schemagraph/pull/10)의
-   main 반영을 진행한다. 현재 승인된 commit·push·PR·CI 작업은 완료했고,
-   병합은 아직 수행하지 않았다. 기동 오판 재현·TCP 대기·timeout/종료 실패 처리와
-   실제 두 DB 검증 및 전체 CI 근거는 위 2026-09-22 기록을 따른다.
-2. 병합 후 main 실행도 확인한다. 실패 실행과 수정 후 성공 실행을 구분해 기록한다.
-   PR 검사 성공만으로 main CI가 복구됐다고 기록하지 않는다.
+1. SQL Server·Oracle 공개 표본과 routine/trigger의 실제 컴파일·실행·정확도를
+   검증했다. 첫 실패·수정 후 결과·작은 표본의 한계는 ACCURACY.md에 있다.
+2. 단일 대형 스키마·밀집 그래프의 메모리·반복 조회·취소 응답 시간과 실제
+   SQLite 수집을 측정했다. 독립 검증·재현 명령·측정 경계는 PERFORMANCE.md에
+   있다. 하드웨어 성능 수치를 CI 통과 기준으로 만들지 않는다.
 
-CI 복구 후 선택적 과제는 SQL Server·Oracle 등 나머지 DB의 공개 표본과 저장
-프로시저·트리거 사례 확대, 단일 대형 스키마·밀집 그래프의 메모리·반복 조회·취소
-응답 시간 검증이다. 현재 추가분은 평가·CI·문서로 런타임이 바뀌지 않아 새 릴리스가
-필수인 상태는 아니다.
+추가 구현 미완료 항목은 없다. 현재 feature 브랜치의 검증 소스는 `da16411`이며,
+후속 완료 기록은 문서 변경이다. PR #11의 리뷰와 머지는 사용자가 승인했으며,
+최종 상태는 위 PR 링크를 따른다. 공개 릴리스는 별도 요청을 따른다.
+
+후속 검증에 필요한 Go `--url-env`, Oracle 무인덱스 문서 계약 수정, SQL Server
+trigger 전이 관계 수정은 모두 미배포 소스 변경이다. 공개 배포는 요청받지 않았으며 기존 0.4.2를 재게시하지 않는다.
 
 ## 의도적으로 남긴 경계
 

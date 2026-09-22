@@ -164,6 +164,12 @@ limits collection to that schema unless `--schema` overrides it. SQLite
 connections use read-only mode. The probe also accepts `--schema`,
 `--format json|ndjson`, and `--document-version 1|2`.
 
+Unreleased source builds also accept `--url-env SG_DATABASE_URL` to read the
+complete URL from an exported environment variable, keeping a credential-bearing
+URL out of process arguments. Choose either `--url` or `--url-env`; an unset or
+empty selected variable is an error. This option is not in the published 0.4.2
+Go binary.
+
 ### Document formats
 
 Both probes emit JSON by default and accept `--format ndjson`.

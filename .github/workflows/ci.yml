@@ -64,6 +64,12 @@ jobs:
       - name: Verify database startup failure paths
         run: python3 Scripts/test-mysql-ready.py
 
+      - name: Verify accuracy and scale measurement invariants
+        run: |
+          python3 Scripts/test-sqlserver-oracle-accuracy.py
+          python3 Scripts/test-benchmark-scale.py
+          python3 Scripts/test-probe-sqlite-benchmark.py
+
       - name: Build and test the Rust workspace
         run: |
           cargo build --manifest-path engine/Cargo.toml --workspace --locked
@@ -129,6 +135,9 @@ jobs:
 
       - name: Build and test the JDBC probe
         run: gradle -p probe check shadowJar --no-daemon --console=plain
+
+      - name: Verify the JDBC accuracy SQL utility
+        run: python3 Scripts/test-accuracy-sql.py --jdbc-jar probe/build/libs/schemagraph-probe-all.jar
 
       - name: Verify local Maven publication and consumers
         run: Scripts/verify-probe-maven.sh

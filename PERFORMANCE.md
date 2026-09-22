@@ -1,5 +1,127 @@
 # Performance measurements
 
+## Large schemas, dense graphs, and cancellation (2026-09-22)
+
+These are bounded observations on one macOS ARM64 host, not an optimization
+claim or a latency SLA. The immutable engine reports 0.4.2 and was built from
+`8e53c4f`; its SHA-256 starts `c28928ce3ade`. Each timing has three samples.
+The JSON reports retain every sample, median, nearest-rank p95, maximum, input
+hash, and executable hash. With three samples, p95 is the maximum, not a
+well-estimated population tail. Process wall time includes startup and uses a
+nominal 1 ms wait4 polling interval. Resident MCP request time starts after the client flush;
+it excludes graph loading. Peak RSS is measured per child process.
+
+### Engine input: one large synthetic catalog
+
+The single schema has 10,000 tables with eight columns each, named PKs/indexes,
+and a chain of FKs. Independent vertex/edge sets and formulas verify exactly
+120,000 vertices and 139,997 edges. Repeated JSON and NDJSON scans produce the
+same graph bytes. No SQL body analysis is involved in this workload.
+
+| Catalog format | Median wall ms | Median peak RSS MiB | Maximum peak RSS MiB |
+| --- | ---: | ---: | ---: |
+| JSON | 525.8 | 254.69 | 270.95 |
+| NDJSON | 452.3 | 171.77 | 171.78 |
+
+### Dense graph queries
+
+Each graph has the listed dependent-node count plus one root, one million
+directed edges, and an explicit density of E / (V × (V − 1)). All dependent
+nodes directly reach the root. The checks independently assert visited counts,
+examined edges, IDs, distance, and truncation; an untimed request also validates
+the complete 2,000-ID result. Timed requests cap returned rows at one while
+traversing the complete graph. CLI numbers include a fresh process and graph
+load; resident MCP numbers do not. They are different operating modes, not an
+algorithm speedup comparison. MCP RSS is the peak of the resident process
+across startup and requests, not a per-request allocation measurement.
+
+| Dependent nodes | Directed density | CLI median ms | Resident MCP median ms | CLI median peak MiB | Resident MCP peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 0.999001 | 880.5 | 65.5 | 450.23 | 450.70 |
+| 2,000 | 0.249875 | 873.4 | 73.8 | 398.52 | 398.80 |
+
+### Real single-schema Go collection
+
+`Scripts/benchmark-probe-sqlite.py` creates an actual SQLite 3.53.4 file with
+2,000 or 10,000 tables, each having `id INTEGER PRIMARY KEY` and
+`value TEXT NOT NULL`. Input construction and graph validation are outside the
+collection timing. Every collected table, column, type, ordinal, PK and absent
+usage observation is checked against this DDL; the engine must preserve the
+expected vertices/contains edges and emit identical JSON/NDJSON graph bytes.
+The Go binary SHA-256 starts `6daea55f8e0b`; it is a source build containing the
+unreleased `--url-env` option. This benchmark uses the unchanged literal SQLite
+URL path. It does not measure JDBC collection or large routine bodies.
+
+| Tables | Catalog format | Median collection ms | Median peak RSS MiB | Maximum peak RSS MiB |
+| --- | --- | ---: | ---: | ---: |
+| 2,000 | JSON | 56.1 | 35.16 | 35.28 |
+| 2,000 | NDJSON | 54.2 | 27.80 | 28.00 |
+| 10,000 | JSON | 260.8 | 80.48 | 87.97 |
+| 10,000 | NDJSON | 252.5 | 44.83 | 45.95 |
+
+The 10,000-table collected graph has 40,001 vertices and 40,000 edges. These
+measurements confirm the format difference for this input; both formats still
+retain a schema-sized collection and do not establish constant memory.
+
+### Cancellation boundaries
+
+The CLI test opens both FIFO ends, then sends SIGINT before any graph byte or
+EOF. Both clocks start before the signal syscall. ACK latency ends when the
+exact stderr line is observed; process-exit latency includes writing the graph
+after the signal, completing the cancelled report, and cleanup. The report
+must show one visited root, zero examined edges, and explicit cancellation.
+
+The MCP test loads the graph, completes an idle preflight request, submits one
+request and waits for at least 0.01 seconds of process CPU while draining
+responses. A completed response or unavailable CPU evidence fails the proof.
+All final samples observed this CPU progress before cancellation. It proves
+active process work after submission, not traversal alone: request handling,
+result construction and serialization may contribute. The cancellation clock
+starts before notification write. A following missing-name `impact` call must
+return the exact `isError=true`, `found=false` result through the compute worker.
+This is an observable upper bound through notification delivery, worker
+availability, the small probe, serialization and stdio. Reader-thread `ping`
+is not worker evidence. The cancelled request must stay response-suppressed.
+
+| Observed boundary | Median ms | Maximum ms |
+| --- | ---: | ---: |
+| CLI signal → ACK | 0.089 | 0.095 |
+| CLI signal → process exit | 834.508 | 834.645 |
+| MCP cancellation → worker response | 0.183 | 0.238 |
+
+The final scale report SHA-256 starts `98549f3ee678` and its
+script SHA-256 starts `eadb870500f9`. The SQLite collector
+report starts `2eaf053fc8f2`. Full hashes, limits and
+clock boundaries are in the reports. Earlier cancellation samples without CPU
+proof and using reader-thread ping are retained with the
+`failed-unconfirmed-active-request-proof` suffix and are not accepted as active
+cancellation measurements. The final runs use 1 ms process-reap polling; earlier
+20 ms polling reports are separately retained under `before-reap-resolution`.
+
+### Reproduce
+
+Build or copy binaries to immutable paths before a quiet timing window. The
+following commands use the measured sizes; increasing repetitions improves
+distribution evidence but does not create a hardware-independent threshold.
+
+```sh
+python3 Scripts/test-benchmark-scale.py
+python3 Scripts/benchmark-scale.py --engine /path/to/immutable/schemagraph \
+  --large-objects 10000 --columns 8 --dense-vertices 1000 2000 --repeat 3 \
+  --timeout-seconds 120 --max-input-mib 512 --max-rss-mib 2048 \
+  --output /path/to/scale-report
+python3 Scripts/benchmark-probe-sqlite.py \
+  --probe /path/to/immutable/schemagraph-probe-go \
+  --engine /path/to/immutable/schemagraph --objects 2000 10000 --repeat 3 \
+  --output /path/to/probe-sqlite-report.json
+```
+
+Use `--smoke` for generator/invariant checks without an engine. Generated DBs,
+inputs, graphs and stderr are removed after success or failure; requested JSON
+reports remain. Inputs, graph size, repeats and child/request duration are
+bounded. Observed child RSS is checked against a limit, rather than pretending
+to reserve or hard-limit total host memory.
+
 ## Graph construction and optional body cache (v0.4)
 
 The graph shares vertex ID strings and indexes existing edge slots instead of

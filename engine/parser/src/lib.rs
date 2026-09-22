@@ -145,7 +145,11 @@ pub fn enrich_with_cache(
                 let parsed_body = match doc.dialect.as_str() {
                     "db2" => parse_db2_trigger_body(dialect.as_deref(), body),
                     "informix" => parse_informix_trigger_body(dialect.as_deref(), body),
-                    _ => parse_trigger_body(dialect.as_deref(), body),
+                    _ => parse_trigger_body(
+                        dialect.as_deref(),
+                        body,
+                        doc.dialect == "sqlserver" || doc.dialect == "mssql",
+                    ),
                 };
                 match parsed_body {
                     Ok(parsed) => {
@@ -642,7 +646,11 @@ impl ParsedTrigger {
 /// CREATE TRIGGER 자체를 못 파는 방언이 많아 껍질(BEGIN..END)은 직접
 /// 벗기고 안쪽 문장만 파서에 넘긴다. 껍질이 없는 몸체(reader가 내부
 /// 문장만 저장한 경우)는 통째로 파싱한다.
-fn parse_trigger_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedTrigger, String> {
+fn parse_trigger_body(
+    dialect: Option<&dyn Dialect>,
+    body: &str,
+    sqlserver_trigger: bool,
+) -> Result<ParsedTrigger, String> {
     let default = GenericDialect {};
     let dialect = dialect.unwrap_or(&default);
     let calls = extract_execute_targets(body);
@@ -667,7 +675,7 @@ fn parse_trigger_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<Parse
                 );
             }
             for stmt in &stmts {
-                collect_trigger_stmt(stmt, &mut parsed);
+                collect_trigger_stmt(stmt, &mut parsed, sqlserver_trigger);
             }
             Ok(parsed)
         }
@@ -696,7 +704,7 @@ fn needs_procedural_recovery(body: &str) -> bool {
 /// 꺼내고, 나머지는 trigger와 같은 문장 수집 골격으로 파싱한다.
 fn parse_routine_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedTrigger, String> {
     let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
-    parse_trigger_body(dialect, &inner)
+    parse_trigger_body(dialect, &inner, false)
 }
 
 /// Db2 LUW와 Informix SPL의 catalog text는 `AS` 문자열이 아니라 CREATE
@@ -854,9 +862,9 @@ fn parse_informix_trigger_body(
         .unwrap_or(body);
     if let Some(alias) = informix_new_alias(body) {
         let normalized = replace_trigger_alias(inner, &alias);
-        return parse_trigger_body(dialect, &normalized);
+        return parse_trigger_body(dialect, &normalized, false);
     }
-    parse_trigger_body(dialect, inner)
+    parse_trigger_body(dialect, inner, false)
 }
 
 fn informix_new_alias(body: &str) -> Option<String> {
@@ -913,7 +921,7 @@ fn parse_db2_trigger_body(
     body: &str,
 ) -> Result<ParsedTrigger, String> {
     let inner = strip_catalog_trigger_header("db2", body).unwrap_or(body);
-    parse_trigger_body(dialect, inner)
+    parse_trigger_body(dialect, inner, false)
 }
 
 fn strip_catalog_trigger_header<'a>(dialect: &str, body: &'a str) -> Option<&'a str> {
@@ -1268,7 +1276,7 @@ fn parse_procedural_body(
         match sqlparser::parser::Parser::parse_sql(dialect, stmt) {
             Ok(list) => {
                 for s in &list {
-                    collect_trigger_stmt(s, &mut parsed);
+                    collect_trigger_stmt(s, &mut parsed, false);
                 }
             }
             // 추출기가 SQL이 아닌 조각을 문장으로 오인한 경우 — 하나의
@@ -2495,7 +2503,7 @@ fn is_query_text(s: &str) -> bool {
 }
 
 /// 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
-fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger) {
+fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_trigger: bool) {
     // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
     // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
     let write_targets = write_targets(stmt);
@@ -2509,6 +2517,11 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger) {
             parsed.ignored_relations.insert(relation_name_key(name));
             return ControlFlow::<()>::Continue(());
         };
+        // SQL Server trigger 의사 테이블은 trigger 스코프에서만 존재한다.
+        // dbo.inserted처럼 한정된 이름은 일반 카탈로그 조회로 남긴다.
+        if sqlserver_trigger && is_sqlserver_transition_relation(&t) {
+            return ControlFlow::<()>::Continue(());
+        }
         // 재귀 방문으로 중첩 문장이 여러 번 오므로 중복을 거른다.
         if !t.1.is_empty() && !write_targets.contains(&t) && !parsed.reads.contains(&t) {
             parsed.reads.push(t);
@@ -2558,8 +2571,14 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger) {
     // 블록 안에 중첩돼 있어 재귀로 내려가지 않으면 writes가 reads로 오분류되고
     // CALL이 조용히 빠진다. 관계·식 수확은 visitor가 이미 트리 전체를 본다.
     for s in nested_statements(stmt) {
-        collect_trigger_stmt(s, parsed);
+        collect_trigger_stmt(s, parsed, sqlserver_trigger);
     }
+}
+
+fn is_sqlserver_transition_relation(relation: &(Option<String>, String)) -> bool {
+    relation.0.is_none()
+        && (relation.1.eq_ignore_ascii_case("inserted")
+            || relation.1.eq_ignore_ascii_case("deleted"))
 }
 
 /// 내장 함수 이름 — 이 목록에 있으면 routine 해석·한계 보고 모두 건너뛴다.
@@ -3090,6 +3109,13 @@ mod tests {
         }
     }
 
+    fn sqlserver_trigger_doc(body: &str) -> CatalogDocument {
+        let mut doc = doc_with_trigger(body);
+        doc.dialect = "sqlserver".into();
+        doc.schemas[0].name = "dbo".into();
+        doc
+    }
+
     fn build(doc: &CatalogDocument) -> (Graph, Vec<String>) {
         let mut g = schemagraph_source::graph::document_to_graph(doc);
         let (_n, notes) = enrich_from_document(&mut g, doc);
@@ -3248,6 +3274,100 @@ mod tests {
         assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
             && e.from.as_str() == "main.orders.trg_touch"
             && e.to.as_str() == "main.customers"));
+    }
+
+    #[test]
+    fn sqlserver_trigger의_inserted_deleted는_transition_relation으로_취급한다() {
+        let doc = sqlserver_trigger_doc(
+            "CREATE TRIGGER trg_touch AFTER UPDATE ON orders \
+             AS BEGIN SET NOCOUNT ON; INSERT INTO customers (id, name) \
+             SELECT n.id, o.name FROM inserted n JOIN deleted o ON o.id = n.id; END",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert_eq!(
+            g.analysis()[&VertexId::from_raw("dbo.orders.trg_touch")].state,
+            schemagraph_core::AnalysisState::Complete,
+            "{notes:?}"
+        );
+        assert!(g.edges().iter().any(|edge| {
+            edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "dbo.orders.trg_touch"
+                && edge.to.as_str() == "dbo.customers"
+        }));
+        assert!(!g.edges().iter().any(|edge| {
+            edge.from.as_str() == "dbo.orders.trg_touch" && edge.to.as_str().ends_with(".inserted")
+        }));
+        assert!(!g.edges().iter().any(|edge| {
+            edge.from.as_str() == "dbo.orders.trg_touch" && edge.to.as_str().ends_with(".deleted")
+        }));
+    }
+
+    #[test]
+    fn sqlserver_trigger의_qualified_transition_relation은_물리참조로_남긴다() {
+        let doc = sqlserver_trigger_doc(
+            "CREATE TRIGGER trg_touch AFTER INSERT ON orders \
+             AS BEGIN INSERT INTO customers (name) \
+             SELECT name FROM dbo.inserted; END",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.iter().any(|note| note.contains("dbo.inserted")));
+        assert_eq!(
+            g.analysis()[&VertexId::from_raw("dbo.orders.trg_touch")].state,
+            schemagraph_core::AnalysisState::Partial
+        );
+        assert!(!g.edges().iter().any(|edge| {
+            edge.from.as_str() == "dbo.orders.trg_touch" && edge.to.as_str() == "dbo.inserted"
+        }));
+    }
+
+    #[test]
+    fn sqlserver_trigger의_미지관계는_진단한다() {
+        let doc = sqlserver_trigger_doc(
+            "CREATE TRIGGER trg_touch AFTER INSERT ON orders \
+             AS BEGIN INSERT INTO customers (name) \
+             SELECT name FROM ghost_table; END",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.iter().any(|note| note.contains("ghost_table")));
+        assert_eq!(
+            g.analysis()[&VertexId::from_raw("dbo.orders.trg_touch")].state,
+            schemagraph_core::AnalysisState::Partial
+        );
+    }
+
+    #[test]
+    fn sqlserver_routine의_inserted는_transition_relation이_아니다() {
+        let mut doc = doc_with_routine(
+            vec![routine(
+                "read_inserted",
+                Some("sql"),
+                "SELECT id FROM inserted",
+            )],
+            "",
+        );
+        doc.dialect = "sqlserver".into();
+        let (g, notes) = build(&doc);
+        assert!(notes.iter().any(|note| note.contains("inserted")));
+        assert_eq!(
+            g.analysis()[&VertexId::from_raw("public.read_inserted")].state,
+            schemagraph_core::AnalysisState::Partial
+        );
+    }
+
+    #[test]
+    fn 다른_방언의_trigger_inserted는_transition_relation이_아니다() {
+        let mut doc = doc_with_trigger(
+            "CREATE TRIGGER trg_touch AFTER INSERT ON orders \
+             BEGIN INSERT INTO customers (name) SELECT name FROM inserted; END",
+        );
+        doc.dialect = "postgres".into();
+        let (g, notes) = build(&doc);
+        assert!(notes.iter().any(|note| note.contains("inserted")));
+        assert_eq!(
+            g.analysis()[&VertexId::from_raw("main.orders.trg_touch")].state,
+            schemagraph_core::AnalysisState::Partial
+        );
     }
 
     #[test]

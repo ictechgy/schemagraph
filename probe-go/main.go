@@ -194,6 +194,7 @@ func ns(s sql.NullString) *string {
 func main() {
 	var (
 		rawURL              = flag.String("url", "", "sqlite:, postgres://, mysql://, oracle://, sqlserver://")
+		urlEnv              = flag.String("url-env", "", "environment variable containing the complete database URL")
 		schemaArg           = flag.String("schema", "", "comma-separated schema allowlist (default: non-system schemas)")
 		output              = flag.String("o", "catalog.json", "output path ('-' for stdout)")
 		format              = flag.String("format", "json", "json | ndjson")
@@ -211,8 +212,9 @@ func main() {
 	if sourceIDProvided && !validSourceID(*sourceID) {
 		fatal("invalid source label", fmt.Errorf("use a logical label, not a connection URL"))
 	}
-	if *rawURL == "" {
-		fatal("connection URL is required", fmt.Errorf("set --url to a supported database URL"))
+	connectionURL, err := resolveConnectionURL(*rawURL, *urlEnv, os.LookupEnv)
+	if err != nil {
+		fatal("invalid connection URL input", err)
 	}
 	if err := validateDocumentVersion(*wireVersion); err != nil {
 		fatal("invalid document version", err)
@@ -220,7 +222,7 @@ func main() {
 	if *format != "json" && *format != "ndjson" {
 		fatal("invalid output format", fmt.Errorf("choose json or ndjson"))
 	}
-	spec, err := parseConnection(*rawURL)
+	spec, err := parseConnection(connectionURL)
 	if err != nil {
 		fatal("invalid connection settings", err)
 	}
@@ -424,10 +426,7 @@ func (h *harvester) collectObjects() map[string][]ObjectDoc {
 		}
 		cons := append(append([]ConstraintDoc{}, pks[key]...), fks[key]...)
 		sort.Slice(cons, func(i, j int) bool { return cons[i].Name < cons[j].Name })
-		idx := []IndexDoc{}
-		if r.kind == "table" || r.kind == "materialized-view" {
-			idx = indexes[key]
-		}
+		idx := oracleObjectIndexes(r.kind, indexes[key])
 		if cols == nil {
 			cols = []ColumnDoc{}
 		}
@@ -444,6 +443,17 @@ func (h *harvester) collectObjects() map[string][]ObjectDoc {
 			"카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라")
 	}
 	return out
+}
+
+// Oracle 객체의 인덱스 목록은 없을 때도 JSON 배열이어야 한다.
+func oracleObjectIndexes(kind string, indexes []IndexDoc) []IndexDoc {
+	if kind != "table" && kind != "materialized-view" {
+		return []IndexDoc{}
+	}
+	if indexes == nil {
+		return []IndexDoc{}
+	}
+	return indexes
 }
 
 func (h *harvester) collectColumns() map[string][]ColumnDoc {
