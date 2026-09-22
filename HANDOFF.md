@@ -4,20 +4,41 @@
 
 ## 지금 상태
 
-- 2026-09-22: **v0.4.3 공개 배포 진행 중** (`feature/release-v0.4.3`).
-  사용자가 새 버전 배포를 승인했다. GitHub CLI/Go/JDBC 바이너리, crates.io의
-  6개 crate, Maven Pages·Central을 동일 릴리스 소스에서 게시하고 공개 설치본을
-  검증한다. 기존 서명·인증 설정을 재사용하며 비밀키 백업은 읽거나 바꾸지 않는다.
-  - 포함 변경: Go `--url-env`, Oracle 무인덱스 배열 계약, SQL Server trigger 전이
-    관계 수정과 실DB 정확도·규모 검증. 이전 0.4.2 산출물은 불변으로 보존한다.
-  - PR #11은 `e2c393ae64d35ef8553473bf58d3a4ef7e1ea15a`로 병합됐다.
-    [main 전체 CI](https://github.com/ictechgy/schemagraph/actions/runs/35683269532),
-    [실DB 정확도](https://github.com/ictechgy/schemagraph/actions/runs/35683269577),
-    [IBM 회귀](https://github.com/ictechgy/schemagraph/actions/runs/35683269543)는 통과했다.
-  - 새 버전 metadata·설치 문서·배포 바이너리의 URL 환경 변수 검사를 준비하고,
-    릴리스 소스 CI와 패키징 dry-run 후 게시한다. 게시·공개 설치 검증 완료 전에는
-    완료로 기록하지 않는다. 근거는 저장소 밖
+- 2026-09-22: **v0.4.3 공개 배포·설치 검증 완료**.
+  [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.3) ·
+  [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.4.3) ·
+  [Maven Central](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.4.3).
+  사용자가 공개 배포를 승인했고 [PR #12](https://github.com/ictechgy/schemagraph/pull/12)를
+  병합했다. 태그·릴리스 소스·6개 crate의 내장 소스 커밋은
+  `22d27f6b60cdcf283fdd1e5416f1fd0aabcd3240`다. 이전 0.4.2 산출물은 보존했다.
+  - Go `--url-env`, Oracle 무인덱스 배열 계약, SQL Server trigger 전이 관계
+    수정이 공개 설치본에 포함됐다. 버전·설치 문서·Maven 예제를 0.4.3으로 맞췄다.
+  - 6개 패키지 dry-run과 [릴리스 소스 CI](https://github.com/ictechgy/schemagraph/actions/runs/35686249564)를
+    통과했다. Rust 259개·전체 fixture 패리티 14개·건너뜀 0이다.
+    [실DB 정확도](https://github.com/ictechgy/schemagraph/actions/runs/35686249608),
+    [IBM 회귀](https://github.com/ictechgy/schemagraph/actions/runs/35686249593),
+    [Linux/macOS 바이너리·JDBC 게시](https://github.com/ictechgy/schemagraph/actions/runs/35686307304)도
+    통과했다. PR의 첫 패키징 CI는 crates.io HTTP/2 연결 오류로 실패했지만,
+    소스 변경 없는 두 번째 실행은 통과했다.
+  - [Pages Maven](https://github.com/ictechgy/schemagraph/actions/runs/35686249597)과
+    [Central](https://github.com/ictechgy/schemagraph/actions/runs/35686449415)에 게시했다.
+    Central deployment `b25952c3-f94d-440c-8c9b-706e4a77c2ae`는 PUBLISHED다.
+    기존 서명·인증 설정을 재사용했으며 비밀키 백업은 읽거나 바꾸지 않았다.
+  - 6개 crate의 공개 체크섬·로컬 게시 바이트·내장 소스 커밋이 모두 일치했다.
+    crates.io 별도 설치본에서 CLI 회귀·취소·Chinook/Pagila 정확도를 통과했고,
+    실제 DB에서 검증해 보존한 SQL Server·Oracle 입력도 각각 18개 사례,
+    Go/JDBC × 원본/DB 저장 SQL 4개 조합에서 통과했다. 이 설치 검사는
+    보존 입력 재분석이며 새 실DB 수집으로 표현하지 않는다.
+  - 공개 Linux/macOS 압축파일의 체크섬을 확인했다. 공개 macOS CLI·Go·JAR로
+    catalog 계약·Chinook/Pagila 정확도·취소·SQL Server/Oracle 보존 입력을 검사했다.
+    Go의 환경 변수/직접 URL 수집 동일성과 잘못된 조합 거부도 통과했다.
+    Go 바이너리의 내장 VCS 커밋도 태그와 일치하고 dirty 상태가 아니다.
+  - Central 5개 payload의 체크섬·기존 PGP 키 서명·Pages 바이트가 일치했다.
+    all JAR은 GitHub 릴리스와도 같고, 빈 Gradle 캐시의 Central-only Java 17
+    소비자가 실제 H2 테이블·컬럼·PK를 수집했다. 임시 DB·다운로드·공개키 keyring·
+    소비자 작업 디렉터리는 검사 후 정리했다. 별도 registry 설치본과 근거는
     `~/Library/Application Support/schemagraph/verification/v0.4.3-20260922`에 보관한다.
+    이후 완료 기록만 바뀌면 위 실행 소스의 동일성을 확인하고 검증을 재사용한다.
 
 - 2026-09-22: **PR #11 리뷰 완료·머지 승인**.
   사용자가 리뷰 후 머지를 승인했다. 최종 구현 `de8d6d9`를 재검토했고 머지를
@@ -777,10 +798,11 @@ MySQL·MariaDB 공개 표본 평가와 PR #10의 main CI 복구도 완료했다.
    있다. 하드웨어 성능 수치를 CI 통과 기준으로 만들지 않는다.
 
 추가 구현 미완료 항목은 없다. PR #11의 병합·main CI 검증까지 완료했으며,
-현재는 사용자가 승인한 v0.4.3의 공개 배포와 설치 검증을 진행한다.
+사용자가 승인한 v0.4.3의 공개 배포와 설치 검증도 완료했다.
 
 후속 검증에 필요한 Go `--url-env`, Oracle 무인덱스 문서 계약 수정, SQL Server
-trigger 전이 관계 수정은 v0.4.3 배포 대상이다. 기존 0.4.2를 재게시하지 않는다.
+trigger 전이 관계 수정은 v0.4.3으로 공개됐다. 승인된 배포에 미완료 항목은 없으며,
+기존 릴리스의 태그와 산출물은 불변으로 유지한다.
 
 ## 의도적으로 남긴 경계
 
