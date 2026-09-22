@@ -217,36 +217,102 @@ Only the requested report persists after successful or failed checks.
 
 ## Reproduce
 
-### Prepared SQL Server and Oracle cohort
+### SQL Server and Oracle cohort
 
-The source tree now includes 18 independently authored cases per database in
+The source tree includes 18 independently authored cases per database in
 [SQL Server cases](Fixtures/accuracy/chinook-sqlserver-cases.json) and
 [Oracle cases](Fixtures/accuracy/chinook-oracle-cases.json): 12 views, four
-routines, and two triggers. Their initial expected facts were committed at
-`8e53c4f` before any analyzer run on these cases. This cohort has **not yet been
-validated on actual SQL Server/Oracle**, and no accuracy percentage is claimed.
-The native upstream DDL, license/checksum entries, and pinned database image
-manifest still need to be added before the new workflow can run.
+routines, and two triggers. Their expected facts were committed at `8e53c4f`
+before any analyzer run and remain unchanged. Native Chinook v1.4.5 DDL,
+licenses and SHA-256 values are recorded in [sources.json](Fixtures/accuracy/sources.json).
+The transformation retains 11 table definitions, indexes and constraints;
+it excludes upstream data and administrative database/user operations.
+[Database images](Fixtures/accuracy/sqlserver-oracle-environments.json) are
+pinned by digest.
 
-The prepared evaluator first checks view binding, stored-object compilation,
-and the actual insert/update/copy/count effects of synthetic Genre rows. It
-then scores the DB definitions and authored original SQL separately, using both
-Go and JDBC collectors. Views have complete reviewed relation/column read and
-value-source sets; routines/triggers score direct object reads, writes, calls,
-and firing owners. Routine column lineage and data-dependent dynamic SQL are
-outside this cohort's scored scope. `--cases` is a variant of this fixed runtime
-cohort, not a generic replacement schema; its six Genre modules and expected
-runtime effects must remain present. Overrides are identified separately in
-report provenance.
+Actual SQL Server 2022 (16.0.4295.3, Linux x86_64) and Oracle AI Database 26ai
+Free (23.26.3, Linux ARM64) accepted all 18 definitions and passed the synthetic
+Genre insert/update/copy/count execution assertions. The evaluator checks SQL
+validity and these effects before calling an analyzer. It separately scores DB
+stored definitions and authored original SQL through both Go and JDBC probes.
+Views score complete relation/column reads and value-source sets; routines and
+triggers score direct object reads, writes, calls and firing owners. Routine
+column lineage and data-dependent dynamic SQL are outside this scored scope.
 
-The new runner is `Scripts/verify-sqlserver-oracle-accuracy.py`. Its helper and
-evaluator tests run locally without these servers. Its real-DB workflow is
-prepared at `.github/workflows/sqlserver-oracle-accuracy.yml`; SQL Server needs
-an actual Linux x86_64 server, not an Azure SQL Edge substitution. The runner
-uses the source Go probe's unreleased `--url-env` option and the JDBC probe's
+The first SQL Server evaluation matched all 63 view reads, 34 value-lineage
+facts and the routine/trigger dependency facts. Two triggers were incorrectly
+marked partial because their `inserted`/`deleted` transition relations were
+looked up as physical tables. The parser correction is limited to unqualified
+transition relations in SQL Server triggers; ordinary routines, other dialects,
+and schema-qualified physical references retain their diagnostics. Replaying
+the preserved Go/JDBC inputs with the correction passes all 18 cases. The
+[first CI evaluation](https://github.com/ictechgy/schemagraph/actions/runs/35679825802)
+is retained separately from the corrected run.
+
+Oracle initially failed verifier authentication with a 40-character temporary
+password; the fixed image/JDBC 19.3 combination accepts the revised 28-character
+credential containing 96 random bits. This is a harness failure, not an accuracy
+score. After SQL validation passed, its first Go catalog was rejected because
+three tables without indexes emitted `indexes: null`. The original failed input
+is preserved separately. Correcting the Go producer to emit an empty array
+allows the original engine (`c28928ce3ade`, source `8e53c4f`) to pass all 18 Oracle
+cases without an Oracle parser change. The local report SHA-256 starts
+`0334de53e54d`; it records the immutable engine, updated Go probe (`f70b2f08d5a42`),
+JDBC jar, external driver and Java versions.
+
+| Scored fact set, per producer and SQL form | SQL Server after trigger fix | Oracle after collector fix |
+| --- | ---: | ---: |
+| View relation/column reads | 63/63 | 63/63 |
+| View value-lineage facts | 34/34 | 34/34 |
+| Routine object reads / writes / calls | 2/2 · 3/3 · 1/1 | 2/2 · 3/3 · 1/1 |
+| Trigger writes / firing owners | 2/2 · 2/2 | 2/2 · 2/2 |
+| Extra facts / missing facts / false-complete cases / ghost vertices | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+
+The [corrected real-DB CI](https://github.com/ictechgy/schemagraph/actions/runs/35681162125)
+passed both databases on Linux x86_64 at source `da16411`, with the facts above
+unchanged across Go/JDBC and native/original SQL. Report SHA-256 prefixes are
+`6822679d8f39` (SQL Server) and `4488a6bb31af` (Oracle). Oracle also passed the
+separate local ARM64 run.
+Each DB checks Go and JDBC catalog v1/v2 in JSON and NDJSON (eight transport
+checks), plus native and authored-SQL graph scoring. Original-SQL replay checks
+the complete graph, including analysis/provenance/metadata; native producer
+comparison requires identical vertices/edges and reports other field differences.
+Neither database had other native differences in the corrected CI run. These are small,
+reviewed cases from one public schema, not a product-wide accuracy estimate or
+a comparison ranking against another tool.
+
+SQL Server view reads are also compared to the relation/column references from
+[sys.dm_sql_referenced_entities](https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-objects/sys-dm-sql-referenced-entities-transact-sql?view=sql-server-ver16).
+Oracle uses [USER_DEPENDENCIES](https://docs.oracle.com/en/database/oracle/oracle-database/26/refrn/USER_DEPENDENCIES.html)
+for relation-level reference checks; it is not a column-lineage oracle.
+`--cases` is a variant of this fixed runtime cohort, not a generic replacement
+schema: its six Genre modules and runtime effects must remain present. Overrides
+are identified separately in report provenance.
+
+Run `Scripts/verify-sqlserver-oracle-accuracy.py` or the
+[real-DB workflow](.github/workflows/sqlserver-oracle-accuracy.yml). SQL Server
+requires [an actual Linux x86_64 server](https://learn.microsoft.com/en-us/sql/linux/containers/deploy?view=sql-server-ver16).
+The runner uses the source Go probe's unreleased `--url-env` option and JDBC's
 existing `SG_DB_PASSWORD` input so temporary passwords do not enter argv.
-Optional artifacts contain guarded catalog/graph files only. Missing image or
-source files are an unmet prerequisite, not an empty successful evaluation.
+Optional artifacts preserve guarded public-corpus catalogs/graphs. The runner
+owns and cleans its labeled containers, and rejects missing prerequisites.
+A real Oracle negative case with an unknown column failed before analysis
+(ORA-00904), emitted no graph artifacts and removed its owned container. The
+original invalid input is kept separately from the unchanged scored corpus.
+
+```sh
+python3 Scripts/verify-sqlserver-oracle-accuracy.py \
+  --database all --engine engine/target/debug/schemagraph \
+  --go-probe /path/to/source-built/schemagraph-probe-go \
+  --jdbc-jar probe/build/libs/schemagraph-probe-all.jar \
+  --oracle-jar /path/to/ojdbc8-19.3.0.0.jar --strict \
+  --artifacts /path/to/new-artifacts --output /path/to/accuracy.json
+```
+
+Use `--database oracle` on ARM64 Docker, or `--validate-only` to check SQL and
+runtime effects without scoring an analyzer. Reports include the actual server
+version and image identity; the same requested image tag is not assumed to mean
+the same engine build.
 
 ### Existing evaluated cohorts
 
