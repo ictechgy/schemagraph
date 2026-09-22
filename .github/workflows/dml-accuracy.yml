@@ -1,0 +1,138 @@
+name: DML producer accuracy
+
+on:
+  push:
+    paths:
+      - ".github/workflows/dml-accuracy.yml"
+      - "Fixtures/accuracy/dml-cases.json"
+      - "Scripts/AccuracySql.java"
+      - "Scripts/verify-dml-accuracy.py"
+      - "Scripts/verify-dml-producers.py"
+      - "Scripts/verify-dml-replay.py"
+      - "Scripts/test-dml-accuracy.py"
+      - "Scripts/test-dml-producers.py"
+      - "Scripts/verify-sqlserver-oracle-accuracy.py"
+      - "Fixtures/accuracy/sqlserver-oracle-environments.json"
+      - "engine/**"
+      - "probe/**"
+      - "probe-go/**"
+  pull_request:
+    paths:
+      - ".github/workflows/dml-accuracy.yml"
+      - "Fixtures/accuracy/dml-cases.json"
+      - "Scripts/AccuracySql.java"
+      - "Scripts/verify-dml-accuracy.py"
+      - "Scripts/verify-dml-producers.py"
+      - "Scripts/verify-dml-replay.py"
+      - "Scripts/test-dml-accuracy.py"
+      - "Scripts/test-dml-producers.py"
+      - "Scripts/verify-sqlserver-oracle-accuracy.py"
+      - "Fixtures/accuracy/sqlserver-oracle-environments.json"
+      - "engine/**"
+      - "probe/**"
+      - "probe-go/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dml-accuracy-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native-producers:
+    name: DML accuracy (${{ matrix.database }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        database: [sqlite, postgres, sqlserver, oracle]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install native tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libsqlite3-dev postgresql-16
+
+      - name: Download published v0.4.3 engine and Go producer
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/ictechgy/schemagraph/releases/download/v0.4.3/schemagraph-0.4.3-x86_64-unknown-linux-gnu.tar.gz \
+            --output "$RUNNER_TEMP/schemagraph-v0.4.3.tar.gz"
+          echo "66839964abf8fca382c463770c98b093f9bdd8a94550da0704d3492d12e54433  $RUNNER_TEMP/schemagraph-v0.4.3.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/published-engine"
+          tar -xzf "$RUNNER_TEMP/schemagraph-v0.4.3.tar.gz" -C "$RUNNER_TEMP/published-engine"
+          "$RUNNER_TEMP/published-engine/schemagraph-0.4.3/schemagraph" --version
+
+      - name: Set up Java 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download published v0.4.3 JDBC producer
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/ictechgy/schemagraph/releases/download/v0.4.3/schemagraph-probe-0.4.3-all.jar \
+            --output "$RUNNER_TEMP/schemagraph-probe-v0.4.3-all.jar"
+          echo "09e27a763b09e3da4c0a668158be818cc8e6ec8a7c66c64522926f30e1f8de29  $RUNNER_TEMP/schemagraph-probe-v0.4.3-all.jar" | sha256sum --check
+
+      - name: Download pinned Oracle JDBC driver
+        if: matrix.database == 'oracle'
+        run: |
+          curl --fail --location --retry 3 \
+            https://repo.maven.apache.org/maven2/com/oracle/ojdbc/ojdbc8/19.3.0.0/ojdbc8-19.3.0.0.jar \
+            --output "$RUNNER_TEMP/ojdbc8.jar"
+          echo "a66d27a14f3adee484427cc4de008af85a5c3e78e2e3285a4dba1277332978a5  $RUNNER_TEMP/ojdbc8.jar" | sha256sum --check
+
+      - name: Verify producer and DML failure paths
+        run: |
+          python3 Scripts/test-dml-accuracy.py
+          python3 Scripts/test-dml-producers.py
+
+      - name: Build immutable native producer baseline
+        env:
+          DATABASE: ${{ matrix.database }}
+        run: |
+          args=(--database "$DATABASE"
+                --engine "$RUNNER_TEMP/published-engine/schemagraph-0.4.3/schemagraph"
+                --go-probe "$RUNNER_TEMP/published-engine/schemagraph-0.4.3/schemagraph-probe-go"
+                --probe-jar "$RUNNER_TEMP/schemagraph-probe-v0.4.3-all.jar"
+                --java "$JAVA_HOME/bin/java"
+                --postgres-bin /usr/lib/postgresql/16/bin
+                --output "$RUNNER_TEMP/dml-first-baseline")
+          if [ "$DATABASE" = oracle ]; then
+            args+=(--oracle-jar "$RUNNER_TEMP/ojdbc8.jar")
+          fi
+          python3 Scripts/verify-dml-producers.py "${args[@]}"
+
+      - name: Build the current engine
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          cargo +1.96.0 build --manifest-path engine/Cargo.toml --locked -p schemagraph-cli
+
+      - name: Score the current engine and compare complete cold/warm graphs
+        run: |
+          python3 Scripts/verify-dml-replay.py --engine engine/target/debug/schemagraph \
+            --baseline "$RUNNER_TEMP/dml-first-baseline" --output "$RUNNER_TEMP/dml-current"
+
+      - name: Preserve immutable baseline evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dml-accuracy-${{ matrix.database }}
+          path: |
+            ${{ runner.temp }}/dml-first-baseline/
+            ${{ runner.temp }}/dml-current/
+          if-no-files-found: error
+          retention-days: 30
