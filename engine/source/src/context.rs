@@ -90,7 +90,10 @@ pub fn comparison_notes(before: &CatalogDocument, after: &CatalogDocument) -> Ve
             } else if a.source_id != b.source_id {
                 notes.push("snapshot logical source identities differ".into());
             }
-            if a.database != b.database {
+            if a.database != b.database
+                || a.database.as_deref().is_none_or(str::is_empty)
+                || b.database.as_deref().is_none_or(str::is_empty)
+            {
                 notes.push("snapshot database identities differ or one is unavailable".into());
             }
             if a.schema_filter != b.schema_filter {

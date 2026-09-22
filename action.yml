@@ -1,0 +1,54 @@
+name: Schemagraph schema review
+description: Review fixed catalog snapshots with policy, Markdown and SARIF reports.
+inputs:
+  before:
+    description: Before catalog document, inside the checked-out workspace.
+    required: true
+  after:
+    description: After catalog document, inside the checked-out workspace.
+    required: true
+  policy:
+    description: Optional review policy TOML, inside the workspace.
+  baseline:
+    description: Optional reviewed finding baseline JSON, inside the workspace.
+  as-of:
+    description: Explicit YYYY-MM-DD evaluation date for expiring waivers.
+  engine-path:
+    description: Existing compatible CLI executable; otherwise build the pinned action source with Rust 1.96.0.
+  require-complete:
+    description: Fail on incomplete analysis or truncated results.
+    default: 'true'
+  timeout-seconds:
+    description: Maximum duration of each review rendering.
+    default: '180'
+  output-directory:
+    description: Optional new directory inside the workspace or runner temp directory.
+outputs:
+  json:
+    description: JSON report path.
+    value: ${{ steps.review.outputs.json }}
+  markdown:
+    description: Markdown report path.
+    value: ${{ steps.review.outputs.markdown }}
+  sarif:
+    description: SARIF report path.
+    value: ${{ steps.review.outputs.sarif }}
+  exit-code:
+    description: '0: no policy failure; 1: findings; 2: invalid or incomplete evaluation; 130: cancelled.'
+    value: ${{ steps.review.outputs.exit_code }}
+runs:
+  using: composite
+  steps:
+    - id: review
+      shell: bash
+      env:
+        SG_REVIEW_BEFORE: ${{ inputs.before }}
+        SG_REVIEW_AFTER: ${{ inputs.after }}
+        SG_REVIEW_POLICY: ${{ inputs.policy }}
+        SG_REVIEW_BASELINE: ${{ inputs.baseline }}
+        SG_REVIEW_AS_OF: ${{ inputs.as-of }}
+        SG_REVIEW_ENGINE: ${{ inputs.engine-path }}
+        SG_REVIEW_COMPLETE: ${{ inputs.require-complete }}
+        SG_REVIEW_TIMEOUT: ${{ inputs.timeout-seconds }}
+        SG_REVIEW_OUTPUT: ${{ inputs.output-directory }}
+      run: python3 "$GITHUB_ACTION_PATH/Scripts/run-review-action.py"

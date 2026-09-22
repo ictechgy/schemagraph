@@ -397,7 +397,14 @@ fn object_change(
         &old.indexes,
         &new.indexes,
         |i| &i.name,
-        |a, b| a.name == b.name && a.unique == b.unique && a.columns == b.columns,
+        |a, b| {
+            a.name == b.name
+                && a.unique == b.unique
+                && a.columns == b.columns
+                && a.definition_complete == b.definition_complete
+                && a.predicate == b.predicate
+                && a.has_predicate == b.has_predicate
+        },
     );
     let triggers = collect(&old.triggers, &new.triggers, |t| &t.name, |a, b| a == b);
     let body_changed = old.body != new.body;

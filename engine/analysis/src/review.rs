@@ -18,7 +18,7 @@ impl Change {
     pub fn requires_review(&self) -> bool {
         !matches!(
             self.kind.as_str(),
-            "object-added" | "column-added" | "index-added"
+            "schema-added" | "object-added" | "column-added" | "index-added"
         )
     }
 }

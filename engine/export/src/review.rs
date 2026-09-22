@@ -3,6 +3,11 @@
 use schemagraph_analysis::review::ReviewReport;
 use serde_json::{json, Value};
 
+pub use crate::sarif::{
+    to_value as to_sarif, to_value_with_policy as to_sarif_with_policy, FindingAnnotation,
+    Suppression,
+};
+
 /// 분석 불완전과 검토가 필요한 변경을 별도 필드로 표현한다.
 pub fn to_value(report: &ReviewReport) -> Value {
     json!({"kind":"review","comparison":if report.comparison_notes.is_empty(){"matched"}else{"unverified"},"comparisonNotes":report.comparison_notes,"analysisPartial":report.analysis_partial,"totalChanges":report.total_changes,"reviewRequiredCount":report.review_required,"truncated":report.truncated,"visited":report.visited,"examinedEdges":report.examined_edges,"truncationReasons":report.truncation_reasons,"complete":report.complete,"limitations":report.limitations,"changes":report.findings.iter().map(|finding| {
@@ -11,6 +16,40 @@ pub fn to_value(report: &ReviewReport) -> Value {
         if let Some(after)=&finding.change.after {value["after"]=json!(after);}
         value
     }).collect::<Vec<_>>()})
+}
+
+/// 정책·기준선 평가를 기존 review JSON에 선택적으로 붙인다.
+///
+/// 기본 `to_value`의 바이트 계약을 보존하기 위해 정책을 사용한 호출자만 이
+/// 함수를 선택한다. `policy` 값은 CLI가 검증·생성한 JSON이어야 한다.
+pub fn to_value_with_policy(report: &ReviewReport, policy: Value) -> Value {
+    let mut value = to_value(report);
+    value["policy"] = policy;
+    value
+}
+
+/// Markdown에 정책 gate의 전체 건수와 실패 여부를 덧붙인다.
+pub fn to_markdown_with_policy(report: &ReviewReport, policy: &Value) -> String {
+    let mut output = to_markdown(report);
+    let failed = policy
+        .get("failed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let total = policy
+        .get("totalChanges")
+        .and_then(Value::as_u64)
+        .unwrap_or(report.total_changes as u64);
+    let suppressed = policy
+        .get("suppressedFindings")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    output.push_str(&format!(
+        "\nPolicy gate: {}; {} evaluated changes; {} suppressed.\n",
+        if failed { "failed" } else { "passed" },
+        total,
+        suppressed
+    ));
+    output
 }
 
 fn escape(text: &str) -> String {

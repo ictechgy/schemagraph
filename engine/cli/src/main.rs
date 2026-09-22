@@ -203,6 +203,18 @@ enum Command {
         strict: bool,
         #[arg(long)]
         require_complete: bool,
+        /// Apply a versioned review policy without changing graph facts.
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Mark previously reviewed finding fingerprints as existing.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Evaluate expiring waivers at this explicit YYYY-MM-DD date.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Write a baseline only for a complete, comparable review.
+        #[arg(long)]
+        write_baseline: Option<PathBuf>,
         #[arg(long, default_value_t = 256)]
         max_changes: usize,
         #[arg(long, default_value_t = 1024)]
@@ -267,6 +279,7 @@ enum GraphFormat {
 enum ReviewFormat {
     Json,
     Markdown,
+    Sarif,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -398,24 +411,36 @@ async fn run(cli: Cli) -> Result<i32> {
             after,
             strict,
             require_complete,
+            policy,
+            baseline,
+            as_of,
+            write_baseline,
             max_changes,
             max_impacted,
             max_visited,
             max_examined_edges,
             format,
-        } => review::run(
-            &before,
-            &after,
+        } => review::run_with_options(review::ReviewOptions {
+            before: &before,
+            after: &after,
             strict,
             require_complete,
             max_changes,
             max_impacted,
-            analysis::budget::Budget {
+            budget: analysis::budget::Budget {
                 max_visited,
                 max_examined_edges,
             },
-            matches!(format, ReviewFormat::Markdown),
-        ),
+            format: match format {
+                ReviewFormat::Json => review::ReviewOutputFormat::Json,
+                ReviewFormat::Markdown => review::ReviewOutputFormat::Markdown,
+                ReviewFormat::Sarif => review::ReviewOutputFormat::Sarif,
+            },
+            policy: policy.as_deref(),
+            baseline: baseline.as_deref(),
+            as_of: as_of.as_deref(),
+            write_baseline: write_baseline.as_deref(),
+        }),
         Command::Serve { graph } => {
             let graph = load_graph(&graph)?;
             mcp::serve(&graph, BufReader::new(std::io::stdin()), std::io::stdout())?;
