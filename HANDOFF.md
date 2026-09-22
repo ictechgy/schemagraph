@@ -4,13 +4,19 @@
 
 ## 지금 상태
 
-- 2026-09-22: **경쟁 보강 구현 완료·최종 CI 대기** (`feature/competitive-hardening`).
+- 2026-09-22: **경쟁 보강 구현·검증 근거** (`feature/competitive-hardening`).
   사용자의 “쭉 수정” 승인으로 여섯 보강 과제를 구현했다. 기준은 `c19c958`이다.
   공개 v0.4.3 태그·배포물은 그대로이며 새 릴리스는 요청되지 않았다.
+  [PR #14](https://github.com/ictechgy/schemagraph/pull/14)의
+  [현재 checks](https://github.com/ictechgy/schemagraph/pull/14/checks)가 최종 CI 상태의
+  정본이다. 아래 수치는 실행이 끝난 근거이며 진행 중인 job을 성공으로 세지 않는다.
   - `776ebe8`에서 DML 16개 기대값을 분석 전에 고정했다(SHA `fd129759…`).
     공개 0.4.3의 첫 실패는 별도 보존했다. 실제 SQLite 15개(MERGE 1개 명시 제외),
     PostgreSQL 16개, Oracle Go/JDBC 각 16개를 새 엔진으로 통과했다.
-    SQL Server 새 16개 실DB 실행은 x86_64 CI에서 확인할 예정이다.
+    SQL Server도 x86_64 CI에서 16개 SQL 실행과 두 생산자의 실제 입력을 확보했다.
+    독립 query의 SELECT INTO가 읽기 경로로 들어가던 2개 사례는 `6b064c6`에서
+    고쳤으며 보존된 Go/JDBC 입력 각각 16개가 통과했다. 첫 실패는
+    `ci-first-sqlserver`에, 수정 후 결과는 `sqlserver-query-route-fixed`에 있다.
   - `71ab08d`·`029e823`: 정적 DML 컬럼 계보, 임시 심벌, cache owner 검증과
     의존 구조별 재사용. `c8083de`는 기존 SQL Server/Oracle 매개변수·변수와
     Oracle/SQLite NEW/OLD 회귀를 해결했다. 기존 SQL Server/Oracle 18개씩도
@@ -37,8 +43,10 @@
     보존된 채 추가된 컬럼 사실과 temporal partial을 검토해 golden에 반영했다.
   - 최종 CI에는 consumer Action 실제 호출, dbt 실행, 제한 권한 PG 세 경로,
     새 DML 4-DB baseline/replay, Docker x86_64, 기존 14 fixture가 들어간다.
-    아직 CI 완료·병합·새 공개 배포를 주장하지 않는다. 작업이 끝나면 원래 중지돼
-    있던 Colima를 중지한다. 소유한 임시 DB 컨테이너는 이미 정리했다.
+    `90461b9`의 CI·기존 실DB 정확도·IBM·release build는 모두 통과했고,
+    마지막 SELECT INTO 수정은 PR checks에서 다시 검증한다. 병합·새 공개 배포는
+    하지 않았다. 로컬 작업 종료 시 원래 중지돼 있던 Colima를 중지한다.
+    소유한 임시 DB 컨테이너는 이미 정리했다.
   - 상세 계획·전/후 실패·실행 로그·고정 바이너리는 저장소 밖
     `~/Library/Application Support/schemagraph/verification/competitive-followups-20260922`
     에 있다. `plan.json`, `final-local-checks.json`, `final-workspace-test.log`,

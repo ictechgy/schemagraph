@@ -176,12 +176,15 @@ python3 Scripts/verify-dml-replay.py --engine /path/to/current/schemagraph \
   --baseline /path/to/dml-first-baseline --output /path/to/new-dml-score
 ```
 
-Local current-source verification has passed SQLite's 15 applicable cases,
+Current-source verification has passed SQLite's 15 applicable cases,
 PostgreSQL's 16 cases, and Oracle Go/JDBC's 16 cases each. Uncached, cold-cache,
 and warm-cache graph bytes match in every run, and every warm body is restored
-without warnings. SQL Server's native 16-case run is checked by the dedicated
-x86_64 CI job. Its result must be read from the tested commit's job, not inferred
-from another dialect's passing score.
+without warnings. The x86_64 SQL Server job executed all 16 cases and preserved
+both producer inputs. Its first current-source score exposed two standalone
+SELECT INTO queries taking the read-only route; commit `6b064c6` corrected that
+route, and both collected inputs then passed 16/16. The dedicated CI job repeats
+the check on the final source. Use the [PR checks](https://github.com/ictechgy/schemagraph/pull/14/checks)
+for the tested commit's final status.
 
 These are targeted static DML fixtures. They do not establish whole-product
 accuracy, every procedural control path, or superiority over another tool.
