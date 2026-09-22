@@ -48,9 +48,10 @@ across startup and requests, not a per-request allocation measurement.
 collection timing. Every collected table, column, type, ordinal, PK and absent
 usage observation is checked against this DDL; the engine must preserve the
 expected vertices/contains edges and emit identical JSON/NDJSON graph bytes.
-The Go binary SHA-256 starts `6daea55f8e0b`; it is a source build containing the
-unreleased `--url-env` option. This benchmark uses the unchanged literal SQLite
-URL path. It does not measure JDBC collection or large routine bodies.
+The Go binary SHA-256 starts `6daea55f8e0b`; this source build includes
+`--url-env`, which was unreleased when measured and shipped in 0.4.3. The
+benchmark uses the unchanged literal SQLite URL path. It does not measure
+JDBC collection or large routine bodies.
 
 | Tables | Catalog format | Median collection ms | Median peak RSS MiB | Maximum peak RSS MiB |
 | --- | --- | ---: | ---: | ---: |
