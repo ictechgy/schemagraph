@@ -183,6 +183,27 @@ class AccuracyTests(unittest.TestCase):
                 with CHECK.database('oracle', settings, Path('java'), 'classpath', Path('/unused')):
                     raise RuntimeError('validation failed')
 
+    def test_oracle_credential_interoperability_and_single_cleanup_owner(self):
+        """고정 Oracle 이미지/JDBC 조합이 거부한 긴 비밀번호와 이중 삭제를 재발시키지 않는다."""
+        sql = SimpleNamespace(execute=lambda *_a, **_k: SimpleNamespace(returncode=0),
+                              rows=lambda *_a: [{'version': 'fixture'}])
+        record = {'id': 'owned-id', 'running': True, 'ports': {'1521/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '1234'}]}, 'image': 'fixture'}
+        settings = {'engines': {'oracle': {'image': 'fixture@sha256:'+'0'*64}}}
+        def command(arguments, **kwargs):
+            self.assertNotIn('--rm', arguments)
+            password = kwargs['env']['APP_USER_PASSWORD']
+            self.assertTrue(CHECK.re.fullmatch(r'Sg9![0-9a-f]{24}', password) is not None,
+                            'Temporary credential must use 28 ASCII characters and 96 random bits')
+            self.assertFalse(password in arguments, 'Temporary credential must not be in argv')
+            return SimpleNamespace(returncode=0)
+        with patch.object(CHECK, 'run', side_effect=command), \
+                patch.object(CHECK, 'Sql', return_value=sql), \
+                patch.object(CHECK, 'inspect_owned', return_value=record), \
+                patch.object(CHECK, 'cleanup_owned', return_value={'removed': True}) as cleanup:
+            with CHECK.database('oracle', settings, Path('java'), 'classpath', Path('/unused')):
+                pass
+            cleanup.assert_called_once()
+
     def test_foreign_container_ownership_is_rejected(self):
         """같은 이름의 다른 컨테이너에는 정리 권한을 부여하지 않는다."""
         result = subprocess.CompletedProcess([], 0, stdout='{"labels":{"'+CHECK.LABEL+'":"someone-else"}}', stderr='')

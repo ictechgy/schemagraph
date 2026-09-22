@@ -144,10 +144,13 @@ def database(kind, settings, java, classpath, work):
         architecture = run(['docker', 'info', '--format', '{{.OSType}}/{{.Architecture}}']).stdout.strip()
         if architecture not in ('linux/x86_64', 'linux/amd64'):
             raise RuntimeError('SQL Server validation requires Linux x86_64 Docker; use the GitHub accuracy workflow')
-    password = 'Sg9!' + secrets.token_hex(18)
+    # 고정 Oracle 이미지/JDBC 19.3 조합에서 40자 인증 실패를 재현했다.
+    # 96비트 난수는 유지하면서 실제 접속으로 검증한 28자 ASCII 범위를 쓴다.
+    password = 'Sg9!' + secrets.token_hex(12)
     port = 1433 if kind == 'sqlserver' else 1521
     env = dict(os.environ)
-    command = ['docker', 'run', '--detach', '--rm', '--name', name, '--label', LABEL+'='+owner,
+    # 삭제 책임은 finally의 소유 ID 정리에 모아 Docker --rm과 경쟁하지 않는다.
+    command = ['docker', 'run', '--detach', '--name', name, '--label', LABEL+'='+owner,
                '--memory', entry.get('memory', '3g'), '--cpus', '2', '--publish', f'127.0.0.1::{port}']
     if kind == 'sqlserver':
         env['MSSQL_SA_PASSWORD'] = password
@@ -175,17 +178,24 @@ def database(kind, settings, java, classpath, work):
             user = 'SGACC'
         sql = Sql(java, classpath, url, user, password, work)
         until = time.monotonic() + 240
+        last_startup_error = ''
         while True:
             record = inspect_owned(name, owner)
             if record is None or not record['running']:
                 raise RuntimeError(f'Temporary {kind} stopped during startup; check Docker memory and disk availability')
             if time.monotonic() >= until:
-                raise RuntimeError(f'Temporary {kind} did not accept SQL within 240 seconds')
+                raise RuntimeError(f'Temporary {kind} did not accept SQL within 240 seconds: {last_startup_error}')
             try:
                 ready = sql.execute(['SELECT 1 AS ready' + (' FROM dual' if kind == 'oracle' else '')],
                                     query=True, timeout=min(10, max(1, until-time.monotonic())), check=False)
                 if not ready.returncode:
                     break
+                detail = ready.stderr.strip()[-1200:]
+                for value in (password, quote(password, safe=''), url):
+                    detail = detail.replace(value, '<redacted>')
+                if detail != last_startup_error:
+                    print(f'{kind}: JDBC startup pending: {detail}', file=sys.stderr, flush=True)
+                last_startup_error = detail
             except RuntimeError:
                 # JDBC 연결 자체의 지연도 전체 기동 기한 안에서만 재시도한다.
                 if time.monotonic() >= until:
@@ -331,11 +341,13 @@ def validate_sql(sql, definition):
     """뷰 바인딩과 저장 객체 컴파일을 실제 DB에서 검사한 뒤에만 분석을 허용한다."""
     kind, schema = definition['dialect'], definition['schema']
     schema_path = CORPUS / f'chinook-{kind}/schema.sql'
+    print(f'{kind}: applying pinned schema', flush=True)
     sql.execute([schema_path.read_text(encoding='utf-8')])
     sql.execute(audit_tables(kind))
     # 함수가 procedure의 정적 호출 대상이므로 실제 생성 순서를 먼저 고정한다.
     order = {'function': 0, 'procedure': 1, 'trigger': 2, 'view': 3}
     for case in sorted(definition['cases'], key=lambda case: order[case['kind']]):
+        print(f'{kind}: validating {case["kind"]} acc_{case["name"]}', flush=True)
         statement = case['sql']
         if case['kind'] == 'view':
             statement = 'CREATE VIEW ' + schema + '.' + folded('acc_'+case['name'], definition) + ' AS ' + statement
