@@ -4,6 +4,20 @@
 
 ## 지금 상태
 
+- 2026-09-22: **PR #11 리뷰 완료·머지 승인**.
+  사용자가 리뷰 후 머지를 승인했다. 최종 구현 `de8d6d9`를 재검토했고 머지를
+  막을 결함은 없었다. SQL Server trigger 전이 관계의 적용 범위, Oracle 빈 배열
+  계약, 접속 정보 비노출, 평가 실패·정리 경로와 성능 측정 한계를 확인했다.
+  [전체 CI](https://github.com/ictechgy/schemagraph/actions/runs/35682028944),
+  [SQL Server/Oracle 정확도](https://github.com/ictechgy/schemagraph/actions/runs/35682028952),
+  [IBM 회귀](https://github.com/ictechgy/schemagraph/actions/runs/35682028957),
+  [릴리스 빌드·패키징](https://github.com/ictechgy/schemagraph/actions/runs/35682028991)은
+  같은 커밋에서 모두 통과했다. Rust 259개·fixture 패리티 14개·건너뜀 0이다.
+  중복 push 실행 `35682007251`은 PR 실행으로 대체되며 취소됐다.
+  이 완료 기록은 문서만 바꾸므로 검증한 실행 소스와 동일하다. 최종 병합 상태와
+  병합 커밋은 [PR #11](https://github.com/ictechgy/schemagraph/pull/11)을 기준으로
+  확인한다. 공개 릴리스는 이번 요청에 포함되지 않는다.
+
 - 2026-09-22: **문서 정리·SQL Server/Oracle 정확도·규모 검증 완료**
   (`feature/sqlserver-oracle-scale-validation`).
   사용자가 문서 정리와 선택 과제 두 건을 승인했다. 기존 Chinook 공개 표본의
@@ -748,8 +762,8 @@ MySQL·MariaDB 공개 표본 평가와 PR #10의 main CI 복구도 완료했다.
    있다. 하드웨어 성능 수치를 CI 통과 기준으로 만들지 않는다.
 
 추가 구현 미완료 항목은 없다. 현재 feature 브랜치의 검증 소스는 `da16411`이며,
-후속 완료 기록은 문서 변경이다. 변경은 PR에서 검토 가능하게 제출한다. 새 PR의
-병합·공개 릴리스는 별도 요청을 따르며, 이전 PR #10 병합과 구분한다.
+후속 완료 기록은 문서 변경이다. PR #11의 리뷰와 머지는 사용자가 승인했으며,
+최종 상태는 위 PR 링크를 따른다. 공개 릴리스는 별도 요청을 따른다.
 
 후속 검증에 필요한 Go `--url-env`, Oracle 무인덱스 문서 계약 수정, SQL Server
 trigger 전이 관계 수정은 모두 미배포 소스 변경이다. 공개 배포는 요청받지 않았으며 기존 0.4.2를 재게시하지 않는다.
