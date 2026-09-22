@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Validate the authored DML corpus before any graph analyzer is evaluated.
+"""그래프 분석기를 실행하기 전에 작성한 DML 코퍼스를 검증한다.
 
-The first phase executes only the SQL engine under test (SQLite for the local
-corpus).  The second phase can score a previously produced catalog/graph.  The
-two phases deliberately have different entry points so an expected fact cannot
-be learned from analyzer output.
+첫 단계는 시험할 SQL 엔진만 실행한다. 두 번째 단계는 이미 만들어진
+catalog/graph를 채점한다. 두 단계의 입력을 분리해 분석기 출력으로 기대값을
+만드는 순환을 막는다.
 """
 
 from __future__ import annotations
@@ -34,18 +33,15 @@ RELATION_KINDS = {
     "partitioned-table",
     "partitioned_table",
 }
-COLUMN_KINDS = {"column", "field"}
-ROUTINE_KINDS = {"procedure", "function", "routine", "method"}
-SUBJECT_KINDS = {"query", "function", "procedure"}
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 
 
 class CorpusError(RuntimeError):
-    """Raised when the authored corpus is structurally unsafe to evaluate."""
+    """작성한 코퍼스의 구조가 검증 범위에 안전하지 않을 때 발생한다."""
 
 
 def load_corpus(path: Path = CORPUS) -> dict[str, Any]:
-    """Load and validate facts before a database or analyzer is touched."""
+    """DB나 분석기를 건드리기 전에 기대 사실을 읽고 검증한다."""
 
     try:
         corpus = json.loads(path.read_text(encoding="utf-8"))
@@ -56,7 +52,7 @@ def load_corpus(path: Path = CORPUS) -> dict[str, Any]:
 
 
 def validate_corpus(corpus: dict[str, Any]) -> None:
-    """Reject duplicate, unmappable, or ambiguous authored references."""
+    """중복·미매핑·모호한 작성 참조를 거부한다."""
 
     if corpus.get("version") != 1:
         raise CorpusError("unsupported DML corpus version")
@@ -123,7 +119,7 @@ def validate_case(
     case_names: set[str],
     dialects: Iterable[str],
 ) -> None:
-    """Validate one case without interpreting SQL text as expected facts."""
+    """SQL 의미를 추측하지 않고 한 사례의 구조만 검증한다."""
 
     name = case.get("name")
     if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in case_names:
@@ -199,7 +195,7 @@ def validate_case(
 
 
 def validate_reference(corpus: dict[str, Any], reference: Any, case_name: str, *, allow_column: bool) -> None:
-    """Validate the logical relation.column notation used by authored facts."""
+    """작성한 relation.column 논리 표기가 실제 catalog 기호인지 확인한다."""
 
     if not isinstance(reference, str):
         raise CorpusError(f"{case_name}: fact reference must be a string")
@@ -216,7 +212,7 @@ def validate_reference(corpus: dict[str, Any], reference: Any, case_name: str, *
 
 
 def relation_id(corpus: dict[str, Any], dialect: str, logical: str) -> str:
-    """Resolve a logical relation to the exact catalog ID reserved by the corpus."""
+    """논리 relation을 코퍼스가 예약한 정확한 catalog ID로 바꾼다."""
 
     if corpus["relations"].get(logical, {}).get("temporary"):
         raise CorpusError(f"temporary relation {logical} has no persistent graph ID")
@@ -227,19 +223,19 @@ def relation_id(corpus: dict[str, Any], dialect: str, logical: str) -> str:
 
 
 def query_name(relative: str) -> str:
-    """Match engine/source sql_files.rs byte-hex naming exactly."""
+    """engine/source sql_files.rs의 byte-hex 이름 규칙과 맞춘다."""
 
     return "query_" + "".join(f"{byte:02x}" for byte in relative.encode("utf-8"))
 
 
 def body_hash(body: str) -> str:
-    """Match parser scope::body_hash, including its sha256 prefix."""
+    """parser scope::body_hash와 같은 sha256 접두사 hash를 만든다."""
 
     return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def eligible_cases(corpus: dict[str, Any], dialect: str) -> list[dict[str, Any]]:
-    """Apply the case dialect filter before runtime, catalog, or graph scoring."""
+    """runtime·catalog·graph 채점 전에 방언 필터를 적용한다."""
 
     return [
         case for case in corpus["cases"]
@@ -248,7 +244,7 @@ def eligible_cases(corpus: dict[str, Any], dialect: str) -> list[dict[str, Any]]
 
 
 def subject_spec(corpus: dict[str, Any], dialect: str, case: dict[str, Any]) -> dict[str, Any]:
-    """Describe the actual document subject for one case and dialect."""
+    """한 사례와 방언에서 document가 실제로 가질 subject를 기술한다."""
 
     contract = corpus["subject_contract"]
     standalone = case.get("wrapper_mode") in set(contract["standalone_wrapper_modes"])
@@ -277,13 +273,13 @@ def subject_spec(corpus: dict[str, Any], dialect: str, case: dict[str, Any]) -> 
 
 
 def subject_id(spec: dict[str, Any]) -> str:
-    """Build the exact graph ID from a subject spec."""
+    """subject 명세에서 정확한 graph ID를 만든다."""
 
     return f"{spec['schema']}.{spec['name']}"
 
 
 def column_id(corpus: dict[str, Any], dialect: str, reference: str) -> str:
-    """Resolve a logical relation.column reference without guessing names."""
+    """이름을 추측하지 않고 논리 relation.column을 ID로 바꾼다."""
 
     relation, column = reference.split(".", 1)
     if dialect == "oracle":
@@ -292,7 +288,7 @@ def column_id(corpus: dict[str, Any], dialect: str, reference: str) -> str:
 
 
 def expected_facts(corpus: dict[str, Any], case: dict[str, Any], dialect: str) -> dict[str, Any]:
-    """Materialize facts as catalog IDs for one dialect."""
+    """한 방언의 catalog ID 집합으로 기대 사실을 구체화한다."""
 
     def refs(values: list[str], columns: bool) -> set[str]:
         return {column_id(corpus, dialect, value) if columns else relation_id(corpus, dialect, value) for value in values}
@@ -315,13 +311,13 @@ def expected_facts(corpus: dict[str, Any], case: dict[str, Any], dialect: str) -
 
 
 def case_sql(case: dict[str, Any], dialect: str) -> str:
-    """Return authored SQL for a dialect, preserving the shared body fallback."""
+    """공통 body를 기본으로 방언별 작성 SQL을 반환한다."""
 
     return case.get("sql_overrides", {}).get(dialect, case["body"])
 
 
 def _json_value(value: Any) -> Any:
-    """Convert a SQLite value to the JSON scalar types used by the oracle."""
+    """SQLite 값을 runtime oracle의 JSON scalar로 바꾼다."""
 
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -329,7 +325,7 @@ def _json_value(value: Any) -> Any:
 
 
 def validate_sqlite(corpus: dict[str, Any], selected: set[str] | None = None) -> dict[str, Any]:
-    """Run every SQLite-supported case on a fresh in-memory database."""
+    """SQLite가 지원하는 각 사례를 새 메모리 DB에서 실행한다."""
 
     report: dict[str, Any] = {
         "dialect": "sqlite",
@@ -375,7 +371,7 @@ def validate_sqlite(corpus: dict[str, Any], selected: set[str] | None = None) ->
 
 
 def _runtime_oracle(case: dict[str, Any], dialect: str) -> dict[str, Any]:
-    """Use a native runtime oracle when present, otherwise the shared row oracle."""
+    """native runtime oracle가 있으면 쓰고 없으면 공통 row oracle로 보완한다."""
 
     native = case.get("runtime", {}).get(dialect)
     if isinstance(native, dict):
@@ -387,7 +383,7 @@ def _runtime_oracle(case: dict[str, Any], dialect: str) -> dict[str, Any]:
 
 
 def _pg_run(command: list[str], *, env: dict[str, str], timeout: float = 120) -> subprocess.CompletedProcess[str]:
-    """Run a PostgreSQL utility without inheriting caller connection settings."""
+    """호출자의 PostgreSQL 설정을 물려받지 않고 유틸리티를 실행한다."""
 
     return subprocess.run(command, capture_output=True, text=True, env=env, timeout=timeout)
 
@@ -397,7 +393,7 @@ def validate_postgres(
     selected: set[str] | None = None,
     bindir: Path = Path("/opt/homebrew/opt/postgresql@16/bin"),
 ) -> dict[str, Any]:
-    """Validate all PostgreSQL-supported cases in an owned temporary cluster."""
+    """소유한 임시 cluster에서 PostgreSQL 지원 사례를 모두 검증한다."""
 
     report: dict[str, Any] = {
         "dialect": "postgres",
@@ -422,6 +418,10 @@ def validate_postgres(
         data = work / "data"
         socket_dir = Path("/tmp")
         env = {key: value for key, value in os.environ.items() if not key.startswith("PG")}
+        password_file = work / "empty-pgpass"
+        password_file.write_text("")
+        password_file.chmod(0o600)
+        env["PGPASSFILE"] = str(password_file)
         init = _pg_run([str(tools["initdb"]), "-D", str(data), "-U", "postgres", "-A", "trust", "--no-locale", "--encoding=UTF8"], env=env)
         if init.returncode:
             report["status"] = "failed"
@@ -547,7 +547,7 @@ def _sha256(value: str) -> str:
 
 
 def _file_sha256(path: Path) -> str:
-    """Hash the frozen case bytes so a later report cannot silently change scope."""
+    """동결 사례 파일의 byte hash로 보고 범위가 바뀌지 않았음을 남긴다."""
 
     import hashlib
 
@@ -555,7 +555,7 @@ def _file_sha256(path: Path) -> str:
 
 
 def _score(expected: set[str], actual: set[str]) -> dict[str, Any]:
-    """Compare exact facts while exposing both missing and unexpected values."""
+    """누락과 예기치 않은 값을 숨기지 않고 정확한 사실 집합을 비교한다."""
 
     missing = sorted(expected - actual)
     unexpected = sorted(actual - expected)
@@ -571,7 +571,7 @@ def _subject_id(corpus: dict[str, Any], dialect: str, case: dict[str, Any]) -> s
 
 
 def validate_catalog_document(document: dict[str, Any], corpus: dict[str, Any], dialect: str) -> dict[str, Any]:
-    """Check raw subject metadata before passing a graph to the scorer."""
+    """graph 채점 전에 raw subject metadata를 확인한다."""
 
     if not isinstance(document.get("schemas"), list):
         raise CorpusError("catalog document needs a schemas array")
@@ -671,7 +671,7 @@ def validate_catalog_document(document: dict[str, Any], corpus: dict[str, Any], 
 
 
 def _subject_record(schema: str, routine: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a raw routine row without changing its body bytes."""
+    """body byte를 바꾸지 않고 raw routine 행을 정규화한다."""
 
     name = routine["name"]
     signature = routine.get("signature")
@@ -688,11 +688,8 @@ def _subject_record(schema: str, routine: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-    return records
-
-
 def _derived_subject_records(corpus: dict[str, Any], dialect: str) -> dict[str, dict[str, Any]]:
-    """Provide a test-only subject map when no raw catalog was supplied."""
+    """raw catalog가 없는 self-test에서만 사용할 subject map을 만든다."""
 
     records = {}
     for case in eligible_cases(corpus, dialect):
@@ -713,7 +710,7 @@ def evaluate_graph(
     dialect: str,
     subject_records: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Score graph facts and owner-attributed origins against frozen facts."""
+    """graph 사실과 owner 귀속 origin을 동결 기대값에 대조한다."""
 
     if dialect in {"postgres", "sqlserver", "oracle"} and subject_records is None:
         raise CorpusError("wrapper-dialect graph scoring requires raw catalog subject records")
@@ -752,9 +749,8 @@ def evaluate_graph(
     for case in eligible_cases(corpus, dialect):
         facts = expected_facts(corpus, case, dialect)
         all_expected_lineage.update(pair for pair in facts["lineage"] if pair[0] != pair[1])
-        # A destination column remains in scope even when its authored value
-        # is constant.  Otherwise an extra derives-from edge on last_writer
-        # would disappear from the global check.
+        # 작성 값이 상수여도 destination column은 범위에 남긴다. 그렇지 않으면
+        # last_writer에 붙은 extra derives-from 간선이 global 검사에서 사라진다.
         all_expected_outputs.update(facts["column_writes"])
     for edge in edges:
         pair = (edge.get("from"), edge.get("to"))
@@ -885,7 +881,7 @@ def evaluate_graph(
 
 
 def scan_document(engine: Path, document: Path, output: Path) -> None:
-    """Run a caller-selected CLI scan; this is never used by validation-only mode."""
+    """호출자가 선택한 CLI scan을 실행한다. validation-only에서는 호출하지 않는다."""
 
     result = subprocess.run([str(engine), "scan", "--document", str(document), "-o", str(output)], capture_output=True, text=True, timeout=120)
     if result.returncode:
@@ -893,7 +889,7 @@ def scan_document(engine: Path, document: Path, output: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run database validation or, explicitly, score an existing analyzer graph."""
+    """DB 검증을 실행하거나 명시적으로 기존 분석 graph를 채점한다."""
 
     parser = argparse.ArgumentParser(description="Validate authored DML facts before scoring a graph analyzer.")
     parser.add_argument("--cases", type=Path, default=CORPUS)

@@ -140,3 +140,48 @@ as SQL-only. PostgreSQL, SQL Server, and Oracle producer parity
 still belongs to their native CI jobs. No analyzer score should be published
 for those producer runs until SQL validity, runtime rows, catalog IDs, raw body
 hashes, and exported origins are captured in a first immutable baseline.
+
+The producer baseline command uses the published v0.4.3 engine and refuses an
+existing output directory. It preserves raw Go/JDBC documents, the document
+after SQL-file subjects are attached, graphs, runtime rows, catalog preflight,
+and score failures in per-dialect directories. The expectation bytes were frozen
+in commit `776ebe8`, SHA-256
+`fd129759650617b06c81ab826fb11627f5315dc72ebc1470dbdaabb10bd41d4b`,
+before any analyzer evaluated them:
+
+```sh
+python3 Scripts/verify-dml-producers.py \
+  --database all \
+  --engine /path/to/published-v0.4.3/schemagraph \
+  --go-probe /path/to/immutable/schemagraph-probe-go \
+  --probe-jar /path/to/immutable/schemagraph-probe-v0.4.3-all.jar \
+  --oracle-jar /path/to/ojdbc8.jar \
+  --output "/path/to/verification/dml-first-baseline"
+```
+
+Operational failures are command failures. Accuracy mismatches are retained in
+the baseline report; add `--strict` when they should also determine the exit
+status. A full invocation requires every requested native runner and never
+turns an unavailable SQL Server or Oracle runner into a successful skip.
+
+## Current-source replay
+
+`Scripts/verify-dml-replay.py` reads a completed producer baseline and writes a
+new result directory. It leaves the frozen input and first failures unchanged.
+For Oracle, the fixture's owner is mapped from the logical `DMLACC` namespace
+to `SGACC`; the mapping changes qualification only and is recorded separately.
+
+```sh
+python3 Scripts/verify-dml-replay.py --engine /path/to/current/schemagraph \
+  --baseline /path/to/dml-first-baseline --output /path/to/new-dml-score
+```
+
+Local current-source verification has passed SQLite's 15 applicable cases,
+PostgreSQL's 16 cases, and Oracle Go/JDBC's 16 cases each. Uncached, cold-cache,
+and warm-cache graph bytes match in every run, and every warm body is restored
+without warnings. SQL Server's native 16-case run is checked by the dedicated
+x86_64 CI job. Its result must be read from the tested commit's job, not inferred
+from another dialect's passing score.
+
+These are targeted static DML fixtures. They do not establish whole-product
+accuracy, every procedural control path, or superiority over another tool.
