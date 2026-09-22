@@ -303,7 +303,7 @@ pub fn write_baseline(path: &Path, fingerprints: impl IntoIterator<Item = String
         version: BASELINE_VERSION,
         fingerprints: values.into_iter().collect(),
     };
-    let text = serde_json::to_string_pretty(&baseline)? + "\n";
+    let text = serde_json::to_string_pretty(&serde_json::to_value(&baseline)?)? + "\n";
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

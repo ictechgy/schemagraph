@@ -23,6 +23,7 @@ pub struct FindingAnnotation {
 }
 
 #[derive(Debug, Clone)]
+/// 승인된 예외만 SARIF suppression으로 표현해 단순 기준선과 구분한다.
 pub struct Suppression {
     /// waiver는 external, 저장된 기준선은 suppression을 만들지 않는다.
     pub kind: String,
