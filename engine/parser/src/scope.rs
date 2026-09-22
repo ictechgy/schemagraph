@@ -2223,19 +2223,37 @@ impl DmlAnalyzer<'_, '_> {
             );
             return;
         };
+        if !names.is_empty() && names.len() != outputs.len() {
+            self.note(
+                "SG_DML_TARGET_SHAPE",
+                format!(
+                    "temporary target column width differs (target {}, source {})",
+                    names.len(),
+                    outputs.len()
+                ),
+            );
+            return;
+        }
         let positions: Vec<usize> = if names.is_empty() {
             (0..local.columns.len()).collect()
         } else {
-            names
-                .iter()
-                .filter_map(|name| {
-                    let wanted = column_name(self.binder.catalog.dialect, name);
-                    local
-                        .columns
-                        .iter()
-                        .position(|column| column.name == wanted)
-                })
-                .collect()
+            let mut positions = Vec::with_capacity(names.len());
+            for name in names {
+                let wanted = column_name(self.binder.catalog.dialect, name);
+                let Some(position) = local
+                    .columns
+                    .iter()
+                    .position(|column| column.name == wanted)
+                else {
+                    self.note(
+                        "SG_DML_TARGET_SHAPE",
+                        format!("temporary target column '{}' is missing", name),
+                    );
+                    return;
+                };
+                positions.push(position);
+            }
+            positions
         };
         if positions.len() != outputs.len() {
             self.note(
@@ -2292,29 +2310,24 @@ impl DmlAnalyzer<'_, '_> {
             );
             return None;
         }
-        let columns: Vec<VertexId> = {
-            names
-                .iter()
-                .filter_map(|name| {
-                    self.assignment_target(
-                        target,
-                        &AssignmentTarget::ColumnName(ObjectName(vec![
-                            ObjectNamePart::Identifier(name.clone()),
-                        ])),
-                    )
-                })
-                .collect()
-        };
-        if columns.len() != width {
+        if names.len() != width {
             self.note(
                 "SG_DML_TARGET_SHAPE",
                 format!(
                     "target column shape is ambiguous or width differs (target {}, source {})",
-                    columns.len(),
+                    names.len(),
                     width
                 ),
             );
             return None;
+        }
+        let mut columns = Vec::with_capacity(names.len());
+        for name in names {
+            let assignment_target =
+                AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                    name.clone(),
+                )]));
+            columns.push(self.assignment_target(target, &assignment_target)?);
         }
         Some(columns)
     }

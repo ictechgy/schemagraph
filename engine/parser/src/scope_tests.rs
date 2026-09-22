@@ -601,6 +601,40 @@ fn implicit_insert_shape_is_partial_even_when_catalog_width_matches() {
 }
 
 #[test]
+fn unresolved_insert_target_name_does_not_shift_a_later_column() {
+    let graph =
+        scan_routine("INSERT INTO audit (missing_column, name) SELECT c.name FROM customers c");
+    assert!(has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"));
+    assert!(!edge(&graph, "s.mutate", "s.audit.name", EdgeKind::Writes));
+    assert!(!edge(
+        &graph,
+        "s.audit.name",
+        "s.customers.name",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn unresolved_temp_insert_target_name_does_not_shift_a_later_column() {
+    let graph = scan_routine(
+        "CREATE TEMP TABLE tmp AS SELECT id, customer_id AS name FROM orders; INSERT INTO tmp (missing_column, name) SELECT name FROM customers; INSERT INTO audit (id, name) SELECT id, name FROM tmp",
+    );
+    assert!(has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"));
+    assert!(edge(
+        &graph,
+        "s.audit.name",
+        "s.orders.customer_id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!edge(
+        &graph,
+        "s.audit.name",
+        "s.customers.name",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
 fn rewritten_procedural_sql_does_not_claim_raw_source_locations() {
     let graph = scan_routine_with(
         "CREATE FUNCTION mutate() RETURNS void AS $$ BEGIN INSERT INTO audit (id, name) SELECT id, name FROM customers; END $$ LANGUAGE plpgsql",
