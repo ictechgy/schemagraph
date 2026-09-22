@@ -97,6 +97,10 @@ fn scan_routine(body: &str) -> Graph {
 }
 
 fn scan_routine_with(body: &str, dialect: &str, language: &str) -> Graph {
+    scan_routine_kind(body, dialect, language, "procedure")
+}
+
+fn scan_routine_kind(body: &str, dialect: &str, language: &str, kind: &str) -> Graph {
     let doc = CatalogDocument {
         context: None,
         dependencies: Vec::new(),
@@ -113,7 +117,7 @@ fn scan_routine_with(body: &str, dialect: &str, language: &str) -> Graph {
             ],
             routines: vec![RoutineDoc {
                 name: "mutate".into(),
-                kind: "procedure".into(),
+                kind: kind.into(),
                 language: Some(language.into()),
                 body: Some(body.into()),
                 signature: None,
@@ -129,6 +133,45 @@ fn scan_routine_with(body: &str, dialect: &str, language: &str) -> Graph {
         graph.add_limitation(note);
     }
     graph
+}
+
+#[test]
+fn external_select_into_uses_dml_target_binding_instead_of_read_only_query_path() {
+    let graph = scan_routine_kind(
+        "SELECT c.id, c.name INTO s.audit FROM s.customers c",
+        "sqlserver",
+        "sql",
+        "query",
+    );
+    assert!(edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes));
+    for column in ["id", "name"] {
+        assert!(edge(
+            &graph,
+            "s.mutate",
+            &format!("s.audit.{column}"),
+            EdgeKind::Writes
+        ));
+        assert!(edge(
+            &graph,
+            &format!("s.audit.{column}"),
+            &format!("s.customers.{column}"),
+            EdgeKind::DerivesFrom
+        ));
+    }
+    assert_eq!(
+        graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Complete
+    );
+    let read_only = scan_routine_kind(
+        "SELECT c.id, c.name FROM s.customers c",
+        "sqlserver",
+        "sql",
+        "query",
+    );
+    assert!(read_only
+        .edges()
+        .iter()
+        .all(|edge| edge.kind != EdgeKind::Writes));
 }
 
 fn scan_oracle_temp_sequence(body: &str) -> Graph {

@@ -398,11 +398,14 @@ fn object_shape(object: &ObjectDoc) -> String {
     format!("{}|{}", object.body.is_some(), columns.join(","))
 }
 
-/// 단일 SELECT는 컬럼 해석기를 쓰고 DML·여러 문장은 기존 객체 의존성 추출기로 보낸다.
+/// 목적지가 없는 단일 SELECT만 읽기 해석기로 보내고 SELECT INTO는 DML로 남긴다.
 pub(crate) fn is_select(dialect: Option<&dyn Dialect>, body: &str) -> bool {
     let default = GenericDialect {};
-    sqlparser::parser::Parser::parse_sql(dialect.unwrap_or(&default), body)
-        .is_ok_and(|s| s.len() == 1 && matches!(s[0], Statement::Query(_)))
+    sqlparser::parser::Parser::parse_sql(dialect.unwrap_or(&default), body).is_ok_and(|s| {
+        s.len() == 1
+            && matches!(s[0], Statement::Query(_))
+            && !super::is_column_dml_statement(&s[0])
+    })
 }
 
 fn catalog_key(dialect: &str, value: &str) -> String {
