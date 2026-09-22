@@ -26,17 +26,27 @@
     },
     {
       "body_hash": "sha256:22967b6ab1d50fc5bc2500f42b201eb2e6b4d6fa8b39ccc3ecef71c89cfaa721",
-      "diagnostics": [],
+      "diagnostics": [
+        {
+          "code": "SG_TEMPORAL_SELF_LINEAGE",
+          "message": "public.customers.name reads its previous value; self DerivesFrom edge omitted"
+        }
+      ],
       "id": "public.dynamic_concat",
       "scope": "object-dependencies",
-      "state": "complete"
+      "state": "partial"
     },
     {
       "body_hash": "sha256:af484b3a32efd869d402c10f4d29586398161d3b9eaa0225b65485a06c68a1d6",
-      "diagnostics": [],
+      "diagnostics": [
+        {
+          "code": "SG_TEMPORAL_SELF_LINEAGE",
+          "message": "public.customers.name reads its previous value; self DerivesFrom edge omitted"
+        }
+      ],
       "id": "public.dynamic_format",
       "scope": "object-dependencies",
-      "state": "complete"
+      "state": "partial"
     },
     {
       "body_hash": "sha256:240b5f1981adee075214e481a1a1f18cd73aafe21c41fdacf16a31a9d7c5a801",
@@ -82,10 +92,19 @@
     },
     {
       "body_hash": "sha256:12909e6692f033cd47f2f33cb5e4c84666734b982b2f6bc6cecb3b0cbc38755d",
-      "diagnostics": [],
+      "diagnostics": [
+        {
+          "code": "SG_COLUMN_UNRESOLVED",
+          "message": "column 'new.customer_id' cannot be resolved in its SQL scope"
+        },
+        {
+          "code": "SG_TEMPORAL_SELF_LINEAGE",
+          "message": "public.customers.name reads its previous value; self DerivesFrom edge omitted"
+        }
+      ],
       "id": "public.trg_orders_touch_fn",
       "scope": "object-dependencies",
-      "state": "complete"
+      "state": "partial"
     }
   ],
   "edges": [
@@ -302,6 +321,28 @@
     {
       "evidence": [
         {
+          "detail": "public.dynamic_concat Reads public.customers.name (value)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_concat",
+      "kind": "reads",
+      "to": "public.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_concat Writes public.customers.name (write)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_concat",
+      "kind": "writes",
+      "to": "public.customers.name"
+    },
+    {
+      "evidence": [
+        {
           "detail": "public.dynamic_format Writes public.customers",
           "layer": "body-parse"
         }
@@ -309,6 +350,39 @@
       "from": "public.dynamic_format",
       "kind": "writes",
       "to": "public.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_format Reads public.customers.id (predicate)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_format",
+      "kind": "reads",
+      "to": "public.customers.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_format Reads public.customers.name (value)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_format",
+      "kind": "reads",
+      "to": "public.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_format Writes public.customers.name (write)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_format",
+      "kind": "writes",
+      "to": "public.customers.name"
     },
     {
       "evidence": [
@@ -364,6 +438,28 @@
       "from": "public.dynamic_touch",
       "kind": "writes",
       "to": "public.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_touch Reads public.customers.id (predicate)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_touch",
+      "kind": "reads",
+      "to": "public.customers.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.dynamic_touch Writes public.customers.name (write)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.dynamic_touch",
+      "kind": "writes",
+      "to": "public.customers.name"
     },
     {
       "evidence": [
@@ -761,6 +857,39 @@
       "from": "public.trg_orders_touch_fn",
       "kind": "writes",
       "to": "public.customers"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.trg_orders_touch_fn Reads public.customers.id (predicate)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.trg_orders_touch_fn",
+      "kind": "reads",
+      "to": "public.customers.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.trg_orders_touch_fn Reads public.customers.name (value)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.trg_orders_touch_fn",
+      "kind": "reads",
+      "to": "public.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "public.trg_orders_touch_fn Writes public.customers.name (write)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "public.trg_orders_touch_fn",
+      "kind": "writes",
+      "to": "public.customers.name"
     }
   ],
   "limitations": [
@@ -778,11 +907,81 @@
       "to": "public.customers"
     },
     {
+      "body_hash": "sha256:22967b6ab1d50fc5bc2500f42b201eb2e6b4d6fa8b39ccc3ecef71c89cfaa721",
+      "from": "public.dynamic_concat",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:22967b6ab1d50fc5bc2500f42b201eb2e6b4d6fa8b39ccc3ecef71c89cfaa721",
+      "from": "public.dynamic_concat",
+      "kind": "reads",
+      "role": "dml-owner:public.dynamic_concat:value",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:22967b6ab1d50fc5bc2500f42b201eb2e6b4d6fa8b39ccc3ecef71c89cfaa721",
+      "from": "public.dynamic_concat",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:22967b6ab1d50fc5bc2500f42b201eb2e6b4d6fa8b39ccc3ecef71c89cfaa721",
+      "from": "public.dynamic_concat",
+      "kind": "writes",
+      "role": "dml-owner:public.dynamic_concat:write",
+      "to": "public.customers.name"
+    },
+    {
       "body_hash": "sha256:af484b3a32efd869d402c10f4d29586398161d3b9eaa0225b65485a06c68a1d6",
       "from": "public.dynamic_format",
       "kind": "writes",
       "role": "body-dependency",
       "to": "public.customers"
+    },
+    {
+      "body_hash": "sha256:af484b3a32efd869d402c10f4d29586398161d3b9eaa0225b65485a06c68a1d6",
+      "from": "public.dynamic_format",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "public.customers.id"
+    },
+    {
+      "body_hash": "sha256:af484b3a32efd869d402c10f4d29586398161d3b9eaa0225b65485a06c68a1d6",
+      "from": "public.dynamic_format",
+      "kind": "reads",
+      "role": "dml-owner:public.dynamic_format:predicate",
+      "to": "public.customers.id"
+    },
+    {
+      "body_hash": "sha256:af484b3a32efd869d402c10f4d29586398161d3b9eaa0225b65485a06c68a1d6",
+      "from": "public.dynamic_format",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:af484b3a32efd869d402c10f4d29586398161d3b9eaa0225b65485a06c68a1d6",
+      "from": "public.dynamic_format",
+      "kind": "reads",
+      "role": "dml-owner:public.dynamic_format:value",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:af484b3a32efd869d402c10f4d29586398161d3b9eaa0225b65485a06c68a1d6",
+      "from": "public.dynamic_format",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:af484b3a32efd869d402c10f4d29586398161d3b9eaa0225b65485a06c68a1d6",
+      "from": "public.dynamic_format",
+      "kind": "writes",
+      "role": "dml-owner:public.dynamic_format:write",
+      "to": "public.customers.name"
     },
     {
       "body_hash": "sha256:0cb61b89285e42518410b756fc4bf5556b284a030ea0672a27275948e9f40ee1",
@@ -818,6 +1017,34 @@
       "kind": "writes",
       "role": "body-dependency",
       "to": "public.customers"
+    },
+    {
+      "body_hash": "sha256:b451276c8627a8d661bb12fa77952e3857c35a728876ee859a1f574889e43892",
+      "from": "public.dynamic_touch",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "public.customers.id"
+    },
+    {
+      "body_hash": "sha256:b451276c8627a8d661bb12fa77952e3857c35a728876ee859a1f574889e43892",
+      "from": "public.dynamic_touch",
+      "kind": "reads",
+      "role": "dml-owner:public.dynamic_touch:predicate",
+      "to": "public.customers.id"
+    },
+    {
+      "body_hash": "sha256:b451276c8627a8d661bb12fa77952e3857c35a728876ee859a1f574889e43892",
+      "from": "public.dynamic_touch",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:b451276c8627a8d661bb12fa77952e3857c35a728876ee859a1f574889e43892",
+      "from": "public.dynamic_touch",
+      "kind": "writes",
+      "role": "dml-owner:public.dynamic_touch:write",
+      "to": "public.customers.name"
     },
     {
       "body_hash": "sha256:b451276c8627a8d661bb12fa77952e3857c35a728876ee859a1f574889e43892",
@@ -969,6 +1196,48 @@
       "kind": "writes",
       "role": "body-dependency",
       "to": "public.customers"
+    },
+    {
+      "body_hash": "sha256:12909e6692f033cd47f2f33cb5e4c84666734b982b2f6bc6cecb3b0cbc38755d",
+      "from": "public.trg_orders_touch_fn",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "public.customers.id"
+    },
+    {
+      "body_hash": "sha256:12909e6692f033cd47f2f33cb5e4c84666734b982b2f6bc6cecb3b0cbc38755d",
+      "from": "public.trg_orders_touch_fn",
+      "kind": "reads",
+      "role": "dml-owner:public.trg_orders_touch_fn:predicate",
+      "to": "public.customers.id"
+    },
+    {
+      "body_hash": "sha256:12909e6692f033cd47f2f33cb5e4c84666734b982b2f6bc6cecb3b0cbc38755d",
+      "from": "public.trg_orders_touch_fn",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:12909e6692f033cd47f2f33cb5e4c84666734b982b2f6bc6cecb3b0cbc38755d",
+      "from": "public.trg_orders_touch_fn",
+      "kind": "reads",
+      "role": "dml-owner:public.trg_orders_touch_fn:value",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:12909e6692f033cd47f2f33cb5e4c84666734b982b2f6bc6cecb3b0cbc38755d",
+      "from": "public.trg_orders_touch_fn",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "public.customers.name"
+    },
+    {
+      "body_hash": "sha256:12909e6692f033cd47f2f33cb5e4c84666734b982b2f6bc6cecb3b0cbc38755d",
+      "from": "public.trg_orders_touch_fn",
+      "kind": "writes",
+      "role": "dml-owner:public.trg_orders_touch_fn:write",
+      "to": "public.customers.name"
     }
   ],
   "schema_metadata": {

@@ -9,10 +9,15 @@
     },
     {
       "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
-      "diagnostics": [],
+      "diagnostics": [
+        {
+          "code": "SG_TEMPORAL_SELF_LINEAGE",
+          "message": "main.customers.name reads its previous value; self DerivesFrom edge omitted"
+        }
+      ],
       "id": "main.orders.trg_orders_touch",
       "scope": "object-dependencies",
-      "state": "complete"
+      "state": "partial"
     }
   ],
   "edges": [
@@ -477,6 +482,39 @@
     {
       "evidence": [
         {
+          "detail": "main.orders.trg_orders_touch Reads main.customers.id (predicate)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "to": "main.customers.id"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "main.orders.trg_orders_touch Reads main.customers.name (value)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "to": "main.customers.name"
+    },
+    {
+      "evidence": [
+        {
+          "detail": "main.orders.trg_orders_touch Writes main.customers.name (write)",
+          "layer": "body-parse"
+        }
+      ],
+      "from": "main.orders.trg_orders_touch",
+      "kind": "writes",
+      "to": "main.customers.name"
+    },
+    {
+      "evidence": [
+        {
           "detail": "trigger trg_orders_touch on orders",
           "layer": "catalog"
         }
@@ -487,6 +525,10 @@
     },
     {
       "evidence": [
+        {
+          "detail": "main.orders.trg_orders_touch Reads main.orders.customer_id (predicate)",
+          "layer": "body-parse"
+        },
         {
           "detail": "trigger main.orders.trg_orders_touch reads NEW/OLD.customer_id on orders",
           "layer": "body-parse"
@@ -553,7 +595,7 @@
     }
   ],
   "limitations": [
-    "DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (인라인 제약 파싱 미지원)"
+    "DDL \uc778\ub77c\uc778 UNIQUE/CHECK \uc81c\uc57d\uc740 \uce74\ud0c8\ub85c\uadf8\uc5d0 \uc5c6\uc5b4 \uc218\uc9d1\ud558\uc9c0 \ubabb\ud568 (\uc778\ub77c\uc778 \uc81c\uc57d \ud30c\uc2f1 \ubbf8\uc9c0\uc6d0)"
   ],
   "origins": [
     {
@@ -698,6 +740,55 @@
       "from": "main.orders.trg_orders_touch",
       "kind": "reads",
       "role": "body-dependency",
+      "to": "main.customers.id"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "dml-owner:main.orders.trg_orders_touch:predicate",
+      "to": "main.customers.id"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "main.customers.name"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "dml-owner:main.orders.trg_orders_touch:value",
+      "to": "main.customers.name"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "writes",
+      "role": "body-dependency",
+      "to": "main.customers.name"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "writes",
+      "role": "dml-owner:main.orders.trg_orders_touch:write",
+      "to": "main.customers.name"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "body-dependency",
+      "to": "main.orders.customer_id"
+    },
+    {
+      "body_hash": "sha256:0799f28f4163a454abb564b26826990e47b70fe49a1cf63e367713e132276dad",
+      "from": "main.orders.trg_orders_touch",
+      "kind": "reads",
+      "role": "dml-owner:main.orders.trg_orders_touch:predicate",
       "to": "main.orders.customer_id"
     }
   ],
@@ -848,92 +939,92 @@
         "pk_position": 0
       }
     },
-    "indexes": {
-      "main.orders.idx_orders_customer": {
-        "table": "main.orders",
-        "columns": [
-          "main.orders.customer_id"
-        ],
-        "unique": false,
-        "has_predicate": false,
-        "complete": true
-      },
-      "main.products.sqlite_autoindex_products_1": {
-        "table": "main.products",
-        "columns": [
-          "main.products.sku"
-        ],
-        "unique": true,
-        "has_predicate": false,
-        "complete": true
-      }
-    },
     "foreign_keys": {
       "main.a.a_fk_0": {
-        "table": "main.a",
         "columns": [
           "main.a.b_id"
         ],
-        "target_table": "main.b",
+        "complete": false,
+        "table": "main.a",
         "target_columns": [
           "main.b.id"
         ],
-        "complete": false
+        "target_table": "main.b"
       },
       "main.b.b_fk_0": {
-        "table": "main.b",
         "columns": [
           "main.b.a_id"
         ],
-        "target_table": "main.a",
+        "complete": false,
+        "table": "main.b",
         "target_columns": [
           "main.a.id"
         ],
-        "complete": false
+        "target_table": "main.a"
       },
       "main.loop_self.loop_self_fk_0": {
-        "table": "main.loop_self",
         "columns": [
           "main.loop_self.parent_id"
         ],
-        "target_table": "main.loop_self",
+        "complete": false,
+        "table": "main.loop_self",
         "target_columns": [
           "main.loop_self.id"
         ],
-        "complete": false
+        "target_table": "main.loop_self"
       },
       "main.order_items.order_items_fk_0": {
-        "table": "main.order_items",
         "columns": [
           "main.order_items.product_id"
         ],
-        "target_table": "main.products",
+        "complete": false,
+        "table": "main.order_items",
         "target_columns": [
           "main.products.id"
         ],
-        "complete": false
+        "target_table": "main.products"
       },
       "main.order_items.order_items_fk_1": {
-        "table": "main.order_items",
         "columns": [
           "main.order_items.order_id"
         ],
-        "target_table": "main.orders",
+        "complete": false,
+        "table": "main.order_items",
         "target_columns": [
           "main.orders.id"
         ],
-        "complete": false
+        "target_table": "main.orders"
       },
       "main.orders.orders_fk_0": {
-        "table": "main.orders",
         "columns": [
           "main.orders.customer_id"
         ],
-        "target_table": "main.customers",
+        "complete": false,
+        "table": "main.orders",
         "target_columns": [
           "main.customers.id"
         ],
-        "complete": false
+        "target_table": "main.customers"
+      }
+    },
+    "indexes": {
+      "main.orders.idx_orders_customer": {
+        "columns": [
+          "main.orders.customer_id"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "main.orders",
+        "unique": false
+      },
+      "main.products.sqlite_autoindex_products_1": {
+        "columns": [
+          "main.products.sku"
+        ],
+        "complete": true,
+        "has_predicate": false,
+        "table": "main.products",
+        "unique": true
       }
     }
   },
