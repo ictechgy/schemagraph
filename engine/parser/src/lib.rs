@@ -2933,10 +2933,20 @@ fn select_into(stmt: &Statement) -> Option<&sqlparser::ast::SelectInto> {
     let Statement::Query(query) = stmt else {
         return None;
     };
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
-    select.into.as_ref()
+    query_select_into(query)
+}
+
+/// 집합 질의의 목적지는 첫 SELECT에 선언되며 값의 원천은 전체 질의에서 구한다.
+fn query_select_into(query: &sqlparser::ast::Query) -> Option<&sqlparser::ast::SelectInto> {
+    let mut body = query.body.as_ref();
+    loop {
+        match body {
+            sqlparser::ast::SetExpr::Select(select) => return select.into.as_ref(),
+            sqlparser::ast::SetExpr::SetOperation { left, .. } => body = left.as_ref(),
+            sqlparser::ast::SetExpr::Query(query) => body = query.body.as_ref(),
+            _ => return None,
+        }
+    }
 }
 
 fn is_sqlserver_transition_relation(relation: &(Option<String>, String)) -> bool {

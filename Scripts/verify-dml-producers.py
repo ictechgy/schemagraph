@@ -532,6 +532,8 @@ def external_baseline(engine: Path, corpus: dict[str, Any], dialect: str, enviro
         classpath = os.pathsep.join(jars)
         with EXT.database(dialect, settings, java, classpath, work) as (sql, server):
             runtime = {"dialect": dialect, "cases": prepare_external(database_corpus, dialect, sql)}
+            if dialect == "sqlserver":
+                runtime["supplemental"] = validate_union_select_into(sql)
             reports = external_documents(engine, database_corpus, dialect, sql, server, java, classpath,
                                          go_probe, probe_jar, oracle_jar, output, work)
     return {"runtime": runtime, "producers": reports,
@@ -541,6 +543,22 @@ def external_baseline(engine: Path, corpus: dict[str, Any], dialect: str, enviro
                 **({"oracle_driver_sha256": digest(oracle_jar)} if oracle_jar else {}),
             },
             "schema_mapping": {"expected": corpus["schemas"][dialect], "actual": database_corpus["schemas"][dialect]}}
+
+
+def validate_union_select_into(sql: Any) -> dict[str, Any]:
+    """동결 코퍼스와 별도로 UNION 목적지 문법과 양쪽 실제 행을 확인한다."""
+    sql.execute([
+        "SELECT source_id AS id, CAST(amount AS VARCHAR(30)) AS label "
+        "INTO dbo.dml_union_check FROM dbo.dml_source WHERE source_id = 1 "
+        "UNION ALL SELECT source_id, CAST(multiplier AS VARCHAR(30)) "
+        "FROM dbo.dml_source_extra WHERE source_id = 1"
+    ])
+    rows = row_values(sql.rows("SELECT id, label FROM dbo.dml_union_check ORDER BY id, label"))
+    actual = [[str(value) for value in row] for row in rows]
+    if actual != [["1", "2"], ["1", "5"]]:
+        raise RuntimeError("SQL Server UNION SELECT INTO did not preserve both input rows")
+    sql.execute(["DROP TABLE dbo.dml_union_check"])
+    return {"name": "union-select-into", "status": "passed", "rows": 2}
 
 
 def validate_resources(args: argparse.Namespace, databases: set[str]) -> None:

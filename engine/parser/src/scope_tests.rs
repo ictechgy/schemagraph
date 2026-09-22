@@ -174,6 +174,30 @@ fn external_select_into_uses_dml_target_binding_instead_of_read_only_query_path(
         .all(|edge| edge.kind != EdgeKind::Writes));
 }
 
+#[test]
+fn external_union_select_into_preserves_destination_and_both_value_sources() {
+    let graph = scan_routine_kind(
+        "SELECT c.id, c.name INTO s.audit FROM s.customers c UNION ALL SELECT o.id, CAST(o.amount AS VARCHAR(30)) FROM s.orders o",
+        "sqlserver",
+        "sql",
+        "query",
+    );
+    assert!(edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes));
+    for (target, sources) in [
+        ("s.audit.id", ["s.customers.id", "s.orders.id"]),
+        ("s.audit.name", ["s.customers.name", "s.orders.amount"]),
+    ] {
+        assert!(edge(&graph, "s.mutate", target, EdgeKind::Writes));
+        for source in sources {
+            assert!(edge(&graph, target, source, EdgeKind::DerivesFrom));
+        }
+    }
+    assert_eq!(
+        graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Complete
+    );
+}
+
 fn scan_oracle_temp_sequence(body: &str) -> Graph {
     let doc = CatalogDocument {
         context: None,

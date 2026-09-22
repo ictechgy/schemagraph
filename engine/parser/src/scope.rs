@@ -2228,10 +2228,7 @@ impl DmlAnalyzer<'_, '_> {
     }
 
     fn select_into(&mut self, query: &Query) {
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            return;
-        };
-        let Some(into) = &select.into else {
+        let Some(into) = super::query_select_into(query) else {
             return;
         };
         let result = self.binder.query(query, &Ctes::new(), None);
