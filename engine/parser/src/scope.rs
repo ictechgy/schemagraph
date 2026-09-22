@@ -11,10 +11,10 @@ use schemagraph_core::{
 use schemagraph_source::document::{CatalogDocument, ObjectDoc};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
-    visit_relations, AssignmentTarget, Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator,
-    MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName, ObjectNamePart, Query, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias,
-    TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Visit, Visitor,
+    visit_relations, AccessExpr, AssignmentTarget, Expr, GroupByExpr, Ident, JoinConstraint,
+    JoinOperator, MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName, ObjectNamePart, Query,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias,
+    TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value, Visit, Visitor,
     WildcardAdditionalOptions, WindowType,
 };
 use sqlparser::dialect::{Dialect, GenericDialect};
@@ -148,6 +148,8 @@ struct Binder<'a, 'd> {
     diagnostics: Vec<Diagnostic>,
     depth: usize,
     window_expansions: usize,
+    scalar_symbols: BTreeSet<String>,
+    pseudo_relations: BTreeMap<String, Relation>,
     /// 문장열 안에서만 유효한 CTAS/temp 기호. 그래프 정점은 만들지 않고 생성
     /// 질의에서 물려받은 실제 source 컬럼 id만 보관한다.
     local_relations: BTreeMap<Vec<String>, Relation>,
@@ -1441,6 +1443,30 @@ impl Binder<'_, '_> {
                 }
             })
             .collect();
+        if parts.len() == 2 {
+            let pseudo = procedural_symbol_key(&parts[0]);
+            if let Some(relation) = self.pseudo_relations.get(&pseudo) {
+                let matches: Vec<_> = relation
+                    .columns
+                    .iter()
+                    .filter(|column| column.name == parts[1])
+                    .collect();
+                return match matches.as_slice() {
+                    [column] if !column.unknown => column.sources.clone(),
+                    _ => {
+                        self.note(
+                            "SG_COLUMN_UNRESOLVED",
+                            format!(
+                                "transition column '{}.{}' is missing or ambiguous",
+                                parts[0], parts[1]
+                            ),
+                            source,
+                        );
+                        Sources::new()
+                    }
+                };
+            }
+        }
         let Some(column) = parts.last() else {
             return Sources::new();
         };
@@ -1497,6 +1523,14 @@ impl Binder<'_, '_> {
                 return matched[0].sources.clone();
             }
         }
+        if ids.len() == 1
+            && ids[0].quote_style.is_none()
+            && self
+                .scalar_symbols
+                .contains(&procedural_symbol_key(&ids[0].value))
+        {
+            return Sources::new();
+        }
         self.note(
             "SG_COLUMN_UNRESOLVED",
             format!(
@@ -1540,6 +1574,7 @@ impl Binder<'_, '_> {
             window_stack,
             queries: 0,
             expression_depth: 0,
+            pseudo_access_roots: 0,
             sources: Sources::new(),
         };
         let _ = node.visit(&mut visitor);
@@ -1575,6 +1610,8 @@ pub(crate) fn apply_dml_column_effects(
             diagnostics: Vec::new(),
             depth: 0,
             window_expansions: 0,
+            scalar_symbols: options.scalar_symbols.clone(),
+            pseudo_relations: BTreeMap::new(),
             local_relations: BTreeMap::new(),
         },
         owner,
@@ -1589,8 +1626,17 @@ pub(crate) fn apply_dml_column_effects(
         for name in transition_names {
             analyzer
                 .binder
+                .pseudo_relations
+                .insert(procedural_symbol_key(name), relation.clone());
+            let normalized = match analyzer.binder.catalog.dialect {
+                "oracle" | "db2" => name.to_uppercase(),
+                "postgres" | "postgresql" | "sqlite" => name.to_lowercase(),
+                _ => (*name).to_owned(),
+            };
+            analyzer
+                .binder
                 .local_relations
-                .insert(vec![(*name).into()], relation.clone());
+                .insert(vec![normalized], relation.clone());
         }
     }
     for statement in statements {
@@ -1634,6 +1680,7 @@ pub(crate) struct DmlApplyOptions<'a> {
     pub(crate) transition: Option<(&'a str, &'a [&'a str])>,
     pub(crate) allow_local_temps: bool,
     pub(crate) locations_trusted: bool,
+    pub(crate) scalar_symbols: &'a BTreeSet<String>,
 }
 
 struct DmlEffect {
@@ -2626,6 +2673,7 @@ struct ExprVisitor<'a, 'b, 'c, 'd> {
     window_stack: &'c mut Vec<String>,
     queries: usize,
     expression_depth: usize,
+    pseudo_access_roots: usize,
     sources: Sources,
 }
 
@@ -2652,6 +2700,16 @@ impl Visitor for ExprVisitor<'_, '_, '_, '_> {
         }
         let root_expression = self.expression_depth == 0;
         self.expression_depth += 1;
+        if let Some((pseudo, field)) = pseudo_field_access(expr) {
+            self.pseudo_access_roots += 1;
+            let ids = [Ident::new(pseudo), field.clone()];
+            let sources = self.binder.resolve(&ids, &self.scope, location(expr), &[]);
+            for id in &sources {
+                self.binder.read(id.clone(), self.role, location(expr));
+            }
+            self.sources.extend(sources);
+            return ControlFlow::Continue(());
+        }
         if let Expr::Function(function) = expr {
             self.binder.call(&function.name, location(expr));
             if let Some(over) = &function.over {
@@ -2684,6 +2742,7 @@ impl Visitor for ExprVisitor<'_, '_, '_, '_> {
             }
         }
         let ids = match expr {
+            Expr::Identifier(_) if self.pseudo_access_roots > 0 => return ControlFlow::Continue(()),
             Expr::Identifier(id) => std::slice::from_ref(id),
             Expr::CompoundIdentifier(ids) => ids.as_slice(),
             _ => return ControlFlow::Continue(()),
@@ -2715,12 +2774,40 @@ impl Visitor for ExprVisitor<'_, '_, '_, '_> {
         self.sources.extend(sources);
         ControlFlow::Continue(())
     }
-    fn post_visit_expr(&mut self, _: &Expr) -> ControlFlow<()> {
+    fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
         if self.queries == 0 {
+            if pseudo_field_access(expr).is_some() {
+                self.pseudo_access_roots -= 1;
+            }
             self.expression_depth -= 1;
         }
         ControlFlow::Continue(())
     }
+}
+
+fn pseudo_field_access(expr: &Expr) -> Option<(&str, &Ident)> {
+    let Expr::CompoundFieldAccess { root, access_chain } = expr else {
+        return None;
+    };
+    let Expr::Value(value) = root.as_ref() else {
+        return None;
+    };
+    let Value::Placeholder(pseudo) = &value.value else {
+        return None;
+    };
+    let [AccessExpr::Dot(Expr::Identifier(field))] = access_chain.as_slice() else {
+        return None;
+    };
+    let pseudo = pseudo.trim_start_matches(':');
+    (pseudo.eq_ignore_ascii_case("new") || pseudo.eq_ignore_ascii_case("old"))
+        .then_some((pseudo, field))
+}
+
+fn procedural_symbol_key(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches(['@', ':'])
+        .to_ascii_lowercase()
 }
 
 /// 뷰의 읽기 의존성과 출력 값의 계보를 실제 reader 정점에만 연결한다.
@@ -2763,6 +2850,8 @@ pub(crate) fn enrich_view(
         diagnostics: Vec::new(),
         depth: 0,
         window_expansions: 0,
+        scalar_symbols: BTreeSet::new(),
+        pseudo_relations: BTreeMap::new(),
         local_relations: BTreeMap::new(),
     };
     let mut outputs = Vec::new();

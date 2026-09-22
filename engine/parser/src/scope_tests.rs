@@ -2,7 +2,7 @@
 
 use schemagraph_core::{AnalysisState, EdgeKind, Graph, VertexId};
 use schemagraph_source::document::{
-    CatalogDocument, CollectionContext, ColumnDoc, ObjectDoc, RoutineDoc, SchemaDoc,
+    CatalogDocument, CollectionContext, ColumnDoc, ObjectDoc, RoutineDoc, SchemaDoc, TriggerDoc,
 };
 
 fn columns(names: &[&str]) -> Vec<ColumnDoc> {
@@ -164,6 +164,253 @@ fn scan_oracle_temp_sequence(body: &str) -> Graph {
         graph.add_limitation(note);
     }
     graph
+}
+
+fn legacy_scalar_routine_graph(dialect: &str) -> Graph {
+    let (schema, genre, genre_id, genre_name, log, observed, rename_body, call_body) = if dialect
+        == "oracle"
+    {
+        (
+                "SGACC",
+                "GENRE",
+                "GENREID",
+                "NAME",
+                "ACC_GENRE_COUNT_LOG",
+                "OBSERVEDCOUNT",
+                "PROCEDURE acc_rename_genre(genre_id IN NUMBER, genre_name IN VARCHAR2) AS BEGIN UPDATE Genre SET Name = genre_name WHERE GenreId = genre_id; END;",
+                "PROCEDURE acc_call_count AS n NUMBER; BEGIN n := acc_genre_count(); INSERT INTO ACC_GENRE_COUNT_LOG (ObservedCount) VALUES (n); END;",
+            )
+    } else {
+        (
+                "dbo",
+                "Genre",
+                "GenreId",
+                "Name",
+                "ACC_GENRE_COUNT_LOG",
+                "ObservedCount",
+                "CREATE PROCEDURE dbo.acc_rename_genre @genre_id INT, @genre_name NVARCHAR(120) AS BEGIN SET NOCOUNT ON; UPDATE Genre SET Name = @genre_name WHERE GenreId = @genre_id; END",
+                "CREATE PROCEDURE dbo.acc_call_count AS BEGIN SET NOCOUNT ON; DECLARE @n INT; SET @n = dbo.acc_genre_count(); INSERT INTO ACC_GENRE_COUNT_LOG (ObservedCount) VALUES (@n); END",
+            )
+    };
+    let procedure = |name: &str, body: &str, language: &str| RoutineDoc {
+        name: name.into(),
+        kind: "procedure".into(),
+        language: Some(language.into()),
+        body: Some(body.into()),
+        signature: None,
+        usage: None,
+        member_of: None,
+        source: None,
+    };
+    let function_name = if dialect == "oracle" {
+        "ACC_GENRE_COUNT"
+    } else {
+        "acc_genre_count"
+    };
+    let rename_name = if dialect == "oracle" {
+        "ACC_RENAME_GENRE"
+    } else {
+        "acc_rename_genre"
+    };
+    let call_name = if dialect == "oracle" {
+        "ACC_CALL_COUNT"
+    } else {
+        "acc_call_count"
+    };
+    let language = if dialect == "oracle" { "plsql" } else { "sql" };
+    let mut routines = vec![
+        procedure(rename_name, rename_body, language),
+        procedure(call_name, call_body, language),
+        RoutineDoc {
+            name: function_name.into(),
+            kind: "function".into(),
+            language: Some(language.into()),
+            body: Some(if dialect == "oracle" {
+                "FUNCTION acc_genre_count RETURN NUMBER AS n NUMBER; BEGIN SELECT COUNT(GenreId) INTO n FROM Genre; RETURN n; END;".into()
+            } else {
+                "CREATE FUNCTION dbo.acc_genre_count() RETURNS INT AS BEGIN RETURN (SELECT COUNT(GenreId) FROM Genre); END".into()
+            }),
+            signature: None,
+            usage: None,
+            member_of: None,
+            source: None,
+        },
+    ];
+    if dialect == "oracle" {
+        routines.push(procedure(
+            "ACC_SHADOW_NAME",
+            "PROCEDURE acc_shadow_name(name IN VARCHAR2) AS BEGIN UPDATE Genre SET Name = Name; END;",
+            language,
+        ));
+    }
+    let doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: dialect.into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: schema.into(),
+            objects: vec![
+                object(genre, &[genre_id, genre_name]),
+                object(log, &[observed]),
+            ],
+            routines,
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+    for note in notes {
+        graph.add_limitation(note);
+    }
+    graph
+}
+
+#[test]
+fn declared_sqlserver_parameters_and_locals_are_not_columns() {
+    let graph = legacy_scalar_routine_graph("sqlserver");
+    for id in ["dbo.acc_rename_genre", "dbo.acc_call_count"] {
+        assert_eq!(
+            graph.analysis()[&VertexId::from_raw(id)].state,
+            AnalysisState::Complete
+        );
+        assert!(!graph.analysis()[&VertexId::from_raw(id)]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SG_COLUMN_UNRESOLVED"));
+    }
+    assert!(edge(
+        &graph,
+        "dbo.acc_call_count",
+        "dbo.acc_genre_count",
+        EdgeKind::Calls
+    ));
+}
+
+#[test]
+fn declared_oracle_parameters_and_locals_are_not_columns() {
+    let graph = legacy_scalar_routine_graph("oracle");
+    for id in ["SGACC.ACC_RENAME_GENRE", "SGACC.ACC_CALL_COUNT"] {
+        assert_eq!(
+            graph.analysis()[&VertexId::from_raw(id)].state,
+            AnalysisState::Complete
+        );
+        assert!(!graph.analysis()[&VertexId::from_raw(id)]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SG_COLUMN_UNRESOLVED"));
+    }
+    assert!(edge(
+        &graph,
+        "SGACC.ACC_CALL_COUNT",
+        "SGACC.ACC_GENRE_COUNT",
+        EdgeKind::Calls
+    ));
+    let shadow = &graph.analysis()[&VertexId::from_raw("SGACC.ACC_SHADOW_NAME")];
+    assert!(shadow
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "SG_TEMPORAL_SELF_LINEAGE"));
+    assert!(edge(
+        &graph,
+        "SGACC.ACC_SHADOW_NAME",
+        "SGACC.GENRE.NAME",
+        EdgeKind::Reads
+    ));
+}
+
+#[test]
+fn oracle_new_old_fields_bind_to_trigger_parent_columns() {
+    let mut genre = object("GENRE", &["GENREID", "NAME"]);
+    genre.triggers = vec![
+        TriggerDoc {
+            name: "ACC_GENRE_INSERT".into(),
+            body: Some("BEGIN INSERT INTO ACC_GENRE_AUDIT (GenreId, GenreName) VALUES (:NEW.GenreId, :NEW.Name); END;".into()),
+        },
+        TriggerDoc {
+            name: "ACC_GENRE_UPDATE".into(),
+            body: Some("BEGIN INSERT INTO ACC_GENRE_CHANGES (GenreId, OldName, NewName) VALUES (:NEW.GenreId, :OLD.Name, :NEW.Name); END;".into()),
+        },
+    ];
+    let doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: "oracle".into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: "SGACC".into(),
+            objects: vec![
+                genre,
+                object("ACC_GENRE_AUDIT", &["GENREID", "GENRENAME"]),
+                object("ACC_GENRE_CHANGES", &["GENREID", "OLDNAME", "NEWNAME"]),
+            ],
+            routines: vec![],
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    super::enrich_from_document(&mut graph, &doc);
+    for trigger in ["ACC_GENRE_INSERT", "ACC_GENRE_UPDATE"] {
+        let id = VertexId::from_raw(&format!("SGACC.GENRE.{trigger}"));
+        assert!(!graph.analysis()[&id]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SG_COLUMN_UNRESOLVED"
+                || diagnostic.code == "SG_TEMPORAL_SELF_LINEAGE"));
+    }
+    assert!(edge(
+        &graph,
+        "SGACC.ACC_GENRE_AUDIT.GENREID",
+        "SGACC.GENRE.GENREID",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &graph,
+        "SGACC.ACC_GENRE_CHANGES.OLDNAME",
+        "SGACC.GENRE.NAME",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn sqlite_new_field_is_resolved_while_real_self_update_stays_partial() {
+    let mut orders = object("orders", &["id", "customer_id"]);
+    orders.triggers.push(TriggerDoc {
+        name: "trg_orders_touch".into(),
+        body: Some("BEGIN UPDATE customers SET name = name WHERE id = NEW.customer_id; END".into()),
+    });
+    let doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: "sqlite".into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: "main".into(),
+            objects: vec![orders, object("customers", &["id", "name"])],
+            routines: vec![],
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    super::enrich_from_document(&mut graph, &doc);
+    let analysis = &graph.analysis()[&VertexId::from_raw("main.orders.trg_orders_touch")];
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "SG_TEMPORAL_SELF_LINEAGE"));
+    assert!(!analysis
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "SG_COLUMN_UNRESOLVED"));
+    assert!(edge(
+        &graph,
+        "main.orders.trg_orders_touch",
+        "main.orders.customer_id",
+        EdgeKind::Reads
+    ));
 }
 
 #[test]

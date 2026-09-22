@@ -727,6 +727,8 @@ struct ParsedTrigger {
     local_relations: BTreeSet<(Option<String>, String)>,
     /// DML 컬럼 계보가 보수적으로 부분 결과임을 알리는 구조화 진단.
     diagnostics: Vec<schemagraph_core::Diagnostic>,
+    /// routine header나 선언부에서 실제로 선언된 scalar symbol만 보관한다.
+    scalar_symbols: BTreeSet<String>,
     partial: bool,
     /// 임시 relation 상태가 모든 문장을 순서대로 관찰했다는 보수적 증명.
     temp_state_safe: bool,
@@ -776,6 +778,7 @@ fn parse_trigger_body(
         dml_statements: Vec::new(),
         local_relations: BTreeSet::new(),
         diagnostics: Vec::new(),
+        scalar_symbols: BTreeSet::new(),
         partial: false,
         temp_state_safe: true,
         locations_trusted,
@@ -825,6 +828,9 @@ fn parse_routine_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<Parse
     let transformed =
         inner.as_ref().len() != body.len() || !std::ptr::eq(inner.as_ref().as_ptr(), body.as_ptr());
     let mut parsed = parse_trigger_body(dialect, &inner, false)?;
+    parsed
+        .scalar_symbols
+        .extend(routine_parameter_symbols(body));
     if transformed {
         parsed.locations_trusted = false;
     }
@@ -870,6 +876,7 @@ fn empty_parsed_trigger() -> ParsedTrigger {
         dml_statements: Vec::new(),
         local_relations: BTreeSet::new(),
         diagnostics: Vec::new(),
+        scalar_symbols: BTreeSet::new(),
         partial: false,
         temp_state_safe: true,
         locations_trusted: false,
@@ -1273,6 +1280,7 @@ struct ExtractionState {
     format_shadowed: bool,
     evaluation_enabled: bool,
     outer_block_seen: bool,
+    declared_symbols: BTreeSet<String>,
 }
 
 impl ExtractionState {
@@ -1285,6 +1293,7 @@ impl ExtractionState {
             format_shadowed,
             evaluation_enabled: true,
             outer_block_seen: false,
+            declared_symbols: BTreeSet::new(),
         }
     }
 
@@ -1338,6 +1347,7 @@ impl ExtractionState {
 
     fn declare(&mut self, name: &str, type_text: &str, expression: Option<&str>) {
         let key = normalize_variable_name(name);
+        self.declared_symbols.insert(key.clone());
         self.variables.remove(&key);
         self.capacities.remove(&key);
         self.unicode_capable.remove(&key);
@@ -1392,9 +1402,17 @@ fn parse_procedural_body(
     text_dialect: constant_sql::TextDialect,
     format_shadowed: bool,
 ) -> (ParsedTrigger, usize) {
-    let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
+    let extracted = extract_as_body(body);
+    let starts_in_declare = extracted
+        .as_ref()
+        .is_some_and(|inner| !starts_with_keyword(skip_ws_comments(inner), "BEGIN"));
+    let inner = extracted.unwrap_or(std::borrow::Cow::Borrowed(body));
     let mut state = ExtractionState::new(text_dialect, format_shadowed);
-    let (stmts, mut unextracted) = extract_procedural_statements(&inner, &mut state);
+    state
+        .declared_symbols
+        .extend(routine_parameter_symbols(body));
+    let (stmts, mut unextracted) =
+        extract_procedural_statements(&inner, &mut state, starts_in_declare);
     let default = GenericDialect {};
     let dialect = dialect.unwrap_or(&default);
     let mut parsed = ParsedTrigger {
@@ -1408,6 +1426,7 @@ fn parse_procedural_body(
         dml_statements: Vec::new(),
         local_relations: BTreeSet::new(),
         diagnostics: Vec::new(),
+        scalar_symbols: state.declared_symbols.clone(),
         partial: false,
         temp_state_safe: true,
         locations_trusted: false,
@@ -1470,12 +1489,16 @@ fn invalidate_temp_state_if_unsafe(parsed: &mut ParsedTrigger, body: &str, unext
 /// `:=` 대입·PL/SQL bare 호출은 그에 맞는 SQL로 재작성한다. 꺼내지 못한
 /// 문장(동적 SQL 식, 인식 못 한 구문)은 수를 돌려 limitation으로 남긴다 —
 /// 추측으로 채우지 않는다.
-fn extract_procedural_statements(body: &str, state: &mut ExtractionState) -> (Vec<String>, usize) {
+fn extract_procedural_statements(
+    body: &str,
+    state: &mut ExtractionState,
+    starts_in_declare: bool,
+) -> (Vec<String>, usize) {
     let mut stmts: Vec<String> = Vec::new();
     let mut unextracted = 0usize;
     // DECLARE/IS 섹션 안의 조각은 선언문 — 의존 대상이 아니라 미추출로 세지
     // 않되, DEFAULT/:= 안의 서브쿼리는 추출한다.
-    let mut in_declare = false;
+    let mut in_declare = starts_in_declare;
     for chunk in split_top_level(body) {
         let mut rest = chunk;
         loop {
@@ -2244,7 +2267,7 @@ fn strip_do<'a>(
     };
     match inner {
         Some(b) => {
-            let (mut s, u) = extract_procedural_statements(&b, state);
+            let (mut s, u) = extract_procedural_statements(&b, state, false);
             stmts.append(&mut s);
             *unextracted += u;
         }
@@ -2535,6 +2558,70 @@ fn normalize_variable_name(name: &str) -> String {
     name.trim().trim_start_matches('@').to_ascii_lowercase()
 }
 
+/// routine header의 parameter 이름만 수집한다. 몸체에 우연히 등장한 identifier는
+/// symbol로 승격하지 않아 SQL 컬럼 오타를 숨기지 않는다.
+fn routine_parameter_symbols(body: &str) -> BTreeSet<String> {
+    let routine = ["PROCEDURE", "FUNCTION"]
+        .iter()
+        .flat_map(|keyword| {
+            find_all_keywords(body, keyword)
+                .into_iter()
+                .map(move |position| (position, *keyword))
+        })
+        .min_by_key(|(position, _)| *position);
+    let Some((position, keyword)) = routine else {
+        return BTreeSet::new();
+    };
+    let mut tail = skip_ws_comments(&body[position + keyword.len()..]);
+    let name_len = dotted_name_len(tail);
+    if name_len == 0 {
+        return BTreeSet::new();
+    }
+    tail = skip_ws_comments(&tail[name_len..]);
+    if tail.starts_with('(') {
+        let Some(end) = find_parameter_list_end(tail) else {
+            return BTreeSet::new();
+        };
+        let parameters = &tail[1..end - 1];
+        return split_top_level_commas(parameters)
+            .into_iter()
+            .filter_map(variable_name)
+            .map(normalize_variable_name)
+            .filter(|name| !name.is_empty())
+            .collect();
+    }
+
+    let header_end = find_top_level(tail, "AS", true)
+        .into_iter()
+        .chain(find_top_level(tail, "IS", true))
+        .min()
+        .unwrap_or(tail.len());
+    declared_at_names(&tail[..header_end])
+}
+
+fn declared_at_names(text: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut index = 0usize;
+    while index < text.len() {
+        if let Some(end) = quoted_or_comment_end(text, index) {
+            index = end;
+            continue;
+        }
+        if text.as_bytes()[index] == b'@'
+            && text.as_bytes().get(index + 1) != Some(&b'@')
+            && (index == 0 || text.as_bytes()[index - 1] != b'@')
+        {
+            if let Some(name) = variable_name(&text[index..]) {
+                names.insert(normalize_variable_name(name));
+                index += name.len();
+                continue;
+            }
+        }
+        index += 1;
+    }
+    names
+}
+
 /// 대입 왼쪽 또는 선언 시작에서 단순 변수 이름을 꺼낸다. 선언의 나머지
 /// 타입 정보는 호출자가 따로 해석하지 않으므로 첫 이름 뒤는 무시한다.
 fn variable_name(fragment: &str) -> Option<&str> {
@@ -2776,6 +2863,23 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_
                     let col = parts[1].value.clone();
                     if (q == "new" || q == "old") && !parsed.fired_columns.contains(&col) {
                         parsed.fired_columns.push(col);
+                    }
+                }
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                if let (
+                    Expr::Value(value),
+                    [sqlparser::ast::AccessExpr::Dot(Expr::Identifier(column))],
+                ) = (root.as_ref(), access_chain.as_slice())
+                {
+                    if let sqlparser::ast::Value::Placeholder(pseudo) = &value.value {
+                        let pseudo = pseudo.trim_start_matches(':');
+                        if (pseudo.eq_ignore_ascii_case("new")
+                            || pseudo.eq_ignore_ascii_case("old"))
+                            && !parsed.fired_columns.contains(&column.value)
+                        {
+                            parsed.fired_columns.push(column.value.clone());
+                        }
                     }
                 }
             }
@@ -3281,6 +3385,7 @@ fn apply_trigger(
                 .any(|diagnostic| diagnostic.code == "SG_DML_CONTROL_FLOW")
                 && parsed.temp_state_safe,
             locations_trusted: parsed.locations_trusted,
+            scalar_symbols: &parsed.scalar_symbols,
         },
         &mut parsed.diagnostics,
     );
@@ -3351,6 +3456,7 @@ fn apply_routine(
                 .any(|diagnostic| diagnostic.code == "SG_DML_CONTROL_FLOW")
                 && parsed.temp_state_safe,
             locations_trusted: parsed.locations_trusted,
+            scalar_symbols: &parsed.scalar_symbols,
         },
         &mut parsed.diagnostics,
     );
