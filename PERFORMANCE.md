@@ -1,5 +1,71 @@
 # Performance measurements
 
+## JDBC and large SQL bodies (2026-09-22 follow-up)
+
+These measurements use fixed binaries on the same macOS ARM64 host and three
+fresh processes per format/mode. They are observations of these fixtures, not
+general database throughput guarantees. Earlier results below retain their
+original executable identities.
+
+### JDBC: one schema with 10,000 tables
+
+The SQLite DDL and independent catalog/graph checks are the same as the Go
+single-schema benchmark below. The JDBC JAR SHA-256 starts `17a75f09bd02`; the
+runtime is OpenJDK 17.0.20 with bundled sqlite-jdbc 3.51.1.0. Python SQLite
+3.53.4 creates the database file. Published engine 0.4.3 (`5f621fee1340`) checks
+the outputs outside the collection timer.
+
+| Tables | Format | Median collection s | Median peak RSS MiB | Maximum peak RSS MiB |
+| --- | --- | ---: | ---: | ---: |
+| 2,000 | JSON | 1.890 | 232.406 | 247.844 |
+| 2,000 | NDJSON | 1.763 | 235.312 | 236.641 |
+| 10,000 | JSON | 23.652 | 458.109 | 461.719 |
+| 10,000 | NDJSON | 22.811 | 435.453 | 436.781 |
+
+Both 10,000-table formats preserve exactly 40,001 vertices and 40,000 edges,
+including every column and primary key. NDJSON does not make JDBC collection
+constant-memory, and its memory result is not lower at every input size. JVM
+startup, driver work, and serialization are included in collection time.
+
+```sh
+python3 Scripts/benchmark-probe-sqlite.py --jdbc-jar /path/to/fixed-probe.jar \
+  --java /path/to/java --engine /path/to/fixed-schemagraph \
+  --objects 2000 10000 --repeat 3 --timeout 600 --output jdbc-scale.json
+```
+
+### Cache: 200 large view definitions
+
+This uses the unreleased parser/cache implementation in release-mode binary
+`43e43458c0f6…`. An actual SQLite file contains 200 views over an eight-column
+table. Each definition has a CTE, a join, computed projections, and a filter
+with 10,000 literal values. The collected document is 10,177,775 bytes.
+The verifier independently checks 1,810 vertices and 5,209 edges, including
+every value-lineage edge; identical graph hashes alone are not the oracle.
+
+| Mode | Median wall s | Median peak RSS MiB |
+| --- | ---: | ---: |
+| Cache disabled | 1.590 | 241.797 |
+| Empty cache | 1.794 | 241.859 |
+| Reused cache | 0.943 | 241.797 |
+
+All nine results have the same complete graph bytes. Every warm run reports
+200 hits, zero misses, zero writes, and zero warnings. This workload shows
+less analysis time with reuse, with no meaningful peak-RSS reduction. Resolution
+footprint validation can still parse an AST; the cache reuses analysis effects,
+not the full in-memory catalog or graph. Separate regression checks verify
+unrelated catalog edits, changed referenced columns, newly resolvable names,
+routine overload changes, and corrupt-cache fallback.
+
+```sh
+python3 Scripts/benchmark-analysis.py --engine /path/to/fixed-schemagraph \
+  --views 200 --columns 8 --filter-values 10000 --repeat 3 --output large-body-cache
+```
+
+Raw evidence is retained in the maintainer's
+`verification/competitive-followups-20260922/jdbc-scale.json` and
+`large-body-cache/results.json`. The latter report SHA-256 starts
+`f155e076a610`; binary/input hashes and individual samples are in the reports.
+
 ## Large schemas, dense graphs, and cancellation (2026-09-22)
 
 These are bounded observations on one macOS ARM64 host, not an optimization

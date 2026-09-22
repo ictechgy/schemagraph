@@ -520,8 +520,8 @@ def check_cache(engine: Path, database: Path, work: Path) -> None:
         "-o",
         work / "cache-warm.graph.json",
     )
-    if read_json(work / "cache-cold.graph.json") != read_json(work / "cache-warm.graph.json"):
-        fail("cold and warm cache graph JSON differed")
+    if not read_json(baseline) == read_json(work / "cache-cold.graph.json") == read_json(work / "cache-warm.graph.json"):
+        fail("uncached, cold and warm cache graph JSON differed")
     if "hits=" not in warm_stderr or "writes=" not in cold_stderr:
         fail(f"cache statistics were not reported: cold={cold_stderr!r}, warm={warm_stderr!r}")
 
@@ -568,13 +568,31 @@ def check_cache(engine: Path, database: Path, work: Path) -> None:
         "-o",
         work / "cache-schema.graph.json",
     )
-    if "hits=0" not in schema_stderr:
-        fail(f"schema change unexpectedly reused body cache: {schema_stderr}")
+    if "hits=0" in schema_stderr:
+        fail(f"unrelated relation invalidated every body: {schema_stderr}")
+    run_capture(engine, "scan", "--document", schema_changed_path, "-o", work / "cache-schema-uncached.graph.json")
+    if read_json(work / "cache-schema.graph.json") != read_json(work / "cache-schema-uncached.graph.json"):
+        fail("unrelated catalog edit produced different cached and uncached graphs")
+
+    referenced = copy.deepcopy(read_json(document))
+    orders = next(obj for schema in referenced['schemas'] for obj in schema['objects'] if obj['name'] == 'orders')
+    orders['columns'].append(dict(name='new_amount', data_type='INTEGER', nullable=True,
+                                 ordinal=max(column['ordinal'] for column in orders['columns'])+1, pk_position=0))
+    referenced_path = work / 'cache-reference-changed.json'
+    referenced_path.write_text(json.dumps(referenced), encoding='utf-8')
+    _, referenced_stderr = run_capture(engine, 'scan', '--document', referenced_path, '--cache-dir', cache_dir,
+                                      '-o', work/'cache-reference.graph.json')
+    run_capture(engine, 'scan', '--document', referenced_path, '-o', work/'cache-reference-uncached.graph.json')
+    if 'misses=0' in referenced_stderr:
+        fail('a changed referenced relation unexpectedly reused every body')
+    if read_json(work/'cache-reference.graph.json') != read_json(work/'cache-reference-uncached.graph.json'):
+        fail('referenced catalog edit produced different cached and uncached graphs')
 
     entries = list(cache_dir.glob("*.json"))
     if not entries:
         fail("cache did not persist any entries")
-    entries[0].write_text("{corrupt", encoding="utf-8")
+    for entry in entries:
+        entry.write_text("{corrupt", encoding="utf-8")
     _, corruption_stderr = run_capture(
         engine,
         "scan",
@@ -587,6 +605,8 @@ def check_cache(engine: Path, database: Path, work: Path) -> None:
     )
     if "warning" not in corruption_stderr.lower():
         fail(f"corrupt cache entry did not produce a stderr warning: {corruption_stderr}")
+    if read_json(work/'cache-corrupt.graph.json') != read_json(baseline):
+        fail('corrupt cache fallback changed graph facts')
 
 
 def check_lint(engine: Path, database: Path, work: Path) -> None:
