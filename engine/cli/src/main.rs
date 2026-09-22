@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 mod cache;
 mod cancellation;
+mod import;
 mod mcp;
 mod merge;
 mod policy;
@@ -36,6 +37,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Attach offline dbt compiled SQL or observed queries to a catalog document.
+    Import {
+        catalog: PathBuf,
+        #[arg(long, value_enum)]
+        format: ImportFormat,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+        /// Root directory for validating dbt source and compiled SQL paths.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        #[arg(long, default_value_t = 67_108_864, value_parser = clap::value_parser!(u64).range(1..=536_870_912))]
+        max_input_bytes: u64,
+        #[arg(long, default_value_t = 100_000, value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
+        max_rows: u32,
+        #[arg(long, default_value_t = 8_388_608, value_parser = clap::value_parser!(u64).range(1..=67_108_864))]
+        max_sql_bytes: u64,
+        #[arg(long, default_value_t = 67_108_864, value_parser = clap::value_parser!(u64).range(1..=536_870_912))]
+        max_total_sql_bytes: u64,
+    },
     /// Read a database catalog and write the dependency graph (the artifact).
     Scan {
         /// Connection URL: sqlite:PATH, postgres://…, mysql://… — omit with --document.
@@ -282,6 +306,12 @@ enum ReviewFormat {
     Sarif,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ImportFormat {
+    Dbt,
+    QueryLog,
+}
+
 #[derive(Clone, ValueEnum)]
 enum LevelArg {
     Schema,
@@ -315,6 +345,39 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<i32> {
     match cli.command {
+        Command::Import {
+            catalog,
+            format,
+            input,
+            output,
+            report,
+            project_root,
+            max_input_bytes,
+            max_rows,
+            max_sql_bytes,
+            max_total_sql_bytes,
+        } => {
+            let kind = match format {
+                ImportFormat::Dbt => source::imports::ImportKind::DbtManifest,
+                ImportFormat::QueryLog => source::imports::ImportKind::QueryLogJsonl,
+            };
+            import::run(
+                &catalog,
+                &input,
+                &output,
+                &report,
+                kind,
+                project_root.as_deref(),
+                source::codec::LATEST_DOCUMENT_VERSION,
+                source::imports::ImportLimits {
+                    max_input_bytes,
+                    max_rows: max_rows as usize,
+                    max_sql_bytes,
+                    max_total_sql_bytes,
+                    ..Default::default()
+                },
+            )
+        }
         Command::Scan {
             url,
             output,
