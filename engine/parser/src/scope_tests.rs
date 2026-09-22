@@ -1,7 +1,9 @@
 //! SQL 스코프와 값 계보를 필요한 간선·금지된 간선 양쪽으로 검증한다.
 
 use schemagraph_core::{AnalysisState, EdgeKind, Graph, VertexId};
-use schemagraph_source::document::{CatalogDocument, ColumnDoc, ObjectDoc, SchemaDoc};
+use schemagraph_source::document::{
+    CatalogDocument, CollectionContext, ColumnDoc, ObjectDoc, RoutineDoc, SchemaDoc,
+};
 
 fn columns(names: &[&str]) -> Vec<ColumnDoc> {
     names
@@ -88,6 +90,618 @@ fn has_diagnostic(g: &Graph, code: &str) -> bool {
         .values()
         .flat_map(|analysis| &analysis.diagnostics)
         .any(|diagnostic| diagnostic.code == code)
+}
+
+fn scan_routine(body: &str) -> Graph {
+    scan_routine_with(body, "postgres", "sql")
+}
+
+fn scan_routine_with(body: &str, dialect: &str, language: &str) -> Graph {
+    let doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: dialect.into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: "s".into(),
+            objects: vec![
+                object("orders", &["id", "customer_id", "amount"]),
+                object("customers", &["id", "name"]),
+                object("audit", &["id", "name"]),
+            ],
+            routines: vec![RoutineDoc {
+                name: "mutate".into(),
+                kind: "procedure".into(),
+                language: Some(language.into()),
+                body: Some(body.into()),
+                signature: None,
+                usage: None,
+                member_of: None,
+                source: None,
+            }],
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+    for note in notes {
+        graph.add_limitation(note);
+    }
+    graph
+}
+
+fn scan_oracle_temp_sequence(body: &str) -> Graph {
+    let doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: "oracle".into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: "SGACC".into(),
+            objects: vec![
+                object("DML_SOURCE", &["SOURCE_ID", "AMOUNT", "ACTIVE"]),
+                object("DML_UPDATE_DELTA", &["TARGET_ID", "BUMP", "ACTIVE"]),
+                object("DML_TARGET", &["TARGET_ID", "TARGET_VALUE", "LAST_WRITER"]),
+            ],
+            routines: vec![RoutineDoc {
+                name: "MUTATE".into(),
+                kind: "query".into(),
+                language: Some("sql".into()),
+                body: Some(body.into()),
+                signature: None,
+                usage: None,
+                member_of: None,
+                source: Some("dml/case.sql".into()),
+            }],
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+    for note in notes {
+        graph.add_limitation(note);
+    }
+    graph
+}
+
+#[test]
+fn oracle_schema_qualified_global_temp_insert_resolves_exact_local_symbol() {
+    let graph = scan_oracle_temp_sequence(
+        "CREATE GLOBAL TEMPORARY TABLE SGACC.DML_TEMP_STAGE ON COMMIT PRESERVE ROWS AS SELECT s.SOURCE_ID + 400 AS STAGED_ID, s.AMOUNT * 3 AS STAGED_VALUE FROM SGACC.DML_SOURCE s WHERE s.ACTIVE = 1; INSERT INTO SGACC.DML_TARGET (TARGET_ID, TARGET_VALUE, LAST_WRITER) SELECT STAGED_ID, STAGED_VALUE, 'temp_insert' FROM SGACC.DML_TEMP_STAGE",
+    );
+    assert!(edge(
+        &graph,
+        "SGACC.DML_TARGET.TARGET_ID",
+        "SGACC.DML_SOURCE.SOURCE_ID",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &graph,
+        "SGACC.DML_TARGET.TARGET_VALUE",
+        "SGACC.DML_SOURCE.AMOUNT",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!has_diagnostic(&graph, "SG_RELATION_UNRESOLVED"));
+    assert!(!graph
+        .vertices()
+        .any(|vertex| vertex.name == "DML_TEMP_STAGE"));
+}
+
+#[test]
+fn oracle_schema_qualified_global_temp_update_preserves_temporal_lineage() {
+    let graph = scan_oracle_temp_sequence(
+        "CREATE GLOBAL TEMPORARY TABLE SGACC.DML_TEMP_DELTA ON COMMIT PRESERVE ROWS AS SELECT TARGET_ID, BUMP + 5 AS BUMP FROM SGACC.DML_UPDATE_DELTA WHERE ACTIVE = 1; UPDATE SGACC.DML_TARGET t SET (TARGET_VALUE, LAST_WRITER) = (SELECT t.TARGET_VALUE + d.BUMP, 'temp_update' FROM SGACC.DML_TEMP_DELTA d WHERE d.TARGET_ID = t.TARGET_ID) WHERE EXISTS (SELECT 1 FROM SGACC.DML_TEMP_DELTA d WHERE d.TARGET_ID = t.TARGET_ID)",
+    );
+    assert!(edge(
+        &graph,
+        "SGACC.DML_TARGET.TARGET_VALUE",
+        "SGACC.DML_UPDATE_DELTA.BUMP",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(has_diagnostic(&graph, "SG_TEMPORAL_SELF_LINEAGE"));
+    assert!(!has_diagnostic(&graph, "SG_RELATION_UNRESOLVED"));
+    assert!(!graph
+        .vertices()
+        .any(|vertex| vertex.name == "DML_TEMP_DELTA"));
+}
+
+#[test]
+fn qualified_temp_symbol_does_not_bind_a_different_schema() {
+    let graph = scan_oracle_temp_sequence(
+        "CREATE GLOBAL TEMPORARY TABLE SGACC.DML_TEMP_STAGE ON COMMIT PRESERVE ROWS AS SELECT SOURCE_ID AS STAGED_ID, AMOUNT AS STAGED_VALUE FROM SGACC.DML_SOURCE; INSERT INTO SGACC.DML_TARGET (TARGET_ID, TARGET_VALUE, LAST_WRITER) SELECT STAGED_ID, STAGED_VALUE, 'wrong_schema' FROM OTHER.DML_TEMP_STAGE",
+    );
+    assert!(has_diagnostic(&graph, "SG_RELATION_UNRESOLVED"));
+    assert!(!edge(
+        &graph,
+        "SGACC.DML_TARGET.TARGET_ID",
+        "SGACC.DML_SOURCE.SOURCE_ID",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn sqlserver_select_into_maps_persistent_target_and_temp_lineage() {
+    let persistent = scan_routine_with(
+        "SELECT o.id AS id, o.customer_id AS name INTO audit FROM orders o",
+        "sqlserver",
+        "sql",
+    );
+    assert!(edge(&persistent, "s.mutate", "s.audit", EdgeKind::Writes));
+    assert!(!edge(&persistent, "s.mutate", "s.audit", EdgeKind::Reads));
+    assert!(edge(
+        &persistent,
+        "s.mutate",
+        "s.audit.id",
+        EdgeKind::Writes
+    ));
+    assert!(edge(
+        &persistent,
+        "s.audit.id",
+        "s.orders.id",
+        EdgeKind::DerivesFrom
+    ));
+
+    let temporary = scan_routine_with(
+        "SELECT o.id AS id, o.customer_id AS name INTO #tmp FROM orders o; INSERT INTO audit (id, name) SELECT id, name FROM #tmp",
+        "sqlserver",
+        "sql",
+    );
+    assert!(edge(
+        &temporary,
+        "s.audit.id",
+        "s.orders.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &temporary,
+        "s.audit.name",
+        "s.orders.customer_id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!temporary.vertices().any(|vertex| vertex.name == "#tmp"));
+}
+
+#[test]
+fn insert_select_maps_target_writes_reads_and_value_lineage() {
+    let graph = scan_routine(
+        "INSERT INTO audit (id, name) SELECT o.id, c.name FROM orders o JOIN customers c ON c.id=o.customer_id WHERE o.amount > 0",
+    );
+    assert!(edge(&graph, "s.mutate", "s.audit.id", EdgeKind::Writes));
+    assert!(edge(&graph, "s.mutate", "s.audit.name", EdgeKind::Writes));
+    assert!(!edge(&graph, "s.mutate", "s.audit", EdgeKind::Reads));
+    assert!(edge(&graph, "s.mutate", "s.orders.id", EdgeKind::Reads));
+    assert!(edge(&graph, "s.mutate", "s.orders.amount", EdgeKind::Reads));
+    assert!(edge(
+        &graph,
+        "s.mutate",
+        "s.customers.name",
+        EdgeKind::Reads
+    ));
+    assert!(edge(
+        &graph,
+        "s.audit.id",
+        "s.orders.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &graph,
+        "s.audit.name",
+        "s.customers.name",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!edge(
+        &graph,
+        "s.audit.id",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!edge(
+        &graph,
+        "s.audit.id",
+        "s.orders.amount",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn update_from_maps_predicate_reads_without_value_lineage() {
+    let graph =
+        scan_routine("UPDATE orders o SET customer_id = c.id FROM customers c WHERE c.id = o.id");
+    assert!(edge(
+        &graph,
+        "s.mutate",
+        "s.orders.customer_id",
+        EdgeKind::Writes
+    ));
+    assert!(edge(&graph, "s.mutate", "s.customers.id", EdgeKind::Reads));
+    assert!(edge(
+        &graph,
+        "s.orders.customer_id",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(&graph, "s.mutate", "s.orders.id", EdgeKind::Reads));
+}
+
+#[test]
+fn update_from_duplicate_target_keeps_target_alias_and_join_sources_distinct() {
+    let graph = scan_routine(
+        "UPDATE orders o SET customer_id = c.id FROM orders o JOIN customers c ON c.id = o.id",
+    );
+    assert!(edge(
+        &graph,
+        "s.orders.customer_id",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!has_diagnostic(&graph, "SG_COLUMN_AMBIGUOUS"));
+}
+
+#[test]
+fn sqlserver_update_alias_promotes_the_unique_from_relation() {
+    let graph = scan_routine_with(
+        "UPDATE o SET amount = o.amount + c.id FROM orders o JOIN customers c ON c.id = o.customer_id",
+        "sqlserver",
+        "sql",
+    );
+    assert!(edge(&graph, "s.mutate", "s.orders", EdgeKind::Writes));
+    assert!(!edge(&graph, "s.mutate", "s.orders", EdgeKind::Reads));
+    assert!(edge(
+        &graph,
+        "s.mutate",
+        "s.orders.amount",
+        EdgeKind::Writes
+    ));
+    assert!(edge(&graph, "s.mutate", "s.orders.amount", EdgeKind::Reads));
+    assert!(edge(&graph, "s.mutate", "s.customers.id", EdgeKind::Reads));
+    assert!(edge(
+        &graph,
+        "s.orders.amount",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"));
+}
+
+#[test]
+fn oracle_tuple_assignment_maps_known_width_positionally() {
+    let graph = scan_routine_with(
+        "UPDATE \"audit\" a SET (\"id\", \"name\") = (SELECT o.\"id\", c.\"name\" FROM \"orders\" o JOIN \"customers\" c ON c.\"id\" = o.\"customer_id\" WHERE o.\"id\" = a.\"id\")",
+        "oracle",
+        "sql",
+    );
+    assert!(edge(&graph, "s.mutate", "s.audit.id", EdgeKind::Writes));
+    assert!(edge(&graph, "s.mutate", "s.audit.name", EdgeKind::Writes));
+    assert!(edge(
+        &graph,
+        "s.audit.id",
+        "s.orders.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &graph,
+        "s.audit.name",
+        "s.customers.name",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"));
+}
+
+#[test]
+fn merge_maps_match_update_and_not_matched_insert_members() {
+    let graph = scan_routine(
+        "MERGE INTO audit a USING customers c ON a.id = c.id WHEN MATCHED THEN UPDATE SET name = c.name WHEN NOT MATCHED THEN INSERT (id, name) VALUES (c.id, c.name)",
+    );
+    assert!(edge(&graph, "s.mutate", "s.audit.name", EdgeKind::Writes));
+    assert!(!edge(&graph, "s.mutate", "s.audit", EdgeKind::Reads));
+    assert!(edge(&graph, "s.mutate", "s.audit.id", EdgeKind::Reads));
+    assert!(edge(&graph, "s.mutate", "s.customers.id", EdgeKind::Reads));
+    assert!(edge(
+        &graph,
+        "s.audit.name",
+        "s.customers.name",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(&graph, "s.mutate", "s.audit.id", EdgeKind::Writes));
+    assert!(edge(
+        &graph,
+        "s.audit.id",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn temporal_self_update_is_partial_without_self_derives_edge() {
+    let graph = scan_routine("UPDATE orders SET amount = amount + 1");
+    assert!(edge(
+        &graph,
+        "s.mutate",
+        "s.orders.amount",
+        EdgeKind::Writes
+    ));
+    assert!(edge(&graph, "s.mutate", "s.orders.amount", EdgeKind::Reads));
+    assert!(!edge(
+        &graph,
+        "s.orders.amount",
+        "s.orders.amount",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(has_diagnostic(&graph, "SG_TEMPORAL_SELF_LINEAGE"));
+}
+
+#[test]
+fn control_flow_dml_is_explicitly_partial() {
+    let graph =
+        scan_routine("BEGIN IF amount > 0 THEN UPDATE orders SET amount = amount + 1; END IF; END");
+    assert!(has_diagnostic(&graph, "SG_DML_CONTROL_FLOW"));
+    assert_eq!(
+        graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Partial
+    );
+}
+
+#[test]
+fn straight_line_temp_ctas_collapses_to_real_sources() {
+    let graph = scan_routine(
+        "CREATE TEMP TABLE tmp AS SELECT id, name FROM customers; INSERT INTO audit (id, name) SELECT id, name FROM tmp",
+    );
+    assert!(edge(
+        &graph,
+        "s.audit.id",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &graph,
+        "s.audit.name",
+        "s.customers.name",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!graph.limitations().iter().any(|note| note.contains("tmp")));
+    assert!(!graph.vertices().any(|vertex| vertex.name == "tmp"));
+}
+
+#[test]
+fn straight_line_temp_insert_appends_sources_without_graph_writes() {
+    let graph = scan_routine(
+        "CREATE TEMP TABLE tmp AS SELECT id, name FROM customers; INSERT INTO tmp (id, name) SELECT id, customer_id FROM orders; INSERT INTO audit (id, name) SELECT id, name FROM tmp",
+    );
+    assert!(edge(
+        &graph,
+        "s.audit.id",
+        "s.orders.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &graph,
+        "s.audit.id",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &graph,
+        "s.audit.name",
+        "s.orders.customer_id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &graph,
+        "s.audit.name",
+        "s.customers.name",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!edge(&graph, "s.mutate", "s.customers", EdgeKind::Writes));
+    assert!(!graph.limitations().iter().any(|note| note.contains("tmp")));
+}
+
+#[test]
+fn temp_update_uses_local_column_identity_and_preserves_unmatched_rows() {
+    let graph = scan_routine(
+        "CREATE TEMP TABLE tmp AS SELECT id AS a, id AS b FROM orders; UPDATE tmp SET b = (SELECT id FROM customers LIMIT 1); INSERT INTO audit (id, name) SELECT a, b FROM tmp",
+    );
+    assert!(edge(
+        &graph,
+        "s.audit.id",
+        "s.orders.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!edge(
+        &graph,
+        "s.audit.id",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &graph,
+        "s.audit.name",
+        "s.orders.id",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(edge(
+        &graph,
+        "s.audit.name",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn unknown_dynamic_sql_invalidates_temp_lineage() {
+    let graph = scan_routine_with(
+        "BEGIN CREATE TEMP TABLE tmp AS SELECT id, name FROM customers; EXECUTE dynamic_sql_variable; INSERT INTO audit (id, name) SELECT id, name FROM tmp; END",
+        "postgres",
+        "plpgsql",
+    );
+    assert!(has_diagnostic(&graph, "SG_DML_TEMP_STATE"));
+    assert!(!edge(
+        &graph,
+        "s.audit.id",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn drop_invalidates_temp_lineage_before_later_reads() {
+    let graph = scan_routine(
+        "CREATE TEMP TABLE tmp AS SELECT id, name FROM customers; DROP TABLE tmp; INSERT INTO audit (id, name) SELECT id, name FROM tmp",
+    );
+    assert!(has_diagnostic(&graph, "SG_DML_TEMP_STATE"));
+    assert!(!edge(
+        &graph,
+        "s.audit.id",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn straight_line_temp_update_rebinds_without_writing_source_columns() {
+    let graph = scan_routine(
+        "CREATE TEMP TABLE tmp AS SELECT id, name FROM customers; UPDATE tmp SET name = name; INSERT INTO audit (id, name) SELECT id, name FROM tmp",
+    );
+    assert!(edge(
+        &graph,
+        "s.audit.name",
+        "s.customers.name",
+        EdgeKind::DerivesFrom
+    ));
+    assert!(!edge(
+        &graph,
+        "s.mutate",
+        "s.customers.name",
+        EdgeKind::Writes
+    ));
+    assert!(!graph.limitations().iter().any(|note| note.contains("tmp")));
+}
+
+#[test]
+fn unsupported_target_shape_is_partial_without_ghost_columns() {
+    let graph = scan_routine("INSERT INTO audit SELECT * FROM orders");
+    assert!(has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"));
+    assert!(!graph
+        .vertices()
+        .any(|vertex| vertex.id.as_str().contains("sink")));
+}
+
+#[test]
+fn implicit_insert_shape_is_partial_even_when_catalog_width_matches() {
+    let graph = scan_routine("INSERT INTO audit SELECT id, name FROM customers");
+    assert!(has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"));
+    assert!(!edge(&graph, "s.mutate", "s.audit.id", EdgeKind::Writes));
+    assert!(!edge(
+        &graph,
+        "s.audit.id",
+        "s.customers.id",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+#[test]
+fn rewritten_procedural_sql_does_not_claim_raw_source_locations() {
+    let graph = scan_routine_with(
+        "CREATE FUNCTION mutate() RETURNS void AS $$ BEGIN INSERT INTO audit (id, name) SELECT id, name FROM customers; END $$ LANGUAGE plpgsql",
+        "postgres",
+        "plpgsql",
+    );
+    let origins: Vec<_> = graph
+        .origins()
+        .values()
+        .flatten()
+        .filter(|origin| origin.role.starts_with("dml-owner:"))
+        .collect();
+    assert!(!origins.is_empty());
+    assert!(origins.iter().all(|origin| origin.location.is_none()));
+}
+
+#[test]
+fn matching_database_qualified_relation_is_local_but_mismatch_is_partial() {
+    fn graph(database: &str) -> Graph {
+        let doc = CatalogDocument {
+            context: Some(CollectionContext {
+                source_id: "fixture".into(),
+                database: Some("corpus".into()),
+                schema_filter: Some(vec!["public".into()]),
+                catalog_complete: true,
+            }),
+            dependencies: Vec::new(),
+            version: 1,
+            dialect: "postgres".into(),
+            reader: "fixture".into(),
+            limitations: vec![],
+            schemas: vec![SchemaDoc {
+                name: "public".into(),
+                objects: vec![object("orders", &["id", "amount"])],
+                routines: vec![RoutineDoc {
+                    name: "model".into(),
+                    kind: "query".into(),
+                    language: Some("sql".into()),
+                    body: Some(format!(
+                        "SELECT id, amount FROM {database}.\"public\".\"orders\""
+                    )),
+                    signature: None,
+                    usage: None,
+                    member_of: None,
+                    source: Some("models/model.sql".into()),
+                }],
+            }],
+        };
+        let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+        let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+        for note in notes {
+            graph.add_limitation(note);
+        }
+        graph
+    }
+
+    let matching = graph("\"corpus\"");
+    assert!(edge(
+        &matching,
+        "public.model",
+        "public.orders",
+        EdgeKind::Reads
+    ));
+    assert!(edge(
+        &matching,
+        "public.model",
+        "public.orders.id",
+        EdgeKind::Reads
+    ));
+    assert!(!has_diagnostic(&matching, "SG_CROSS_DATABASE"));
+
+    let folded = graph("Corpus");
+    assert!(edge(
+        &folded,
+        "public.model",
+        "public.orders.id",
+        EdgeKind::Reads
+    ));
+    assert!(!has_diagnostic(&folded, "SG_CROSS_DATABASE"));
+
+    let mismatched = graph("\"warehouse\"");
+    assert!(!edge(
+        &mismatched,
+        "public.model",
+        "public.orders",
+        EdgeKind::Reads
+    ));
+    assert!(!edge(
+        &mismatched,
+        "public.model",
+        "public.orders.id",
+        EdgeKind::Reads
+    ));
+    assert!(has_diagnostic(&mismatched, "SG_CROSS_DATABASE"));
+}
+
+#[test]
+fn generated_default_insert_shape_is_partial_without_guessed_writes() {
+    let graph = scan_routine("INSERT INTO audit DEFAULT VALUES");
+    assert!(has_diagnostic(&graph, "SG_DML_SOURCE_SHAPE"));
+    assert!(!edge(&graph, "s.mutate", "s.audit.id", EdgeKind::Writes));
 }
 
 #[test]
