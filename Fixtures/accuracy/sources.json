@@ -35,6 +35,30 @@
       "transformation": "strip UTF-8 BOM; normalize CRLF to LF; retain schema before Populate Tables; remove DROP DATABASE, CREATE DATABASE, and USE statements so the runner selects its owned database; no INSERT statements",
       "upstream_sha256": "02a1835417c3ea19bff64e1d1f22be738ce51b3f88b0473c24eebff9a3ccde4b",
       "url": "https://raw.githubusercontent.com/lerocha/chinook-database/4a944a942426e1f3263fe539155fb7ef92b04b4a/ChinookDatabase/DataSources/Chinook_MySql.sql"
+    },
+    {
+      "commit": "4a944a942426e1f3263fe539155fb7ef92b04b4a",
+      "file": "chinook-sqlserver/schema.sql",
+      "license_file": "chinook-sqlserver/LICENSE.md",
+      "license_sha256": "5064d720db431474b0a0b0cef9d2b5e362b6c6f80602b35c6443b07cbc979f77",
+      "name": "chinook-sqlserver",
+      "release": "v1.4.5",
+      "sha256": "96bbceef1314fb6f47cf0a256b4b5d21b9204d0fae81fd950205a231bb62904a",
+      "transformation": "strip UTF-8 BOM; normalize CRLF to LF; keep first attribution block and only table/index/ALTER TABLE DDL before Populate Tables; omit database/user/connection commands and all inserts; replace GO (SQL Server) or statement semicolons (Oracle) with explicit JDBC batch markers; remove final statement semicolons",
+      "upstream_sha256": "5ea75c9e925ead917d3fabea6ed3cc8c1ff1d036b61e915c94631aafa2b0802b",
+      "url": "https://raw.githubusercontent.com/lerocha/chinook-database/4a944a942426e1f3263fe539155fb7ef92b04b4a/ChinookDatabase/DataSources/Chinook_SqlServer.sql"
+    },
+    {
+      "commit": "4a944a942426e1f3263fe539155fb7ef92b04b4a",
+      "file": "chinook-oracle/schema.sql",
+      "license_file": "chinook-oracle/LICENSE.md",
+      "license_sha256": "5064d720db431474b0a0b0cef9d2b5e362b6c6f80602b35c6443b07cbc979f77",
+      "name": "chinook-oracle",
+      "release": "v1.4.5",
+      "sha256": "941ff348af55ac761e3cb060d5a81c8690057ec87bfa3e2d277ced086b21bb6f",
+      "transformation": "strip UTF-8 BOM; normalize CRLF to LF; keep first attribution block and only table/index/ALTER TABLE DDL before Populate Tables; omit database/user/connection commands and all inserts; replace GO (SQL Server) or statement semicolons (Oracle) with explicit JDBC batch markers; remove final statement semicolons",
+      "upstream_sha256": "8db05a9b191c5c02d3f92c7775f7f581a611f5a46ba6ba8b614a042736dadcda",
+      "url": "https://raw.githubusercontent.com/lerocha/chinook-database/4a944a942426e1f3263fe539155fb7ef92b04b4a/ChinookDatabase/DataSources/Chinook_Oracle.sql"
     }
   ]
 }

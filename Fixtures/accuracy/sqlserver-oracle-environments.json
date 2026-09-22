@@ -1,0 +1,14 @@
+{
+  "engines": {
+    "oracle": {
+      "image": "gvenzl/oracle-free@sha256:6d61d267a3b978c24c5ac1790e62e927416a0aec446bd86e4b3a1527562757bd",
+      "memory": "3g",
+      "tag": "gvenzl/oracle-free:23.26.3-slim"
+    },
+    "sqlserver": {
+      "image": "mcr.microsoft.com/mssql/server@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090",
+      "memory": "3g",
+      "tag": "mcr.microsoft.com/mssql/server:2022-latest"
+    }
+  }
+}

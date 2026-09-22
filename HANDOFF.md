@@ -4,7 +4,7 @@
 
 ## 지금 상태
 
-- 2026-09-22: **문서 정리·로컬 규모 검증 완료, SQL Server·Oracle 실DB 평가 대기**
+- 2026-09-22: **문서 정리·로컬 규모 검증 완료, SQL Server·Oracle 실DB 평가 진행 중**
   (`feature/sqlserver-oracle-scale-validation`).
   사용자가 문서 정리와 선택 과제 두 건을 승인했다. 기존 Chinook 공개 표본의
   SQL Server·Oracle DDL을 추가하고, view·저장 루틴·trigger의 독립 기대값을
@@ -15,11 +15,12 @@
     34개이며 실제 정확도 점수가 아니다. `Scripts/verify-sqlserver-oracle-accuracy.py`,
     `Scripts/AccuracySql.java`, 전용 CI workflow를 준비했다. 평가기 실패 검사
     18개와 실제 H2의 batch/query·JSON·실패 차단·비밀번호 비노출 검사는 통과했다.
-  - **새 원본 DDL·라이선스·체크섬·이미지 manifest와 실제 SQL Server/Oracle 실행은
-    미완료**다. 새 사례에 엔진을 실행하거나 점수를 보고하지 않았다.
-    `ACCURACY.md`에도 준비 상태를 명시했다. 필요한 파일이 없는 전용 workflow는
-    아직 원격으로 실행하지 않는다. 변경은 현재 로컬 커밋으로만 보관하며,
-    새 branch push·PR·CI는 prerequisites가 갖춰진 뒤 진행한다.
+  - 새 원본 DDL·라이선스·체크섬과 immutable 이미지 manifest를 추가했다.
+    SQL Server는 공식 `mcr.microsoft.com/mssql/server:2022-latest`의 digest,
+    Oracle은 `gvenzl/oracle-free:23.26.3-slim`의 multi-arch digest를 고정했다.
+    DB·사용자 생성/삭제와 데이터 행은 제외하고 11개 공개 테이블의 DDL만 쓴다.
+    **실제 SQL 유효성·실행 효과·정확도 평가와 원격 CI는 진행 중**이며, 완료 전
+    정확도 점수나 완료 상태를 주장하지 않는다.
   - 규모 검증은 외부 부하 없는 구간에서 고정 release 바이너리(`c28928ce3ade`,
     source `8e53c4f`, v0.4.2)로 실행했다. 1만 테이블·8컬럼 문서의 12만 정점·
     139,997개 간선을 독립 검증했다. JSON/NDJSON peak RSS 중앙값은
@@ -41,10 +42,10 @@
     Go test/vet·CGO 없는 빌드·실제 SQLite의 literal/env 입력 동일성과 거부 경로를
     확인했다. 바이너리는 `6daea55f8e0b`로 시작한다. 이는 미배포 소스 기능으로,
     공개 0.4.2 Go 바이너리에는 없음을 README·INSTALLATION에 명시했다.
-  - 기존 GitHub 작업 권한은 재사용한다. 새 Chinook 자료·공식 문서·DB 이미지·
-    필요한 JDBC 드라이버의 외부 접근은 승인 답변을 기다린다. 그동안 로컬
-    문서·평가 도구·성능 측정기 작업을 진행한다. 기대값을 엔진 결과에 맞춰 바꾸지
-    않으며, 첫 평가와 발견한 오류 수정 후의 결과를 구분한다.
+  - 사용자가 새 Chinook 자료·공식 문서·DB 이미지·필요한 JDBC 드라이버의
+    외부 접근을 승인했다. 기존 GitHub 작업 권한도 재사용한다. SQL Server는
+    실제 Linux x86_64 CI에서, Oracle은 로컬 ARM64와 CI에서 검증한다.
+    기대값을 엔진 결과에 맞춰 바꾸지 않으며 첫 평가와 수정 후 결과를 구분한다.
   - 새 근거는 저장소 밖
     `~/Library/Application Support/schemagraph/verification/followups-20260922`에 보관한다.
 
