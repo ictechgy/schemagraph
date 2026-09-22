@@ -130,11 +130,26 @@ document unchanged. Exporting query records requires catalog version 2 and the
 `external-queries-v1` required feature; the example selects v2 automatically.
 
 The optional cache stores body analysis with provenance, not raw SQL, current
-catalog facts, or usage counters. Its namespace includes the running executable,
-dialect, and structural catalog; a changed body invalidates that body's entry,
-while changed catalog structure invalidates the namespace. Corrupt or oversized
+catalog facts, or usage counters. In the current source, entries record the
+relations, column shapes, and routine candidates needed for name resolution.
+An unrelated catalog edit can reuse those entries; changed or newly resolvable
+dependencies invalidate them. Executable, dialect, and collection context are
+also part of compatibility. Bodies without a trustworthy resolution footprint
+use a conservative whole-catalog namespace. Corrupt or oversized
 entries are reported on stderr and reparsed. Cache counts also go to stderr so
 graph JSON stays machine-readable. Cache files are disposable build artifacts.
+The full catalog and graph are still rebuilt and held in memory. This caches
+SQL analysis; it is not a persistent incremental graph engine. Published
+v0.4.3 uses whole-catalog structural invalidation for all entries.
+
+Current-source DML analysis records destination-column `writes`, source and
+predicate `reads`, and value-only `derives-from` edges for the supported static
+INSERT SELECT, CTAS/SELECT INTO, UPDATE, MERGE, and straight-line temp-table
+subset. Temporary symbols never create catalog vertices. A self-update such as
+`x = x + 1` records its read/write facts and `SG_TEMPORAL_SELF_LINEAGE`, with
+partial state instead of a fabricated physical self-edge. Implicit INSERT
+destination shape and unknown procedural effects remain conservative. See
+[the independent DML corpus](DML-ACCURACY.md) and [external imports](EXTERNAL-SQL.md).
 
 ## Collect and combine DB catalog references
 

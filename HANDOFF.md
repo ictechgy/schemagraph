@@ -4,6 +4,46 @@
 
 ## 지금 상태
 
+- 2026-09-22: **경쟁 보강 구현 완료·최종 CI 대기** (`feature/competitive-hardening`).
+  사용자의 “쭉 수정” 승인으로 여섯 보강 과제를 구현했다. 기준은 `c19c958`이다.
+  공개 v0.4.3 태그·배포물은 그대로이며 새 릴리스는 요청되지 않았다.
+  - `776ebe8`에서 DML 16개 기대값을 분석 전에 고정했다(SHA `fd129759…`).
+    공개 0.4.3의 첫 실패는 별도 보존했다. 실제 SQLite 15개(MERGE 1개 명시 제외),
+    PostgreSQL 16개, Oracle Go/JDBC 각 16개를 새 엔진으로 통과했다.
+    SQL Server 새 16개 실DB 실행은 x86_64 CI에서 확인할 예정이다.
+  - `71ab08d`·`029e823`: 정적 DML 컬럼 계보, 임시 심벌, cache owner 검증과
+    의존 구조별 재사용. `c8083de`는 기존 SQL Server/Oracle 매개변수·변수와
+    Oracle/SQLite NEW/OLD 회귀를 해결했다. 기존 SQL Server/Oracle 18개씩도
+    보존된 실제 입력에서 통과했다. 불완전 변수 문맥은 계속 partial로 보고한다.
+  - `d9b93a9`·`259727d`: 정책·기준선·만료 예외·SARIF·consumer Action.
+    부분 인덱스 조건·UNIQUE 추가·빈 스키마 변경의 누락을 수정했다.
+    출력 상한으로 gate를 우회할 수 없고 비교 불가/불완전을 기준선으로 숨기지 않는다.
+  - `89df6be`: dbt manifest와 query-log import. 실제 dbt Core 1.12.5/
+    dbt-postgres 1.11.0의 manifest v12 컴파일·SQL 실행·읽기 그래프를 검증했다.
+    기간/횟수는 별도 report에 보존하고 usage를 합성하지 않는다. 경로/FD/예산,
+    canonical ID, 동일 adapter 재import, 산출물 실패 복구를 검증했다.
+  - `60539b5`: 제한 권한 PG에서 native/Go가 숨긴 관계 3개·컬럼 6개를 세어
+    불완전을 보고한다. JDBC 원본 정의 수집도 보강했다. 세 경로의 데이터 SELECT/
+    DDL 거부, USAGE/REFERENCES만으로의 수집, 없는 스키마/다른 DB 실패를 확인했다.
+  - `4c8aca4`·`e6c64f6`: Docker arm64의 비루트·네트워크 차단·읽기 전용 root
+    smoke, 지원표와 추가 성능 계측. JDBC 1만 테이블 JSON/NDJSON RSS 중앙값은
+    458.109/435.453 MiB다. 큰 SQL 200개(문서 약 10MB)의 cache off/cold/warm은
+    1.590/1.794/0.943초, RSS 약 241.8 MiB다. 각 3회 고정 바이너리 관측이다.
+  - 로컬 Rust workspace **335개**와 포맷을 통과했다. 6개 crate package,
+    JSON 계약·Action/SARIF 공식 schema·취소·SQLite/PG 공개 정확도·실제 dbt·
+    새 DML 및 전체 uncached/cold/warm 그래프 일치도 통과했다. 마지막 parser
+    변경 전 package 검증은 통과했고 최종 소스 package는 CI에서 다시 확인한다.
+    `2f7f2e8`·`c3f662a`는 실제 SQLite/PG/MySQL/MariaDB fixture에서 기존 정점/간선이
+    보존된 채 추가된 컬럼 사실과 temporal partial을 검토해 golden에 반영했다.
+  - 최종 CI에는 consumer Action 실제 호출, dbt 실행, 제한 권한 PG 세 경로,
+    새 DML 4-DB baseline/replay, Docker x86_64, 기존 14 fixture가 들어간다.
+    아직 CI 완료·병합·새 공개 배포를 주장하지 않는다. 작업이 끝나면 원래 중지돼
+    있던 Colima를 중지한다. 소유한 임시 DB 컨테이너는 이미 정리했다.
+  - 상세 계획·전/후 실패·실행 로그·고정 바이너리는 저장소 밖
+    `~/Library/Application Support/schemagraph/verification/competitive-followups-20260922`
+    에 있다. `plan.json`, `final-local-checks.json`, `final-workspace-test.log`,
+    `golden-candidates`, `legacy-current-scalar-transition-10fd4b0`를 먼저 확인한다.
+
 - 2026-09-22: **v0.4.3 공개 배포·설치 검증 완료**.
   [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.4.3) ·
   [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.4.3) ·
