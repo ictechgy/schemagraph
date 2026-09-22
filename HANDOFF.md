@@ -4,6 +4,39 @@
 
 ## 지금 상태
 
+- 2026-09-22: **v0.5.0 공개 배포·설치 검증 완료**.
+  [GitHub 릴리스](https://github.com/ictechgy/schemagraph/releases/tag/v0.5.0) ·
+  [crates.io CLI](https://crates.io/crates/schemagraph-cli/0.5.0) ·
+  [Maven Central](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.5.0).
+  사용자 요청에 따라 [PR #15](https://github.com/ictechgy/schemagraph/pull/15)의
+  CI를 확인하고 병합했다. 태그·배포 소스·6개 crate의 내장 소스 커밋은
+  `94d1db89a563549e6df697b7ca27933624305a18`이며 기존 릴리스는 보존했다.
+  - [소스 CI](https://github.com/ictechgy/schemagraph/actions/runs/35720225067),
+    [DML](https://github.com/ictechgy/schemagraph/actions/runs/35720225200),
+    [SQL Server/Oracle](https://github.com/ictechgy/schemagraph/actions/runs/35720225125),
+    [IBM](https://github.com/ictechgy/schemagraph/actions/runs/35720225150),
+    [릴리스 빌드·게시](https://github.com/ictechgy/schemagraph/actions/runs/35720281202)가
+    모두 통과했다. 릴리스 준비 diff는 버전 기본값과 문서뿐이며 고정 기대값은
+    변경하지 않았다. 6개 crate 게시 전 빌드와 공개 바이트·체크섬·소스 대조도 통과했다.
+  - [Pages Maven](https://github.com/ictechgy/schemagraph/actions/runs/35720293785)은
+    기존 파일을 읽던 HTTP 503 이후 소스 변경 없는 두 번째 실행에서 게시됐다.
+    [Central](https://github.com/ictechgy/schemagraph/actions/runs/35720785245)의
+    deployment `8d7ddc68-e0ac-4d8c-a06c-bdf65bbb51b0`는 PUBLISHED다.
+    5개 payload의 공개 체크섬·PGP 서명·Pages 바이트와 GitHub all JAR이 일치했다.
+    빈 Gradle 캐시의 Central-only Java 17 소비자가 실제 H2 테이블·컬럼·PK를 수집했다.
+  - crates.io 별도 설치본에서 JSON 계약·경쟁 보강 CLI·정책/SARIF·실제 dbt import와
+    4개 DB의 보존 입력 DML 검증이 통과했다. SQLite/PG/Oracle에서는 전체
+    uncached/cold/warm 그래프 일치도 확인했다. SQL Server/Oracle 보존 입력은
+    새 실DB 수집으로 표현하지 않는다. 공개 macOS CLI·Go·JAR의 catalog 계약,
+    Chinook/Pagila 정확도·취소·Go URL 입력 계약·기존 18개씩의 정확도도 통과했다.
+    Linux/macOS 압축파일의 공개 체크섬과 Go 내장 VCS 커밋을 확인했다.
+  - 검증용 임시 DB·다운로드·공개키 keyring·Java 소비자 디렉터리는 정리했다.
+    별도 registry 설치본과 근거는 저장소 밖
+    `~/Library/Application Support/schemagraph/verification/v0.5.0-20260922`에 있다.
+    `plan.json`, `release-source-ci.json`, `public-crates.json`,
+    `installed-features/result.json`, `public-verification.json`이 최종 근거다.
+    이 완료 기록은 실행 소스를 바꾸지 않으며 새 버전 게시가 남아 있지 않다.
+
 - 2026-09-22: **v0.5.0 배포 진행 승인**.
   사용자가 “ci 확인 후 배포”를 요청했다. PR #14는 `15c5fc5`로 병합됐고,
   새 기능과 Rust public parser/cache 타입 변경을 함께 내보내도록 버전을
