@@ -595,7 +595,7 @@
     }
   ],
   "limitations": [
-    "DDL \uc778\ub77c\uc778 UNIQUE/CHECK \uc81c\uc57d\uc740 \uce74\ud0c8\ub85c\uadf8\uc5d0 \uc5c6\uc5b4 \uc218\uc9d1\ud558\uc9c0 \ubabb\ud568 (\uc778\ub77c\uc778 \uc81c\uc57d \ud30c\uc2f1 \ubbf8\uc9c0\uc6d0)"
+    "DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (인라인 제약 파싱 미지원)"
   ],
   "origins": [
     {
@@ -939,92 +939,92 @@
         "pk_position": 0
       }
     },
-    "foreign_keys": {
-      "main.a.a_fk_0": {
-        "columns": [
-          "main.a.b_id"
-        ],
-        "complete": false,
-        "table": "main.a",
-        "target_columns": [
-          "main.b.id"
-        ],
-        "target_table": "main.b"
-      },
-      "main.b.b_fk_0": {
-        "columns": [
-          "main.b.a_id"
-        ],
-        "complete": false,
-        "table": "main.b",
-        "target_columns": [
-          "main.a.id"
-        ],
-        "target_table": "main.a"
-      },
-      "main.loop_self.loop_self_fk_0": {
-        "columns": [
-          "main.loop_self.parent_id"
-        ],
-        "complete": false,
-        "table": "main.loop_self",
-        "target_columns": [
-          "main.loop_self.id"
-        ],
-        "target_table": "main.loop_self"
-      },
-      "main.order_items.order_items_fk_0": {
-        "columns": [
-          "main.order_items.product_id"
-        ],
-        "complete": false,
-        "table": "main.order_items",
-        "target_columns": [
-          "main.products.id"
-        ],
-        "target_table": "main.products"
-      },
-      "main.order_items.order_items_fk_1": {
-        "columns": [
-          "main.order_items.order_id"
-        ],
-        "complete": false,
-        "table": "main.order_items",
-        "target_columns": [
-          "main.orders.id"
-        ],
-        "target_table": "main.orders"
-      },
-      "main.orders.orders_fk_0": {
-        "columns": [
-          "main.orders.customer_id"
-        ],
-        "complete": false,
-        "table": "main.orders",
-        "target_columns": [
-          "main.customers.id"
-        ],
-        "target_table": "main.customers"
-      }
-    },
     "indexes": {
       "main.orders.idx_orders_customer": {
+        "table": "main.orders",
         "columns": [
           "main.orders.customer_id"
         ],
-        "complete": true,
+        "unique": false,
         "has_predicate": false,
-        "table": "main.orders",
-        "unique": false
+        "complete": true
       },
       "main.products.sqlite_autoindex_products_1": {
+        "table": "main.products",
         "columns": [
           "main.products.sku"
         ],
-        "complete": true,
+        "unique": true,
         "has_predicate": false,
-        "table": "main.products",
-        "unique": true
+        "complete": true
+      }
+    },
+    "foreign_keys": {
+      "main.a.a_fk_0": {
+        "table": "main.a",
+        "columns": [
+          "main.a.b_id"
+        ],
+        "target_table": "main.b",
+        "target_columns": [
+          "main.b.id"
+        ],
+        "complete": false
+      },
+      "main.b.b_fk_0": {
+        "table": "main.b",
+        "columns": [
+          "main.b.a_id"
+        ],
+        "target_table": "main.a",
+        "target_columns": [
+          "main.a.id"
+        ],
+        "complete": false
+      },
+      "main.loop_self.loop_self_fk_0": {
+        "table": "main.loop_self",
+        "columns": [
+          "main.loop_self.parent_id"
+        ],
+        "target_table": "main.loop_self",
+        "target_columns": [
+          "main.loop_self.id"
+        ],
+        "complete": false
+      },
+      "main.order_items.order_items_fk_0": {
+        "table": "main.order_items",
+        "columns": [
+          "main.order_items.product_id"
+        ],
+        "target_table": "main.products",
+        "target_columns": [
+          "main.products.id"
+        ],
+        "complete": false
+      },
+      "main.order_items.order_items_fk_1": {
+        "table": "main.order_items",
+        "columns": [
+          "main.order_items.order_id"
+        ],
+        "target_table": "main.orders",
+        "target_columns": [
+          "main.orders.id"
+        ],
+        "complete": false
+      },
+      "main.orders.orders_fk_0": {
+        "table": "main.orders",
+        "columns": [
+          "main.orders.customer_id"
+        ],
+        "target_table": "main.customers",
+        "target_columns": [
+          "main.customers.id"
+        ],
+        "complete": false
       }
     }
   },
