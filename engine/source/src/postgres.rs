@@ -147,6 +147,7 @@ async fn read_schema(
         obj.indexes = read_indexes(pool, schema, &obj.name).await?;
         obj.triggers = read_triggers(pool, schema, &obj.name).await?;
     }
+    check_catalog_visibility(pool, schema, &objects, limitations).await;
     let mut routines = read_routines(pool, schema, limitations).await?;
     *catalog_complete &= limitations.len() == metadata_start;
     attach_usage(pool, schema, &mut objects, &mut routines, limitations).await;
@@ -156,6 +157,59 @@ async fn read_schema(
         objects,
         routines,
     })
+}
+
+/// 권한으로 걸러진 0행을 실제 빈 스키마와 구분한다. 추정 개수는 만들지 않는다.
+async fn check_catalog_visibility(
+    pool: &PgPool,
+    schema: &str,
+    objects: &[ObjectDoc],
+    limitations: &mut Vec<String>,
+) {
+    let query = include_str!("sql/visibility-postgres.sql").replace(":schema", "$1");
+    let rows = match sqlx::query(&query).bind(schema).fetch_all(pool).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            limitations.push(format!(
+                "{schema}: catalog visibility could not be checked: {error}; verify metadata permissions"
+            ));
+            return;
+        }
+    };
+    let known: std::collections::BTreeMap<_, std::collections::BTreeSet<_>> = objects
+        .iter()
+        .map(|object| {
+            (
+                object.name.as_str(),
+                object
+                    .columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut relations = std::collections::BTreeSet::new();
+    let mut columns = 0usize;
+    for row in rows {
+        let name: String = row.get("relation_name");
+        let column: Option<String> = row.get("column_name");
+        let object = known.get(name.as_str());
+        if object.is_none() {
+            relations.insert(name);
+        }
+        if let Some(column) = column {
+            if !object.is_some_and(|columns| columns.contains(column.as_str())) {
+                columns += 1;
+            }
+        }
+    }
+    if !relations.is_empty() || columns > 0 {
+        limitations.push(format!(
+            "{schema}: catalog visibility check found {} uncollected relations and {columns} uncollected columns; verify metadata permissions and reader coverage",
+            relations.len()
+        ));
+    }
 }
 
 /// 사용 통계 — pg_stat은 stats_reset 이후만 유효하다. 카탈로그 읽기와 달리

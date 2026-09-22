@@ -27,7 +27,21 @@ pub fn annotate(
     let mut filter = schemas.to_vec();
     filter.sort();
     filter.dedup();
+    let missing: Vec<_> = filter
+        .iter()
+        .filter(|name| !doc.schemas.iter().any(|schema| &schema.name == *name))
+        .cloned()
+        .collect();
     if !filter.is_empty() {
+        for name in &missing {
+            doc.limitations.push(format!(
+                "requested schema '{name}' was not collected; verify existence and metadata permissions"
+            ));
+        }
+        if !missing.is_empty() {
+            doc.limitations.sort();
+            doc.limitations.dedup();
+        }
         doc.schemas.retain(|s| filter.contains(&s.name));
         doc.dependencies
             .retain(|d| filter.contains(&d.source.schema));
@@ -43,6 +57,9 @@ pub fn annotate(
     });
     if let Some(id) = source_id {
         context.source_id = id.to_owned();
+    }
+    if !missing.is_empty() {
+        context.catalog_complete = false;
     }
     if !filter.is_empty() {
         if let Some(previous) = &context.schema_filter {
@@ -73,6 +90,9 @@ pub fn comparison_notes(before: &CatalogDocument, after: &CatalogDocument) -> Ve
             } else if a.source_id != b.source_id {
                 notes.push("snapshot logical source identities differ".into());
             }
+            if a.database != b.database {
+                notes.push("snapshot database identities differ or one is unavailable".into());
+            }
             if a.schema_filter != b.schema_filter {
                 notes.push("snapshot schema collection filters differ".into());
             }
@@ -88,4 +108,43 @@ pub fn comparison_notes(before: &CatalogDocument, after: &CatalogDocument) -> Ve
     notes.sort();
     notes.dedup();
     notes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn document(database: Option<&str>) -> CatalogDocument {
+        CatalogDocument {
+            version: 1,
+            dialect: "postgres".into(),
+            reader: "native-sqlx".into(),
+            schemas: vec![],
+            dependencies: vec![],
+            limitations: vec![],
+            context: Some(CollectionContext {
+                source_id: "production".into(),
+                database: database.map(str::to_owned),
+                schema_filter: None,
+                catalog_complete: true,
+            }),
+        }
+    }
+
+    #[test]
+    fn same_logical_source_does_not_hide_a_changed_database() {
+        let before = document(Some("billing"));
+        assert!(!comparison_notes(&before, &document(Some("analytics"))).is_empty());
+        assert!(!comparison_notes(&before, &document(None)).is_empty());
+        assert!(comparison_notes(&before, &before).is_empty());
+    }
+
+    #[test]
+    fn requested_but_uncollected_schema_is_not_a_complete_empty_snapshot() {
+        let mut doc = document(Some("billing"));
+        annotate(&mut doc, None, &["private".into()]).unwrap();
+        assert!(!doc.context.as_ref().unwrap().catalog_complete);
+        assert_eq!(doc.limitations.len(), 1);
+        assert!(doc.limitations[0].contains("private"));
+    }
 }
