@@ -191,7 +191,10 @@ jobs:
           "$cli" scan "sqlite:$fixture" --source-id release-smoke \
             --emit-document "$RUNNER_TEMP/smoke/catalog.json" \
             -o "$RUNNER_TEMP/smoke/graph.json"
-          "$go_probe" --url "sqlite:$fixture" -o "$RUNNER_TEMP/smoke/go-catalog.json"
+          export SG_RELEASE_DB_URL="sqlite:$fixture"
+          "$go_probe" --url-env SG_RELEASE_DB_URL -o "$RUNNER_TEMP/smoke/go-catalog.json"
+          "$go_probe" --url "$SG_RELEASE_DB_URL" -o "$RUNNER_TEMP/smoke/go-literal-catalog.json"
+          cmp "$RUNNER_TEMP/smoke/go-catalog.json" "$RUNNER_TEMP/smoke/go-literal-catalog.json"
           "$cli" scan --document "$RUNNER_TEMP/smoke/go-catalog.json" \
             -o "$RUNNER_TEMP/smoke/go-graph.json"
           "$cli" query main.orders --graph "$RUNNER_TEMP/smoke/graph.json" \

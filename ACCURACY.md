@@ -292,7 +292,7 @@ are identified separately in report provenance.
 Run `Scripts/verify-sqlserver-oracle-accuracy.py` or the
 [real-DB workflow](.github/workflows/sqlserver-oracle-accuracy.yml). SQL Server
 requires [an actual Linux x86_64 server](https://learn.microsoft.com/en-us/sql/linux/containers/deploy?view=sql-server-ver16).
-The runner uses the source Go probe's unreleased `--url-env` option and JDBC's
+The runner uses the Go probe's `--url-env` option (0.4.3+) and JDBC's
 existing `SG_DB_PASSWORD` input so temporary passwords do not enter argv.
 Optional artifacts preserve guarded public-corpus catalogs/graphs. The runner
 owns and cleans its labeled containers, and rejects missing prerequisites.
