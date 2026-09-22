@@ -1,0 +1,14 @@
+# 공개 소스만 build context로 전송한다.
+*
+!Dockerfile
+!README.md
+!LICENSE-MIT
+!LICENSE-APACHE
+!engine/
+!engine/**
+engine/target/
+**/.env
+**/.env.*
+**/auth.json
+**/*.pem
+**/*.key

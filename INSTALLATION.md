@@ -1,5 +1,9 @@
 # Installing schemagraph
 
+The current source also includes [a consumer GitHub Action](REVIEW-ACTION.md)
+and [a reproducible Docker build](SUPPORT-MATRIX.md#runtime-and-distribution).
+These additions are not in the published v0.4.3 artifacts.
+
 The GitHub release page contains prebuilt CLI and probe artifacts. The release
 workflow publishes them only from a `vMAJOR.MINOR.PATCH` tag whose version
 matches both `engine/Cargo.toml` and `probe/build.gradle.kts`. A manual run of
