@@ -130,7 +130,7 @@ document unchanged. Exporting query records requires catalog version 2 and the
 `external-queries-v1` required feature; the example selects v2 automatically.
 
 The optional cache stores body analysis with provenance, not raw SQL, current
-catalog facts, or usage counters. In the current source, entries record the
+catalog facts, or usage counters. From v0.5.0, entries record the
 relations, column shapes, and routine candidates needed for name resolution.
 An unrelated catalog edit can reuse those entries; changed or newly resolvable
 dependencies invalidate them. Executable, dialect, and collection context are
@@ -139,10 +139,10 @@ use a conservative whole-catalog namespace. Corrupt or oversized
 entries are reported on stderr and reparsed. Cache counts also go to stderr so
 graph JSON stays machine-readable. Cache files are disposable build artifacts.
 The full catalog and graph are still rebuilt and held in memory. This caches
-SQL analysis; it is not a persistent incremental graph engine. Published
+SQL analysis; it is not a persistent incremental graph engine. Version
 v0.4.3 uses whole-catalog structural invalidation for all entries.
 
-Current-source DML analysis records destination-column `writes`, source and
+Version 0.5.0 DML analysis records destination-column `writes`, source and
 predicate `reads`, and value-only `derives-from` edges for the supported static
 INSERT SELECT, CTAS/SELECT INTO, UPDATE, MERGE, and straight-line temp-table
 subset. Temporary symbols never create catalog vertices. A self-update such as

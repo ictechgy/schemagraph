@@ -4,6 +4,20 @@
 
 ## 지금 상태
 
+- 2026-09-22: **v0.5.0 배포 진행 승인**.
+  사용자가 “ci 확인 후 배포”를 요청했다. PR #14는 `15c5fc5`로 병합됐고,
+  새 기능과 Rust public parser/cache 타입 변경을 함께 내보내도록 버전을
+  0.5.0으로 올린다. [릴리스 노트](RELEASE-NOTES.md)에 변경과 제약을 정리했다.
+  main CI와 릴리스 준비 PR의 검증을 통과한 뒤 그 병합 커밋을 태그로 고정한다.
+  배포 대상은 6개 crate, GitHub Linux/macOS 바이너리와 JDBC JAR,
+  Pages Maven, Maven Central이다. Pages는 태그에서 수동 게시하고,
+  공개 Pages 바이트와 비교한 뒤 Central을 게시한다. 기존 릴리스와 DML의
+  고정된 0.4.3 비교 기준은 보존한다. 공개 설치본의 체크섬·소스 커밋·서명·
+  실제 소비자 검증까지 완료해야 배포 완료로 보고한다.
+  진행 상태와 최종 근거는 저장소 밖
+  `~/Library/Application Support/schemagraph/verification/v0.5.0-20260922`의
+  `plan.json`과 검증 결과에 기록한다. 이 항목 자체는 게시 성공을 뜻하지 않는다.
+
 - 2026-09-22: **PR #14 리뷰 후 머지 승인**.
   사용자가 최종 리뷰와 머지를 승인했다. 리뷰에서 UNION ALL이 붙은 SELECT INTO가
   쓰기 경로에서 빠지는 경우를 재현해 목적지 해석을 집합 질의의 첫 SELECT까지
