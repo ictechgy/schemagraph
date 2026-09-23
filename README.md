@@ -1,5 +1,7 @@
 # schemagraph
 
+<img src="icon.png" alt="schemagraph's owl mascot" width="112" height="112" align="right">
+
 English is the canonical version of this README. [한국어 참고 번역](README.ko.md)
 
 schemagraph builds a dependency graph of a database schema and helps you assess
