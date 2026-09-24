@@ -1145,7 +1145,7 @@ fn load_rules(path: &std::path::Path) -> Result<Vec<analysis::Rule>> {
                     ks.iter()
                         .map(|k| {
                             export::edge_kind_parse(k).ok_or_else(|| {
-                                anyhow!(
+                                anyhow::anyhow!(
                                     "규칙 '{}': 알 수 없는 간선 종류 '{k}' — \
                                      references|reads|writes|calls|fires|uses-sequence|uses-type",
                                     r.name
