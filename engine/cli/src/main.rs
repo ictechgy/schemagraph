@@ -707,14 +707,21 @@ fn rfc3339_utc_at(time: std::time::SystemTime) -> Result<String> {
             "system clock is before 1970-01-01; cannot stamp generatedAt — fix the host clock and retry"
         )
     })?;
-    // u64 초가 i64를 넘는 시각은 달력 변환 범위 밖이라 같은 원인으로 거절한다.
-    let seconds = i64::try_from(elapsed.as_secs()).map_err(|_| {
-        anyhow!(
-            "system clock is out of range; cannot stamp generatedAt — fix the host clock and retry"
-        )
-    })?;
+    // RFC 3339 연도는 네 자리라 9999년을 넘는 시각은 형식을 지킬 수 없다 —
+    // 다섯 자리 연도를 싣지 않고 같은 원인으로 거절한다.
+    let seconds = i64::try_from(elapsed.as_secs())
+        .ok()
+        .filter(|seconds| *seconds <= LAST_RFC3339_SECOND)
+        .ok_or_else(|| {
+            anyhow!(
+                "system clock is beyond 9999-12-31; cannot stamp generatedAt — fix the host clock and retry"
+            )
+        })?;
     Ok(rfc3339_from_unix_seconds(seconds))
 }
+
+/// RFC 3339 네 자리 연도로 표현할 수 있는 마지막 Unix 초(9999-12-31T23:59:59Z)다.
+const LAST_RFC3339_SECOND: i64 = 253_402_300_799;
 
 /// Unix 초를 RFC 3339 UTC 문자열로 바꾼다.
 /// 달력 변환은 외부 의존 없이 표준 civil 알고리즘으로 처리한다.
@@ -1226,6 +1233,17 @@ mod tests {
     fn clock_before_epoch_is_an_error_not_a_1970_timestamp() {
         let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
         let error = rfc3339_utc_at(before_epoch).unwrap_err().to_string();
+        assert!(error.contains("system clock"), "{error}");
+    }
+
+    /// RFC 3339 연도는 네 자리다 — 9999년 끝까지는 받고 그 다음 초부터는 거절한다.
+    /// 경계값 253_402_300_799는 Python `datetime(9999,12,31,23,59,59, UTC)`로 계산했다.
+    #[test]
+    fn clock_beyond_year_9999_is_an_error_not_a_five_digit_year() {
+        let last = std::time::UNIX_EPOCH + std::time::Duration::from_secs(253_402_300_799);
+        assert_eq!(rfc3339_utc_at(last).unwrap(), "9999-12-31T23:59:59Z");
+        let beyond = last + std::time::Duration::from_secs(1);
+        let error = rfc3339_utc_at(beyond).unwrap_err().to_string();
         assert!(error.contains("system clock"), "{error}");
     }
 }
