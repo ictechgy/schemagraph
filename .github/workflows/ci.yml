@@ -237,6 +237,13 @@ jobs:
             --jdbc-jar probe/build/libs/schemagraph-probe-all.jar --java "$JAVA_HOME/bin/java" \
             --output "$RUNNER_TEMP/scope-jdbc.json"
 
+      - name: Verify isthmus bridge-facts export against real catalogs
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+        run: |
+          python3 Scripts/verify-bridge-facts.py --engine engine/target/debug/schemagraph \
+            --output "$RUNNER_TEMP/bridge-facts.json"
+
       - name: Verify every database fixture
         env:
           SG_MYSQL_JAR: ${{ runner.temp }}/mysql-connector-j.jar
