@@ -105,6 +105,7 @@ read that file by default; use `--graph <path>` to select another snapshot.
 | `review <before> <after>` | Combine catalog changes with dependent impact and comparison coverage. |
 | `lint` | Inspect FK index-prefix facts and unresolved/ambiguous references. |
 | `merge <documents>…` | Combine independently parsed DB catalogs under distinct source IDs. |
+| `facts --document <path>` | Export catalog declarations as an isthmus persistence bridge-facts document (`relation-decl`, platform `sql`). |
 | `serve` | Expose read-only MCP tools over one preloaded graph. |
 | `stats` | List collected usage evidence and collection coverage. |
 | `rules --config <path>` | Check dependency edges against TOML rules. |

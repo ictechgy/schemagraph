@@ -14,7 +14,7 @@ use schemagraph_export::{self as export, GraphDoc};
 use schemagraph_source::{self as source};
 use serde::Deserialize;
 use std::io::{BufReader, BufWriter, Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod cache;
 mod cancellation;
@@ -263,6 +263,18 @@ enum Command {
         documents: Vec<PathBuf>,
         #[arg(short, long, default_value = "graph.json")]
         output: String,
+    },
+    /// Export catalog declarations as isthmus bridge-facts (persistence target).
+    Facts {
+        /// Catalog document to convert (probe output or scan --emit-document).
+        #[arg(long)]
+        document: PathBuf,
+        /// Project root shared with code-side producer documents (the join key).
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Output path; '-' or omitted writes to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
     },
     /// Report schema facts and unresolved SQL references from the graph.
     Lint {
@@ -513,6 +525,11 @@ async fn run(cli: Cli) -> Result<i32> {
             write_graph_output(&output, &merge::run(&documents)?)?;
             Ok(0)
         }
+        Command::Facts {
+            document,
+            project,
+            output,
+        } => facts(&document, &project, output.as_deref()),
         Command::Lint { graph, max, strict } => {
             let graph = load_graph(&graph)?;
             let report = analysis::schema_lint::lint(&graph, max);
@@ -646,6 +663,71 @@ fn analyze_document_with_cache(
         }
     }
     graph
+}
+
+/// 카탈로그 문서를 isthmus bridge-facts 문서로 변환해 출력한다.
+/// `project`는 호출 측 문서와 공유하는 realpath라 canonicalize로 정규화한다
+/// — 다른 표기의 같은 경로가 조인에서 갈라지지 않게 한다.
+fn facts(document: &Path, project: &Path, output: Option<&str>) -> Result<i32> {
+    let doc = load_document(document)?;
+    let project = std::fs::canonicalize(project).with_context(|| {
+        format!(
+            "project root를 읽을 수 없다: {} — 존재하는 디렉터리를 지정해라",
+            project.display()
+        )
+    })?;
+    let generated_at = rfc3339_utc_now();
+    let value = source::bridge_facts::bridge_facts_document(
+        &doc,
+        project.to_string_lossy().as_ref(),
+        env!("CARGO_PKG_VERSION"),
+        &generated_at,
+    );
+    let json = export::to_pretty_json(&value)?;
+    match output {
+        Some(path) if path != "-" => {
+            std::fs::write(path, format!("{json}\n"))
+                .with_context(|| format!("bridge-facts 쓰기 실패: {path}"))?;
+        }
+        _ => println!("{json}"),
+    }
+    Ok(0)
+}
+
+/// bridge-facts 계약이 요구하는 RFC 3339 UTC 타임스탬프를 만든다.
+/// 달력 변환은 외부 의존 없이 표준 civil 알고리즘으로 처리한다.
+fn rfc3339_utc_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// Unix 일수를 그레고리력 (year, month, day)로 변환한다 — Howard Hinnant의
+/// civil_from_days 알고리즘이다.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
 }
 
 /// 프로브가 만든 catalog document를 읽는다. 단일 JSON과 NDJSON(행 단위)을

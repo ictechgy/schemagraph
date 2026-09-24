@@ -3,6 +3,7 @@
 //! reader는 document를 뱉고, [`graph::document_to_graph`]가 그래프로 바꾼다.
 //! 프로브(P2)도 같은 document를 뱉으므로 변환기는 경로를 모른다.
 
+pub mod bridge_facts;
 pub mod codec;
 pub mod context;
 pub mod dependencies;
