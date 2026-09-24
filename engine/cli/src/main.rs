@@ -676,7 +676,7 @@ fn facts(document: &Path, project: &Path, output: Option<&str>) -> Result<i32> {
             project.display()
         )
     })?;
-    let generated_at = rfc3339_utc_now();
+    let generated_at = rfc3339_utc_now()?;
     let value = source::bridge_facts::bridge_facts_document(
         &doc,
         project.to_string_lossy().as_ref(),
@@ -694,13 +694,31 @@ fn facts(document: &Path, project: &Path, output: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
-/// bridge-facts 계약이 요구하는 RFC 3339 UTC 타임스탬프를 만든다.
+/// bridge-facts 계약이 요구하는 현재 시각의 RFC 3339 UTC 타임스탬프를 만든다.
+fn rfc3339_utc_now() -> Result<String> {
+    rfc3339_utc_at(std::time::SystemTime::now())
+}
+
+/// 주어진 시각을 RFC 3339 UTC로 만든다. 시계가 epoch 이전이면 실패한다 —
+/// 1970년으로 대체하면 `generatedAt`이 관측이 아니라 거짓 값이 된다.
+fn rfc3339_utc_at(time: std::time::SystemTime) -> Result<String> {
+    let elapsed = time.duration_since(std::time::UNIX_EPOCH).map_err(|_| {
+        anyhow!(
+            "system clock is before 1970-01-01; cannot stamp generatedAt — fix the host clock and retry"
+        )
+    })?;
+    // u64 초가 i64를 넘는 시각은 달력 변환 범위 밖이라 같은 원인으로 거절한다.
+    let seconds = i64::try_from(elapsed.as_secs()).map_err(|_| {
+        anyhow!(
+            "system clock is out of range; cannot stamp generatedAt — fix the host clock and retry"
+        )
+    })?;
+    Ok(rfc3339_from_unix_seconds(seconds))
+}
+
+/// Unix 초를 RFC 3339 UTC 문자열로 바꾼다.
 /// 달력 변환은 외부 의존 없이 표준 civil 알고리즘으로 처리한다.
-fn rfc3339_utc_now() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+fn rfc3339_from_unix_seconds(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -1127,7 +1145,7 @@ fn load_rules(path: &std::path::Path) -> Result<Vec<analysis::Rule>> {
                     ks.iter()
                         .map(|k| {
                             export::edge_kind_parse(k).ok_or_else(|| {
-                                anyhow::anyhow!(
+                                anyhow!(
                                     "규칙 '{}': 알 수 없는 간선 종류 '{k}' — \
                                      references|reads|writes|calls|fires|uses-sequence|uses-type",
                                     r.name
@@ -1176,5 +1194,38 @@ fn write_graph_output(output: &str, graph: &Graph) -> Result<()> {
             format!("cannot create graph output {output}; check the directory and permissions")
         })?;
         write(BufWriter::new(file), graph)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 기대값은 Python `datetime.fromtimestamp(s, timezone.utc)`로 독립 계산했다 —
+    /// 엔진 출력에서 역산하면 달력 변환 오류가 기대값에 그대로 복사된다.
+    #[test]
+    fn rfc3339_formats_epoch_leap_and_century_boundaries() {
+        assert_eq!(rfc3339_from_unix_seconds(0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            rfc3339_from_unix_seconds(951_782_400),
+            "2000-02-29T00:00:00Z"
+        );
+        assert_eq!(
+            rfc3339_from_unix_seconds(1_790_207_999),
+            "2026-09-23T23:59:59Z"
+        );
+        // 2100년은 윤년이 아니다 — 2월 28일 다음이 3월 1일이어야 한다.
+        assert_eq!(
+            rfc3339_from_unix_seconds(4_107_542_400),
+            "2100-03-01T00:00:00Z"
+        );
+    }
+
+    /// 시계가 1970년 이전이면 조용히 epoch 시각을 싣지 않고 원인을 담아 실패한다.
+    #[test]
+    fn clock_before_epoch_is_an_error_not_a_1970_timestamp() {
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let error = rfc3339_utc_at(before_epoch).unwrap_err().to_string();
+        assert!(error.contains("system clock"), "{error}");
     }
 }
