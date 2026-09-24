@@ -83,6 +83,7 @@ jobs:
             cmp "engine/source/src/sql/catalog-$dialect.sql" "probe-go/sql/catalog-$dialect.sql"
           done
           cmp engine/source/src/sql/visibility-postgres.sql probe-go/sql/visibility-postgres.sql
+          cmp engine/source/src/sql/columns-postgres.sql probe-go/sql/columns-postgres.sql
           python3 -m venv "$RUNNER_TEMP/jsonschema-venv"
           "$RUNNER_TEMP/jsonschema-venv/bin/pip" install --disable-pip-version-check --no-input 'jsonschema==4.23.0' 'sqlglot==30.18.0'
           "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-contracts.py \
@@ -235,6 +236,13 @@ jobs:
           python3 Scripts/verify-collection-scope.py --engine engine/target/debug/schemagraph \
             --jdbc-jar probe/build/libs/schemagraph-probe-all.jar --java "$JAVA_HOME/bin/java" \
             --output "$RUNNER_TEMP/scope-jdbc.json"
+
+      - name: Verify isthmus bridge-facts export against real catalogs
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+        run: |
+          python3 Scripts/verify-bridge-facts.py --engine engine/target/debug/schemagraph \
+            --output "$RUNNER_TEMP/bridge-facts.json"
 
       - name: Verify every database fixture
         env:

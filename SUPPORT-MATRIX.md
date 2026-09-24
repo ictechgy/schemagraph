@@ -9,7 +9,7 @@ truncation are separate facts.
 
 | Database / version | Reader paths | Verified scope | Role evidence |
 | --- | --- | --- | --- |
-| PostgreSQL 16.13 | Native, Go, JDBC (pgjdbc 42.7.8) | Tables, columns, PK/FK, view and SQL-function definitions; same-scope and wrong-scope review | Restricted role tested below |
+| PostgreSQL 16.13 | Native, Go, JDBC (pgjdbc 42.7.8) | Tables, columns (including materialized-view columns), PK/FK, view and SQL-function definitions; same-scope and wrong-scope review | Restricted role tested below |
 | SQLite | Native, Go, JDBC (sqlite-jdbc 3.51.1.0) | File catalog, tables, keys, views, triggers; no database usage counters | File access; database roles do not apply |
 | MySQL 8.4 / MariaDB 11.4 pinned images | Native, Go, JDBC | Public SQL accuracy corpus and fixture parity; statistics enabled/disabled cases | Fixture accounts; a minimal production role has not been certified |
 | SQL Server 2022, 16.0.4295.3 | Go, JDBC | 18 independently authored view/routine/trigger cases, original and stored SQL; 8 producer/transport combinations | Fixture owner/admin; metadata visibility under restricted grants is not certified |
@@ -30,11 +30,11 @@ its separate baseline are described in [DML-ACCURACY.md](DML-ACCURACY.md).
 
 Version 0.5.0 adds a real PostgreSQL 16.13 test with a login role declared
 `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT`. The known schema has two tables,
-one view, one SQL function, six columns, and one foreign key.
+one view, one materialized view, one SQL function, eight columns, and one foreign key.
 
 | Profile | Native / Go | JDBC |
 | --- | --- | --- |
-| No object grants | Detects 3 uncollected relations and 6 uncollected columns; `catalog_complete: false`; strict review exits 2 | pgjdbc exposes the known catalog without table data privileges; definitions are read from `pg_catalog` |
+| No object grants | Detects 3 uncollected relations and 8 uncollected columns; `catalog_complete: false`; strict review exits 2. Materialized-view names stay visible through `pg_matviews`, but their columns follow the same privilege rule as table columns | pgjdbc exposes the known catalog without table data privileges; definitions are read from `pg_catalog` |
 | Schema `USAGE` plus `REFERENCES` on its tables/views | Collects all fixture facts; owner-vs-collector review has zero structural changes | Collects the same fixture facts |
 | Requested schema absent | Incomplete collection and strict review exit 2 | Incomplete collection and strict review exit 2 |
 | Different physical database, same logical source ID | Strict review exits 2 | Strict review exits 2 |

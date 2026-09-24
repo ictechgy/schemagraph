@@ -438,16 +438,16 @@ async fn read_columns(
     schema: &str,
     table: &str,
 ) -> Result<Vec<ColumnDoc>, SourceError> {
-    let rows = sqlx::query(
-        "SELECT column_name, data_type, is_nullable, column_default, ordinal_position \
-         FROM information_schema.columns \
-         WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
-    )
-    .bind(schema)
-    .bind(table)
-    .fetch_all(pool)
-    .await
-    .map_err(SourceError::Query)?;
+    // Go 프로브와 같은 파일을 써서 MV 컬럼까지 두 수집기가 같은 사실을 낸다.
+    let query = include_str!("sql/columns-postgres.sql")
+        .replace(":schema", "$1")
+        .replace(":table", "$2");
+    let rows = sqlx::query(&query)
+        .bind(schema)
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .map_err(SourceError::Query)?;
     Ok(rows
         .iter()
         .map(|r| ColumnDoc {
