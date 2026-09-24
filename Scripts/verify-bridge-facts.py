@@ -7,6 +7,7 @@
 """
 
 import argparse
+from contextlib import closing
 import hashlib
 import importlib.util
 import json
@@ -17,13 +18,18 @@ import sqlite3
 import subprocess
 import tempfile
 
+# 임시 PostgreSQL cluster·명령 실행 도우미를 정확도 검증기와 공유한다 —
+# 사용자 PG 설정을 읽지 않는 같은 격리 규칙을 두 번 구현하지 않기 위해서다.
 SPEC = importlib.util.spec_from_file_location('accuracy', Path(__file__).with_name('verify-accuracy.py'))
 ACCURACY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ACCURACY)
 
 # 계약상 선언 대상인 관계 종류다 — sequence·type·index 등은 선언이 아니다.
 RELATION_KINDS = {'table', 'view', 'materialized-view'}
-TIMESTAMP = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+# 계약의 generatedAt 형식(초 단위 RFC 3339 UTC)이다. fullmatch로만 쓴다 —
+# `$`는 끝의 개행을 허용해 오염된 값을 통과시킨다.
+TIMESTAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z')
+# isthmus가 수신 측 공백으로 인정해 미선언 진단을 -unverified로 내리는 접두사다.
 COVERAGE_PREFIX = 'catalog-coverage:'
 
 # 이름 충돌·escape·대소문자·비관계 객체를 실제 DB에서 만든다.
@@ -57,7 +63,8 @@ CREATE TABLE public.clash (id integer, x integer, CONSTRAINT id CHECK (id > 0));
 CREATE FUNCTION public.touch() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
 CREATE TRIGGER x BEFORE INSERT ON public.clash FOR EACH ROW EXECUTE FUNCTION public.touch();
 CREATE DOMAIN public.positive AS integer CHECK (VALUE > 0);
-CREATE TABLE public.typed (a integer, b varchar(10), c integer[], d public.mood, e numeric(5,2), f public.positive, g timestamptz);
+CREATE DOMAIN public.required AS integer NOT NULL;
+CREATE TABLE public.typed (a integer, b varchar(10), c integer[], d public.mood, e numeric(5,2), f public.positive, g timestamptz, h public.required);
 CREATE MATERIALIZED VIEW public.typed_copy AS SELECT * FROM public.typed;
 '''
 
@@ -109,7 +116,7 @@ def check_contract(document, project, version):
     """GRAPH-EXCHANGE의 bridge-facts v1 머리 필드와 relation-decl 사실 규칙을 검사한다."""
     assert (document['format'], document['version'], document['platform']) == ('bridge-facts', 1, 'sql'), document
     assert document['tool'] == {'name': 'schemagraph', 'version': version}, document['tool']
-    assert TIMESTAMP.match(document['generatedAt']), document['generatedAt']
+    assert TIMESTAMP.fullmatch(document['generatedAt']), document['generatedAt']
     assert document['project'] == os.path.realpath(project), document['project']
     assert document['target'] == ('persistence' if document['facts'] else None), document['target']
     for fact in document['facts']:
@@ -157,7 +164,7 @@ def check_outputs(engine, catalog, work, env, version):
 
 def sqlite_relations(database):
     """SQLite 자체 카탈로그에서 관계와 컬럼을 읽는다 — 내부 sqlite_ 객체는 제외한다."""
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         schema = connection.execute('PRAGMA database_list').fetchone()[1]
         names = connection.execute("SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'").fetchall()
         return {(schema, name): [row[1] for row in connection.execute(f'PRAGMA table_info("{name.replace(chr(34), chr(34)*2)}")')]
@@ -167,7 +174,7 @@ def sqlite_relations(database):
 def sqlite_case(engine, work, version):
     """실제 SQLite 파일에서 scan→facts를 독립 기대값·그래프와 대조한다."""
     database = work/'facts.sqlite'
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.executescript(SQLITE_DDL)
     catalog, graph = work/'sqlite.catalog.json', work/'sqlite.graph.json'
     ACCURACY.run([engine, 'scan', f'sqlite:{database}', '--emit-document', catalog, '-o', graph])
@@ -203,7 +210,8 @@ def restricted_case(engine, url, psql, work, env, version, complete):
     ACCURACY.run(admin+['-qc', 'CREATE ROLE collector LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT'], env=env)
     ACCURACY.run(psql+['-qc', 'GRANT REFERENCES ON public.users TO collector'], env=env)
     catalog = work/'restricted.catalog.json'
-    ACCURACY.run([engine, 'scan', url.replace('corpus@', 'collector@'), '--schema', 'public',
+    # 스키마를 한정하지 않는다 — USAGE가 없는 audit 스키마의 관계가 새지 않는지도 본다.
+    ACCURACY.run([engine, 'scan', url.replace('corpus@', 'collector@'),
                   '--emit-document', catalog, '-o', work/'restricted.graph.json'], env=env)
     document = run_facts(engine, catalog, work/'project', work/'restricted.facts.json', env)
     check_contract(document, work/'project', version)
@@ -237,9 +245,11 @@ def check_matview_columns(catalog):
     원본 테이블 쪽은 information_schema가 직접 준 값이라 독립 기준이 된다.
     """
     objects = {obj['name']: obj for schema in catalog['schemas'] if schema['name'] == 'public' for obj in schema['objects']}
-    shape = lambda name: [(c['name'], c['data_type'], c['ordinal']) for c in objects[name]['columns']]
+    shape = lambda name: [(c['name'], c['data_type'], c['nullable'], c['ordinal']) for c in objects[name]['columns']]
     assert objects['typed_copy']['kind'] == 'materialized-view', objects['typed_copy']['kind']
-    assert shape('typed_copy') == shape('typed') and len(shape('typed')) == 7, (shape('typed_copy'), shape('typed'))
+    assert shape('typed_copy') == shape('typed') and len(shape('typed')) == 8, (shape('typed_copy'), shape('typed'))
+    # NOT NULL 도메인은 MV에서도 nullable이 아니다 — 도메인 분기가 실제로 쓰였는지 확인한다.
+    assert ('h', 'integer', False, 8) in shape('typed_copy'), shape('typed_copy')
     assert catalog['context']['catalog_complete'] is True, catalog['limitations']
 
 
@@ -322,6 +332,12 @@ def engine_version(engine):
 
 
 def main():
+    """DB 사례를 실행하고 결과를 JSON으로 남긴다.
+
+    isthmus의 persistence 조인은 아직 npm 배포본에 없어 --isthmus가 없으면 소비
+    검사를 건너뛴다. 그때 status는 ok가 아니라 partial이다 — 건너뛴 검사를
+    통과로 읽히게 두지 않는다. 실패는 예외로 끝나 종료 코드가 0이 아니다.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', type=Path, required=True)
     parser.add_argument('--postgres-bin', type=Path, default=Path(os.environ.get('PGBIN', '/opt/homebrew/opt/postgresql@16/bin')))
@@ -341,6 +357,7 @@ def main():
         if args.isthmus:
             result['isthmus'] = isthmus_case(args.node, args.isthmus.resolve(), work, complete, restricted)
         else:
+            result['status'] = 'partial'
             result['isthmus'] = 'skipped: --isthmus not given (persistence join is unreleased in isthmus 0.9.0)'
     assert hashlib.sha256(engine.read_bytes()).hexdigest() == digest, 'engine binary changed during verification'
     args.output.parent.mkdir(parents=True, exist_ok=True)
