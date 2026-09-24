@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-//go:embed sql/catalog-*.sql sql/visibility-postgres.sql
+//go:embed sql/catalog-*.sql sql/visibility-postgres.sql sql/columns-postgres.sql
 var catalogQueries embed.FS
 
 // CollectionContext는 인증정보 없이 논리 DB와 수집 범위를 전달한다.

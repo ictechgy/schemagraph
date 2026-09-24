@@ -199,12 +199,17 @@ func (h *harvester) postgresObjects(schema string) []ObjectDoc {
 	return objects
 }
 
+// postgresColumns는 엔진과 같은 SQL 파일로 테이블·뷰·materialized view 컬럼을 읽는다.
 func (h *harvester) postgresColumns(schema, table string) []ColumnDoc {
 	columns := []ColumnDoc{}
-	h.pgRows("columns", `
-		SELECT column_name, data_type, is_nullable, column_default, ordinal_position
-		FROM information_schema.columns
-		WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`, []any{schema, table}, func(rows *sql.Rows) error {
+	raw, err := catalogQueries.ReadFile("sql/columns-postgres.sql")
+	if err != nil {
+		h.catalogIncomplete = true
+		h.limitations = append(h.limitations, "bundled PostgreSQL column query is missing; rebuild the probe")
+		return columns
+	}
+	query := strings.NewReplacer(":schema", "$1", ":table", "$2").Replace(string(raw))
+	h.pgRows("columns", query, []any{schema, table}, func(rows *sql.Rows) error {
 		var name, dataType, nullable string
 		var def sql.NullString
 		var ordinal int

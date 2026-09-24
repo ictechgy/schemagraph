@@ -34,6 +34,7 @@ def check(engine, bindir, go_probe=None, jdbc_jar=None, java=None):
                 CREATE TABLE locked.parent (id integer PRIMARY KEY, value text NOT NULL);
                 CREATE TABLE locked.child (id integer PRIMARY KEY, parent_id integer REFERENCES locked.parent(id));
                 CREATE VIEW locked.parent_values AS SELECT id, value FROM locked.parent;
+                CREATE MATERIALIZED VIEW locked.parent_labels AS SELECT id, value AS label FROM locked.parent;
                 CREATE FUNCTION locked.count_parents() RETURNS bigint LANGUAGE SQL
                     AS 'SELECT count(*) FROM locked.parent';
                 REVOKE ALL ON SCHEMA locked FROM PUBLIC;
@@ -69,17 +70,18 @@ def check(engine, bindir, go_probe=None, jdbc_jar=None, java=None):
             if jdbc_jar:
                 # pgjdbc의 pg_catalog 경로는 테이블 데이터 권한 없이도 메타데이터를 준다.
                 assert no_grants_complete is True
-                assert sum(len(s['objects']) for s in denied['schemas']) == 3
-                assert sum(len(o['columns']) for s in denied['schemas'] for o in s['objects']) == 6
+                assert sum(len(s['objects']) for s in denied['schemas']) == 4
+                assert sum(len(o['columns']) for s in denied['schemas'] for o in s['objects']) == 8
             else:
                 assert no_grants_complete is False
-                assert any('3 uncollected relations and 6 uncollected columns' in note for note in denied['limitations'])
+                # MV는 pg_matviews로 관계는 보이지만 컬럼은 권한 규칙으로 숨는다.
+                assert any('3 uncollected relations and 8 uncollected columns' in note for note in denied['limitations'])
             ACCURACY.run(owner+['-qc', '''
                 GRANT USAGE ON SCHEMA locked TO collector;
                 GRANT REFERENCES ON ALL TABLES IN SCHEMA locked TO collector;
             '''], env=environment)
             after, restricted = scan('restricted', url.replace('corpus@', 'collector@'))
-            expected = {'parent': 2, 'child': 2, 'parent_values': 2}
+            expected = {'parent': 2, 'child': 2, 'parent_values': 2, 'parent_labels': 2}
             for value in (collected, restricted):
                 assert value['context']['catalog_complete'] is True
                 assert len(value['schemas']) == 1
@@ -122,7 +124,7 @@ def check(engine, bindir, go_probe=None, jdbc_jar=None, java=None):
             return {'status': 'ok', 'server_version': version, 'reader': collected['reader'],
                     'role': 'NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; schema USAGE and table REFERENCES only',
                     'data_select_denied': True, 'ddl_denied': True,
-                    'catalog': {'tables': 2, 'views': 1, 'routines': 1, 'columns': 6, 'foreign_keys': 1},
+                    'catalog': {'tables': 2, 'views': 1, 'materialized_views': 1, 'routines': 1, 'columns': 8, 'foreign_keys': 1},
                     'no_grants_catalog_complete': no_grants_complete,
                     'same_scope_review_exit': 0, 'no_grants_review_exit': denied_code,
                     'missing_schema_review_exit': 2, 'different_database_review_exit': 2,
