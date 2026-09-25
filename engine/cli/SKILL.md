@@ -92,7 +92,8 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   facts (`enforcesUniqueness`, `coversForeignKeys`, `bodyDependents`, ...);
   a candidate is an observation, not a deletion verdict.
 - `openlineage --namespace <uri>` — column lineage as OpenLineage RunEvents
-  (NDJSON). `DIRECT` has no subtype; `INDIRECT` covers only JOIN and FILTER.
+  (NDJSON). `DIRECT` has no subtype; `INDIRECT` covers only JOIN and FILTER, and
+  only for views. Partial analysis appears as a `schemagraphAnalysis` job facet.
 - `stats` — every collected usage entry with `since`; `totals` shows how
   much of the graph went unobserved.
 - `dead --retain <glob>` protects a root and its dependency closure. TOML

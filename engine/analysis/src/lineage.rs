@@ -106,8 +106,9 @@ fn dataset_of(graph: &Graph, id: &VertexId) -> Option<VertexId> {
 
 /// `derives-from`(출력 컬럼 → 입력 컬럼)을 그 값을 만든 작업에 귀속한다.
 ///
-/// DML 계보는 origin 역할 `dml-owner:<작업>:…`이 작업을 밝힌다. 그런 표시가
-/// 없으면 뷰 컬럼이므로 출력 컬럼의 부모 뷰가 작업이다.
+/// DML 계보는 origin 역할 `dml-owner:<작업>:…`이 작업을 밝히고, 그 밖의 역할
+/// (뷰 정의의 `value`)이나 origin이 없으면 출력 컬럼의 부모 뷰가 작업이다. 같은
+/// 간선에 둘 다 있으면(루틴이 쓰는 갱신 가능 뷰) 두 작업 모두에 귀속한다.
 fn add_direct(
     graph: &Graph,
     jobs: &mut BTreeMap<VertexId, Job>,
@@ -115,16 +116,19 @@ fn add_direct(
     input: &VertexId,
     origins: Option<&BTreeSet<Origin>>,
 ) {
-    let owners: BTreeSet<VertexId> = origins
-        .into_iter()
-        .flatten()
-        .filter_map(|origin| dml_owner(&origin.role))
-        .collect();
-    let owners = if owners.is_empty() {
-        output.parent().into_iter().collect()
-    } else {
-        owners
-    };
+    let mut owners = BTreeSet::new();
+    let mut defines_view = origins.is_none_or(|origins| origins.is_empty());
+    for origin in origins.into_iter().flatten() {
+        match dml_owner(&origin.role) {
+            Some(owner) => {
+                owners.insert(owner);
+            }
+            None => defines_view = true,
+        }
+    }
+    if defines_view {
+        owners.extend(output.parent());
+    }
     let (Some(output_dataset), Some(input_dataset)) =
         (dataset_of(graph, output), dataset_of(graph, input))
     else {
@@ -154,17 +158,22 @@ fn add_read(
     };
     let entry = jobs.entry(job.clone()).or_default();
     entry.inputs.insert(dataset);
-    let is_column = graph
+    if graph
         .vertex(target)
-        .is_some_and(|vertex| vertex.kind == VertexKind::Column);
-    for origin in origins.into_iter().flatten() {
-        if let (true, Some(kind)) = (is_column, indirect_use(&origin.role)) {
-            entry
-                .indirect
-                .entry(target.clone())
-                .or_default()
-                .insert(kind);
-        }
+        .is_none_or(|vertex| vertex.kind != VertexKind::Column)
+    {
+        return;
+    }
+    let uses = origins
+        .into_iter()
+        .flatten()
+        .filter_map(|origin| indirect_use(&origin.role));
+    for kind in uses {
+        entry
+            .indirect
+            .entry(target.clone())
+            .or_default()
+            .insert(kind);
     }
 }
 
@@ -315,6 +324,27 @@ mod tests {
         assert!(!jobs[&id("s.report")]
             .direct
             .contains_key(&id("s.orders.total")));
+    }
+
+    /// 같은 간선에 뷰 정의(value)와 루틴의 DML 소유가 함께 있으면 둘 다 계보를 가진다.
+    #[test]
+    fn view_value_and_dml_owner_on_one_edge_both_keep_lineage() {
+        let mut graph = fixture();
+        graph.add_origin(
+            (
+                id("s.report.name"),
+                id("s.customers.name"),
+                EdgeKind::DerivesFrom,
+            ),
+            origin("dml-owner:s.load:value"),
+        );
+        let jobs = jobs(&graph);
+        assert!(jobs[&id("s.report")]
+            .direct
+            .contains_key(&id("s.report.name")));
+        assert!(jobs[&id("s.load")]
+            .direct
+            .contains_key(&id("s.report.name")));
     }
 
     #[test]

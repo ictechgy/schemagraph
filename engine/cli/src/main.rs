@@ -825,20 +825,39 @@ fn openlineage(
         None => rfc3339_utc_now()?,
     };
     let graph = load_graph(path)?;
-    let jobs = analysis::lineage::jobs(&graph);
-    let producer = format!(
-        "https://github.com/ictechgy/schemagraph/tree/v{}",
-        env!("CARGO_PKG_VERSION")
+    let result = lineage_events(&graph, namespace, database, &event_time);
+    write_ndjson(&result.events, output)?;
+    report_lineage_gaps(&graph, &result);
+    Ok(0)
+}
+
+/// 계보 작업을 RunEvent로 만든다. 생산자와 facet 설명 URL은 이 도구 버전을 가리킨다.
+fn lineage_events(
+    graph: &Graph,
+    namespace: &str,
+    database: Option<&str>,
+    event_time: &str,
+) -> export::openlineage::Events {
+    let version = env!("CARGO_PKG_VERSION");
+    let producer = format!("https://github.com/ictechgy/schemagraph/tree/v{version}");
+    let facet_url = format!(
+        "https://github.com/ictechgy/schemagraph/blob/v{version}/ANALYSIS.md#export-lineage-to-openlineage"
     );
     let context = export::openlineage::EventContext {
         namespace,
         database,
-        event_time: &event_time,
+        event_time,
         producer: &producer,
+        analysis_facet_url: &facet_url,
     };
-    let result = export::openlineage::events(&graph, &jobs, &context, content_run_id);
+    let jobs = analysis::lineage::jobs(graph);
+    export::openlineage::events(graph, &jobs, &context, content_run_id)
+}
+
+/// 이벤트를 한 줄에 하나씩 쓴다. `-`나 생략은 stdout이다.
+fn write_ndjson(events: &[serde_json::Value], output: Option<&str>) -> Result<()> {
     let mut text = String::new();
-    for event in &result.events {
+    for event in events {
         text.push_str(&serde_json::to_string(event)?);
         text.push('\n');
     }
@@ -847,17 +866,42 @@ fn openlineage(
             format!(
                 "cannot write OpenLineage events to {path}; check the directory and permissions"
             )
-        })?,
-        _ => print!("{text}"),
+        }),
+        _ => {
+            print!("{text}");
+            Ok(())
+        }
     }
+}
+
+/// 이벤트에 담지 못한 계보 공백을 stderr로 알린다 — 출력 파일은 결정적으로 남긴다.
+fn report_lineage_gaps(graph: &Graph, result: &export::openlineage::Events) {
+    let names = |ids: &[schemagraph_core::VertexId]| {
+        ids.iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     if !result.indirect_omitted.is_empty() {
         eprintln!(
-            "note: {} job(s) write several datasets, so their join/filter columns were not attributed to a specific output: {}",
+            "note: join/filter columns of {} routine job(s) were not exported because the graph does not record which statement a condition belongs to: {}",
             result.indirect_omitted.len(),
-            result.indirect_omitted.iter().map(|id| id.as_str()).collect::<Vec<_>>().join(", ")
+            names(&result.indirect_omitted)
         );
     }
-    Ok(0)
+    if !result.incomplete.is_empty() {
+        eprintln!(
+            "note: {} job(s) have incomplete SQL analysis and may miss lineage; see their schemagraphAnalysis job facet: {}",
+            result.incomplete.len(),
+            names(&result.incomplete)
+        );
+    }
+    if !graph.limitations().is_empty() {
+        eprintln!(
+            "note: the graph records {} collection limitation(s); read graph.json limitations before treating missing lineage as absent",
+            graph.limitations().len()
+        );
+    }
 }
 
 /// 이벤트 내용(runId 제외)의 SHA-256으로 RFC 9562 버전 8 UUID를 만든다.
@@ -882,33 +926,57 @@ fn content_run_id(event: &serde_json::Value) -> String {
     )
 }
 
-/// RFC 3339 날짜-시각 형태인지 확인한다(날짜, `T`, 시각, `Z` 또는 오프셋).
+/// RFC 3339 날짜-시각인지 확인한다 — 필드 범위와 선택적 소수 초, `Z` 또는 `±HH:MM`.
+///
+/// 바이트 단위로만 읽어 비ASCII 입력에서도 패닉하지 않는다. 형식이 맞지 않는 값을
+/// 싣으면 시각을 파싱하는 소비자가 이벤트 전체를 거부한다.
 fn validate_rfc3339(value: &str) -> Result<&str> {
     let bytes = value.as_bytes();
-    let digits = |range: std::ops::Range<usize>| {
-        bytes
-            .get(range)
-            .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
-    };
-    let shape = digits(0..4)
-        && bytes.get(4) == Some(&b'-')
-        && digits(5..7)
-        && bytes.get(7) == Some(&b'-')
-        && digits(8..10)
-        && matches!(bytes.get(10), Some(b'T' | b't'))
-        && digits(11..13)
-        && bytes.get(13) == Some(&b':')
-        && digits(14..16)
-        && bytes.get(16) == Some(&b':')
-        && digits(17..19);
-    let zone = value.ends_with('Z') || value.ends_with('z') || {
-        let tail = &value[value.len().saturating_sub(6)..];
-        tail.len() == 6 && matches!(tail.as_bytes()[0], b'+' | b'-') && tail.as_bytes()[3] == b':'
-    };
-    if shape && zone {
+    let date_time = bytes.len() >= 19 && rfc3339_date_time(&bytes[..19]);
+    if date_time && rfc3339_zone(&bytes[19..]) {
         Ok(value)
     } else {
         bail!("--event-time must be RFC 3339, such as 2026-09-25T00:00:00Z; got '{value}'")
+    }
+}
+
+/// 두 자리 십진수를 읽는다.
+fn two_digits(high: u8, low: u8) -> Option<u32> {
+    (high.is_ascii_digit() && low.is_ascii_digit())
+        .then(|| u32::from(high - b'0') * 10 + u32::from(low - b'0'))
+}
+
+/// `YYYY-MM-DDTHH:MM:SS`의 구분자와 필드 범위를 검사한다.
+fn rfc3339_date_time(b: &[u8]) -> bool {
+    let in_range = |at: usize, low: u32, high: u32| {
+        two_digits(b[at], b[at + 1]).is_some_and(|n| (low..=high).contains(&n))
+    };
+    b[..4].iter().all(u8::is_ascii_digit)
+        && (b[4], b[7], b[13], b[16]) == (b'-', b'-', b':', b':')
+        && matches!(b[10], b'T' | b't')
+        && in_range(5, 1, 12)
+        && in_range(8, 1, 31)
+        && in_range(11, 0, 23)
+        && in_range(14, 0, 59)
+        && in_range(17, 0, 60)
+}
+
+/// 초 뒤의 선택적 소수부와 `Z`/`±HH:MM` 시간대를 검사한다.
+fn rfc3339_zone(rest: &[u8]) -> bool {
+    let fraction = match rest.first() {
+        Some(b'.') => 1 + rest[1..].iter().take_while(|b| b.is_ascii_digit()).count(),
+        _ => 0,
+    };
+    if fraction == 1 {
+        return false;
+    }
+    match &rest[fraction..] {
+        [b'Z' | b'z'] => true,
+        [b'+' | b'-', h1, h2, b':', m1, m2] => {
+            two_digits(*h1, *h2).is_some_and(|h| h <= 23)
+                && two_digits(*m1, *m2).is_some_and(|m| m <= 59)
+        }
+        _ => false,
     }
 }
 
@@ -1548,6 +1616,11 @@ mod tests {
             "2026-09-25 00:00:00Z",
             "yesterday",
             "2026-09-25T00:00:00",
+            "2026-13-45T99:99:99garbageZ",
+            "2026-09-25T00:00:00+ab:cd",
+            "2026-09-25T00:00:00.Z",
+            "é12345",
+            "2026-09-25T00:00:00é12345",
         ] {
             assert!(validate_rfc3339(bad).is_err(), "{bad}");
         }

@@ -242,18 +242,23 @@ lineage exists, a `columnLineage` facet:
 
 - Value lineage (`derives-from`) becomes `DIRECT` input fields without a subtype,
   because the graph does not record whether a value is copied or transformed.
-- Columns used in join and filter conditions become dataset-level `INDIRECT`
-  entries with subtype `JOIN` or `FILTER`. Sorting, grouping, and window use are
-  not recorded separately in the graph and are not reported.
-- A body that writes several datasets gets no `INDIRECT` entries, since the graph
-  does not say which statement a condition belongs to; the command names such
-  jobs on stderr.
+- For views and materialized views (a single SELECT), columns used in join and
+  filter conditions become dataset-level `INDIRECT` entries with subtype `JOIN`
+  or `FILTER`. Routines, triggers, and queries get no `INDIRECT` entries, since
+  the graph does not record which statement (a load, a delete, ...) a condition
+  belongs to; the command names such jobs on stderr. Sorting, grouping, and
+  window use are not recorded separately in the graph and are not reported.
+- A job whose SQL analysis is partial or unsupported carries a
+  `schemagraphAnalysis` job facet (`state`, `diagnostics`), so consumers can tell
+  missing lineage from absent lineage. stderr also counts graph limitations.
 
-Datasets are named `[database.]schema.object` in the given namespace. The
-`runId` is a version 8 UUID derived from the event content, so fixing
-`--event-time` makes the output byte-for-byte reproducible and re-ingestion
-idempotent. This is a static snapshot, not an observed run. Events are validated
-against the pinned official schemas in `schemas/openlineage`; ingestion by a
+Jobs and datasets share the `[database.]` prefix: a view's job name equals its
+output dataset name (`database.schema.object`); a routine's job name is its
+graph id with the prefix. The `runId` is a version 8 UUID derived from the event
+content, so fixing `--event-time` (validated as RFC 3339) makes the output
+byte-for-byte reproducible and re-ingestion idempotent. This is a static
+snapshot, not an observed run. Events are validated against the pinned official
+schemas in `schemas/openlineage`, including their formats; ingestion by a
 specific catalog (Marquez, DataHub, OpenMetadata) has not been tested.
 
 ## Share or serve a snapshot

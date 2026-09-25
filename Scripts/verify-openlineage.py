@@ -14,8 +14,11 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
+from urllib.parse import urlsplit
+import uuid
 
 try:
     from jsonschema import Draft202012Validator
@@ -34,6 +37,7 @@ EVENT_TIME = '2026-09-25T00:00:00Z'
 
 # order_names는 customers와 조인하고 total로 거르며 name을 그대로 옮긴다.
 # load_archive는 한 테이블에만 쓰고(단일 출력), fan_out은 두 테이블에 쓴다(다중 출력).
+# dynamic_cleanup은 동적 SQL 때문에 분석이 부분적이라 상태 facet이 붙어야 한다.
 DDL = '''
 CREATE TABLE customers (id integer PRIMARY KEY, name text NOT NULL);
 CREATE TABLE orders (id integer PRIMARY KEY, customer_id integer REFERENCES customers(id), total integer);
@@ -51,6 +55,12 @@ CREATE FUNCTION fan_out() RETURNS void LANGUAGE sql AS $$
   INSERT INTO archive (customer_name) SELECT name FROM customers WHERE id > 1;
   INSERT INTO audit (total) SELECT total FROM orders WHERE total > 5
 $$;
+CREATE FUNCTION dynamic_cleanup() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO audit (total) SELECT total FROM orders;
+  EXECUTE 'DELETE FROM ' || quote_ident('audit');
+END
+$$;
 '''
 
 
@@ -62,19 +72,39 @@ def validator():
         schema = json.loads(path.read_text())
         schemas[path.name] = schema
         registry = registry.with_resource(schema['$id'], Resource.from_contents(schema))
-    return Draft202012Validator(schemas['OpenLineage.json'], registry=registry), registry
+    checker = Draft202012Validator.FORMAT_CHECKER
+    return Draft202012Validator(schemas['OpenLineage.json'], registry=registry, format_checker=checker), registry
+
+
+# jsonschema의 date-time·uri 형식 검사는 선택 패키지가 없으면 조용히 건너뛰므로 직접도 검사한다.
+RFC3339 = re.compile(r'\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d+)?(Z|[+-]([01]\d|2[0-3]):[0-5]\d)')
+
+
+def check_formats(event):
+    """eventTime은 RFC 3339, runId는 버전 8 UUID, producer·_producer·_schemaURL은 절대 URI여야 한다."""
+    assert RFC3339.fullmatch(event['eventTime']), event['eventTime']
+    run_id = uuid.UUID(event['run']['runId'])
+    assert str(run_id) == event['run']['runId'] and run_id.version == 8, event['run']['runId']
+    uris = [event['producer'], event['schemaURL']]
+    facets = [f for o in event['outputs'] for f in o.get('facets', {}).values()] + list(event['job'].get('facets', {}).values())
+    uris += [value for facet in facets for value in (facet['_producer'], facet['_schemaURL'])]
+    for uri in uris:
+        parts = urlsplit(uri)
+        assert parts.scheme in ('http', 'https') and parts.netloc, uri
 
 
 def validate_events(events):
     """이벤트와 그 facet을 각 스키마로 검증한다(facet은 $schemaURL이 가리키는 정의로)."""
     event_validator, registry = validator()
     for event in events:
+        check_formats(event)
         errors = sorted(event_validator.iter_errors(event), key=lambda e: list(e.path))
         assert not errors, (event['job']['name'], [e.message for e in errors[:3]])
         for output in event['outputs']:
             for name, facet in output.get('facets', {}).items():
                 # $ref 래퍼로 검증해야 facet 문서 안의 상대 참조가 원래 문서 기준으로 풀린다.
-                facet_validator = Draft202012Validator({'$ref': facet['_schemaURL']}, registry=registry)
+                facet_validator = Draft202012Validator({'$ref': facet['_schemaURL']}, registry=registry,
+                                                       format_checker=Draft202012Validator.FORMAT_CHECKER)
                 errors = list(facet_validator.iter_errors(facet))
                 assert not errors, (event['job']['name'], name, [e.message for e in errors[:3]])
 
@@ -93,6 +123,11 @@ def dataset_field(entry):
     return entry['name'].removeprefix('corpus.') + '.' + entry['field']
 
 
+def job_id(event):
+    """job 이름에서 `corpus.` 접두를 떼 그래프 정점 id와 맞춘다."""
+    return event['job']['name'].removeprefix('corpus.')
+
+
 def event_pairs(events):
     """이벤트의 DIRECT (작업, 출력 컬럼 id, 입력 컬럼 id)와 INDIRECT (작업, 입력 컬럼 id, subtype)."""
     direct, indirect = [], set()
@@ -103,11 +138,11 @@ def event_pairs(events):
             for field, value in lineage.get('fields', {}).items():
                 for source in value['inputFields']:
                     assert source['transformations'] == [{'type': 'DIRECT'}], source
-                    direct.append((event['job']['name'], f'{target}.{field}', dataset_field(source)))
+                    direct.append((job_id(event), f'{target}.{field}', dataset_field(source)))
             for source in lineage.get('dataset', []):
                 for transformation in source['transformations']:
                     assert transformation['type'] == 'INDIRECT', transformation
-                    indirect.add((event['job']['name'], dataset_field(source), transformation['subtype']))
+                    indirect.add((job_id(event), dataset_field(source), transformation['subtype']))
     return direct, indirect
 
 
@@ -133,8 +168,9 @@ def check_bijection(graph, events, stderr):
     assert len(direct) == len(set(direct)), 'a derives-from edge appears twice within one job'
     pairs = {(output, source) for _, output, source in direct}
     assert pairs == derives, {'graph_only': sorted(derives - pairs), 'events_only': sorted(pairs - derives)}
-    # 알림 끝의 `: ` 뒤가 작업 목록이다(문장 앞부분에도 `: `가 있다).
-    omitted = {job for jobs in (line.rsplit(': ', 1)[-1] for line in stderr.splitlines() if line.startswith('note:'))
+    # 간접 사용 생략 알림의 끝 `: ` 뒤가 작업 목록이다.
+    omitted = {job for jobs in (line.rsplit(': ', 1)[-1] for line in stderr.splitlines()
+                                if line.startswith('note: join/filter columns'))
                for job in jobs.split(', ')}
     assert indirect <= graph_indirect, sorted(indirect - graph_indirect)
     missing = {fact for fact in graph_indirect - indirect if fact[0] not in omitted}
@@ -143,16 +179,21 @@ def check_bijection(graph, events, stderr):
 
 
 def check_ddl_facts(events):
-    """DDL에서 손으로 도출한 사실 — 뷰의 조인·필터 컬럼과 DML 계보의 소유 작업."""
+    """DDL에서 손으로 도출한 사실 — 뷰의 조인·필터 컬럼, DML 계보의 소유 작업, 루틴 조건의 생략."""
     _, indirect = event_pairs(events)
-    by_job = {event['job']['name']: event for event in events}
+    by_job = {job_id(event): event for event in events}
+    assert by_job['public.order_names']['job']['name'] == by_job['public.order_names']['outputs'][0]['name']
     assert {('public.order_names', 'public.customers.id', 'JOIN'), ('public.order_names', 'public.orders.customer_id', 'JOIN'),
             ('public.order_names', 'public.orders.total', 'FILTER')} <= indirect, sorted(indirect)
     archive = by_job['public.load_archive']
     assert [o['name'] for o in archive['outputs']] == ['corpus.public.archive'], archive['outputs']
     fields = archive['outputs'][0]['facets']['columnLineage']['fields']
     assert [s['field'] for s in fields['customer_name']['inputFields']] == ['name'], fields
-    assert ('public.load_archive', 'public.orders.total', 'FILTER') in indirect, sorted(indirect)
+    # 루틴의 조건은 어느 문장에 속하는지 몰라 싣지 않는다.
+    assert not any(job != 'public.order_names' for job, _, _ in indirect), sorted(indirect)
+    facet = by_job['public.dynamic_cleanup']['job']['facets']['schemagraphAnalysis']
+    assert facet['state'] == 'partial' and facet['diagnostics'] >= 1, facet
+    assert 'facets' not in by_job['public.order_names']['job'], by_job['public.order_names']['job']
     fan_out = by_job['public.fan_out']
     assert sorted(o['name'] for o in fan_out['outputs']) == ['corpus.public.archive', 'corpus.public.audit']
 
@@ -173,12 +214,12 @@ def main():
             graph_path = work / 'graph.json'
             ACCURACY.run([engine, 'scan', url, '--schema', 'public', '-o', graph_path], env=env)
             events, stderr = run_export(engine, graph_path, work / 'first.ndjson', env)
-            again, _ = run_export(engine, graph_path, work / 'second.ndjson', env)
+            run_export(engine, graph_path, work / 'second.ndjson', env)
             assert (work / 'first.ndjson').read_bytes() == (work / 'second.ndjson').read_bytes(), 'output is not deterministic'
             validate_events(events)
             direct, indirect, omitted = check_bijection(json.loads(graph_path.read_text()), events, stderr)
             check_ddl_facts(events)
-            assert omitted == ['public.fan_out'], omitted
+            assert omitted == ['public.fan_out', 'public.load_archive'], omitted
     assert hashlib.sha256(engine.read_bytes()).hexdigest() == digest, 'engine binary changed during verification'
     result = {'status': 'ok', 'engine_sha256': digest, 'events': len(events), 'direct': direct,
               'indirect': indirect, 'indirect_omitted': omitted,
