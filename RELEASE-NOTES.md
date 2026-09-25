@@ -1,3 +1,82 @@
+# schemagraph 0.6.0
+
+This release adds agent-facing discovery tools, catalog lint rules, an
+observation-based unused-object report, and OpenLineage export. It also fixes
+PostgreSQL collection gaps found while validating them.
+
+## Discovery and MCP
+
+- `schemagraph search <pattern>` finds vertices by a case-insensitive name
+  fragment or a `*`/`?` glob. The default `names` detail lists ids; `summary`
+  adds kind, schema, name, and neighbor counts. `total` and `truncated` report
+  what was cut.
+- The MCP server adds `search`, `dead`, `cycles`, `lint`, `stats`, and `unused`
+  tools, each returning the same JSON as the CLI, plus two read-only resources:
+  a snapshot summary and the agent skill contract.
+- `serve --config/--retain/--as-of` sets the `dead` retention policy at startup.
+  `serve` does not read `schemagraph.toml` from its working directory, and tool
+  arguments never name files. `review` is not exposed, since it needs two
+  snapshots.
+
+## Catalog lint
+
+- `fk-type-mismatch` reports a foreign-key column whose declared type differs
+  from the referenced column (PostgreSQL `serial` shorthands compare as their
+  integer types; references that omit target columns use the referenced key).
+- `table-without-primary-key` and `duplicate-index` are advisory: they are
+  reported but never fail `lint --strict`, which now uses `blockingCount`.
+  Primary-key absence is confirmed only for a complete catalog, and duplicate
+  indexes stay unverified because index access methods are not collected.
+- Graph metadata carries `schema_metadata.catalog_complete` when the collector
+  declared a complete catalog.
+
+## Unused tables and indexes
+
+- `schemagraph unused` (CLI and MCP) reports tables and indexes with zero
+  observed reads since `usage.since`, with facts that weaken a removal reading:
+  uniqueness, constraint backing, covered foreign keys, SQL references, missing
+  index counters, missing scan counts, and unknown windows. Objects without
+  counters are counted as unobserved. It is an observation, not a deletion
+  verdict.
+- Table usage may carry `scans` (sequential plus index scans), so a table polled
+  while empty is not reported. PostgreSQL partitioned parents carry no usage,
+  and `track_counts = off` records no table or index usage with a limitation.
+
+## OpenLineage export
+
+- `schemagraph openlineage --namespace <uri>` writes one OpenLineage RunEvent
+  (spec 2-0-2) per SQL body that produces a dataset, with schema and column
+  lineage facets. Value lineage is `DIRECT` without a subtype; join and filter
+  columns are dataset-level `INDIRECT` entries for views only. Jobs with partial
+  analysis carry a `schemagraphAnalysis` facet. Fixing `--event-time` makes the
+  output reproducible; `runId` is derived from the event content.
+
+## Fixes
+
+- PostgreSQL native and Go collectors now fill `pk_position` from the primary-key
+  constraint; the engine also repairs documents that omitted it. Previously the
+  FK primary-key-prefix lint could not confirm PostgreSQL coverage.
+
+## Upgrade and validation
+
+Install the CLI with `cargo install schemagraph-cli --version 0.6.0 --locked`,
+or use the Linux x86_64/macOS arm64 release archives. Maven coordinates are
+`io.github.ictechgy:schemagraph-probe:0.6.0`. The JDBC and Go probes collect
+table scan counts and check `track_counts`. The Action can be referenced as
+`ictechgy/schemagraph@v0.6.0`.
+
+All six Rust crates move to 0.6.0 because of new public modules and fields.
+Catalog v1/v2 and graph v2 gain optional fields (`usage.scans`,
+`schema_metadata.catalog_complete`) that older readers ignore; existing fields
+keep their meaning. `lint --strict` results do not change for existing rules.
+
+New CI checks run the lint rules, `unused`, and OpenLineage export against real
+PostgreSQL (native, Go, and JDBC collectors for the first two). OpenLineage
+events are validated against pinned official schemas; ingestion by a specific
+catalog has not been tested.
+
+---
+
 # schemagraph 0.5.1
 
 This patch release fixes PostgreSQL materialized-view column collection and

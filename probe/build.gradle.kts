@@ -10,7 +10,7 @@ plugins {
 }
 
 group = providers.gradleProperty("probeGroup").orElse("io.github.ictechgy").get()
-version = providers.gradleProperty("probeVersion").orElse("0.5.1").get()
+version = providers.gradleProperty("probeVersion").orElse("0.6.0").get()
 
 repositories {
     mavenCentral()
