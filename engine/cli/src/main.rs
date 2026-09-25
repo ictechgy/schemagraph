@@ -307,7 +307,7 @@ enum Command {
         graph: PathBuf,
         #[arg(long, default_value_t = 256)]
         max: usize,
-        /// Exit 1 for confirmed findings, or 2 when coverage is incomplete.
+        /// Exit 1 for confirmed non-advisory findings, or 2 when coverage is incomplete.
         #[arg(long)]
         strict: bool,
     },
@@ -608,7 +608,7 @@ async fn run(cli: Cli) -> Result<i32> {
             );
             Ok(if strict && !report.complete {
                 2
-            } else if strict && report.confirmed_count > 0 {
+            } else if strict && report.blocking_count > 0 {
                 1
             } else {
                 0

@@ -25,12 +25,15 @@ SPEC.loader.exec_module(ACCURACY)
 RULES = {'fk-type-mismatch', 'table-without-primary-key', 'duplicate-index', 'fk-index-prefix'}
 
 # child.parent_id는 참조 대상과 선언 타입이 다르고 같은 키의 인덱스가 둘이다.
-# same_type은 타입이 같지만 FK 인덱스가 없고, nopk는 PK가 없다.
+# same_type은 타입이 같지만 FK 인덱스가 없고, nopk는 PK가 없다. implicit_ref는
+# 대상 컬럼을 생략해(PK로 해석) 타입이 다르고, docs는 PK를 선언할 수 없는 가상 테이블이다.
 SQLITE_DDL = '''
 CREATE TABLE parent (id INTEGER PRIMARY KEY);
 CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id BIGINT REFERENCES parent(id));
 CREATE TABLE same_type (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+CREATE TABLE implicit_ref (id INTEGER PRIMARY KEY, parent_id BIGINT REFERENCES parent);
 CREATE TABLE nopk (x TEXT);
+CREATE VIRTUAL TABLE docs USING fts5(body);
 CREATE VIEW nopk_view AS SELECT x FROM nopk;
 CREATE INDEX child_a ON child (parent_id);
 CREATE INDEX child_b ON child (parent_id);
@@ -38,10 +41,11 @@ CREATE UNIQUE INDEX child_unique ON child (parent_id, id);
 CREATE INDEX child_partial ON child (parent_id) WHERE parent_id > 0;
 '''
 
-# PG는 child_hash가 같은 키의 hash 인덱스다 — 방식이 달라도 수집 사실로는 구분되지
+# parent.id는 serial이다 — pgjdbc는 `serial`로, 참조 쪽은 `int4`로 보고하므로 JDBC 경로에서도
+# same_type이 불일치로 나오면 안 된다. PG는 child_hash가 같은 키의 hash 인덱스다 — 방식이 달라도 수집 사실로는 구분되지
 # 않으므로 duplicate-index가 확정이 아니라 미확인이어야 하는 실제 사례다.
 POSTGRES_DDL = '''
-CREATE TABLE parent (id integer PRIMARY KEY);
+CREATE TABLE parent (id serial PRIMARY KEY);
 CREATE TABLE child (id integer PRIMARY KEY, parent_id bigint REFERENCES parent(id));
 CREATE TABLE same_type (id integer PRIMARY KEY, parent_id integer REFERENCES parent(id));
 CREATE TABLE nopk (x text);
@@ -64,8 +68,13 @@ def expected(schema, fk_names, duplicate):
 
 
 def lint(engine, graph, env=None):
-    """lint JSON에서 비교 대상 규칙의 finding만 고른다."""
+    """lint JSON에서 비교 대상 규칙의 finding만 고르고 advisory·blocking 계약을 검사한다."""
     report = json.loads(ACCURACY.run([engine, 'lint', '--graph', graph, '--max', '1000'], env=env))
+    for finding in report['findings']:
+        advisory = finding['rule'] in ('table-without-primary-key', 'duplicate-index')
+        assert finding.get('advisory', False) is advisory, finding
+    blocking = sum(1 for f in report['findings'] if f['status'] == 'confirmed' and not f.get('advisory'))
+    assert report['blockingCount'] == blocking, report
     return report, {(f['rule'], f['subject'], f['status']) for f in report['findings'] if f['rule'] in RULES}
 
 
@@ -80,6 +89,27 @@ def sqlite_fk_names(database):
     return ('child_fk_0', 'same_type_fk_0')
 
 
+def sqlite_extra(schema):
+    """SQLite DDL에만 있는 사례 — 대상 컬럼을 생략한 FK와 PK를 선언할 수 없는 가상 테이블."""
+    return {
+        ('fk-type-mismatch', f'{schema}.implicit_ref.implicit_ref_fk_0', 'confirmed'),
+        ('fk-index-prefix', f'{schema}.implicit_ref.implicit_ref_fk_0', 'confirmed'),
+        ('table-without-primary-key', f'{schema}.docs', 'confirmed'),
+    }
+
+
+def strict_ignores_advisory(engine, work):
+    """참고용 finding만 있는 DB에서 lint --strict가 기존처럼 0으로 끝나는지 본다(호환성)."""
+    database = work / 'advisory.sqlite'
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript('CREATE TABLE only_rows (x TEXT);')
+    graph = work / 'advisory.graph.json'
+    ACCURACY.run([engine, 'scan', f'sqlite:{database}', '-o', graph])
+    report, actual = lint(engine, graph)
+    assert actual == {('table-without-primary-key', 'main.only_rows', 'confirmed')}, actual
+    ACCURACY.run([engine, 'lint', '--graph', graph, '--strict'])
+
+
 def sqlite_case(engine, work):
     """SQLite 파일을 scan해 새 규칙의 확정·미확인 판정을 확인한다."""
     database = work / 'lint.sqlite'
@@ -88,7 +118,8 @@ def sqlite_case(engine, work):
     graph = work / 'sqlite.graph.json'
     ACCURACY.run([engine, 'scan', f'sqlite:{database}', '-o', graph])
     report, actual = lint(engine, graph)
-    check('sqlite', actual, expected('main', sqlite_fk_names(database), 'child_b'))
+    check('sqlite', actual, expected('main', sqlite_fk_names(database), 'child_b') | sqlite_extra('main'))
+    strict_ignores_advisory(engine, work)
     message = next(f['message'] for f in report['findings'] if f['rule'] == 'fk-type-mismatch')
     assert 'BIGINT' in message and 'INTEGER' in message, message
     return {'findings': len(actual), 'complete': report['complete']}
@@ -131,7 +162,10 @@ def restricted_case(engine, url, psql, work, env):
     ACCURACY.run([engine, 'scan', url.replace('corpus@', 'collector@'), '--schema', 'public', '-o', graph], env=env)
     report, actual = lint(engine, graph, env)
     assert ('table-without-primary-key', 'public.nopk', 'unverified') in actual, actual
-    assert report['complete'] is False, report
+    # 미확인 PK는 참고용이라 strict 실패·완전성 하향 사유가 아니고, 수집 공백은
+    # limitations로 전달된다 — 옛 그래프의 lint --strict 결과가 바뀌지 않게 하기 위해서다.
+    assert report['blockingCount'] == 0, report
+    assert any('uncollected relations' in note for note in report['limitations']), report
 
 
 def postgres_case(engine, bindir, work, go_probe, jdbc_jar, java):

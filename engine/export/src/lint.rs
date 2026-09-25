@@ -14,6 +14,10 @@ fn finding_value(finding: &LintFinding) -> Value {
         "status": status_value(finding.status),
         "subject": finding.subject.as_str(),
     });
+    // 참고용 규칙만 표시한다 — 없는 선택 필드는 키를 생략하는 계약이다.
+    if finding.advisory {
+        value["advisory"] = json!(true);
+    }
     if let Some(table) = &finding.table {
         value["table"] = json!(table.as_str());
     }
@@ -42,6 +46,7 @@ fn finding_value(finding: &LintFinding) -> Value {
 pub fn to_value(report: &LintReport) -> Value {
     json!({
         "kind": "lint",
+        "blockingCount": report.blocking_count,
         "complete": report.complete,
         "confirmedCount": report.confirmed_count,
         "findings": report.findings.iter().map(finding_value).collect::<Vec<_>>(),
@@ -60,6 +65,7 @@ mod tests {
         LintFinding {
             rule: rule.into(),
             status,
+            advisory: false,
             subject: VertexId::from_raw(subject),
             table: None,
             columns: vec![],
@@ -79,6 +85,7 @@ mod tests {
             )],
             total_findings: 2,
             confirmed_count: 1,
+            blocking_count: 1,
             truncated: true,
             limitations: vec!["metadata incomplete".into()],
             complete: false,
@@ -105,6 +112,7 @@ mod tests {
             findings: vec![item],
             total_findings: 1,
             confirmed_count: 0,
+            blocking_count: 0,
             truncated: false,
             limitations: vec![],
             complete: true,
