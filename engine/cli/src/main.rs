@@ -119,8 +119,8 @@ enum Command {
         #[arg(long)]
         kind: Option<String>,
         /// `names` lists ids; `summary` adds kind, schema, name, and neighbor counts.
-        #[arg(long, default_value = "names")]
-        detail: String,
+        #[arg(long, value_enum, default_value_t = DetailArg::Names)]
+        detail: DetailArg,
         /// Max matches before `truncated` is reported.
         #[arg(long, default_value_t = 100)]
         max: usize,
@@ -272,7 +272,7 @@ enum Command {
     Serve {
         #[arg(short, long, default_value = "graph.json")]
         graph: PathBuf,
-        /// Retention policy for the `dead` tool; schemagraph.toml is loaded when present.
+        /// Retention policy for the `dead` tool; schemagraph.toml is not read implicitly.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Retention roots for the `dead` tool, as with `dead --retain`.
@@ -334,6 +334,28 @@ enum GraphFormat {
     Json,
     Dot,
     Html,
+}
+
+/// `search --detail`의 CLI 값 — 와이어 라벨은 export가 소유한다.
+#[derive(Clone, Copy, ValueEnum)]
+enum DetailArg {
+    Names,
+    Summary,
+}
+
+impl DetailArg {
+    /// export의 공개 단계로 바꾼다.
+    fn detail(self) -> export::search::SearchDetail {
+        match self {
+            Self::Names => export::search::SearchDetail::Names,
+            Self::Summary => export::search::SearchDetail::Summary,
+        }
+    }
+}
+
+/// MCP가 CLI `--level`과 같은 라벨·같은 대응으로 레벨을 해석하게 한다.
+pub(crate) fn parse_level_label(label: &str) -> Option<Level> {
+    LevelArg::from_str(label, false).ok().map(|arg| arg.level())
 }
 
 #[derive(Clone, ValueEnum)]
@@ -456,7 +478,7 @@ async fn run(cli: Cli) -> Result<i32> {
             kind,
             detail,
             max,
-        } => search(&pattern, &graph, kind.as_deref(), &detail, max),
+        } => search(&pattern, &graph, kind.as_deref(), detail.detail(), max),
         Command::Query {
             name,
             graph,
@@ -554,8 +576,8 @@ async fn run(cli: Cli) -> Result<i32> {
             retain,
             as_of,
         } => {
-            // 정책은 운영자가 시작 시 정한다 — 도구 인자로 파일 경로를 받지 않는다.
-            let retention = policy::load(config.as_deref(), &retain, as_of.as_deref())?;
+            // 정책은 운영자가 시작 시 명시한다 — 도구 인자나 실행 위치의 파일에 좌우되지 않는다.
+            let retention = policy::load_explicit(config.as_deref(), &retain, as_of.as_deref())?;
             let graph = load_graph(&graph)?;
             let snapshot = mcp::Snapshot {
                 graph: &graph,
@@ -969,39 +991,41 @@ fn search(
     pattern: &str,
     path: &std::path::Path,
     kind: Option<&str>,
-    detail: &str,
+    detail: export::search::SearchDetail,
     max: usize,
 ) -> Result<i32> {
-    let (kind, detail) = parse_search_filters(pattern, kind, detail)?;
+    let kind = parse_search_filters(pattern, kind)?;
     let graph = load_graph(path)?;
-    let report = analysis::search::search(&graph, pattern, kind, max);
+    let query = analysis::search::SearchQuery {
+        pattern,
+        kind,
+        max,
+        count_neighbors: detail == export::search::SearchDetail::Summary,
+    };
+    let report = analysis::search::search(&graph, query);
     let value = export::search::to_value(&report, pattern, kind, detail, graph.limitations());
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(0)
 }
 
-/// 검색 인자를 검증한다. CLI와 MCP가 같은 규칙으로 거절하도록 한곳에 둔다.
+/// 검색 패턴과 종류 필터를 검증한다. CLI와 MCP가 같은 규칙으로 거절하도록 한곳에 둔다.
+/// 종류 라벨은 패턴처럼 대소문자를 무시한다.
 pub(crate) fn parse_search_filters(
     pattern: &str,
     kind: Option<&str>,
-    detail: &str,
-) -> Result<(
-    Option<schemagraph_core::VertexKind>,
-    export::search::SearchDetail,
-)> {
+) -> Result<Option<schemagraph_core::VertexKind>> {
     if pattern.trim().is_empty() {
         bail!("search pattern must be nonempty; pass a name fragment or a glob such as 'public.*'");
     }
-    let kind = kind
-        .map(|kind| {
-            export::vertex_kind_parse(kind).ok_or_else(|| {
-                anyhow!("unknown vertex kind '{kind}'; use a kind reported by graph output, such as table, view, or column")
-            })
+    kind.map(|kind| {
+        export::vertex_kind_parse(&kind.to_ascii_lowercase()).ok_or_else(|| {
+            anyhow!(
+                "unknown vertex kind '{kind}'; use one of {}",
+                export::VERTEX_KIND_LABELS.join(", ")
+            )
         })
-        .transpose()?;
-    let detail = export::search::SearchDetail::parse(detail)
-        .ok_or_else(|| anyhow!("unknown detail '{detail}'; use names or summary"))?;
-    Ok((kind, detail))
+    })
+    .transpose()
 }
 
 fn dead(

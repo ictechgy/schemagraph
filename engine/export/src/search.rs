@@ -66,14 +66,17 @@ pub fn to_value(
     value
 }
 
-/// 요약 단계의 한 건 — 이웃 수는 의존 간선 기준이다.
+/// 요약 단계의 한 건 — 이웃 수는 계산했을 때만 싣는다(없는 선택 필드는 키 생략).
 fn summary(hit: &SearchHit) -> serde_json::Value {
-    serde_json::json!({
-        "dependencies": hit.dependencies,
-        "dependents": hit.dependents,
+    let mut value = serde_json::json!({
         "id": hit.vertex.id.as_str(),
         "kind": super::vertex_kind_str(hit.vertex.kind),
         "name": hit.vertex.name,
         "schema": hit.vertex.schema,
-    })
+    });
+    if let Some(counts) = hit.neighbors {
+        value["dependencies"] = serde_json::json!(counts.dependencies);
+        value["dependents"] = serde_json::json!(counts.dependents);
+    }
+    value
 }

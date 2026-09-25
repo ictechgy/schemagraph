@@ -49,6 +49,25 @@ fn vertex_kind_str(kind: VertexKind) -> &'static str {
     }
 }
 
+/// 정점 종류의 와이어 라벨 전체 — MCP 입력 스키마가 허용 값을 알리는 데 쓴다.
+pub const VERTEX_KIND_LABELS: &[&str] = &[
+    "schema",
+    "table",
+    "view",
+    "materialized-view",
+    "sequence",
+    "type",
+    "synonym",
+    "column",
+    "index",
+    "constraint",
+    "trigger",
+    "function",
+    "procedure",
+    "package",
+    "query",
+];
+
 /// 와이어 종류 라벨을 해석한다 — CLI·MCP의 종류 필터가 공유한다.
 pub fn vertex_kind_parse(s: &str) -> Option<VertexKind> {
     Some(match s {
@@ -669,6 +688,15 @@ pub fn rules_to_value(report: &RulesReport) -> serde_json::Value {
 mod tests {
     use super::*;
     use schemagraph_core::{Evidence, VertexId};
+
+    /// 라벨 목록이 해석기·출력기와 어긋나면 MCP가 받을 수 없는 값을 광고하게 된다.
+    #[test]
+    fn vertex_kind_labels_round_trip() {
+        for label in VERTEX_KIND_LABELS {
+            let kind = vertex_kind_parse(label).expect("advertised label must parse");
+            assert_eq!(vertex_kind_str(kind), *label);
+        }
+    }
 
     fn sample() -> Graph {
         let mut g = Graph::new();

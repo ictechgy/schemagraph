@@ -736,10 +736,13 @@ struct Resources {
 impl Resources {
     /// 그래프 요약을 결정적 JSON 문자열로 미리 직렬화한다.
     fn new(graph: &Graph) -> Self {
-        Self {
-            summary: serde_json::to_string_pretty(&export::graph_summary_value(graph))
-                .unwrap_or_else(|error| format!("{{\"error\":\"summary unavailable: {error}\"}}")),
-        }
+        let summary = serde_json::to_string_pretty(&export::graph_summary_value(graph))
+            .unwrap_or_else(|error| {
+                // 소비자에게는 파싱 가능한 오류 문서를, 운영자에게는 원인을 남긴다.
+                eprintln!("schemagraph serve: graph summary serialization failed: {error}");
+                json!({"error": "graph summary is unavailable; see the server log"}).to_string()
+            });
+        Self { summary }
     }
 
     /// 목록 또는 한 리소스의 내용을 JSON-RPC 응답으로 만든다.
@@ -953,15 +956,11 @@ fn prepare_tool_call(
             Ok(PreparedToolCall::Dead { max })
         }
         "cycles" => {
-            let level = match optional_name(arguments, "level")?.as_deref() {
-                None | Some("object") => Level::Object,
-                Some("schema") => Level::Schema,
-                Some("column" | "member") => Level::Member,
-                Some(other) => {
-                    return Err(format!(
-                        "unknown level '{other}'; use schema, object, column, or member"
-                    ))
-                }
+            let level = match optional_name(arguments, "level")? {
+                None => Level::Object,
+                Some(label) => crate::parse_level_label(&label).ok_or_else(|| {
+                    format!("unknown level '{label}'; use schema, object, column, or member")
+                })?,
             };
             reject_unknown(arguments, &["level"])?;
             Ok(PreparedToolCall::Cycles { level })
@@ -983,10 +982,14 @@ fn prepare_tool_call(
 fn prepare_search(arguments: &Map<String, Value>) -> Result<PreparedToolCall, String> {
     let pattern = required_name(arguments, "pattern")?;
     let kind = optional_name(arguments, "kind")?;
-    let detail = optional_name(arguments, "detail")?.unwrap_or_else(|| "names".into());
+    let detail = match optional_name(arguments, "detail")?.as_deref() {
+        None => export::search::SearchDetail::Names,
+        Some(label) => export::search::SearchDetail::parse(label)
+            .ok_or_else(|| format!("unknown detail '{label}'; use names or summary"))?,
+    };
     let max = bounded_u64(arguments, "max", 100, MAX_RESULTS)? as usize;
     reject_unknown(arguments, &["pattern", "kind", "detail", "max"])?;
-    let (kind, detail) = crate::parse_search_filters(&pattern, kind.as_deref(), &detail)
+    let kind = crate::parse_search_filters(&pattern, kind.as_deref())
         .map_err(|error| error.to_string())?;
     Ok(PreparedToolCall::Search {
         pattern,
@@ -1033,7 +1036,13 @@ fn call_tool(snapshot: &Snapshot, call: &PreparedToolCall, cancel: &AtomicBool) 
             detail,
             max,
         } => whole_graph(cancel, || {
-            let report = analysis::search::search(graph, pattern, *kind, *max);
+            let query = analysis::search::SearchQuery {
+                pattern,
+                kind: *kind,
+                max: *max,
+                count_neighbors: *detail == export::search::SearchDetail::Summary,
+            };
+            let report = analysis::search::search(graph, query);
             export::search::to_value(&report, pattern, *kind, *detail, graph.limitations())
         }),
         PreparedToolCall::Dead { max } => whole_graph(cancel, || {
@@ -1428,7 +1437,7 @@ fn tool_definitions() -> Vec<Value> {
                 "type":"object",
                 "properties": {
                     "pattern":{"type":"string","minLength":1,"maxLength":MAX_NAME_BYTES},
-                    "kind":{"type":"string","minLength":1,"maxLength":MAX_NAME_BYTES},
+                    "kind":{"type":"string","enum":export::VERTEX_KIND_LABELS},
                     "detail":{"type":"string","enum":["names","summary"],"default":"names"},
                     "max":{"type":"integer","minimum":0,"maximum":MAX_RESULTS,"default":100}
                 },
@@ -1601,7 +1610,7 @@ mod tests {
     fn search_discloses_names_then_summary_and_rejects_unknown_kind() {
         let responses = call(&[
             r#"{"name":"search","arguments":{"pattern":"OR"}}"#,
-            r#"{"name":"search","arguments":{"pattern":"public.*","kind":"view","detail":"summary"}}"#,
+            r#"{"name":"search","arguments":{"pattern":"public.*","kind":"VIEW","detail":"summary"}}"#,
             r#"{"name":"search","arguments":{"pattern":"x","kind":"tabel"}}"#,
         ]);
         let names = &responses[0]["result"]["structuredContent"];

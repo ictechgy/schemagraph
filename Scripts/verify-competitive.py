@@ -71,10 +71,10 @@ def run(engine: Path, *arguments: object, expected: int = 0) -> str:
     return result.stdout
 
 
-def run_capture(engine: Path, *arguments: object, expected: int = 0, input_text: str = "") -> tuple[str, str]:
+def run_capture(engine: Path, *arguments: object, expected: int = 0, input_text: str = "", cwd: Path | None = None) -> tuple[str, str]:
     """실행 결과의 stdout/stderr를 함께 돌려준다 — cache 통계와 경고를 검사할 때 쓴다."""
     command = [str(engine), *(str(argument) for argument in arguments)]
-    result = subprocess.run(command, input=input_text, capture_output=True, text=True, check=False)
+    result = subprocess.run(command, input=input_text, capture_output=True, text=True, check=False, cwd=cwd)
     if result.returncode != expected:
         detail = (result.stderr or result.stdout).strip()
         fail(f"{command[1]} exited {result.returncode}, expected {expected}: {detail}")
@@ -633,7 +633,7 @@ def check_lint(engine: Path, database: Path, work: Path) -> None:
         fail(f"partial FK index did not preserve its caveat: {report}")
 
 
-def mcp_session(engine: Path, graph_path: Path, calls: list[dict], *serve_args: object) -> list[dict]:
+def mcp_session(engine: Path, graph_path: Path, calls: list[dict], *serve_args: object, cwd: Path | None = None) -> list[dict]:
     """한 MCP 세션에서 요청들을 보내고 initialize 이후의 응답을 id 순으로 돌려준다."""
     messages = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "verify", "version": "1"}}},
@@ -641,7 +641,7 @@ def mcp_session(engine: Path, graph_path: Path, calls: list[dict], *serve_args: 
     ]
     messages += [dict(call, jsonrpc="2.0", id=index) for index, call in enumerate(calls, start=2)]
     requests = "\n".join(json.dumps(message) for message in messages) + "\n"
-    output, _ = run_capture(engine, "serve", "--graph", graph_path, *serve_args, input_text=requests)
+    output, _ = run_capture(engine, "serve", "--graph", graph_path, *serve_args, input_text=requests, cwd=cwd)
     responses = [json.loads(line) for line in output.splitlines() if line.strip()]
     if len(responses) != len(calls) + 1:
         fail(f"MCP handshake/notification response count was wrong: {responses}")
@@ -700,6 +700,16 @@ def check_mcp_retention(engine: Path, graph_path: Path, unretained: dict) -> Non
         fail(f"MCP dead with serve --retain differed from CLI: {response}")
     if retained_cli == unretained:
         fail(f"retention root did not change the dead report: {retained_cli}")
+    # 실행 위치의 schemagraph.toml은 serve가 읽지 않는다 — dead 전용 설정 오류가
+    # 서버 시작을 막거나, 클라이언트가 고른 cwd에 따라 정책이 바뀌면 안 된다.
+    workdir = graph_path.parent / "serve-cwd"
+    workdir.mkdir(exist_ok=True)
+    (workdir / "schemagraph.toml").write_text(
+        f'retain = ["{root}"]\n[[suppress]]\npattern = "*"\nreason = "x"\nuntil = "2099-01-01"\n', encoding="utf-8")
+    run(engine, "dead", "--graph", graph_path, "--config", workdir / "schemagraph.toml", expected=2)
+    response = mcp_session(engine, graph_path, [tool("dead")], cwd=workdir)[0]
+    if response.get("result", {}).get("structuredContent") != unretained:
+        fail(f"serve read schemagraph.toml from its working directory: {response}")
 
 
 def check_mcp_resources(engine: Path, graph_path: Path) -> None:

@@ -191,9 +191,11 @@ tool returns the same JSON as the CLI command with the same options.
 
 Start with `search` when the exact id is unknown. Its default `names` detail
 lists ids only; request `summary` for the candidates you need. The `dead` tool
-uses the retention policy given when the server starts
-(`serve --config policy.toml --retain <glob> --as-of YYYY-MM-DD`, or
-`schemagraph.toml` in the working directory); tool arguments never name a file.
+uses only the retention policy given explicitly when the server starts
+(`serve --config policy.toml --retain <glob> --as-of YYYY-MM-DD`). Unlike the
+`dead` command, `serve` does not read `schemagraph.toml` from its working
+directory, because the MCP client chooses that directory; tool arguments never
+name a file. Search `kind` labels are case-insensitive.
 `review` is not exposed because it compares two snapshots and the server holds one.
 
 The server also lists two read-only resources: `schemagraph://graph/summary`

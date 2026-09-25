@@ -32,6 +32,19 @@ pub(crate) fn load(
 ) -> Result<RetentionPolicy> {
     let default = PathBuf::from("schemagraph.toml");
     let selected = path.or_else(|| default.is_file().then_some(default.as_path()));
+    load_explicit(selected, retain, as_of)
+}
+
+/// 명시한 설정만 읽는다 — 작업 디렉터리의 `schemagraph.toml`을 찾지 않는다.
+///
+/// 장기 실행 서버는 실행 위치를 클라이언트가 정하므로, 암묵적 파일을 읽으면
+/// 어떤 정책이 적용될지가 실행 위치에 따라 달라지고 무관한 설정 오류가
+/// 서버 시작 자체를 막는다.
+pub(crate) fn load_explicit(
+    selected: Option<&Path>,
+    retain: &[String],
+    as_of: Option<&str>,
+) -> Result<RetentionPolicy> {
     let mut file = match selected {
         Some(p) => toml::from_str::<PolicyFile>(
             &std::fs::read_to_string(p)
