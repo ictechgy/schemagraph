@@ -12,6 +12,7 @@ the artifact. Every command after `scan` is a query over that artifact.
 ```bash
 schemagraph scan postgres://… -o graph.json     # build the artifact
 schemagraph scan --document catalog.json -o graph.json   # from a probe doc
+schemagraph search <pattern> [--detail summary]  # find ids by name fragment or glob first
 schemagraph query <object> [--depth N]          # who uses / what it uses
 schemagraph impact <object>                     # what breaks if it changes
 schemagraph dead                                # no-internal-consumer candidates
@@ -72,6 +73,9 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
 
 ## What the queries answer
 
+- `search <pattern>` — ids matching a case-insensitive name fragment or a
+  `*`/`?` glob over the whole id. Start with the default `names` detail and ask
+  for `summary` only for candidates; `total` and `truncated` say what was cut.
 - `query <x>` — direct neighbors both directions + reachability context.
 - `impact <x>` — transitive dependents that may be affected if `x` changed.
 - Version 0.4.2 and later support Ctrl+C for `query`, `impact`, `path`, and

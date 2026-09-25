@@ -109,6 +109,22 @@ enum Command {
         #[arg(long, value_enum)]
         level: Option<LevelArg>,
     },
+    /// Find vertices by name substring or `*`/`?` glob (case-insensitive).
+    Search {
+        /// Substring of an id or name, or a glob over the whole id.
+        pattern: String,
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        /// Restrict matches to one vertex kind (for example table, view, column).
+        #[arg(long)]
+        kind: Option<String>,
+        /// `names` lists ids; `summary` adds kind, schema, name, and neighbor counts.
+        #[arg(long, default_value = "names")]
+        detail: String,
+        /// Max matches before `truncated` is reported.
+        #[arg(long, default_value_t = 100)]
+        max: usize,
+    },
     /// Who depends on this object / what does it depend on (agent JSON).
     Query {
         /// Object name or qualified id (schema.object[.member]).
@@ -425,6 +441,13 @@ async fn run(cli: Cli) -> Result<i32> {
             format,
             level,
         } => render_graph(&graph, format, level.map(|level| level.level())),
+        Command::Search {
+            pattern,
+            graph,
+            kind,
+            detail,
+            max,
+        } => search(&pattern, &graph, kind.as_deref(), &detail, max),
         Command::Query {
             name,
             graph,
@@ -914,6 +937,47 @@ fn impact(
             Ok(1)
         }
     }
+}
+
+/// 이름 패턴으로 정점을 찾아 출력한다. 일치가 없어도 성공(0)이다 —
+/// 빈 결과는 유효한 답이고, 수집 공백은 `limitations`로 따로 전달된다.
+fn search(
+    pattern: &str,
+    path: &std::path::Path,
+    kind: Option<&str>,
+    detail: &str,
+    max: usize,
+) -> Result<i32> {
+    let (kind, detail) = parse_search_filters(pattern, kind, detail)?;
+    let graph = load_graph(path)?;
+    let report = analysis::search::search(&graph, pattern, kind, max);
+    let value = export::search::to_value(&report, pattern, kind, detail, graph.limitations());
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(0)
+}
+
+/// 검색 인자를 검증한다. CLI와 MCP가 같은 규칙으로 거절하도록 한곳에 둔다.
+pub(crate) fn parse_search_filters(
+    pattern: &str,
+    kind: Option<&str>,
+    detail: &str,
+) -> Result<(
+    Option<schemagraph_core::VertexKind>,
+    export::search::SearchDetail,
+)> {
+    if pattern.trim().is_empty() {
+        bail!("search pattern must be nonempty; pass a name fragment or a glob such as 'public.*'");
+    }
+    let kind = kind
+        .map(|kind| {
+            export::vertex_kind_parse(kind).ok_or_else(|| {
+                anyhow!("unknown vertex kind '{kind}'; use a kind reported by graph output, such as table, view, or column")
+            })
+        })
+        .transpose()?;
+    let detail = export::search::SearchDetail::parse(detail)
+        .ok_or_else(|| anyhow!("unknown detail '{detail}'; use names or summary"))?;
+    Ok((kind, detail))
 }
 
 fn dead(

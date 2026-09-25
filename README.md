@@ -95,6 +95,7 @@ read that file by default; use `--graph <path>` to select another snapshot.
 | `scan <url>` | Collect a catalog and build the dependency graph. |
 | `scan --document <path>` | Build a graph from a JSON or NDJSON catalog document. |
 | `graph --format mermaid\|json\|dot\|html` | Render the graph; select `--level schema\|object\|column`. |
+| `search <pattern>` | Find vertices by case-insensitive name substring or `*`/`?` glob; `--detail summary` adds kind and neighbor counts. |
 | `query <name> --depth N` | List dependencies and dependents, with supporting edges. |
 | `impact <name>` | Trace dependents that may be affected by a change. |
 | `cycles` | Report dependency cycles and self-loops. |

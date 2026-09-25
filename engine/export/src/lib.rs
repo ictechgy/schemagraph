@@ -21,6 +21,7 @@ pub mod mermaid;
 pub mod review;
 pub mod sarif;
 pub mod schema_metadata;
+pub mod search;
 pub mod stream;
 
 /// graph.json의 와이어 버전. 형식이 깨지는 변경은 올린다.
@@ -48,7 +49,8 @@ fn vertex_kind_str(kind: VertexKind) -> &'static str {
     }
 }
 
-fn vertex_kind_parse(s: &str) -> Option<VertexKind> {
+/// 와이어 종류 라벨을 해석한다 — CLI·MCP의 종류 필터가 공유한다.
+pub fn vertex_kind_parse(s: &str) -> Option<VertexKind> {
     Some(match s {
         "schema" => VertexKind::Schema,
         "table" => VertexKind::Table,

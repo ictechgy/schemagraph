@@ -13,6 +13,7 @@ pub mod budget;
 pub mod paths;
 pub mod review;
 pub mod schema_lint;
+pub mod search;
 
 /// 질의 대상을 못 찾았을 때. `notFound`에도 limitations를 싣는다 —
 /// 없는 것과 이 도구가 못 보는 것을 소비자가 구분해야 한다.

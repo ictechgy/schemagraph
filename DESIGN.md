@@ -112,6 +112,7 @@ id가 다른 kind에 점유됐으면 나중 정점은 `name@kind`로 분리된�
 schemagraph scan <jdbc-url> [-o graph.json]   # 카탈로그+몸체 파싱 → 그래프 산출물
 schemagraph scan <jdbc-url> --sql-dir queries --query-schema app  # 외부 SQL query root 추가
 schemagraph graph --format mermaid|json|dot|html [--level schema|object|column]
+schemagraph search <패턴> [--kind K] [--detail names|summary]  # id를 모를 때 이름·글롭으로 후보 찾기
 schemagraph query <객체> [--depth N]           # 누가 쓰나·무엇을 쓰나 (JSON, 에이전트용)
 schemagraph impact <객체>                      # 바꾸면/지우면 뭐가 깨지나 — query의 역방향 전이 클로저
 schemagraph cycles [--level object|column]     # FK 순환 — 삭제 순서·데드락 분석
