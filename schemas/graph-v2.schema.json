@@ -141,7 +141,8 @@
         "foreign_keys": {
           "type": "object",
           "additionalProperties": {"$ref": "#/$defs/foreign_key_metadata"}
-        }
+        },
+        "catalog_complete": {"type": "boolean"}
       },
       "additionalProperties": true
     },

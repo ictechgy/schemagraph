@@ -43,6 +43,14 @@ pub struct SchemaMetadataDoc {
     pub columns: BTreeMap<String, ColumnMetadataDoc>,
     pub indexes: BTreeMap<String, IndexMetadataDoc>,
     pub foreign_keys: BTreeMap<String, ForeignKeyMetadataDoc>,
+    /// 참일 때만 싣는다 — 없으면 옛 그래프와 같이 "완전성 미선언"으로 읽는다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub catalog_complete: bool,
+}
+
+/// serde가 거짓 값의 선택 필드를 생략하도록 쓰는 판정이다.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Core metadata를 GraphDoc wire 값으로 변환한다.
@@ -110,12 +118,16 @@ pub fn to_doc(metadata: &SchemaMetadata) -> SchemaMetadataDoc {
                 )
             })
             .collect(),
+        catalog_complete: metadata.catalog_complete,
     }
 }
 
 /// GraphDoc metadata를 실제 그래프 정점에만 연결한다.
 pub fn from_doc(doc: &SchemaMetadataDoc, graph: &Graph) -> Result<SchemaMetadata, String> {
-    let mut metadata = SchemaMetadata::default();
+    let mut metadata = SchemaMetadata {
+        catalog_complete: doc.catalog_complete,
+        ..SchemaMetadata::default()
+    };
     for (raw, value) in &doc.columns {
         let id = checked_vertex(graph, raw, VertexKind::Column, "column")?;
         metadata.columns.insert(
@@ -341,6 +353,18 @@ mod tests {
         );
         let wire = to_doc(&metadata);
         assert_eq!(from_doc(&wire, &graph()).unwrap(), metadata);
+        // 완전성을 선언하지 않은 메타데이터는 키를 싣지 않아 옛 그래프와 같은 모양이다.
+        assert!(serde_json::to_value(&wire)
+            .unwrap()
+            .get("catalog_complete")
+            .is_none());
+        metadata.catalog_complete = true;
+        let wire = to_doc(&metadata);
+        assert_eq!(
+            serde_json::to_value(&wire).unwrap()["catalog_complete"],
+            true
+        );
+        assert_eq!(from_doc(&wire, &graph()).unwrap(), metadata);
     }
 
     #[test]
@@ -349,6 +373,7 @@ mod tests {
             columns: BTreeMap::new(),
             indexes: BTreeMap::new(),
             foreign_keys: BTreeMap::new(),
+            catalog_complete: false,
         };
         wire.indexes.insert(
             "app.orders.idx".into(),

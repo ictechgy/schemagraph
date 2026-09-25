@@ -85,6 +85,9 @@ id가 다른 kind에 점유됐으면 나중 정점은 `name@kind`로 분리된�
 검증해 유령 metadata를 거부한다. 인덱스의 ordered prefix, predicate 유무,
 완전성, FK 컬럼 대응은 `lint`가 이 메타데이터로 검사한다. metadata가 없거나
 불완전하면 `confirmed` 판정을 내리지 않고 `unverified`와 limitation을 보고한다.
+수집기가 카탈로그 완전성을 선언하면 `schema_metadata.catalog_complete: true`를
+싣는다 — `pk_position` 0만으로는 "PK 없음"과 "못 읽음"을 구분할 수 없어서 PK 부재는
+이 값이 참일 때만 확정한다. 값이 거짓이면 키를 생략하므로 옛 그래프와 같은 모양이다.
 
 ## 어댑터 등급 — "JDBC 전부"가 성립하는 방식
 

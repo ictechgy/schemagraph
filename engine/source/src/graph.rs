@@ -156,6 +156,10 @@ fn attach_schema_metadata(graph: &mut Graph, doc: &CatalogDocument) {
             }
         }
     }
+    metadata.catalog_complete = doc
+        .context
+        .as_ref()
+        .is_some_and(|context| context.catalog_complete);
     graph.set_schema_metadata(metadata);
 }
 
@@ -695,14 +699,13 @@ mod tests {
         );
         let fk_id = VertexId::member("main", "orders", "orders_fk_0");
         assert!(metadata.foreign_keys[&fk_id].complete);
+        assert!(metadata.catalog_complete);
         doc.context.as_mut().unwrap().catalog_complete = false;
-        assert!(
-            !document_to_graph(&doc)
-                .schema_metadata()
-                .unwrap()
-                .foreign_keys[&fk_id]
-                .complete
-        );
+        let incomplete = document_to_graph(&doc);
+        let incomplete = incomplete.schema_metadata().unwrap();
+        assert!(!incomplete.foreign_keys[&fk_id].complete);
+        // PK 부재를 확정할 근거가 사라진다.
+        assert!(!incomplete.catalog_complete);
     }
 
     #[test]

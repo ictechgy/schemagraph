@@ -338,6 +338,7 @@ mod tests {
             columns,
             indexes,
             foreign_keys,
+            catalog_complete: complete,
         }
     }
 

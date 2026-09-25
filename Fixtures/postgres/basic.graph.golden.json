@@ -1241,6 +1241,7 @@
     }
   ],
   "schema_metadata": {
+    "catalog_complete": true,
     "columns": {
       "public.a.b_id": {
         "data_type": "integer",
