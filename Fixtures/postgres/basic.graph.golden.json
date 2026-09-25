@@ -1252,7 +1252,7 @@
         "data_type": "integer",
         "nullable": false,
         "ordinal": 1,
-        "pk_position": 0
+        "pk_position": 1
       },
       "public.b.a_id": {
         "data_type": "integer",
@@ -1264,13 +1264,13 @@
         "data_type": "integer",
         "nullable": false,
         "ordinal": 1,
-        "pk_position": 0
+        "pk_position": 1
       },
       "public.customers.id": {
         "data_type": "integer",
         "nullable": false,
         "ordinal": 1,
-        "pk_position": 0
+        "pk_position": 1
       },
       "public.customers.name": {
         "data_type": "text",
@@ -1282,7 +1282,7 @@
         "data_type": "integer",
         "nullable": false,
         "ordinal": 1,
-        "pk_position": 0
+        "pk_position": 1
       },
       "public.loop_self.parent_id": {
         "data_type": "integer",
@@ -1294,7 +1294,7 @@
         "data_type": "integer",
         "nullable": false,
         "ordinal": 1,
-        "pk_position": 0
+        "pk_position": 1
       },
       "public.order_items.order_id": {
         "data_type": "integer",
@@ -1336,7 +1336,7 @@
         "data_type": "integer",
         "nullable": false,
         "ordinal": 1,
-        "pk_position": 0
+        "pk_position": 1
       },
       "public.orders.total": {
         "data_type": "numeric",
@@ -1348,7 +1348,7 @@
         "data_type": "integer",
         "nullable": false,
         "ordinal": 1,
-        "pk_position": 0
+        "pk_position": 1
       },
       "public.products.sku": {
         "data_type": "text",
@@ -1360,7 +1360,7 @@
         "data_type": "integer",
         "nullable": false,
         "ordinal": 1,
-        "pk_position": 0
+        "pk_position": 1
       },
       "public.standalone.note": {
         "data_type": "text",
@@ -1372,7 +1372,7 @@
         "data_type": "integer",
         "nullable": false,
         "ordinal": 1,
-        "pk_position": 0
+        "pk_position": 1
       },
       "public.tickets.note": {
         "data_type": "text",

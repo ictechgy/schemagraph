@@ -144,6 +144,7 @@ async fn read_schema(
     for obj in &mut objects {
         obj.columns = read_columns(pool, schema, &obj.name).await?;
         obj.constraints = read_constraints(pool, schema, &obj.name).await?;
+        apply_primary_key_positions(obj);
         obj.indexes = read_indexes(pool, schema, &obj.name).await?;
         obj.triggers = read_triggers(pool, schema, &obj.name).await?;
     }
@@ -456,11 +457,26 @@ async fn read_columns(
             nullable: r.get::<String, _>("is_nullable") == "YES",
             default: r.get::<Option<String>, _>("column_default"),
             ordinal: r.get::<i32, _>("ordinal_position") as u32,
-            // pk_position은 제약 조회에서 별도로 채운다 — information_schema의
-            // constraint_column_usage는 PK 순서를 안 준다.
+            // pk_position은 apply_primary_key_positions가 PK 제약에서 채운다 —
+            // information_schema의 constraint_column_usage는 PK 순서를 안 준다.
             pk_position: 0,
         })
         .collect())
+}
+
+/// PK 제약의 키 순서(conkey 순)를 컬럼의 `pk_position`에 옮긴다.
+///
+/// 이 값이 0으로 남으면 FK의 PK prefix 판정과 PK 부재 판정이 "PK 없음"과
+/// "못 읽음"을 구분하지 못한다. Go·JDBC 수집기와 같은 규칙이다.
+fn apply_primary_key_positions(object: &mut ObjectDoc) {
+    let Some(primary) = object.constraints.iter().find(|c| c.kind == "pk") else {
+        return;
+    };
+    for column in &mut object.columns {
+        if let Some(position) = primary.columns.iter().position(|name| *name == column.name) {
+            column.pk_position = position as u32 + 1;
+        }
+    }
 }
 
 /// PK·FK·UNIQUE·CHECK 제약. 컬럼 대응은 pg_constraint의 conkey/confkey를
@@ -674,5 +690,44 @@ fn sort_all(objects: &mut [ObjectDoc], routines: &mut [RoutineDoc]) {
         obj.constraints.sort_by(|a, b| a.name.cmp(&b.name));
         obj.indexes.sort_by(|a, b| a.name.cmp(&b.name));
         obj.triggers.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(name: &str, ordinal: u32) -> ColumnDoc {
+        ColumnDoc {
+            name: name.into(),
+            data_type: "integer".into(),
+            nullable: false,
+            default: None,
+            ordinal,
+            pk_position: 0,
+        }
+    }
+
+    /// PK 순서는 컬럼 선언 순서가 아니라 제약의 키 순서를 따른다.
+    #[test]
+    fn primary_key_positions_follow_constraint_key_order() {
+        let mut object = ObjectDoc {
+            name: "t".into(),
+            kind: "table".into(),
+            columns: vec![column("a", 1), column("b", 2), column("c", 3)],
+            constraints: vec![ConstraintDoc {
+                name: "t_pkey".into(),
+                kind: "pk".into(),
+                columns: vec!["b".into(), "a".into()],
+                referenced: None,
+            }],
+            indexes: vec![],
+            triggers: vec![],
+            body: None,
+            usage: None,
+        };
+        apply_primary_key_positions(&mut object);
+        let positions: Vec<u32> = object.columns.iter().map(|c| c.pk_position).collect();
+        assert_eq!(positions, [2, 1, 0]);
     }
 }
