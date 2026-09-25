@@ -111,7 +111,20 @@ Lint checks ordered foreign-key prefixes supplied by either an unfiltered index
 or the table primary key, and surfaces structured unresolved/ambiguous SQL
 references. A partial or expression index, incomplete inventory, or missing PK
 column positions cannot establish complete coverage and is reported as
-`unverified`. A finding describes observed facts; it is not an instruction to
+`unverified`.
+
+It also reports three catalog facts:
+
+- `fk-type-mismatch`: a foreign-key column's declared type text differs from the
+  referenced column's (case and spacing are ignored; type synonyms and implicit
+  conversions are not interpreted).
+- `table-without-primary-key`: no primary-key column was declared. It is
+  `confirmed` only when the collector declared a complete catalog, because a
+  zero key position cannot otherwise distinguish "no key" from "not read".
+- `duplicate-index`: two unfiltered indexes share key columns, order, and
+  uniqueness. It is always `unverified` because the access method, operator
+  class, and sort order are not collected (a B-tree and a hash index on the same
+  column are different indexes). It does not lower report completeness. A finding describes observed facts; it is not an instruction to
 add or drop an index. Strict lint exits 1 for confirmed findings, 2 for
 incomplete coverage, and 0 for a complete report without confirmed findings.
 

@@ -4,7 +4,8 @@
 //! 카탈로그에서 관찰한 외래 키와 인덱스의 순서 관계, 그리고 구조화된 SQL
 //! 진단만 보고한다.
 
-use schemagraph_core::{Diagnostic, Graph, SourceLocation, VertexId};
+use schemagraph_core::{Diagnostic, Graph, SchemaMetadata, SourceLocation, VertexId, VertexKind};
+use std::collections::BTreeMap;
 
 /// lint 결과가 카탈로그 사실로 확정되었는지 나타낸다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -178,6 +179,163 @@ fn foreign_key_findings(
     }
 }
 
+/// FK 컬럼과 참조 컬럼의 선언 타입 문자열이 다른지 보고한다.
+///
+/// 수집기가 옮긴 선언 타입을 그대로 비교한다 — 방언별 암묵 변환이나 affinity를
+/// 추측하지 않으므로 "선언이 다르다"는 사실만 말한다. 불완전한 FK는
+/// `fk-index-prefix`가 이미 미확인으로 알리므로 여기서 중복 보고하지 않는다.
+fn foreign_key_type_findings(
+    metadata: &SchemaMetadata,
+    findings: &mut Vec<LintFinding>,
+    complete: &mut bool,
+) {
+    for (subject, foreign_key) in &metadata.foreign_keys {
+        if !foreign_key.complete || foreign_key.columns.len() != foreign_key.target_columns.len() {
+            continue;
+        }
+        for (column, target) in foreign_key.columns.iter().zip(&foreign_key.target_columns) {
+            if let Some(finding) = type_pair_finding(metadata, subject, foreign_key, column, target)
+            {
+                if finding.status == LintStatus::Unverified {
+                    *complete = false;
+                }
+                findings.push(finding);
+            }
+        }
+    }
+}
+
+/// FK 컬럼 한 쌍의 선언 타입을 비교해 차이가 있거나 판정할 수 없으면 finding을 만든다.
+fn type_pair_finding(
+    metadata: &SchemaMetadata,
+    subject: &VertexId,
+    foreign_key: &schemagraph_core::ForeignKeyMetadata,
+    column: &VertexId,
+    target: &VertexId,
+) -> Option<LintFinding> {
+    let finding = |status, message: String| LintFinding {
+        rule: "fk-type-mismatch".into(),
+        status,
+        subject: subject.clone(),
+        table: Some(foreign_key.table.clone()),
+        columns: vec![column.clone()],
+        code: None,
+        message,
+        location: None,
+    };
+    let (Some(local), Some(remote)) = (metadata.columns.get(column), metadata.columns.get(target))
+    else {
+        return Some(finding(
+            LintStatus::Unverified,
+            format!(
+                "column types of {} -> {} were not collected; type agreement is unverified",
+                column.as_str(),
+                target.as_str()
+            ),
+        ));
+    };
+    (normalized_type(&local.data_type) != normalized_type(&remote.data_type)).then(|| {
+        finding(
+            LintStatus::Confirmed,
+            format!(
+                "declared type {} of {} differs from {} of referenced {}",
+                local.data_type,
+                column.as_str(),
+                remote.data_type,
+                target.as_str()
+            ),
+        )
+    })
+}
+
+/// 대소문자와 공백 차이만 접어 선언 타입을 비교한다 — 동의어 해석은 하지 않는다.
+fn normalized_type(data_type: &str) -> String {
+    data_type
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// PK 컬럼이 하나도 보고되지 않은 테이블을 알린다.
+///
+/// `pk_position` 0은 "PK 아님"과 "못 읽음"을 구분하지 못하므로, 수집기가
+/// 카탈로그를 완전하게 읽었다고 선언했을 때만 확정한다.
+fn missing_primary_key_findings(
+    graph: &Graph,
+    metadata: &SchemaMetadata,
+    findings: &mut Vec<LintFinding>,
+    complete: &mut bool,
+) {
+    let mut has_primary_key = BTreeMap::<VertexId, bool>::new();
+    for (column, value) in &metadata.columns {
+        if let Some(table) = column.parent() {
+            *has_primary_key.entry(table).or_default() |= value.pk_position > 0;
+        }
+    }
+    let tables = has_primary_key.into_iter().filter(|(table, has_pk)| {
+        !has_pk
+            && graph
+                .vertex(table)
+                .is_some_and(|v| v.kind == VertexKind::Table)
+    });
+    for (table, _) in tables {
+        let (status, message) = if metadata.catalog_complete {
+            (
+                LintStatus::Confirmed,
+                "no primary-key column was declared in a complete catalog",
+            )
+        } else {
+            *complete = false;
+            (LintStatus::Unverified, "no primary-key column was reported, but the collector did not declare a complete catalog")
+        };
+        findings.push(LintFinding {
+            rule: "table-without-primary-key".into(),
+            status,
+            subject: table.clone(),
+            table: Some(table),
+            columns: Vec::new(),
+            code: None,
+            message: message.into(),
+            location: None,
+        });
+    }
+}
+
+/// 키 컬럼·순서·유일성이 같은 조건 없는 인덱스를 알린다.
+///
+/// 수집기가 access method·operator class·정렬 방향을 옮기지 않으므로 같은
+/// 컬럼의 btree와 GIN을 구분할 수 없다. 그래서 항상 미확인이며, 규칙의
+/// 경계이지 입력 누락이 아니므로 보고서 완전성은 낮추지 않는다.
+fn duplicate_index_findings(metadata: &SchemaMetadata, findings: &mut Vec<LintFinding>) {
+    let mut groups = BTreeMap::<(&VertexId, &[VertexId], bool), Vec<&VertexId>>::new();
+    for (id, index) in &metadata.indexes {
+        if index.complete && !index.has_predicate && !index.columns.is_empty() {
+            groups
+                .entry((&index.table, index.columns.as_slice(), index.unique))
+                .or_default()
+                .push(id);
+        }
+    }
+    for ((table, columns, _), ids) in groups {
+        let Some((first, rest)) = ids.split_first() else {
+            continue;
+        };
+        for id in rest {
+            findings.push(LintFinding {
+                rule: "duplicate-index".into(),
+                status: LintStatus::Unverified,
+                subject: (*id).clone(),
+                table: Some(table.clone()),
+                columns: columns.to_vec(),
+                code: None,
+                message: format!("same key columns, order, and uniqueness as {}; access method, operator class, and sort order are not collected, so compare the definitions before treating either as redundant", first.as_str()),
+                location: None,
+            });
+        }
+    }
+}
+
 /// 구조화된 unresolved/ambiguous 진단만 lint finding으로 표면화한다.
 fn diagnostic_findings(graph: &Graph, findings: &mut Vec<LintFinding>) {
     for (subject, analysis) in graph.analysis() {
@@ -227,7 +385,12 @@ pub fn lint(graph: &Graph, max_results: usize) -> LintReport {
     let mut complete = true;
     let mut limitations = graph.limitations().to_vec();
     match graph.schema_metadata() {
-        Some(metadata) => foreign_key_findings(graph, metadata, &mut findings, &mut complete),
+        Some(metadata) => {
+            foreign_key_findings(graph, metadata, &mut findings, &mut complete);
+            foreign_key_type_findings(metadata, &mut findings, &mut complete);
+            missing_primary_key_findings(graph, metadata, &mut findings, &mut complete);
+            duplicate_index_findings(metadata, &mut findings);
+        }
         None => {
             complete = false;
             limitations.push("schema metadata unavailable; FK index coverage is unverified".into());
@@ -342,6 +505,16 @@ mod tests {
         }
     }
 
+    /// 이 테스트들이 검증하는 FK 인덱스 규칙의 finding만 고른다 — fixture에는
+    /// 참조 대상과 PK가 없어 새 규칙도 finding을 내며, 그 규칙은 전용 테스트가 본다.
+    fn prefix_findings(report: &LintReport) -> Vec<&LintFinding> {
+        report
+            .findings
+            .iter()
+            .filter(|finding| finding.rule == "fk-index-prefix")
+            .collect()
+    }
+
     #[test]
     fn composite_prefix_order_is_factual_and_partial_is_not_confirmed() {
         let table = id("app.orders");
@@ -354,11 +527,11 @@ mod tests {
             has_predicate: false,
             complete: true,
         };
-        assert!(
-            lint(&graph_with_metadata(Some(metadata(Some(good), true))), 10)
-                .findings
-                .is_empty()
-        );
+        assert!(prefix_findings(&lint(
+            &graph_with_metadata(Some(metadata(Some(good), true))),
+            10
+        ))
+        .is_empty());
         let partial = IndexMetadata {
             table,
             columns: vec![first],
@@ -370,10 +543,10 @@ mod tests {
             &graph_with_metadata(Some(metadata(Some(partial), true))),
             10,
         );
-        assert_eq!(report.confirmed_count, 0);
-        assert_eq!(report.findings[0].status, LintStatus::Unverified);
+        let prefix = prefix_findings(&report);
+        assert!(prefix.iter().all(|f| f.status == LintStatus::Unverified));
         assert!(!report.complete);
-        assert!(report.findings[0].message.contains("partial indexes"));
+        assert!(prefix[0].message.contains("partial indexes"));
     }
 
     #[test]
@@ -389,9 +562,8 @@ mod tests {
             &graph_with_metadata(Some(metadata(Some(incomplete), true))),
             10,
         );
-        assert_eq!(report.confirmed_count, 0);
         assert!(!report.complete);
-        assert_eq!(report.findings[0].status, LintStatus::Unverified);
+        assert_eq!(prefix_findings(&report)[0].status, LintStatus::Unverified);
         let unavailable = lint(&graph_with_metadata(None), 10);
         assert!(unavailable.findings.is_empty());
         assert!(!unavailable.complete);
@@ -468,7 +640,8 @@ mod tests {
             },
         );
         let report = lint(&graph, 1);
-        assert_eq!(report.total_findings, 2);
+        // FK 인덱스·진단·PK 부재(카탈로그 미완전이라 미확인) 세 건이다.
+        assert_eq!(report.total_findings, 3);
         assert_eq!(report.findings.len(), 1);
         assert!(report.truncated);
         assert!(!report.complete);
@@ -476,5 +649,148 @@ mod tests {
             .findings
             .iter()
             .all(|finding| !finding.message.to_lowercase().contains("drop")));
+    }
+
+    /// 새 규칙 전용 fixture — 부모·자식·PK 없는 테이블·view와 인덱스를 갖는다.
+    fn rule_fixture(child_type: &str, catalog_complete: bool) -> Graph {
+        let mut graph = Graph::new();
+        let objects = [
+            ("app.parent", VertexKind::Table),
+            ("app.child", VertexKind::Table),
+            ("app.nopk", VertexKind::Table),
+            ("app.report", VertexKind::View),
+        ];
+        let members = [
+            ("app.parent.id", VertexKind::Column),
+            ("app.child.id", VertexKind::Column),
+            ("app.child.parent_id", VertexKind::Column),
+            ("app.nopk.x", VertexKind::Column),
+            ("app.report.x", VertexKind::Column),
+            ("app.child.child_fk", VertexKind::Constraint),
+            ("app.child.i1", VertexKind::Index),
+            ("app.child.i2", VertexKind::Index),
+            ("app.child.i3", VertexKind::Index),
+            ("app.child.i4", VertexKind::Index),
+        ];
+        for (raw, kind) in objects.into_iter().chain(members) {
+            let name = raw.rsplit('.').next().unwrap();
+            graph.add_vertex(Vertex {
+                id: id(raw),
+                kind,
+                name: name.into(),
+                schema: "app".into(),
+            });
+        }
+        let column = |data_type: &str, pk_position| ColumnMetadata {
+            data_type: data_type.into(),
+            nullable: pk_position == 0,
+            ordinal: 1,
+            pk_position,
+        };
+        let mut metadata = SchemaMetadata {
+            catalog_complete,
+            ..SchemaMetadata::default()
+        };
+        for (raw, value) in [
+            ("app.parent.id", column("integer", 1)),
+            ("app.child.id", column("integer", 1)),
+            ("app.child.parent_id", column(child_type, 0)),
+            ("app.nopk.x", column("text", 0)),
+            ("app.report.x", column("text", 0)),
+        ] {
+            metadata.columns.insert(id(raw), value);
+        }
+        let index = |unique, has_predicate| IndexMetadata {
+            table: id("app.child"),
+            columns: vec![id("app.child.parent_id")],
+            unique,
+            has_predicate,
+            complete: true,
+        };
+        metadata
+            .indexes
+            .insert(id("app.child.i1"), index(false, false));
+        metadata
+            .indexes
+            .insert(id("app.child.i2"), index(false, false));
+        metadata
+            .indexes
+            .insert(id("app.child.i3"), index(true, false));
+        metadata
+            .indexes
+            .insert(id("app.child.i4"), index(false, true));
+        metadata.foreign_keys.insert(
+            id("app.child.child_fk"),
+            ForeignKeyMetadata {
+                table: id("app.child"),
+                columns: vec![id("app.child.parent_id")],
+                target_table: Some(id("app.parent")),
+                target_columns: vec![id("app.parent.id")],
+                complete: true,
+            },
+        );
+        graph.set_schema_metadata(metadata);
+        graph
+    }
+
+    fn rule_findings<'a>(report: &'a LintReport, rule: &str) -> Vec<&'a LintFinding> {
+        report.findings.iter().filter(|f| f.rule == rule).collect()
+    }
+
+    #[test]
+    fn fk_type_mismatch_reports_declared_type_difference_only() {
+        let report = lint(&rule_fixture("BIGINT", true), 50);
+        let mismatch = rule_findings(&report, "fk-type-mismatch");
+        assert_eq!(mismatch.len(), 1, "{report:?}");
+        assert_eq!(mismatch[0].status, LintStatus::Confirmed);
+        assert!(mismatch[0].message.contains("BIGINT") && mismatch[0].message.contains("integer"));
+        // 대소문자·공백 차이는 같은 선언으로 본다.
+        let same = lint(&rule_fixture(" INTEGER ", true), 50);
+        assert!(rule_findings(&same, "fk-type-mismatch").is_empty());
+    }
+
+    #[test]
+    fn fk_type_without_target_metadata_is_unverified_and_incomplete() {
+        let mut graph = rule_fixture("integer", true);
+        let mut metadata = graph.schema_metadata().unwrap().clone();
+        metadata.columns.remove(&id("app.parent.id"));
+        graph.set_schema_metadata(metadata);
+        let report = lint(&graph, 50);
+        let finding = rule_findings(&report, "fk-type-mismatch");
+        assert_eq!(finding[0].status, LintStatus::Unverified);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn missing_primary_key_is_confirmed_only_in_a_complete_catalog() {
+        let report = lint(&rule_fixture("integer", true), 50);
+        let missing = rule_findings(&report, "table-without-primary-key");
+        // 뷰(app.report)와 PK가 있는 테이블은 대상이 아니다.
+        assert_eq!(
+            missing
+                .iter()
+                .map(|f| f.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["app.nopk"]
+        );
+        assert_eq!(missing[0].status, LintStatus::Confirmed);
+        let incomplete = lint(&rule_fixture("integer", false), 50);
+        assert_eq!(
+            rule_findings(&incomplete, "table-without-primary-key")[0].status,
+            LintStatus::Unverified
+        );
+        assert!(!incomplete.complete);
+    }
+
+    #[test]
+    fn duplicate_index_is_unverified_without_lowering_completeness() {
+        let report = lint(&rule_fixture("integer", true), 50);
+        let duplicates = rule_findings(&report, "duplicate-index");
+        // i3는 유일성, i4는 조건이 달라 제외되고 i2만 i1의 중복 후보다.
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].subject.as_str(), "app.child.i2");
+        assert!(duplicates[0].message.contains("app.child.i1"));
+        assert_eq!(duplicates[0].status, LintStatus::Unverified);
+        assert!(report.complete, "{report:?}");
     }
 }

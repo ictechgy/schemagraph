@@ -124,7 +124,7 @@ schemagraph rules                              # 레이어·규칙 검사
 schemagraph stats                              # 수집된 사용 통계 열람 (그래프 위의 질의)
 schemagraph diff <old.json> <new.json>         # 마이그레이션 전후 델타
 schemagraph merge <catalog-a.json> <catalog-b.json>  # source namespace를 보존해 병합
-schemagraph lint                                # FK ordered-prefix와 구조화 진단 검사
+schemagraph lint                                # FK prefix·타입, PK 부재, 중복 인덱스 후보, 구조화 진단
 schemagraph serve --graph graph.json            # 고정 그래프를 읽기 전용 MCP stdio로 제공
 schemagraph skill                              # 에이전트 스킬 설치 (계열 전통)
 ```

@@ -97,7 +97,10 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   2 for incomparable snapshots. `--require-complete` also fails on incomplete
   analysis or truncation. It does not execute migrations or prove runtime breakage.
 - `lint` distinguishes confirmed facts from unverified metadata. Partial indexes
-  may be useful even when no unfiltered FK prefix index was observed.
+  may be useful even when no unfiltered FK prefix index was observed. It also
+  reports FK declared-type mismatches, tables without a primary key (confirmed
+  only for a complete catalog), and always-unverified duplicate-index candidates
+  whose access methods were not collected.
 - `merge` requires unique logical source IDs. Database catalog references cross
   namespaces only when the collected target database/object is unambiguous.
 

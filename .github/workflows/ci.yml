@@ -237,6 +237,15 @@ jobs:
             --jdbc-jar probe/build/libs/schemagraph-probe-all.jar --java "$JAVA_HOME/bin/java" \
             --output "$RUNNER_TEMP/scope-jdbc.json"
 
+      - name: Verify schema lint rules against real catalogs and producers
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+        run: |
+          python3 Scripts/verify-schema-lint.py --engine engine/target/debug/schemagraph \
+            --go-probe probe-go/schemagraph-probe-go \
+            --jdbc-jar probe/build/libs/schemagraph-probe-all.jar --java "$JAVA_HOME/bin/java" \
+            --output "$RUNNER_TEMP/schema-lint.json"
+
       - name: Verify isthmus bridge-facts export against real catalogs
         env:
           PGBIN: /usr/lib/postgresql/16/bin
