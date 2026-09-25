@@ -4,13 +4,22 @@ _최종 갱신: 2026-09-25 KST · Claude_
 
 ## 목표
 
-v0.5.1 배포 이후, 경쟁 재조사(2026-09-25)에서 정한 보강 네 가지를 구현·리뷰·머지했다(#24~#27).
-**main에는 있지만 아직 배포하지 않았다.** 다음 릴리스 여부는 사용자 결정 대기다.
+경쟁 재조사(2026-09-25)에서 정한 보강 네 가지(#24~#27)를 구현·리뷰·머지하고
+**v0.6.0으로 공개 배포·설치 검증까지 완료**했다. 남은 승인 작업은 없다.
 
 ## 현재 상태
 
 - 프로젝트: `/Users/jinhongan/Desktop/schemagraph`.
-- 공개 버전: [v0.5.1](https://github.com/ictechgy/schemagraph/releases/tag/v0.5.1) (2026-09-25).
+- 공개 버전: [v0.6.0](https://github.com/ictechgy/schemagraph/releases/tag/v0.6.0) (2026-09-25).
+  태그·배포 소스·6개 crate·Go 바이너리의 내장 커밋은 `e5f3b9cdfe453b6c6ee872e1283fd6a18af592b2`
+  ([PR #29](https://github.com/ictechgy/schemagraph/pull/29) 머지 커밋). crates.io 6개, GitHub Release
+  ([빌드](https://github.com/ictechgy/schemagraph/actions/runs/36138711491)), Pages
+  ([실행](https://github.com/ictechgy/schemagraph/actions/runs/36139205607)), Maven Central
+  ([실행](https://github.com/ictechgy/schemagraph/actions/runs/36139607863), deployment
+  `be128a33-79b8-446f-9cd5-ecd8459411c4` **PUBLISHED**). 근거는 `verification/v0.6.0-20260925/`
+  (`plan.json` complete, `public-crates.json`, `installed-features/result.json` 15개 검사,
+  `public-verification.json`, `published-crates/`). 공개 CLI·Go·JAR로 lint·unused도 세 수집기 검증했다.
+- 이전 공개 버전: [v0.5.1](https://github.com/ictechgy/schemagraph/releases/tag/v0.5.1) (2026-09-25).
   태그·배포 소스·6개 crate·Go 바이너리의 내장 커밋은 `fce98ec61dacabb99fa9e626cc17760771eb0554`
   ([PR #22](https://github.com/ictechgy/schemagraph/pull/22) 머지 커밋). 이전 v0.5.0(`94d1db8`)은 보존했다.
 - v0.5.0 이후 v0.5.1에 포함된 변경:
@@ -23,7 +32,7 @@ v0.5.1 배포 이후, 경쟁 재조사(2026-09-25)에서 정한 보강 네 가�
   - [PR #20](https://github.com/ictechgy/schemagraph/pull/20): 아래 "facts 검증과 MV 수정" 참고.
 - isthmus 쪽 명령 표기 수정([isthmus#113](https://github.com/ictechgy/isthmus/pull/113),
   `facts --graph` → `facts --document`)도 머지됐다.
-- 확인한 main: `2e940be`(#27 머지). v0.5.1 이후 **미배포 변경**(각 PR에 리뷰 처리 내역 코멘트가 있다):
+- v0.5.1 이후 v0.6.0에 포함된 변경(각 PR에 리뷰 처리 내역 코멘트가 있다):
   - [#24](https://github.com/ictechgy/schemagraph/pull/24): `search`(점진 공개)와 MCP `search`·`dead`·`cycles`·
     `lint`·`stats`·스냅샷 resources. `serve`는 명시한 `--config/--retain/--as-of`만 읽는다.
   - [#25](https://github.com/ictechgy/schemagraph/pull/25): lint `fk-type-mismatch`(blocking)·
@@ -146,8 +155,7 @@ HANDOFF만 바뀌었는지 확인하는 검사를 통과했다. 런타임 검사
 
 ## Blocker와 열린 질문
 
-blocker 없음. **열린 질문: #24~#27을 담은 다음 릴리스.** 새 명령·공개 Rust API·카탈로그/그래프
-선택 필드(`catalog_complete`, `usage.scans`)가 추가됐으므로 0.6.0(minor)이 맞아 보인다(판단, 미확정).
+없음. v0.6.0 배포 완료 상태이며 추가 게시나 실패 CI 재실행이 남아 있지 않다. 다음 제품 작업은 미정이다.
 남은 경쟁 공백과 하지 않을 것은 [COMPETITIVE-ANALYSIS.md](COMPETITIVE-ANALYSIS.md)의 2026-09-25 절에 있다.
 isthmus의 persistence 조인이 npm에 배포되면 CI의 `verify-bridge-facts.py`에 `--isthmus`를 붙일 수 있다.
 
@@ -175,12 +183,12 @@ isthmus의 persistence 조인이 npm에 배포되면 CI의 `verify-bridge-facts.
    수집기(native·Go·JDBC)를 바꾸면 PG fixture golden과 세 수집기 검증(`verify-collection-scope.py` 등)을 함께 돌린다.
 4. 다음 릴리스는 v0.5.1 절차를 따른다: 버전·문서 PR → CI → merge commit 머지 → 병합 커밋 main CI →
    lightweight 태그 push(GitHub Release) → `cargo publish --workspace`(별도 target) → Pages → Central →
-   `verify-{crates,installed,public}.py`. 근거 스크립트는 `v0.5.1-20260925/`에 있다.
+   `verify-{crates,installed,public}.py`. 최신 근거 스크립트는 `v0.6.0-20260925/`에 있다.
 
 ## 재개 프롬프트
 
 ```text
 /Users/jinhongan/Desktop/schemagraph에서 HANDOFF.md와 AGENTS.md를 읽어줘.
-v0.5.1 배포 후 #24~#27(search·MCP 확장, lint 규칙, unused, openlineage)이 main에 미배포로 머지돼 있어.
+v0.6.0(search·MCP 확장, lint 규칙, unused, openlineage) 배포·공개 설치 검증은 완료됐어.
 먼저 git 상태를 확인하고 로컬 변경을 보존한 뒤, 내가 추가로 요청하는 작업부터 이어가줘.
 ```
