@@ -1,26 +1,29 @@
 # HANDOFF.md
 
-_최종 갱신: 2026-09-24 KST · Claude_
+_최종 갱신: 2026-09-25 KST · Claude_
 
 ## 목표
 
-경쟁 보강 6개 과제의 구현·리뷰·머지와 **v0.5.0 공개 배포·설치 검증까지 완료**했다.
-현재 요청은 다음 세션이 완료된 작업을 반복하지 않도록 이 문서를 정리하는 것이다.
+v0.5.0 공개 배포·설치 검증을 마쳤다. 이후 `facts` 명령(#18)에 실DB·isthmus 검증을 붙였고,
+그 과정에서 찾은 PG materialized view 수집 결함을 고쳐 main에 머지했다(#20). **아직 배포하지 않았다.**
 
 ## 현재 상태
 
 - 프로젝트: `/Users/jinhongan/Desktop/schemagraph`.
 - 공개 버전: [v0.5.0](https://github.com/ictechgy/schemagraph/releases/tag/v0.5.0).
   태그·배포 소스·6개 crate의 내장 커밋은 `94d1db89a563549e6df697b7ca27933624305a18`.
-- 확인한 main: `6b3a0925b841fe715462abc8bace136544cc9389` (2026-09-24).
-  v0.5.0 태그 이후 **미배포 변경 2건**이 머지돼 있다:
+- 확인한 main: `e5795c0` (2026-09-25, #20 머지 커밋).
+  v0.5.0 태그 이후 **미배포 변경**이 머지돼 있다:
   - [PR #17](https://github.com/ictechgy/schemagraph/pull/17): README 마스코트 아이콘(`icon.png`).
   - [PR #18](https://github.com/ictechgy/schemagraph/pull/18): `facts --document` 명령.
     카탈로그의 table/view/materialized-view와 컬럼을 isthmus bridge-facts v1
     `relation-decl`로 내보낸다(`engine/source/src/bridge_facts.rs`). 계약 정본은
     `../isthmus/docs/GRAPH-EXCHANGE.md`이며, 공개 설치본에는 아직 없다.
-- 이 문서 정리는 `refactor/handoff-v0.5.0` 브랜치의 PR로 올린다.
-- 승인된 구현·배포에 미완료 항목이나 알려진 blocker는 없다. 다음 제품 과제는 미정이다.
+  - [PR #19](https://github.com/ictechgy/schemagraph/pull/19): 이 HANDOFF 정리.
+  - [PR #20](https://github.com/ictechgy/schemagraph/pull/20): 아래 "facts 검증과 MV 수정" 참고.
+- isthmus 쪽 명령 표기 수정([isthmus#113](https://github.com/ictechgy/isthmus/pull/113),
+  `facts --graph` → `facts --document`)도 머지됐다.
+- 승인된 구현에 미완료 항목은 없다. **v0.5.1 패치 릴리스 여부가 사용자 결정 대기**다.
 
 ## 완료한 일
 
@@ -35,6 +38,24 @@ _최종 갱신: 2026-09-24 KST · Claude_
   [Pages Maven](https://ictechgy.github.io/schemagraph/maven/),
   [Maven Central](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.5.0)을 게시했다.
   Central deployment `8d7ddc68-e0ac-4d8c-a06c-bdf65bbb51b0`는 **PUBLISHED**다.
+
+## facts 검증과 MV 수정 (#20, 2026-09-25)
+
+- **결함 (v0.5.0 공개본에도 있음):** native·Go 수집기가 PG materialized view 컬럼을 비워 두었다.
+  공유 가시성 검사(`sql/visibility-postgres.sql`)는 MV 컬럼을 세므로, MV가 있는 DB는 소유자 scan에서도
+  `uncollected columns` limitation과 `catalog_complete: false`가 되었다. 그 결과 `review`는 `unverified`,
+  `facts`는 `catalog-coverage`로 isthmus 미선언 error가 경고로 강등됐다. JDBC는 원래 MV 컬럼을 읽었다.
+- **수정:** 두 수집기가 공유하는 `sql/columns-postgres.sql`(engine/source·probe-go 사본, CI `cmp`).
+  MV 컬럼은 `pg_attribute`에서 `information_schema`와 같은 권한 조건·data_type·is_nullable 표기로 읽는다.
+- `facts`의 `generatedAt`은 시계가 1970년 이전·9999년 이후면 조용히 값을 만들지 않고 실패한다.
+- `Scripts/verify-bridge-facts.py`(CI 단계 있음): 기대값을 DB 시스템 카탈로그에서 직접 만들고
+  같은 scan 그래프 정점 id와 양방향 대조한다. `--isthmus <dist/cli/main.js>`를 주면 실제 isthmus check로
+  소비까지 확인한다. isthmus persistence 조인은 npm 0.9.0에 없어 **CI는 `status: partial`로 이 단계를 건너뛴다.**
+  로컬 소비 검증은 isthmus main `b6a0eec`를 `git archive`로 scratchpad에 풀고 `node_modules`를 symlink해
+  `node scripts/build.mjs`로 빌드해 수행했다(사용자 isthmus 작업 트리는 건드리지 않음).
+- 알려진 비대칭(범위 밖): MV 이름은 `pg_matviews`라 권한과 무관하게 보이고, MV 컬럼은 권한 규칙을 따른다.
+  `SUPPORT-MATRIX.md`에 명시했다.
+- 리뷰에서 보류한 2건: 컬럼 SQL 문자열의 객체별 재생성(측정 근거 없음), Go 번들 쿼리 로딩 중복(기존 패턴).
 
 ## 주요 파일과 근거 위치
 
@@ -101,8 +122,9 @@ HANDOFF만 바뀌었는지 확인하는 검사를 통과했다. 런타임 검사
 
 ## Blocker와 열린 질문
 
-없음. 배포 완료 상태이며 추가 게시나 실패 CI 재실행이 남아 있지 않다.
-#17·#18은 main에 있지만 미배포다. 새 릴리스 여부와 다음 제품 작업은 다음 요청 범위에 맞춰 처리한다.
+blocker 없음. **열린 질문: v0.5.1 패치 릴리스 여부.** MV 결함이 v0.5.0 공개본에 있고,
+미배포 `facts` 명령도 함께 나간다. 릴리스한다면 v0.5.0과 같은 절차(태그에서 Pages·Central 수동 게시,
+공개 설치본 검증)를 따른다. 다음 제품 작업도 미정이다.
 
 ## 효과가 있었던 방법
 
@@ -115,6 +137,8 @@ HANDOFF만 바뀌었는지 확인하는 검사를 통과했다. 런타임 검사
 - Pages 첫 게시의 HTTP 503은 [같은 실행의 두 번째 시도](https://github.com/ictechgy/schemagraph/actions/runs/35720293785)에서 해결됐다. 새 버전 게시로 해결할 일이 아니다.
 - `cargo test`만으로 CLI가 갱신된다고 가정하지 않는다. 필요하면 먼저 build하되 검증 중 바이너리를 교체하지 않는다.
   패키징 target을 분리하고, 이번 Cargo 게시 아카이브는 `package/tmp-crate/*.crate`에서 확인했다.
+- PR의 2~3초 `fail`은 push 실행이 저장소 동시 실행 설정으로 취소된 것이다.
+  `gh run list --commit <sha>`로 같은 SHA의 `pull_request` 실행 성공을 확인한다.
 - fixture 종료 코드만으로 전체 성공을 선언하지 않는다. stderr의 건너뜀/주의도 확인한다.
   임시 DB는 작업 소유 label·ID로만 정리하고 다른 프로젝트 컨테이너를 건드리지 않는다.
 
@@ -123,11 +147,12 @@ HANDOFF만 바뀌었는지 확인하는 검사를 통과했다. 런타임 검사
 1. `git status --short`, `git branch --show-current`로 위 상태와 로컬 HANDOFF 변경을 확인한다.
 2. 다음 요청이 문서 반영이면 diff·문서 참조를 검증해 개발 브랜치에서 처리한다. 현재 배포는 반복하지 않는다.
 3. 새 기능 요청이면 해당 정본 문서와 코드부터 읽고 범위를 정한다. 기존 승인에 미완료 구현은 없다.
+4. v0.5.1 릴리스를 승인받으면 [RELEASE-NOTES.md](RELEASE-NOTES.md)·버전·설치 문서를 먼저 준비하고 v0.5.0 절차를 따른다.
 
 ## 재개 프롬프트
 
 ```text
 /Users/jinhongan/Desktop/schemagraph에서 HANDOFF.md와 AGENTS.md를 읽어줘.
-v0.5.0 배포·공개 설치 검증은 완료됐고, 이후 main에 facts 명령(#18) 등이 미배포로 머지돼 있어.
+v0.5.0 배포는 완료됐고, 이후 main에 facts 명령(#18)·PG MV 컬럼 수정(#20)이 미배포로 머지돼 있어.
 먼저 git 상태를 확인하고 로컬 변경을 보존한 뒤, 내가 추가로 요청하는 작업부터 이어가줘.
 ```
