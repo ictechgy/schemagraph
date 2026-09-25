@@ -392,6 +392,29 @@ pub fn query_to_value(report: &QueryReport) -> serde_json::Value {
     value
 }
 
+/// 스냅샷 요약 — 종류별 정점·간선 수, 스키마, 수집 한계를 싣는다.
+///
+/// 에이전트가 첫 요청에서 그래프의 크기와 사각지대를 알고 나서 탐색 범위를
+/// 정하도록 한다. 키 순서가 정렬된 맵이라 같은 그래프면 같은 문서다.
+pub fn graph_summary_value(g: &Graph) -> serde_json::Value {
+    let mut vertices = std::collections::BTreeMap::<&str, usize>::new();
+    let mut schemas = std::collections::BTreeSet::<&str>::new();
+    for vertex in g.vertices() {
+        *vertices.entry(vertex_kind_str(vertex.kind)).or_default() += 1;
+        schemas.insert(vertex.schema.as_str());
+    }
+    let mut edges = std::collections::BTreeMap::<&str, usize>::new();
+    for edge in g.edges() {
+        *edges.entry(edge_kind_str(edge.kind)).or_default() += 1;
+    }
+    serde_json::json!({
+        "edges": edges,
+        "limitations": g.limitations(),
+        "schemas": schemas,
+        "vertices": vertices,
+    })
+}
+
 /// 대상을 못 찾은 경우의 notFound 응답 — limitations도 싣는다.
 pub fn not_found_value(
     name: &str,

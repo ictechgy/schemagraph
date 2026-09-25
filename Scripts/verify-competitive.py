@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import copy
 import json
 import shutil
@@ -632,26 +633,99 @@ def check_lint(engine: Path, database: Path, work: Path) -> None:
         fail(f"partial FK index did not preserve its caveat: {report}")
 
 
-def check_mcp_parity(engine: Path, graph_path: Path) -> None:
-    """MCP query/impact structuredContent가 CLI JSON과 일치하는지 확인한다."""
-    query_cli = json.loads(run(engine, "query", "main.orders", "--graph", graph_path))
-    impact_cli = json.loads(run(engine, "impact", "main.customers", "--graph", graph_path))
-    requests = "\n".join(
-        [
-            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "verify", "version": "1"}}}),
-            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "query", "arguments": {"name": "main.orders"}}}),
-            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "impact", "arguments": {"name": "main.customers"}}}),
-        ]
-    ) + "\n"
-    output, _ = run_capture(engine, "serve", "--graph", graph_path, input_text=requests)
+def mcp_session(engine: Path, graph_path: Path, calls: list[dict], *serve_args: object) -> list[dict]:
+    """한 MCP 세션에서 요청들을 보내고 initialize 이후의 응답을 id 순으로 돌려준다."""
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "verify", "version": "1"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    ]
+    messages += [dict(call, jsonrpc="2.0", id=index) for index, call in enumerate(calls, start=2)]
+    requests = "\n".join(json.dumps(message) for message in messages) + "\n"
+    output, _ = run_capture(engine, "serve", "--graph", graph_path, *serve_args, input_text=requests)
     responses = [json.loads(line) for line in output.splitlines() if line.strip()]
-    if len(responses) != 3:
+    if len(responses) != len(calls) + 1:
         fail(f"MCP handshake/notification response count was wrong: {responses}")
-    if responses[1].get("result", {}).get("structuredContent") != query_cli:
-        fail(f"MCP query report differed from CLI: {responses[1]}")
-    if responses[2].get("result", {}).get("structuredContent") != impact_cli:
-        fail(f"MCP impact report differed from CLI: {responses[2]}")
+    return sorted(responses[1:], key=lambda response: response["id"])
+
+
+def tool(tool_name: str, /, **arguments: object) -> dict:
+    """tools/call 요청 본문을 만든다. 도구 인자 `name`과 겹치지 않게 위치 전용이다."""
+    return {"method": "tools/call", "params": {"name": tool_name, "arguments": arguments}}
+
+
+def check_mcp_parity(engine: Path, graph_path: Path) -> None:
+    """MCP 도구 결과가 같은 그래프에 대한 CLI JSON과 일치하는지 확인한다."""
+    cli = {
+        "query": ("query", "main.orders"),
+        "impact": ("impact", "main.customers"),
+        "search-names": ("search", "VIEW"),
+        "search-summary": ("search", "main.*", "--kind", "view", "--detail", "summary", "--max", "3"),
+        "dead": ("dead",),
+        "cycles": ("cycles",),
+        "lint": ("lint",),
+        "stats": ("stats",),
+    }
+    expected = {key: json.loads(run(engine, *arguments, "--graph", graph_path)) for key, arguments in cli.items()}
+    responses = mcp_session(engine, graph_path, [
+        tool("query", name="main.orders"),
+        tool("impact", name="main.customers"),
+        tool("search", pattern="VIEW"),
+        tool("search", pattern="main.*", kind="view", detail="summary", max=3),
+        tool("dead"),
+        tool("cycles"),
+        tool("lint"),
+        tool("stats"),
+        {"method": "tools/list"},
+    ])
+    for key, response in zip(cli, responses):
+        if response.get("result", {}).get("structuredContent") != expected[key]:
+            fail(f"MCP {key} report differed from CLI: {response}")
+    if not expected["search-names"]["matches"] or not expected["search-summary"]["truncated"]:
+        fail(f"search fixture did not exercise matches and truncation: {expected['search-names']} {expected['search-summary']}")
+    if not expected["dead"].get("candidates"):
+        fail(f"dead fixture has no candidates to compare: {expected['dead']}")
+    names = [item["name"] for item in responses[-1]["result"]["tools"]]
+    if names[-5:] != ["search", "dead", "cycles", "lint", "stats"]:
+        fail(f"MCP tools/list lacks the discovery tools: {names}")
+    check_mcp_retention(engine, graph_path, expected["dead"])
+    check_mcp_resources(engine, graph_path)
+
+
+def check_mcp_retention(engine: Path, graph_path: Path, unretained: dict) -> None:
+    """serve 시작 시 준 보존 루트가 MCP dead에 CLI dead --retain과 같게 적용되는지 본다."""
+    root = unretained["candidates"][0]["id"]
+    retained_cli = json.loads(run(engine, "dead", "--graph", graph_path, "--retain", root))
+    response = mcp_session(engine, graph_path, [tool("dead")], "--retain", root)[0]
+    if response.get("result", {}).get("structuredContent") != retained_cli:
+        fail(f"MCP dead with serve --retain differed from CLI: {response}")
+    if retained_cli == unretained:
+        fail(f"retention root did not change the dead report: {retained_cli}")
+
+
+def check_mcp_resources(engine: Path, graph_path: Path) -> None:
+    """요약 리소스를 graph.json을 직접 센 독립 기대값과, skill 리소스를 CLI 출력과 대조한다."""
+    graph = read_json(graph_path)
+    vertices = Counter(vertex["kind"] for vertex in graph["vertices"])
+    edges = Counter(edge["kind"] for edge in graph["edges"])
+    schemas = sorted({vertex["schema"] for vertex in graph["vertices"]})
+    responses = mcp_session(engine, graph_path, [
+        {"method": "resources/list"},
+        {"method": "resources/read", "params": {"uri": "schemagraph://graph/summary"}},
+        {"method": "resources/read", "params": {"uri": "schemagraph://skill"}},
+        {"method": "resources/read", "params": {"uri": "file:///etc/hosts"}},
+    ])
+    uris = [item["uri"] for item in responses[0]["result"]["resources"]]
+    if uris != ["schemagraph://graph/summary", "schemagraph://skill"]:
+        fail(f"MCP resources/list was unexpected: {uris}")
+    summary = json.loads(responses[1]["result"]["contents"][0]["text"])
+    if (summary["vertices"], summary["edges"], summary["schemas"]) != (dict(vertices), dict(edges), schemas):
+        fail(f"MCP summary differed from graph.json counts: {summary}")
+    if summary["limitations"] != graph.get("limitations", []):
+        fail(f"MCP summary limitations differed from graph.json: {summary['limitations']}")
+    if responses[2]["result"]["contents"][0]["text"] != run(engine, "skill"):
+        fail("MCP skill resource differed from `schemagraph skill`")
+    if responses[3].get("error", {}).get("code") != -32002:
+        fail(f"MCP resources/read accepted an arbitrary URI: {responses[3]}")
 
 
 def check_merge_dependencies(engine: Path, database: Path, work: Path) -> None:

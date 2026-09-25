@@ -272,6 +272,15 @@ enum Command {
     Serve {
         #[arg(short, long, default_value = "graph.json")]
         graph: PathBuf,
+        /// Retention policy for the `dead` tool; schemagraph.toml is loaded when present.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Retention roots for the `dead` tool, as with `dead --retain`.
+        #[arg(long, value_delimiter = ',')]
+        retain: Vec<String>,
+        /// Date for expiring suppressions, as with `dead --as-of`.
+        #[arg(long)]
+        as_of: Option<String>,
     },
     /// Merge catalog documents under their explicit source-id namespaces.
     Merge {
@@ -539,9 +548,24 @@ async fn run(cli: Cli) -> Result<i32> {
             as_of: as_of.as_deref(),
             write_baseline: write_baseline.as_deref(),
         }),
-        Command::Serve { graph } => {
+        Command::Serve {
+            graph,
+            config,
+            retain,
+            as_of,
+        } => {
+            // 정책은 운영자가 시작 시 정한다 — 도구 인자로 파일 경로를 받지 않는다.
+            let retention = policy::load(config.as_deref(), &retain, as_of.as_deref())?;
             let graph = load_graph(&graph)?;
-            mcp::serve(&graph, BufReader::new(std::io::stdin()), std::io::stdout())?;
+            let snapshot = mcp::Snapshot {
+                graph: &graph,
+                retention: &retention,
+            };
+            mcp::serve(
+                &snapshot,
+                BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            )?;
             Ok(0)
         }
         Command::Merge { documents, output } => {

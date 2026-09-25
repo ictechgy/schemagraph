@@ -101,7 +101,7 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 | `lint` | FK 인덱스 prefix와 미해결·모호한 참조 사실을 검사합니다. |
 | `merge <documents>…` | source ID별로 구분한 DB 카탈로그를 통합합니다. |
 | `facts --document <path>` | 카탈로그 선언을 isthmus persistence bridge-facts 문서(`relation-decl`, platform `sql`)로 보냅니다. |
-| `serve` | 미리 읽은 그래프 하나를 조회하는 MCP 도구를 제공합니다. |
+| `serve` | 미리 읽은 그래프 하나를 조회하는 MCP 도구와 리소스를 제공합니다. |
 | `stats` | 수집된 사용 통계와 수집 범위를 보여줍니다. |
 | `rules --config <path>` | TOML 규칙으로 의존 간선을 검사합니다. |
 | `diff <old> <new>` | 그래프 스냅샷 두 개 또는 JSON/NDJSON catalog document 두 개를 비교합니다. |

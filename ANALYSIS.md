@@ -183,10 +183,23 @@ neighbors, and analysis evidence. It embeds the catalog-derived names and graph
 metadata; share it with the same audience as the graph snapshot.
 
 `serve` provides JSON-RPC MCP tools over stdin/stdout: `query`, `impact`, `explain`,
-`path`, and `diagnostics`. It loads one graph at startup and exposes no database
-connection or arbitrary file-reading tools. Configure the MCP client to launch
-the command above. The tool results preserve the CLI analysis contract and
-explicit result/traversal limits.
+`path`, `diagnostics`, `search`, `dead`, `cycles`, `lint`, and `stats`. It loads
+one graph at startup and exposes no database connection or arbitrary file-reading
+tools. Configure the MCP client to launch the command above. The tool results
+preserve the CLI analysis contract and explicit result/traversal limits; each
+tool returns the same JSON as the CLI command with the same options.
+
+Start with `search` when the exact id is unknown. Its default `names` detail
+lists ids only; request `summary` for the candidates you need. The `dead` tool
+uses the retention policy given when the server starts
+(`serve --config policy.toml --retain <glob> --as-of YYYY-MM-DD`, or
+`schemagraph.toml` in the working directory); tool arguments never name a file.
+`review` is not exposed because it compares two snapshots and the server holds one.
+
+The server also lists two read-only resources: `schemagraph://graph/summary`
+(vertex and edge counts by kind, schemas, and limitations) and
+`schemagraph://skill` (the output contract printed by `schemagraph skill`).
+Other URIs are rejected with the MCP resource-not-found error.
 
 Since v0.4.2, stdin remains responsive while a single worker
 executes tool calls. Use a fresh request ID for each call in the session. To

@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use schemagraph_analysis::{self as analysis, Resolve};
-use schemagraph_core::Graph;
 #[cfg(test)]
 use schemagraph_core::VertexId;
+use schemagraph_core::{Graph, Level};
 use schemagraph_export as export;
 use serde_json::{json, Map, Value};
 
@@ -31,15 +31,28 @@ const MAX_OUTSTANDING_JOBS: usize = 16;
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
+/// MCP 서버가 적재한 읽기 전용 입력 — 그래프와 운영자가 시작할 때 정한 보존 정책이다.
+///
+/// 보존 정책을 도구 인자로 받지 않는 이유: 에이전트가 넘긴 경로로 서버가
+/// 파일을 읽으면 "요청마다 파일을 열지 않는다"는 스냅샷 모델이 깨진다.
+pub(crate) struct Snapshot<'a> {
+    /// 서버 시작 전에 완성된 그래프.
+    pub(crate) graph: &'a Graph,
+    /// `dead` 도구가 CLI `dead`와 같은 판정을 내도록 쓰는 보존 정책.
+    pub(crate) retention: &'a analysis::RetentionPolicy,
+}
+
 /// MCP stdio 서버를 실행한다.
 ///
-/// `graph`는 호출 전에 완성된 읽기 전용 스냅샷이다. `reader`와 `writer`는
+/// `snapshot`은 호출 전에 완성된 읽기 전용 입력이다. `reader`와 `writer`는
 /// 테스트에서 메모리 스트림으로 바꿀 수 있도록 일반 스트림으로 받는다.
 pub(crate) fn serve<R: BufRead + Send + 'static, W: Write + Send>(
-    graph: &Graph,
+    snapshot: &Snapshot,
     reader: R,
     writer: W,
 ) -> io::Result<()> {
+    // 리소스는 스냅샷에서 한 번만 만든다 — 요청 처리 스레드가 그래프를 다시 읽지 않는다.
+    let resources = Resources::new(snapshot.graph);
     let writer = Arc::new(Mutex::new(writer));
     let registry = Arc::new(Mutex::new(RequestRegistry::default()));
     let stop_input = Arc::new(AtomicBool::new(false));
@@ -73,7 +86,7 @@ pub(crate) fn serve<R: BufRead + Send + 'static, W: Write + Send>(
             .name("mcp-analysis".into())
             .spawn_scoped(scope, move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    worker_loop(graph, jobs_rx, worker_writer, worker_registry)
+                    worker_loop(snapshot, jobs_rx, worker_writer, worker_registry)
                 }))
                 .unwrap_or_else(|_| Err(io::Error::other("MCP analysis worker panicked")));
                 if events_tx.send(Event::WorkerFinished(result)).is_err() {
@@ -81,7 +94,7 @@ pub(crate) fn serve<R: BufRead + Send + 'static, W: Write + Send>(
                     return;
                 }
             })?;
-        let mut result = coordinate(&events_rx, jobs_tx, &registry, &writer);
+        let mut result = coordinate(&events_rx, jobs_tx, &registry, &writer, &resources);
         if result.is_err() {
             if let Err(error) = cancel_all(&registry) {
                 result = Err(error);
@@ -126,6 +139,7 @@ fn coordinate<W: Write>(
     jobs: SyncSender<Job>,
     registry: &Arc<Mutex<RequestRegistry>>,
     writer: &Arc<Mutex<W>>,
+    resources: &Resources,
 ) -> io::Result<()> {
     let mut jobs = Some(jobs);
     let mut initialized = false;
@@ -172,6 +186,9 @@ fn coordinate<W: Write>(
                         ..
                     } => write_shared(writer, &response)?,
                     MessageAction::Reply { response: None, .. } | MessageAction::Cancel { .. } => {}
+                    MessageAction::Resource { id, request, .. } => {
+                        write_shared(writer, &resources.respond(id, &request))?
+                    }
                     MessageAction::Submit { id, call, .. } => {
                         let sender = jobs.as_ref().ok_or_else(|| {
                             io::Error::other("MCP request arrived after input EOF")
@@ -227,6 +244,12 @@ enum MessageAction {
         call: PreparedToolCall,
         initialized: bool,
     },
+    /// 사전 계산한 리소스로 조정 스레드가 바로 답한다.
+    Resource {
+        id: Value,
+        request: ResourceRequest,
+        initialized: bool,
+    },
 }
 
 impl MessageAction {
@@ -234,31 +257,32 @@ impl MessageAction {
         match self {
             Self::Reply { initialized, .. }
             | Self::Cancel { initialized }
-            | Self::Submit { initialized, .. } => *initialized,
+            | Self::Submit { initialized, .. }
+            | Self::Resource { initialized, .. } => *initialized,
         }
     }
 }
 
 fn worker_loop<W: Write + Send>(
-    graph: &Graph,
+    snapshot: &Snapshot,
     jobs: Receiver<Job>,
     writer: Arc<Mutex<W>>,
     registry: Arc<Mutex<RequestRegistry>>,
 ) -> io::Result<()> {
-    worker_loop_with(graph, jobs, writer, registry, call_tool)
+    worker_loop_with(snapshot, jobs, writer, registry, call_tool)
 }
 
 // 실행 시작/취소 경합을 시간 지연 없이 검사할 수 있도록 계산 경계만 분리한다.
 fn worker_loop_with<W: Write + Send>(
-    graph: &Graph,
+    snapshot: &Snapshot,
     jobs: Receiver<Job>,
     writer: Arc<Mutex<W>>,
     registry: Arc<Mutex<RequestRegistry>>,
-    mut evaluate: impl FnMut(&Graph, &PreparedToolCall, &AtomicBool) -> ToolResult,
+    mut evaluate: impl FnMut(&Snapshot, &PreparedToolCall, &AtomicBool) -> ToolResult,
 ) -> io::Result<()> {
     while let Ok(job) = jobs.recv() {
         if !job.token.load(Ordering::Acquire) {
-            let result = evaluate(graph, &job.call, &job.token);
+            let result = evaluate(snapshot, &job.call, &job.token);
             let suppress = match finish_job(&registry, &job.id, &job.token) {
                 Ok(suppress) => suppress,
                 Err(error) => return Err(error),
@@ -532,6 +556,7 @@ fn handle_message(
             })
         }
         "tools/call" => Ok(handle_tools_call(id, object)),
+        "resources/list" | "resources/read" => Ok(handle_resources(id, method, object)),
         _ => Ok(MessageAction::Reply {
             response: Some(error_response(id, -32601, "Method not found")),
             initialized,
@@ -623,7 +648,7 @@ fn handle_initialize(id: Value, object: &Map<String, Value>) -> (Option<Value>, 
             id,
             json!({
                 "protocolVersion": protocol_version,
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {"name": "schemagraph", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": "Read-only schema graph queries over a preloaded graph.",
             }),
@@ -692,6 +717,108 @@ fn handle_tools_call(id: Value, object: &Map<String, Value>) -> MessageAction {
     }
 }
 
+/// 스냅샷 요약 리소스의 URI.
+const SUMMARY_URI: &str = "schemagraph://graph/summary";
+/// 에이전트 출력 계약(`schemagraph skill`) 리소스의 URI.
+const SKILL_URI: &str = "schemagraph://skill";
+
+/// 조정 스레드가 답할 리소스 요청이다.
+enum ResourceRequest {
+    List,
+    Read { uri: String },
+}
+
+/// 서버 시작 시 한 번 만든 읽기 전용 리소스 — 요약은 그래프가 바뀌지 않으므로 고정이다.
+struct Resources {
+    summary: String,
+}
+
+impl Resources {
+    /// 그래프 요약을 결정적 JSON 문자열로 미리 직렬화한다.
+    fn new(graph: &Graph) -> Self {
+        Self {
+            summary: serde_json::to_string_pretty(&export::graph_summary_value(graph))
+                .unwrap_or_else(|error| format!("{{\"error\":\"summary unavailable: {error}\"}}")),
+        }
+    }
+
+    /// 목록 또는 한 리소스의 내용을 JSON-RPC 응답으로 만든다.
+    fn respond(&self, id: Value, request: &ResourceRequest) -> Value {
+        match request {
+            ResourceRequest::List => {
+                success_response(id, json!({"resources": resource_definitions()}))
+            }
+            ResourceRequest::Read { uri } => match self.text(uri) {
+                Some((mime, text)) => success_response(
+                    id,
+                    json!({"contents": [{"uri": uri, "mimeType": mime, "text": text}]}),
+                ),
+                // MCP 명세의 resource-not-found 코드다.
+                None => error_response(
+                    id,
+                    -32002,
+                    &format!("Resource not found: {uri}; call resources/list for available URIs"),
+                ),
+            },
+        }
+    }
+
+    /// URI에 해당하는 MIME 타입과 본문이다.
+    fn text(&self, uri: &str) -> Option<(&'static str, &str)> {
+        match uri {
+            SUMMARY_URI => Some(("application/json", self.summary.as_str())),
+            SKILL_URI => Some(("text/markdown", include_str!("../SKILL.md"))),
+            _ => None,
+        }
+    }
+}
+
+/// `resources/list`가 알리는 리소스 목록이다.
+fn resource_definitions() -> Value {
+    json!([
+        {
+            "uri": SUMMARY_URI,
+            "name": "graph-summary",
+            "description": "Vertex and edge counts by kind, schemas, and collection limitations of the loaded snapshot.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": SKILL_URI,
+            "name": "skill",
+            "description": "Output contract and usage guide for coding agents (same as `schemagraph skill`).",
+            "mimeType": "text/markdown"
+        }
+    ])
+}
+
+/// `resources/list`·`resources/read` 요청을 검증해 조정 스레드 작업으로 바꾼다.
+fn handle_resources(id: Value, method: &str, object: &Map<String, Value>) -> MessageAction {
+    let request = if method == "resources/list" {
+        validate_optional_object_params(object.get("params")).map(|()| ResourceRequest::List)
+    } else {
+        required_object_params(object).and_then(|params| {
+            params
+                .get("uri")
+                .and_then(Value::as_str)
+                .map(|uri| ResourceRequest::Read {
+                    uri: uri.to_owned(),
+                })
+                .ok_or_else(|| "resources/read.params.uri must be a string".to_owned())
+        })
+    };
+    match request {
+        Ok(request) => MessageAction::Resource {
+            id,
+            request,
+            initialized: true,
+        },
+        Err(error) => MessageAction::Reply {
+            response: Some(error_response(id, -32602, &error)),
+            initialized: true,
+        },
+    }
+}
+
 struct ToolResult {
     value: Value,
     is_error: bool,
@@ -723,6 +850,22 @@ enum PreparedToolCall {
         to: String,
         options: analysis::paths::SearchOptions,
     },
+    Search {
+        pattern: String,
+        kind: Option<schemagraph_core::VertexKind>,
+        detail: export::search::SearchDetail,
+        max: usize,
+    },
+    Dead {
+        max: usize,
+    },
+    Cycles {
+        level: Level,
+    },
+    Lint {
+        max: usize,
+    },
+    Stats,
 }
 
 fn prepare_tool_call(
@@ -803,11 +946,58 @@ fn prepare_tool_call(
             )?;
             Ok(PreparedToolCall::Path { from, to, options })
         }
+        "search" => prepare_search(arguments),
+        "dead" => {
+            let max = bounded_u64(arguments, "max", 1024, MAX_RESULTS)? as usize;
+            reject_unknown(arguments, &["max"])?;
+            Ok(PreparedToolCall::Dead { max })
+        }
+        "cycles" => {
+            let level = match optional_name(arguments, "level")?.as_deref() {
+                None | Some("object") => Level::Object,
+                Some("schema") => Level::Schema,
+                Some("column" | "member") => Level::Member,
+                Some(other) => {
+                    return Err(format!(
+                        "unknown level '{other}'; use schema, object, column, or member"
+                    ))
+                }
+            };
+            reject_unknown(arguments, &["level"])?;
+            Ok(PreparedToolCall::Cycles { level })
+        }
+        "lint" => {
+            let max = bounded_u64(arguments, "max", 256, MAX_RESULTS)? as usize;
+            reject_unknown(arguments, &["max"])?;
+            Ok(PreparedToolCall::Lint { max })
+        }
+        "stats" => {
+            reject_unknown(arguments, &[])?;
+            Ok(PreparedToolCall::Stats)
+        }
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
 
-fn call_tool(graph: &Graph, call: &PreparedToolCall, cancel: &AtomicBool) -> ToolResult {
+/// `search` 인자를 CLI와 같은 규칙으로 검증한다.
+fn prepare_search(arguments: &Map<String, Value>) -> Result<PreparedToolCall, String> {
+    let pattern = required_name(arguments, "pattern")?;
+    let kind = optional_name(arguments, "kind")?;
+    let detail = optional_name(arguments, "detail")?.unwrap_or_else(|| "names".into());
+    let max = bounded_u64(arguments, "max", 100, MAX_RESULTS)? as usize;
+    reject_unknown(arguments, &["pattern", "kind", "detail", "max"])?;
+    let (kind, detail) = crate::parse_search_filters(&pattern, kind.as_deref(), &detail)
+        .map_err(|error| error.to_string())?;
+    Ok(PreparedToolCall::Search {
+        pattern,
+        kind,
+        detail,
+        max,
+    })
+}
+
+fn call_tool(snapshot: &Snapshot, call: &PreparedToolCall, cancel: &AtomicBool) -> ToolResult {
+    let graph = snapshot.graph;
     match call {
         PreparedToolCall::Query {
             name,
@@ -837,6 +1027,43 @@ fn call_tool(graph: &Graph, call: &PreparedToolCall, cancel: &AtomicBool) -> Too
         PreparedToolCall::Path { from, to, options } => {
             resolve_path(graph, from, to, *options, cancel)
         }
+        PreparedToolCall::Search {
+            pattern,
+            kind,
+            detail,
+            max,
+        } => whole_graph(cancel, || {
+            let report = analysis::search::search(graph, pattern, *kind, *max);
+            export::search::to_value(&report, pattern, *kind, *detail, graph.limitations())
+        }),
+        PreparedToolCall::Dead { max } => whole_graph(cancel, || {
+            export::dead_to_value(&analysis::dead_with_policy(graph, *max, snapshot.retention))
+        }),
+        PreparedToolCall::Cycles { level } => whole_graph(cancel, || {
+            export::cycles_to_value(&analysis::cycles(graph, *level))
+        }),
+        PreparedToolCall::Lint { max } => whole_graph(cancel, || {
+            export::lint::to_value(&analysis::schema_lint::lint(graph, *max))
+        }),
+        PreparedToolCall::Stats => whole_graph(cancel, || export::stats_to_value(graph)),
+    }
+}
+
+/// 중간 취소 지점이 없는 전체 그래프 질의를 실행한다.
+///
+/// 계산 앞뒤에서만 취소를 확인한다 — `diagnostics`와 같은 경계로, 취소된
+/// 호출은 부분 결과를 완전한 답처럼 내지 않는다.
+fn whole_graph(cancel: &AtomicBool, compute: impl FnOnce() -> Value) -> ToolResult {
+    if is_cancelled(cancel) {
+        return cancelled_result();
+    }
+    let value = compute();
+    if is_cancelled(cancel) {
+        return cancelled_result();
+    }
+    ToolResult {
+        value,
+        is_error: false,
     }
 }
 
@@ -1194,6 +1421,52 @@ fn tool_definitions() -> Vec<Value> {
                 "required":["from","to"],"additionalProperties":false
             }),
         ),
+        tool_definition(
+            "search",
+            "Find objects by case-insensitive id/name substring or `*`/`?` glob; start with detail=names and request summary only for candidates.",
+            json!({
+                "type":"object",
+                "properties": {
+                    "pattern":{"type":"string","minLength":1,"maxLength":MAX_NAME_BYTES},
+                    "kind":{"type":"string","minLength":1,"maxLength":MAX_NAME_BYTES},
+                    "detail":{"type":"string","enum":["names","summary"],"default":"names"},
+                    "max":{"type":"integer","minimum":0,"maximum":MAX_RESULTS,"default":100}
+                },
+                "required":["pattern"],"additionalProperties":false
+            }),
+        ),
+        tool_definition(
+            "dead",
+            "Report views/routines unreachable from retention roots set when the server started; a candidate is a graph fact, not a deletion verdict.",
+            json!({
+                "type":"object",
+                "properties":{"max":{"type":"integer","minimum":0,"maximum":MAX_RESULTS,"default":1024}},
+                "additionalProperties":false
+            }),
+        ),
+        tool_definition(
+            "cycles",
+            "Report dependency cycles and self-loops at a graph level.",
+            json!({
+                "type":"object",
+                "properties":{"level":{"type":"string","enum":["schema","object","column","member"],"default":"object"}},
+                "additionalProperties":false
+            }),
+        ),
+        tool_definition(
+            "lint",
+            "Report confirmed and unverified catalog facts such as FK index prefixes and unresolved references.",
+            json!({
+                "type":"object",
+                "properties":{"max":{"type":"integer","minimum":0,"maximum":MAX_RESULTS,"default":256}},
+                "additionalProperties":false
+            }),
+        ),
+        tool_definition(
+            "stats",
+            "List collected usage counters with their `since` windows and coverage totals.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+        ),
     ]
 }
 
@@ -1236,10 +1509,20 @@ mod tests {
         graph
     }
 
+    /// 보존 정책이 없는 테스트 스냅샷 — CLI `dead`의 기본값과 같다.
+    fn snapshot(graph: &Graph) -> Snapshot<'_> {
+        static NO_RETENTION: std::sync::OnceLock<analysis::RetentionPolicy> =
+            std::sync::OnceLock::new();
+        Snapshot {
+            graph,
+            retention: NO_RETENTION.get_or_init(analysis::RetentionPolicy::default),
+        }
+    }
+
     fn run(input: &str) -> Vec<Value> {
         let mut output = Vec::new();
         serve(
-            &fixture(),
+            &snapshot(&fixture()),
             Cursor::new(input.as_bytes().to_vec()),
             &mut output,
         )
@@ -1273,7 +1556,131 @@ mod tests {
         assert_eq!(responses.len(), 3);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
         assert!(responses[1]["result"].is_object());
-        assert_eq!(responses[2]["result"]["tools"].as_array().unwrap().len(), 5);
+        let names: Vec<&str> = responses[2]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "query",
+                "impact",
+                "explain",
+                "diagnostics",
+                "path",
+                "search",
+                "dead",
+                "cycles",
+                "lint",
+                "stats"
+            ]
+        );
+        assert!(responses[0]["result"]["capabilities"]["resources"].is_object());
+    }
+
+    /// 한 번의 세션에서 도구 호출 결과만 요청 id 순으로 모아 돌려준다.
+    fn call(tool_calls: &[&str]) -> Vec<Value> {
+        let mut input = handshake();
+        for (index, params) in tool_calls.iter().enumerate() {
+            input.push_str(&format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{params}}}"#,
+                index + 2
+            ));
+            input.push('\n');
+        }
+        let mut responses = run(&input);
+        responses.remove(0);
+        // 인자 오류는 조정 스레드가, 도구 결과는 워커가 쓰므로 도착 순서가 요청 순서와 다를 수 있다.
+        responses.sort_by_key(|response| response["id"].as_u64());
+        responses
+    }
+
+    #[test]
+    fn search_discloses_names_then_summary_and_rejects_unknown_kind() {
+        let responses = call(&[
+            r#"{"name":"search","arguments":{"pattern":"OR"}}"#,
+            r#"{"name":"search","arguments":{"pattern":"public.*","kind":"view","detail":"summary"}}"#,
+            r#"{"name":"search","arguments":{"pattern":"x","kind":"tabel"}}"#,
+        ]);
+        let names = &responses[0]["result"]["structuredContent"];
+        assert_eq!(names["matches"], json!(["public.orders", "public.report"]));
+        assert_eq!(
+            (names["total"].as_u64(), names["truncated"].as_bool()),
+            (Some(2), Some(false))
+        );
+        assert!(names.get("kind").is_none());
+        let summary = &responses[1]["result"]["structuredContent"];
+        assert_eq!(summary["kind"], "view");
+        assert_eq!(summary["matches"][0]["id"], "public.report");
+        assert_eq!(summary["matches"][0]["dependencies"], 1);
+        assert_eq!(responses[2]["error"]["code"], -32602);
+        assert!(responses[2]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown vertex kind"));
+    }
+
+    #[test]
+    fn whole_graph_tools_match_cli_exports() {
+        let graph = fixture();
+        let responses = call(&[
+            r#"{"name":"dead","arguments":{}}"#,
+            r#"{"name":"cycles","arguments":{"level":"column"}}"#,
+            r#"{"name":"lint","arguments":{"max":3}}"#,
+            r#"{"name":"stats"}"#,
+            r#"{"name":"cycles","arguments":{"level":"table"}}"#,
+        ]);
+        let content = |index: usize| responses[index]["result"]["structuredContent"].clone();
+        assert_eq!(
+            content(0),
+            export::dead_to_value(&analysis::dead(&graph, 1024))
+        );
+        assert_eq!(
+            content(1),
+            export::cycles_to_value(&analysis::cycles(&graph, Level::Member))
+        );
+        assert_eq!(
+            content(2),
+            export::lint::to_value(&analysis::schema_lint::lint(&graph, 3))
+        );
+        assert_eq!(content(3), export::stats_to_value(&graph));
+        assert_eq!(responses[4]["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn resources_list_and_read_summary_and_skill() {
+        let input = format!(
+            "{}{}\n{}\n{}\n{}\n{}\n",
+            handshake(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/list"}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"schemagraph://graph/summary"}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"schemagraph://skill"}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"file:///etc/passwd"}}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{}}"#
+        );
+        let responses = run(&input);
+        let uris: Vec<&str> = responses[1]["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|resource| resource["uri"].as_str().unwrap())
+            .collect();
+        assert_eq!(uris, [SUMMARY_URI, SKILL_URI]);
+        let summary = &responses[2]["result"]["contents"][0];
+        assert_eq!(summary["mimeType"], "application/json");
+        let summary: Value = serde_json::from_str(summary["text"].as_str().unwrap()).unwrap();
+        assert_eq!(summary, export::graph_summary_value(&fixture()));
+        assert_eq!(summary["vertices"], json!({"table": 2, "view": 1}));
+        assert_eq!(summary["edges"], json!({"reads": 1, "references": 1}));
+        assert_eq!(
+            responses[3]["result"]["contents"][0]["text"],
+            include_str!("../SKILL.md")
+        );
+        // 임의 URI로 파일을 읽지 않는다 — 알려진 두 리소스만 답한다.
+        assert_eq!(responses[4]["error"]["code"], -32002);
+        assert_eq!(responses[5]["error"]["code"], -32602);
     }
 
     #[test]
@@ -1412,8 +1819,13 @@ mod tests {
         ));
         cancel_request(&registry, &json!(1)).expect("queued request should be cancellable");
         drop(sender);
-        worker_loop(&graph, receiver, Arc::clone(&writer), Arc::clone(&registry))
-            .expect("worker should finish without an error");
+        worker_loop(
+            &snapshot(&graph),
+            receiver,
+            Arc::clone(&writer),
+            Arc::clone(&registry),
+        )
+        .expect("worker should finish without an error");
 
         let output = writer.lock().unwrap().clone();
         let responses: Vec<Value> = String::from_utf8(output)
@@ -1431,7 +1843,7 @@ mod tests {
         let graph = fixture();
         let query = query_call();
         let flag = AtomicBool::new(true);
-        let result = call_tool(&graph, &query, &flag);
+        let result = call_tool(&snapshot(&graph), &query, &flag);
         assert_eq!(result.value["complete"], false);
         assert!(result.value["truncationReasons"]
             .as_array()
@@ -1442,7 +1854,7 @@ mod tests {
         let path_arguments = json!({"from":"report","to":"customers"});
         let path =
             prepare_tool_call("path", path_arguments.as_object().unwrap()).expect("path arguments");
-        let path_result = call_tool(&graph, &path, &flag);
+        let path_result = call_tool(&snapshot(&graph), &path, &flag);
         assert!(path_result.value["truncationReasons"]
             .as_array()
             .unwrap()
@@ -1488,22 +1900,28 @@ mod tests {
             let active = Arc::clone(&registry);
             let worker = scope.spawn(move || {
                 let mut first = true;
-                worker_loop_with(&graph, receiver, output, active, |graph, call, cancel| {
-                    if first {
-                        first = false;
-                        assert!(!cancel.load(Ordering::Acquire));
-                        started.send(()).unwrap();
-                        gate.recv_timeout(std::time::Duration::from_secs(5))
-                            .unwrap();
-                        assert!(cancel.load(Ordering::Acquire));
-                        let result = call_tool(graph, call, cancel);
-                        assert_eq!(result.value["complete"], false);
-                        result
-                    } else {
-                        assert!(!cancel.load(Ordering::Acquire));
-                        call_tool(graph, call, cancel)
-                    }
-                })
+                worker_loop_with(
+                    &snapshot(&graph),
+                    receiver,
+                    output,
+                    active,
+                    |graph, call, cancel| {
+                        if first {
+                            first = false;
+                            assert!(!cancel.load(Ordering::Acquire));
+                            started.send(()).unwrap();
+                            gate.recv_timeout(std::time::Duration::from_secs(5))
+                                .unwrap();
+                            assert!(cancel.load(Ordering::Acquire));
+                            let result = call_tool(graph, call, cancel);
+                            assert_eq!(result.value["complete"], false);
+                            result
+                        } else {
+                            assert!(!cancel.load(Ordering::Acquire));
+                            call_tool(graph, call, cancel)
+                        }
+                    },
+                )
             });
             ready
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -1619,7 +2037,7 @@ mod tests {
                 until_closed,
             };
             let outcome = serve(
-                &fixture(),
+                &snapshot(&fixture()),
                 io::BufReader::new(input),
                 FailingToolOutput::default(),
             );
