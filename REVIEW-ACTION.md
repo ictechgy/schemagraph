@@ -68,9 +68,9 @@ Neither a baseline nor a waiver makes incomplete evidence complete.
 
 ## Consumer workflow
 
-Use the v0.5.0 Action or pin a reviewed full commit containing `action.yml`;
+Use the v0.5.1 Action or pin a reviewed full commit containing `action.yml`;
 v0.4.3 does not contain it.
-For an immutable source pin, replace `v0.5.0` below with its verified full commit SHA.
+For an immutable source pin, replace `v0.5.1` below with its verified full commit SHA.
 
 ```yaml
 permissions:
@@ -85,7 +85,7 @@ jobs:
           persist-credentials: false
       # Produce before.json and after.json using your existing collection job.
       - id: schema
-        uses: ictechgy/schemagraph@v0.5.0
+        uses: ictechgy/schemagraph@v0.5.1
         with:
           before: snapshots/before.json
           after: snapshots/after.json

@@ -29,7 +29,7 @@ dependency records.
 Install the CLI with Rust and Cargo:
 
 ```sh
-cargo install schemagraph-cli --version 0.5.0 --locked
+cargo install schemagraph-cli --version 0.5.1 --locked
 ```
 
 ### Build from source
