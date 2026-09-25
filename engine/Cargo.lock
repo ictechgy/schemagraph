@@ -1139,14 +1139,14 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "schemagraph-analysis"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "schemagraph-core",
 ]
 
 [[package]]
 name = "schemagraph-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1166,11 +1166,11 @@ dependencies = [
 
 [[package]]
 name = "schemagraph-core"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "schemagraph-export"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "schemagraph-analysis",
  "schemagraph-core",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "schemagraph-parser"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "schemagraph-core",
  "schemagraph-source",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "schemagraph-source"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "rustix",
  "schemagraph-core",

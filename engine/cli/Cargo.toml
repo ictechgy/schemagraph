@@ -14,11 +14,11 @@ name = "schemagraph"
 path = "src/main.rs"
 
 [dependencies]
-schemagraph-core = { path = "../core", version = "0.5.0" }
-schemagraph-source = { path = "../source", version = "0.5.0" }
-schemagraph-parser = { path = "../parser", version = "0.5.0" }
-schemagraph-analysis = { path = "../analysis", version = "0.5.0" }
-schemagraph-export = { path = "../export", version = "0.5.0" }
+schemagraph-core = { path = "../core", version = "0.5.1" }
+schemagraph-source = { path = "../source", version = "0.5.1" }
+schemagraph-parser = { path = "../parser", version = "0.5.1" }
+schemagraph-analysis = { path = "../analysis", version = "0.5.1" }
+schemagraph-export = { path = "../export", version = "0.5.1" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"

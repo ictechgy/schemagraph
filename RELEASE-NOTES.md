@@ -1,3 +1,56 @@
+# schemagraph 0.5.1
+
+This patch release fixes PostgreSQL materialized-view column collection and
+adds `facts`, an export of catalog declarations for isthmus.
+
+## PostgreSQL materialized views
+
+- The native and Go PostgreSQL collectors now read materialized-view columns.
+  In 0.5.0 these columns were empty, while the catalog visibility check still
+  counted them. Owner-privileged scans of any database with a materialized view
+  reported `catalog_complete: false` with a misleading permissions limitation,
+  and reviews of those documents were `unverified`. The JDBC probe already
+  collected these columns.
+- Both collectors share one column query. Materialized-view columns follow the
+  same privilege rule, `data_type` spelling, and nullability as
+  `information_schema.columns` reports for tables. Materialized-view names
+  remain visible through `pg_matviews` regardless of table privileges.
+- Graphs of such databases now include materialized-view column vertices.
+  Re-collect review baselines that were taken with 0.5.0.
+
+## isthmus bridge-facts export
+
+- `schemagraph facts --document <catalog>` writes an isthmus bridge-facts v1
+  document (`platform: "sql"`, `target: "persistence"`). It declares tables,
+  views, materialized views, and their columns as `relation-decl` facts. Each
+  `symbol.qualifiedName` is the vertex id in the graph built from the same
+  catalog. Incomplete catalogs carry a `catalog-coverage:` limitation so
+  isthmus reports missing declarations as unverified.
+- `generatedAt` fails with an explanation instead of recording a false time
+  when the host clock is before 1970 or after 9999.
+- Joining these documents needs an isthmus build with the persistence domain.
+  isthmus 0.9.0 does not include it.
+
+## Upgrade and validation
+
+Install the CLI with `cargo install schemagraph-cli --version 0.5.1 --locked`,
+or use the Linux x86_64/macOS arm64 release archives. Maven coordinates are
+`io.github.ictechgy:schemagraph-probe:0.5.1`; the JDBC probe is unchanged apart
+from its version. The Action can be referenced as `ictechgy/schemagraph@v0.5.1`.
+
+All six Rust crates move to 0.5.1. `schemagraph-source` adds the public
+`bridge_facts` module; existing public APIs, catalog v1/v2, and graph v2 are
+unchanged.
+
+`facts` output is checked in CI against declarations read directly from real
+SQLite and PostgreSQL system catalogs, and against the graph from the same scan
+in both directions. Consumption by isthmus was verified locally against its
+development build; CI records that step as partial. Restricted-role PostgreSQL
+collection with a materialized view is verified for the native, Go, and JDBC
+collectors.
+
+---
+
 # schemagraph 0.5.0
 
 This release adds policy-driven schema reviews, static DML column lineage,
