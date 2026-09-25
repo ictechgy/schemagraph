@@ -255,6 +255,13 @@ jobs:
             --jdbc-jar probe/build/libs/schemagraph-probe-all.jar --java "$JAVA_HOME/bin/java" \
             --output "$RUNNER_TEMP/unused.json"
 
+      - name: Verify OpenLineage export against official schemas and the graph
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+        run: |
+          "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-openlineage.py \
+            --engine engine/target/debug/schemagraph --output "$RUNNER_TEMP/openlineage.json"
+
       - name: Verify isthmus bridge-facts export against real catalogs
         env:
           PGBIN: /usr/lib/postgresql/16/bin
