@@ -227,6 +227,35 @@ uniquely among the supplied documents. Missing or ambiguous targets remain
 limitations. This does not resolve arbitrary dynamic SQL or create remote nodes
 for databases that were not collected.
 
+## Export lineage to OpenLineage
+
+```sh
+schemagraph openlineage --graph graph.json --namespace postgres://db.example:5432 \
+  --database app --event-time 2026-09-25T00:00:00Z -o lineage.ndjson
+```
+
+`openlineage` writes one OpenLineage `RunEvent` (spec 2-0-2, `eventType`
+`COMPLETE`) per SQL body that produces a dataset: a view or materialized view
+produces itself, and a routine, trigger, or query produces the tables it writes.
+Inputs are the datasets it reads. Each output carries a `schema` facet and, when
+lineage exists, a `columnLineage` facet:
+
+- Value lineage (`derives-from`) becomes `DIRECT` input fields without a subtype,
+  because the graph does not record whether a value is copied or transformed.
+- Columns used in join and filter conditions become dataset-level `INDIRECT`
+  entries with subtype `JOIN` or `FILTER`. Sorting, grouping, and window use are
+  not recorded separately in the graph and are not reported.
+- A body that writes several datasets gets no `INDIRECT` entries, since the graph
+  does not say which statement a condition belongs to; the command names such
+  jobs on stderr.
+
+Datasets are named `[database.]schema.object` in the given namespace. The
+`runId` is a version 8 UUID derived from the event content, so fixing
+`--event-time` makes the output byte-for-byte reproducible and re-ingestion
+idempotent. This is a static snapshot, not an observed run. Events are validated
+against the pinned official schemas in `schemas/openlineage`; ingestion by a
+specific catalog (Marquez, DataHub, OpenMetadata) has not been tested.
+
 ## Share or serve a snapshot
 
 ```sh

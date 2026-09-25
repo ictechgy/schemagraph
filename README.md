@@ -106,6 +106,7 @@ read that file by default; use `--graph <path>` to select another snapshot.
 | `review <before> <after>` | Combine catalog changes with dependent impact and comparison coverage. |
 | `lint` | Inspect FK index prefixes and declared types, missing primary keys, duplicate-index candidates, and unresolved/ambiguous references. |
 | `merge <documents>…` | Combine independently parsed DB catalogs under distinct source IDs. |
+| `openlineage --namespace <uri>` | Export column lineage as OpenLineage RunEvents (NDJSON) for data catalogs. |
 | `facts --document <path>` | Export catalog declarations as an isthmus persistence bridge-facts document (`relation-decl`, platform `sql`). |
 | `serve` | Expose read-only MCP tools and resources over one preloaded graph. |
 | `unused` | Report tables and indexes with zero observed reads since the statistics window began, with facts that weaken a removal reading. |

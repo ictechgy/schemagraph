@@ -300,6 +300,23 @@ enum Command {
         #[arg(short, long, default_value = "graph.json")]
         output: String,
     },
+    /// Export column lineage as OpenLineage RunEvents (NDJSON, one event per SQL body).
+    Openlineage {
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        /// Dataset and job namespace, for example postgres://db.example:5432.
+        #[arg(long)]
+        namespace: String,
+        /// Database name prefixed to dataset names (database.schema.object).
+        #[arg(long)]
+        database: Option<String>,
+        /// RFC 3339 event time; defaults to now. Fix it for reproducible output.
+        #[arg(long)]
+        event_time: Option<String>,
+        /// Output path; '-' or omitted writes to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Export catalog declarations as isthmus bridge-facts (persistence target).
     Facts {
         /// Catalog document to convert (probe output or scan --emit-document).
@@ -611,6 +628,19 @@ async fn run(cli: Cli) -> Result<i32> {
             project,
             output,
         } => facts(&document, &project, output.as_deref()),
+        Command::Openlineage {
+            graph,
+            namespace,
+            database,
+            event_time,
+            output,
+        } => openlineage(
+            &graph,
+            &namespace,
+            database.as_deref(),
+            event_time.as_deref(),
+            output.as_deref(),
+        ),
         Command::Lint { graph, max, strict } => {
             let graph = load_graph(&graph)?;
             let report = analysis::schema_lint::lint(&graph, max);
@@ -773,6 +803,113 @@ fn facts(document: &Path, project: &Path, output: Option<&str>) -> Result<i32> {
         _ => println!("{json}"),
     }
     Ok(0)
+}
+
+/// 그래프 계보를 OpenLineage RunEvent NDJSON으로 쓴다.
+///
+/// 이벤트 시각을 고정하면 같은 그래프는 같은 파일이 된다(runId는 내용에서 만든다).
+fn openlineage(
+    path: &Path,
+    namespace: &str,
+    database: Option<&str>,
+    event_time: Option<&str>,
+    output: Option<&str>,
+) -> Result<i32> {
+    if namespace.trim().is_empty() {
+        bail!(
+            "--namespace must be nonempty; use the data source URI, such as postgres://host:5432"
+        );
+    }
+    let event_time = match event_time {
+        Some(time) => validate_rfc3339(time)?.to_owned(),
+        None => rfc3339_utc_now()?,
+    };
+    let graph = load_graph(path)?;
+    let jobs = analysis::lineage::jobs(&graph);
+    let producer = format!(
+        "https://github.com/ictechgy/schemagraph/tree/v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let context = export::openlineage::EventContext {
+        namespace,
+        database,
+        event_time: &event_time,
+        producer: &producer,
+    };
+    let result = export::openlineage::events(&graph, &jobs, &context, content_run_id);
+    let mut text = String::new();
+    for event in &result.events {
+        text.push_str(&serde_json::to_string(event)?);
+        text.push('\n');
+    }
+    match output {
+        Some(path) if path != "-" => std::fs::write(path, text).with_context(|| {
+            format!(
+                "cannot write OpenLineage events to {path}; check the directory and permissions"
+            )
+        })?,
+        _ => print!("{text}"),
+    }
+    if !result.indirect_omitted.is_empty() {
+        eprintln!(
+            "note: {} job(s) write several datasets, so their join/filter columns were not attributed to a specific output: {}",
+            result.indirect_omitted.len(),
+            result.indirect_omitted.iter().map(|id| id.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(0)
+}
+
+/// 이벤트 내용(runId 제외)의 SHA-256으로 RFC 9562 버전 8 UUID를 만든다.
+///
+/// 같은 내용은 같은 runId가 되어 재적재해도 소비자 쪽에서 중복 실행이 생기지 않는다.
+/// serde_json 맵은 키가 정렬돼 있어 직렬화가 결정적이다.
+fn content_run_id(event: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(event.to_string().as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// RFC 3339 날짜-시각 형태인지 확인한다(날짜, `T`, 시각, `Z` 또는 오프셋).
+fn validate_rfc3339(value: &str) -> Result<&str> {
+    let bytes = value.as_bytes();
+    let digits = |range: std::ops::Range<usize>| {
+        bytes
+            .get(range)
+            .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+    };
+    let shape = digits(0..4)
+        && bytes.get(4) == Some(&b'-')
+        && digits(5..7)
+        && bytes.get(7) == Some(&b'-')
+        && digits(8..10)
+        && matches!(bytes.get(10), Some(b'T' | b't'))
+        && digits(11..13)
+        && bytes.get(13) == Some(&b':')
+        && digits(14..16)
+        && bytes.get(16) == Some(&b':')
+        && digits(17..19);
+    let zone = value.ends_with('Z') || value.ends_with('z') || {
+        let tail = &value[value.len().saturating_sub(6)..];
+        tail.len() == 6 && matches!(tail.as_bytes()[0], b'+' | b'-') && tail.as_bytes()[3] == b':'
+    };
+    if shape && zone {
+        Ok(value)
+    } else {
+        bail!("--event-time must be RFC 3339, such as 2026-09-25T00:00:00Z; got '{value}'")
+    }
 }
 
 /// bridge-facts 계약이 요구하는 현재 시각의 RFC 3339 UTC 타임스탬프를 만든다.
@@ -1379,5 +1516,40 @@ mod tests {
         let beyond = last + std::time::Duration::from_secs(1);
         let error = rfc3339_utc_at(beyond).unwrap_err().to_string();
         assert!(error.contains("system clock"), "{error}");
+    }
+
+    /// runId는 내용이 같으면 같고, RFC 9562 버전 8·변형 비트를 가진 UUID다.
+    #[test]
+    fn content_run_id_is_a_deterministic_version_8_uuid() {
+        let event = serde_json::json!({"job": {"name": "s.report"}});
+        let id = content_run_id(&event);
+        assert_eq!(id, content_run_id(&event.clone()));
+        assert_ne!(
+            id,
+            content_run_id(&serde_json::json!({"job": {"name": "s.other"}}))
+        );
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(parts[2].starts_with('8'));
+        assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'));
+    }
+
+    /// 이벤트 시각은 RFC 3339 형태만 받는다.
+    #[test]
+    fn event_time_accepts_rfc3339_only() {
+        for good in ["2026-09-25T00:00:00Z", "2026-09-25T09:00:00.5+09:00"] {
+            assert!(validate_rfc3339(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "2026-09-25",
+            "2026-09-25 00:00:00Z",
+            "yesterday",
+            "2026-09-25T00:00:00",
+        ] {
+            assert!(validate_rfc3339(bad).is_err(), "{bad}");
+        }
     }
 }

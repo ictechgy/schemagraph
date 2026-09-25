@@ -10,6 +10,7 @@ use schemagraph_core::{EdgeKind, Graph, Level, Usage, Vertex, VertexId, VertexKi
 mod retention;
 pub use retention::{RetentionPolicy, Suppression};
 pub mod budget;
+pub mod lineage;
 pub mod paths;
 pub mod review;
 pub mod schema_lint;
