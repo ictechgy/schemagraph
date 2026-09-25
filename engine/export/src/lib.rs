@@ -18,6 +18,7 @@ pub mod explain;
 pub mod html;
 pub mod lint;
 pub mod mermaid;
+pub mod openlineage;
 pub mod review;
 pub mod sarif;
 pub mod schema_metadata;
