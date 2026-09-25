@@ -23,6 +23,7 @@ pub mod sarif;
 pub mod schema_metadata;
 pub mod search;
 pub mod stream;
+pub mod unused;
 
 /// graph.json의 와이어 버전. 형식이 깨지는 변경은 올린다.
 pub const GRAPH_VERSION: u32 = 2;

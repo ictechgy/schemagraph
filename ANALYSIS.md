@@ -74,6 +74,33 @@ These are reachability facts, not permission to delete database objects. A
 missing usage record is different from observed zero activity; neither is an
 application entry-point inventory.
 
+## Find objects with no observed reads
+
+```sh
+schemagraph unused --graph graph.json
+```
+
+`unused` looks at collected usage counters instead of reachability. It reports
+tables and indexes whose read counter is zero since `usage.since` (the
+statistics reset or server start). A table is not reported when any of its
+indexes was read, because index-only scans do not count as table reads. Objects
+without a usage record are counted under `unobserved`, never as candidates.
+
+Each candidate carries the facts that weaken a removal reading when they apply:
+`enforcesUniqueness`, `backsConstraint`, `coversForeignKeys`, `bodyDependents`
+(SQL bodies that reference the table), `indexWithoutUsage` (index-only reads
+cannot be ruled out), and `windowUnknown`. Writes stay visible in `usage`. The
+counters only cover their window and never include use by other databases,
+replicas, or periods before a reset. `--strict` exits 1 when any candidate
+exists.
+
+Coverage depends on the collector. PostgreSQL provides table and index counters
+(`pg_stat_user_*`); this path is verified against a real workload, including the
+index-only-scan case. MySQL/MariaDB provide table counters and record only the
+indexes that `sys.schema_unused_indexes` lists, so indexes that were used stay
+unobserved and their tables carry `indexWithoutUsage`. SQLite has no counters,
+so everything is unobserved.
+
 ## Review a schema change
 
 Capture both documents with a stable logical label and the same producer and
@@ -203,7 +230,7 @@ neighbors, and analysis evidence. It embeds the catalog-derived names and graph
 metadata; share it with the same audience as the graph snapshot.
 
 `serve` provides JSON-RPC MCP tools over stdin/stdout: `query`, `impact`, `explain`,
-`path`, `diagnostics`, `search`, `dead`, `cycles`, `lint`, and `stats`. It loads
+`path`, `diagnostics`, `search`, `dead`, `cycles`, `lint`, `stats`, and `unused`. It loads
 one graph at startup and exposes no database connection or arbitrary file-reading
 tools. Configure the MCP client to launch the command above. The tool results
 preserve the CLI analysis contract and explicit result/traversal limits; each

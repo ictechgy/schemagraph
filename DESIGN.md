@@ -122,6 +122,7 @@ schemagraph cycles [--level object|column]     # FK 순환 — 삭제 순서·�
 schemagraph dead                               # 도달 불가/무사용 후보 — state는 그래프 사실
 schemagraph rules                              # 레이어·규칙 검사
 schemagraph stats                              # 수집된 사용 통계 열람 (그래프 위의 질의)
+schemagraph unused                             # 통계 창 안에서 읽힌 기록이 없는 테이블·인덱스 (관측, 판정 아님)
 schemagraph diff <old.json> <new.json>         # 마이그레이션 전후 델타
 schemagraph merge <catalog-a.json> <catalog-b.json>  # source namespace를 보존해 병합
 schemagraph lint                                # FK prefix·타입, PK 부재, 중복 인덱스 후보, 구조화 진단

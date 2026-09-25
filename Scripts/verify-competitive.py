@@ -664,6 +664,7 @@ def check_mcp_parity(engine: Path, graph_path: Path) -> None:
         "cycles": ("cycles",),
         "lint": ("lint",),
         "stats": ("stats",),
+        "unused": ("unused",),
     }
     expected = {key: json.loads(run(engine, *arguments, "--graph", graph_path)) for key, arguments in cli.items()}
     responses = mcp_session(engine, graph_path, [
@@ -675,6 +676,7 @@ def check_mcp_parity(engine: Path, graph_path: Path) -> None:
         tool("cycles"),
         tool("lint"),
         tool("stats"),
+        tool("unused"),
         {"method": "tools/list"},
     ])
     for key, response in zip(cli, responses):
@@ -685,7 +687,7 @@ def check_mcp_parity(engine: Path, graph_path: Path) -> None:
     if not expected["dead"].get("candidates"):
         fail(f"dead fixture has no candidates to compare: {expected['dead']}")
     names = [item["name"] for item in responses[-1]["result"]["tools"]]
-    if names[-5:] != ["search", "dead", "cycles", "lint", "stats"]:
+    if not {"search", "dead", "cycles", "lint", "stats", "unused"} <= set(names):
         fail(f"MCP tools/list lacks the discovery tools: {names}")
     check_mcp_retention(engine, graph_path, expected["dead"])
     check_mcp_resources(engine, graph_path)
