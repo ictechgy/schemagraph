@@ -211,6 +211,7 @@ mod tests {
             since: Some("2026-09-01".into()),
             reads,
             writes,
+            scans: Some(0),
             total_ms: None,
             self_ms: None,
         }

@@ -834,19 +834,34 @@ class Extractor(
                         ).use { rs -> if (rs.next()) rs.getString(1) else null }
                     }
                 }.getOrNull()
-                bestEffort("table stats",
-                    "SELECT schemaname, relname, " +
-                        "seq_tup_read + COALESCE(idx_tup_fetch,0), " +
-                        "n_tup_ins + n_tup_upd + n_tup_del " +
-                        "FROM pg_stat_user_tables") { rs ->
-                    tables[rs.getString(1) to rs.getString(2)] =
-                        UsageDoc(since, rs.getLong(3), rs.getLong(4))
-                }
-                bestEffort("index stats",
-                    "SELECT schemaname, relname, indexrelname, idx_scan " +
-                        "FROM pg_stat_user_indexes") { rs ->
-                    indexes[Triple(rs.getString(1), rs.getString(2), rs.getString(3))] =
-                        UsageDoc(since, rs.getLong(4), 0)
+                // track_counts=off면 모든 카운터가 0인 행이 나온다 — 관측된 0이
+                // 아니므로 테이블·인덱스 usage를 싣지 않고 limitation으로 남긴다.
+                val counting = runCatching {
+                    conn.createStatement().use { st ->
+                        st.executeQuery("SELECT current_setting('track_counts')")
+                            .use { rs -> if (rs.next()) rs.getString(1) else null }
+                    }
+                }.getOrNull()
+                if (counting != "on") {
+                    limitations += "track_counts=off — table/index usage 미수집(카운터 비활성, 0행은 관측이 아님)"
+                } else {
+                    // 파티션 부모(relkind p)는 스캔이 리프 파티션에 세어져 항상 0이라 제외한다.
+                    bestEffort("table stats",
+                        "SELECT s.schemaname, s.relname, " +
+                            "s.seq_tup_read + COALESCE(s.idx_tup_fetch,0), " +
+                            "s.n_tup_ins + s.n_tup_upd + s.n_tup_del, " +
+                            "s.seq_scan + COALESCE(s.idx_scan,0) " +
+                            "FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid " +
+                            "WHERE c.relkind <> 'p'") { rs ->
+                        tables[rs.getString(1) to rs.getString(2)] =
+                            UsageDoc(since, rs.getLong(3), rs.getLong(4), scans = rs.getLong(5))
+                    }
+                    bestEffort("index stats",
+                        "SELECT schemaname, relname, indexrelname, idx_scan " +
+                            "FROM pg_stat_user_indexes") { rs ->
+                        indexes[Triple(rs.getString(1), rs.getString(2), rs.getString(3))] =
+                            UsageDoc(since, rs.getLong(4), 0)
+                    }
                 }
                 // routine 호출 수 — calls를 reads에 싣는다(단위는 kind별로 다르다는
                 // 계약). funcname엔 시그니처가 없어 오버로드 귀속은 extract()에서

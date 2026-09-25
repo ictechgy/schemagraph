@@ -225,6 +225,10 @@ pub struct Usage {
     pub reads: u64,
     /// 관측된 쓰기 작업량(insert·update·delete 계열 합산).
     pub writes: u64,
+    /// 테이블 스캔 횟수(순차·인덱스 스캔 합). `reads`가 가져온 튜플 수라서 늘
+    /// 비어 있는 채로 폴링되는 테이블은 reads 0이지만 스캔은 쌓인다 — 미사용
+    /// 판정은 이 값을 본다. 수집하지 않는 방언·옛 문서는 None.
+    pub scans: Option<u64>,
     /// routine 누적 실행 시간 ms(중첩 호출 포함). routine이 아니면 None.
     pub total_ms: Option<f64>,
     /// routine 자기 실행 시간 ms(중첩 호출 제외) — 비용 핫스팟 판별용.
@@ -500,6 +504,9 @@ impl Graph {
             let entry = projected.usage.entry(ancestor).or_default();
             entry.reads += usage.reads;
             entry.writes += usage.writes;
+            if let Some(scans) = usage.scans {
+                *entry.scans.get_or_insert(0) += scans;
+            }
             // 시간 필드도 합산한다 — 어느 한 멤버라도 관측됐으면 합계가 의미 있다.
             if let Some(ms) = usage.total_ms {
                 *entry.total_ms.get_or_insert(0.0) += ms;
@@ -934,6 +941,7 @@ mod tests {
                 since: Some("2025-01-01".into()),
                 reads: 3,
                 writes: 1,
+                scans: None,
                 total_ms: Some(30.0),
                 self_ms: Some(10.0),
             },
@@ -944,6 +952,7 @@ mod tests {
                 since: Some("2025-03-01".into()),
                 reads: 10,
                 writes: 5,
+                scans: None,
                 total_ms: None,
                 self_ms: None,
             },

@@ -48,6 +48,7 @@ pub fn explanation_value(report: &Explanation, graph: &Graph) -> Value {
             since: usage.since.clone(),
             reads: usage.reads,
             writes: usage.writes,
+            scans: usage.scans,
             total_ms: usage.total_ms,
             self_ms: usage.self_ms
         });

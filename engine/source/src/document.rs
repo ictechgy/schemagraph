@@ -160,6 +160,9 @@ pub struct UsageDoc {
     pub reads: u64,
     /// 관측된 쓰기 작업량(insert·update·delete 합산).
     pub writes: u64,
+    /// 테이블 스캔 횟수(순차·인덱스 스캔 합) — 튜플 수와 달리 빈 테이블 폴링도 센다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scans: Option<u64>,
     /// routine 누적 실행 시간 ms(pg_stat_user_functions.total_time).
     /// 중첩 호출 시간을 포함한다. routine이 아닌 정점·미지원 방언은 None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -333,7 +336,7 @@ const ROUTINE_KEYS: &[&str] = &[
     "member_of",
     "source",
 ];
-const USAGE_KEYS: &[&str] = &["since", "reads", "writes", "total_ms", "self_ms"];
+const USAGE_KEYS: &[&str] = &["since", "reads", "writes", "scans", "total_ms", "self_ms"];
 
 #[cfg(test)]
 mod tests {

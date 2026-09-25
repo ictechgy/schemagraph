@@ -191,6 +191,9 @@ pub struct UsageDoc {
     pub since: Option<String>,
     pub reads: u64,
     pub writes: u64,
+    /// 테이블 스캔 횟수 — 수집한 경우에만 싣는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scans: Option<u64>,
     /// routine 누적 실행 시간 ms — routine 정점에만 온다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_ms: Option<f64>,
@@ -230,6 +233,7 @@ pub fn graph_to_doc(g: &Graph) -> GraphDoc {
                 since: u.since.clone(),
                 reads: u.reads,
                 writes: u.writes,
+                scans: u.scans,
                 total_ms: u.total_ms,
                 self_ms: u.self_ms,
             }),
@@ -294,6 +298,7 @@ pub fn graph_from_doc(doc: &GraphDoc) -> Graph {
                             since: u.since.clone(),
                             reads: u.reads,
                             writes: u.writes,
+                            scans: u.scans,
                             total_ms: u.total_ms,
                             self_ms: u.self_ms,
                         },
@@ -544,6 +549,7 @@ pub fn dead_to_value(report: &DeadReport) -> serde_json::Value {
                     since: u.since.clone(),
                     reads: u.reads,
                     writes: u.writes,
+                    scans: u.scans,
                     total_ms: u.total_ms,
                     self_ms: u.self_ms,
                 })
@@ -587,6 +593,9 @@ pub fn stats_to_value(g: &Graph) -> serde_json::Value {
             }
             if let Some(since) = &u.since {
                 v["since"] = serde_json::json!(since);
+            }
+            if let Some(scans) = u.scans {
+                v["scans"] = serde_json::json!(scans);
             }
             if let Some(ms) = u.total_ms {
                 v["total_ms"] = serde_json::json!(ms);
@@ -795,6 +804,7 @@ mod tests {
                 since: Some("2025-06-01".into()),
                 reads: 9,
                 writes: 2,
+                scans: None,
                 total_ms: Some(42.5),
                 self_ms: Some(10.0),
             },
@@ -835,6 +845,7 @@ mod tests {
                 since: None,
                 reads: 0,
                 writes: 0,
+                scans: None,
                 total_ms: None,
                 self_ms: None,
             },

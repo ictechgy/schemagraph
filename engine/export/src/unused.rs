@@ -30,6 +30,7 @@ fn candidate(candidate: &UnusedCandidate) -> serde_json::Value {
             since: usage.since.clone(),
             reads: usage.reads,
             writes: usage.writes,
+            scans: usage.scans,
             total_ms: usage.total_ms,
             self_ms: usage.self_ms,
         })

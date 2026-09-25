@@ -236,10 +236,19 @@ async fn attach_usage(
     .ok()
     .flatten();
 
+    // track_counts=off면 테이블·인덱스 카운터가 모두 0인 행이 나온다 — 관측된
+    // 0이 아니라 미수집이므로 usage를 싣지 않고 limitation으로 신고한다.
+    if !track_counts_enabled(pool, limitations).await {
+        attach_routine_usage(pool, schema, routines, &since, limitations).await;
+        return;
+    }
+    // 파티션 부모(relkind p)는 스캔이 리프 파티션에 세어져 항상 0이라 제외한다.
     let rows = sqlx::query(
-        "SELECT relname, seq_tup_read + COALESCE(idx_tup_fetch, 0) AS reads, \
-         n_tup_ins + n_tup_upd + n_tup_del AS writes \
-         FROM pg_stat_user_tables WHERE schemaname = $1",
+        "SELECT s.relname, s.seq_tup_read + COALESCE(s.idx_tup_fetch, 0) AS reads, \
+         s.n_tup_ins + s.n_tup_upd + s.n_tup_del AS writes, \
+         s.seq_scan + COALESCE(s.idx_scan, 0) AS scans \
+         FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid \
+         WHERE s.schemaname = $1 AND c.relkind <> 'p'",
     )
     .bind(schema)
     .fetch_all(pool)
@@ -253,6 +262,7 @@ async fn attach_usage(
                         since: since.clone(),
                         reads: r.get::<i64, _>("reads").max(0) as u64,
                         writes: r.get::<i64, _>("writes").max(0) as u64,
+                        scans: Some(r.get::<i64, _>("scans").max(0) as u64),
                         total_ms: None,
                         self_ms: None,
                     });
@@ -284,6 +294,7 @@ async fn attach_usage(
                         since: since.clone(),
                         reads: r.get::<i64, _>("reads").max(0) as u64,
                         writes: 0,
+                        scans: None,
                         total_ms: None,
                         self_ms: None,
                     });
@@ -295,6 +306,43 @@ async fn attach_usage(
         )),
     }
 
+    attach_routine_usage(pool, schema, routines, &since, limitations).await;
+}
+
+/// `track_counts`가 켜져 있는지 확인한다. 꺼져 있거나 확인하지 못하면 limitation을 남기고 거짓이다.
+///
+/// 꺼진 서버의 pg_stat_user_* 는 모든 카운터가 0인 행을 준다 — 이를 관측된 0으로
+/// 실으면 모든 테이블·인덱스가 미사용 후보처럼 보인다.
+async fn track_counts_enabled(pool: &PgPool, limitations: &mut Vec<String>) -> bool {
+    match sqlx::query_scalar::<_, String>("SELECT current_setting('track_counts')")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(value) if value == "on" => true,
+        Ok(_) => {
+            limitations.push(
+                "track_counts=off — table/index usage 미수집(카운터 비활성, 0행은 관측이 아님)"
+                    .to_owned(),
+            );
+            false
+        }
+        Err(e) => {
+            limitations.push(format!(
+                "track_counts 확인 실패 — table/index usage 미수집: {e}"
+            ));
+            false
+        }
+    }
+}
+
+/// routine 호출 통계를 붙인다 — track_counts와 별개로 track_functions가 결정한다.
+async fn attach_routine_usage(
+    pool: &PgPool,
+    schema: &str,
+    routines: &mut [RoutineDoc],
+    since: &Option<String>,
+    limitations: &mut Vec<String>,
+) {
     // routine 호출 통계 — calls는 routine의 "reads"다(단위는 kind별로 다르다는
     // 계약). funcname은 시그니처가 없어 오버로드면 어느 것의 calls인지
     // 알 수 없다 — 둘 다에 달면 이중 집계라, 이름이 유일할 때만 귀속한다.
@@ -330,6 +378,7 @@ async fn attach_usage(
                             since: since.clone(),
                             reads: r.get::<i64, _>("calls").max(0) as u64,
                             writes: 0,
+                            scans: None,
                             total_ms: r.get::<Option<f64>, _>("total_time"),
                             self_ms: r.get::<Option<f64>, _>("self_time"),
                         });
