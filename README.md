@@ -108,6 +108,7 @@ read that file by default; use `--graph <path>` to select another snapshot.
 | `merge <documents>…` | Combine independently parsed DB catalogs under distinct source IDs. |
 | `facts --document <path>` | Export catalog declarations as an isthmus persistence bridge-facts document (`relation-decl`, platform `sql`). |
 | `serve` | Expose read-only MCP tools and resources over one preloaded graph. |
+| `unused` | Report tables and indexes with zero observed reads since the statistics window began, with facts that weaken a removal reading. |
 | `stats` | List collected usage evidence and collection coverage. |
 | `rules --config <path>` | Check dependency edges against TOML rules. |
 | `diff <old> <new>` | Compare two graph snapshots or two JSON/NDJSON catalog documents. |

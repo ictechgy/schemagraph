@@ -14,6 +14,7 @@ pub mod paths;
 pub mod review;
 pub mod schema_lint;
 pub mod search;
+pub mod unused;
 
 /// 질의 대상을 못 찾았을 때. `notFound`에도 limitations를 싣는다 —
 /// 없는 것과 이 도구가 못 보는 것을 소비자가 구분해야 한다.
@@ -844,6 +845,7 @@ mod tests {
                 since: Some("2025-01-01".into()),
                 reads: 0,
                 writes: 0,
+                scans: None,
                 total_ms: None,
                 self_ms: None,
             },
@@ -1006,6 +1008,7 @@ mod tests {
                 since: Some("2026-01-01".into()),
                 reads: 10,
                 writes: 1,
+                scans: None,
                 total_ms: None,
                 self_ms: None,
             },

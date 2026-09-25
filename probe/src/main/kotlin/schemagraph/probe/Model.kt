@@ -107,6 +107,8 @@ data class UsageDoc(
     // routine 누적/자기 실행 시간 ms — routine 정점에만 온다(미지원 방언은 null).
     val totalMs: Double? = null,
     val selfMs: Double? = null,
+    // 테이블 스캔 횟수(순차+인덱스) — 튜플 수인 reads가 빈 테이블 폴링을 세지 못해 따로 싣는다.
+    val scans: Long? = null,
 )
 
 data class TriggerDoc(

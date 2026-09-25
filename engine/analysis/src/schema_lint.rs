@@ -411,15 +411,23 @@ fn duplicate_index_findings(
     }
 }
 
-/// 같은 테이블에 인덱스와 이름이 같은 제약 정점이 있으면 그 제약을 받치는 인덱스로 본다.
-fn backs_constraint(graph: &Graph, table: &VertexId, index: &VertexId) -> bool {
+/// 같은 테이블에 인덱스와 이름이 같은 PK·UNIQUE 계열 제약이 있으면 그 제약을 받치는 인덱스로 본다.
+///
+/// 제약 정점에는 종류가 없어서, 메타데이터가 FK로 아는 제약은 제외한다 — FK는
+/// 인덱스를 소유하지 않는다. `unused`도 이 규칙을 공유해 두 질의가 어긋나지 않게 한다.
+pub(crate) fn backs_constraint(graph: &Graph, table: &VertexId, index: &VertexId) -> bool {
     let Some(name) = graph.vertex(index).map(|vertex| vertex.name.as_str()) else {
         return false;
     };
+    let foreign_keys = graph
+        .schema_metadata()
+        .map(|metadata| &metadata.foreign_keys);
     graph.outgoing(table).iter().any(|edge| {
-        graph
-            .vertex(&edge.to)
-            .is_some_and(|vertex| vertex.kind == VertexKind::Constraint && vertex.name == name)
+        graph.vertex(&edge.to).is_some_and(|vertex| {
+            vertex.kind == VertexKind::Constraint
+                && vertex.name == name
+                && !foreign_keys.is_some_and(|fks| fks.contains_key(&vertex.id))
+        })
     })
 }
 

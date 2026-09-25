@@ -179,6 +179,17 @@ enum Command {
         #[arg(long)]
         as_of: Option<String>,
     },
+    /// Report tables and indexes with no observed reads in their statistics window.
+    Unused {
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        /// Max candidates before `truncated` is reported.
+        #[arg(long, default_value_t = 1024)]
+        max: usize,
+        /// Exit 1 when any candidate is reported (for CI).
+        #[arg(long)]
+        strict: bool,
+    },
     /// Report structured per-object analysis coverage and diagnostic codes.
     Diagnostics {
         name: Option<String>,
@@ -505,6 +516,7 @@ async fn run(cli: Cli) -> Result<i32> {
             let policy = policy::load(config.as_deref(), &retain, as_of.as_deref())?;
             dead(&graph, max, strict, &policy)
         }
+        Command::Unused { graph, max, strict } => unused(&graph, max, strict),
         Command::Diagnostics { graph, name } => diagnostics(&graph, name.as_deref()),
         Command::Explain { graph, name, max } => explain(&graph, &name, max),
         Command::Path {
@@ -1045,6 +1057,16 @@ fn dead(
     } else {
         0
     })
+}
+
+/// 통계 창 안에서 읽힌 기록이 없는 테이블·인덱스를 출력한다.
+/// strict는 후보가 있으면 1이다 — 판정이 아니라 검토가 필요하다는 신호다.
+fn unused(path: &std::path::Path, max: usize, strict: bool) -> Result<i32> {
+    let graph = load_graph(path)?;
+    let report = analysis::unused::unused(&graph, max);
+    let value = export::unused::to_value(&report, graph.limitations());
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(if strict && report.total > 0 { 1 } else { 0 })
 }
 
 fn diagnostics(path: &std::path::Path, name: Option<&str>) -> Result<i32> {

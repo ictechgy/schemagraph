@@ -99,6 +99,9 @@ the catalog actually exposed and are not inferred by the engine. Routine
 document inputs for parser analysis and are not copied into `graph.schema_metadata`.
 The structural column/index/FK facts are projected into graph v2's optional
 `schema_metadata` maps and retain their string vertex IDs for codec validation.
+Table `usage` may carry `scans` (sequential plus index scans). `reads` counts
+tuples for tables, so `scans` is what distinguishes a polled empty table from an
+unused one; collectors that cannot count scans omit it.
 When the collection context declares `catalog_complete`, the graph also carries
 `schema_metadata.catalog_complete: true`; the key is omitted otherwise. PostgreSQL
 readers fill `pk_position` from the primary-key constraint's key order.

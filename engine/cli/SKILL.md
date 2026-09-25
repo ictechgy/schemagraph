@@ -87,6 +87,10 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   objects (views, routines, packages) with no caller are the usual
   candidates; each carries its usage evidence when collected.
 - `cycles` — dependency cycles, useful for delete ordering and deadlock analysis.
+- `unused` — tables and indexes with zero observed reads since `usage.since`.
+  Objects without counters are `unobserved`, not unused. Quote the attached
+  facts (`enforcesUniqueness`, `coversForeignKeys`, `bodyDependents`, ...);
+  a candidate is an observation, not a deletion verdict.
 - `stats` — every collected usage entry with `since`; `totals` shows how
   much of the graph went unobserved.
 - `dead --retain <glob>` protects a root and its dependency closure. TOML

@@ -166,6 +166,7 @@ async fn attach_usage(
                         since: since.clone(),
                         reads: r.get::<i64, _>("reads").max(0) as u64,
                         writes: r.get::<i64, _>("writes").max(0) as u64,
+                        scans: None,
                         total_ms: None,
                         self_ms: None,
                     });
@@ -199,6 +200,7 @@ async fn attach_usage(
                         since: since.clone(),
                         reads: 0,
                         writes: 0,
+                        scans: None,
                         total_ms: None,
                         self_ms: None,
                     });

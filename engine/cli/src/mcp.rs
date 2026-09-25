@@ -869,6 +869,9 @@ enum PreparedToolCall {
         max: usize,
     },
     Stats,
+    Unused {
+        max: usize,
+    },
 }
 
 fn prepare_tool_call(
@@ -974,6 +977,11 @@ fn prepare_tool_call(
             reject_unknown(arguments, &[])?;
             Ok(PreparedToolCall::Stats)
         }
+        "unused" => {
+            let max = bounded_u64(arguments, "max", 1024, MAX_RESULTS)? as usize;
+            reject_unknown(arguments, &["max"])?;
+            Ok(PreparedToolCall::Unused { max })
+        }
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -1055,6 +1063,9 @@ fn call_tool(snapshot: &Snapshot, call: &PreparedToolCall, cancel: &AtomicBool) 
             export::lint::to_value(&analysis::schema_lint::lint(graph, *max))
         }),
         PreparedToolCall::Stats => whole_graph(cancel, || export::stats_to_value(graph)),
+        PreparedToolCall::Unused { max } => whole_graph(cancel, || {
+            export::unused::to_value(&analysis::unused::unused(graph, *max), graph.limitations())
+        }),
     }
 }
 
@@ -1476,6 +1487,15 @@ fn tool_definitions() -> Vec<Value> {
             "List collected usage counters with their `since` windows and coverage totals.",
             json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
+        tool_definition(
+            "unused",
+            "Report tables and indexes with zero observed reads since their statistics window began, with facts that weaken a removal reading; objects without counters are counted as unobserved, not unused.",
+            json!({
+                "type":"object",
+                "properties":{"max":{"type":"integer","minimum":0,"maximum":MAX_RESULTS,"default":1024}},
+                "additionalProperties":false
+            }),
+        ),
     ]
 }
 
@@ -1583,7 +1603,8 @@ mod tests {
                 "dead",
                 "cycles",
                 "lint",
-                "stats"
+                "stats",
+                "unused"
             ]
         );
         assert!(responses[0]["result"]["capabilities"]["resources"].is_object());
@@ -1640,6 +1661,7 @@ mod tests {
             r#"{"name":"lint","arguments":{"max":3}}"#,
             r#"{"name":"stats"}"#,
             r#"{"name":"cycles","arguments":{"level":"table"}}"#,
+            r#"{"name":"unused","arguments":{}}"#,
         ]);
         let content = |index: usize| responses[index]["result"]["structuredContent"].clone();
         assert_eq!(
@@ -1655,6 +1677,10 @@ mod tests {
             export::lint::to_value(&analysis::schema_lint::lint(&graph, 3))
         );
         assert_eq!(content(3), export::stats_to_value(&graph));
+        assert_eq!(
+            content(5),
+            export::unused::to_value(&analysis::unused::unused(&graph, 1024), graph.limitations())
+        );
         assert_eq!(responses[4]["error"]["code"], -32602);
     }
 

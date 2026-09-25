@@ -92,9 +92,11 @@ type IndexDoc struct {
 }
 
 type UsageDoc struct {
-	Since   *string  `json:"since,omitempty"`
-	Reads   int64    `json:"reads"`
-	Writes  int64    `json:"writes"`
+	Since  *string `json:"since,omitempty"`
+	Reads  int64   `json:"reads"`
+	Writes int64   `json:"writes"`
+	// Scans는 테이블 스캔 횟수(순차+인덱스)다 — 튜플 수인 Reads가 빈 테이블 폴링을 세지 못해서 따로 싣는다.
+	Scans   *int64   `json:"scans,omitempty"`
 	TotalMs *float64 `json:"total_ms,omitempty"`
 	SelfMs  *float64 `json:"self_ms,omitempty"`
 }

@@ -525,6 +525,7 @@ mod tests {
             since: None,
             reads: 5,
             writes: 0,
+            scans: None,
             total_ms: None,
             self_ms: None,
         });
@@ -549,6 +550,7 @@ mod tests {
             since: None,
             reads: 4,
             writes: 0,
+            scans: None,
             total_ms: None,
             self_ms: None,
         });

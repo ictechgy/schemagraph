@@ -126,6 +126,7 @@ impl<'a> VertexView<'a> {
             schema: &vertex.schema,
             usage: usage.map(|usage| UsageView {
                 reads: usage.reads,
+                scans: usage.scans,
                 self_ms: usage.self_ms,
                 since: usage.since.as_deref(),
                 total_ms: usage.total_ms,
@@ -138,6 +139,8 @@ impl<'a> VertexView<'a> {
 #[derive(Serialize)]
 struct UsageView<'a> {
     reads: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scans: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     self_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,6 +189,7 @@ mod tests {
                     since: Some("2026-01-01T00:00:00Z".into()),
                     reads: u64::MAX,
                     writes: 0,
+                    scans: None,
                     total_ms: Some(12.5),
                     self_ms: None,
                 },

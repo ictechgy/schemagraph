@@ -246,6 +246,15 @@ jobs:
             --jdbc-jar probe/build/libs/schemagraph-probe-all.jar --java "$JAVA_HOME/bin/java" \
             --output "$RUNNER_TEMP/schema-lint.json"
 
+      - name: Verify unused-object reports against a real PostgreSQL workload
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+        run: |
+          python3 Scripts/verify-unused.py --engine engine/target/debug/schemagraph \
+            --go-probe probe-go/schemagraph-probe-go \
+            --jdbc-jar probe/build/libs/schemagraph-probe-all.jar --java "$JAVA_HOME/bin/java" \
+            --output "$RUNNER_TEMP/unused.json"
+
       - name: Verify isthmus bridge-facts export against real catalogs
         env:
           PGBIN: /usr/lib/postgresql/16/bin

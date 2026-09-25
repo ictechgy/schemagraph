@@ -412,13 +412,18 @@ func (h *harvester) postgresObjectUsage(schema string, objects []ObjectDoc) {
 		FROM pg_stat_database WHERE datname = current_database()`).Scan(&since); err != nil {
 		h.limitations = append(h.limitations, fmt.Sprintf("%s: pg stats reset time unavailable — %s", schema, oneLine(err.Error())))
 	}
+	// track_counts=off면 모든 카운터가 0인 행이 나온다 — 관측된 0이 아니므로 싣지 않는다.
+	if !h.postgresTrackCounts(schema) {
+		return
+	}
 	// schema 전체를 한 번에 읽어 같은 통계 조회를 객체마다 반복하지 않는다.
-	tableReads, tableWrites := h.postgresTableUsage(schema)
+	tableReads, tableWrites, tableScans := h.postgresTableUsage(schema)
 	indexReads := h.postgresIndexUsage(schema)
 	for i := range objects {
 		obj := &objects[i]
 		if usage, ok := tableReads[obj.Name]; ok {
-			obj.Usage = &UsageDoc{Since: ns(since), Reads: maxInt64(usage), Writes: maxInt64(tableWrites[obj.Name])}
+			scans := maxInt64(tableScans[obj.Name])
+			obj.Usage = &UsageDoc{Since: ns(since), Reads: maxInt64(usage), Writes: maxInt64(tableWrites[obj.Name]), Scans: &scans}
 		}
 		for j := range obj.Indexes {
 			if reads, ok := indexReads[obj.Name+"\x00"+obj.Indexes[j].Name]; ok {
@@ -428,28 +433,46 @@ func (h *harvester) postgresObjectUsage(schema string, objects []ObjectDoc) {
 	}
 }
 
-func (h *harvester) postgresTableUsage(schema string) (map[string]int64, map[string]int64) {
-	reads, writes := map[string]int64{}, map[string]int64{}
-	rows, err := h.db.Query(`SELECT relname, seq_tup_read + COALESCE(idx_tup_fetch, 0),
-		n_tup_ins + n_tup_upd + n_tup_del FROM pg_stat_user_tables WHERE schemaname = $1`, schema)
+// postgresTrackCounts는 track_counts가 켜져 있는지 본다. 꺼져 있거나 확인하지 못하면 limitation을 남기고 거짓이다.
+func (h *harvester) postgresTrackCounts(schema string) bool {
+	var tracking string
+	if err := h.db.QueryRow(`SELECT current_setting('track_counts')`).Scan(&tracking); err != nil {
+		h.limitations = append(h.limitations, fmt.Sprintf("%s: failed to inspect track_counts; no table/index usage — %s", schema, oneLine(err.Error())))
+		return false
+	}
+	if tracking != "on" {
+		h.limitations = append(h.limitations, "track_counts=off — table/index usage unavailable because counters are disabled (zero rows are not observations)")
+		return false
+	}
+	return true
+}
+
+// postgresTableUsage는 테이블 읽기(튜플)·쓰기·스캔 횟수를 읽는다.
+// 파티션 부모(relkind p)는 스캔이 리프 파티션에 세어져 항상 0이라 제외한다.
+func (h *harvester) postgresTableUsage(schema string) (map[string]int64, map[string]int64, map[string]int64) {
+	reads, writes, scans := map[string]int64{}, map[string]int64{}, map[string]int64{}
+	rows, err := h.db.Query(`SELECT s.relname, s.seq_tup_read + COALESCE(s.idx_tup_fetch, 0),
+		s.n_tup_ins + s.n_tup_upd + s.n_tup_del, s.seq_scan + COALESCE(s.idx_scan, 0)
+		FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+		WHERE s.schemaname = $1 AND c.relkind <> 'p'`, schema)
 	if err != nil {
 		h.limitations = append(h.limitations, fmt.Sprintf("pg_stat_user_tables unavailable; no usage evidence — %s", oneLine(err.Error())))
-		return reads, writes
+		return reads, writes, scans
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var name string
-		var read, write int64
-		if err := rows.Scan(&name, &read, &write); err != nil {
+		var read, write, scan int64
+		if err := rows.Scan(&name, &read, &write, &scan); err != nil {
 			h.limitations = append(h.limitations, fmt.Sprintf("pg_stat_user_tables row read failed — %s", oneLine(err.Error())))
-			return reads, writes
+			return reads, writes, scans
 		}
-		reads[name], writes[name] = read, write
+		reads[name], writes[name], scans[name] = read, write, scan
 	}
 	if err := rows.Err(); err != nil {
 		h.limitations = append(h.limitations, fmt.Sprintf("pg_stat_user_tables unavailable — %s", oneLine(err.Error())))
 	}
-	return reads, writes
+	return reads, writes, scans
 }
 
 func (h *harvester) postgresIndexUsage(schema string) map[string]int64 {
