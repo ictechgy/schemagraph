@@ -111,9 +111,29 @@ Lint checks ordered foreign-key prefixes supplied by either an unfiltered index
 or the table primary key, and surfaces structured unresolved/ambiguous SQL
 references. A partial or expression index, incomplete inventory, or missing PK
 column positions cannot establish complete coverage and is reported as
-`unverified`. A finding describes observed facts; it is not an instruction to
-add or drop an index. Strict lint exits 1 for confirmed findings, 2 for
-incomplete coverage, and 0 for a complete report without confirmed findings.
+`unverified`. It also reports three catalog facts:
+
+- `fk-type-mismatch` (blocking): a foreign-key column's declared type differs
+  from the referenced column's. Case and spacing are ignored and PostgreSQL
+  `serial` shorthands compare as their integer types; other synonyms and implicit
+  conversions are not interpreted. A reference that omits its target columns is
+  compared with the referenced primary key. Pairs whose types were not collected
+  are `unverified` without lowering report completeness.
+- `table-without-primary-key` (advisory): no primary-key column was declared. It
+  is `confirmed` only when the collector declared a complete catalog, because a
+  zero key position cannot otherwise distinguish "no key" from "not read".
+  Foreign and virtual tables are collected as tables and cannot declare a key.
+- `duplicate-index` (advisory): two unfiltered indexes share key columns, order,
+  and uniqueness. It is always `unverified` because the access method, operator
+  class, and sort order are not collected (a B-tree and a hash index on the same
+  column are different indexes). An index backing a constraint is named as the
+  reference, not as the candidate.
+
+A finding describes observed facts; it is not an instruction to add or drop an
+index. Strict lint exits 1 for confirmed blocking findings (`blockingCount`), 2
+for incomplete coverage, and 0 otherwise. Findings marked `advisory: true` are
+reported and counted in `confirmedCount` but never fail strict mode, so adding
+these rules does not change an existing strict gate.
 
 ## Add SQL files and reuse parsing work
 

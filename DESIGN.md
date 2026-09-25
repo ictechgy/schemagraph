@@ -85,6 +85,9 @@ id가 다른 kind에 점유됐으면 나중 정점은 `name@kind`로 분리된�
 검증해 유령 metadata를 거부한다. 인덱스의 ordered prefix, predicate 유무,
 완전성, FK 컬럼 대응은 `lint`가 이 메타데이터로 검사한다. metadata가 없거나
 불완전하면 `confirmed` 판정을 내리지 않고 `unverified`와 limitation을 보고한다.
+수집기가 카탈로그 완전성을 선언하면 `schema_metadata.catalog_complete: true`를
+싣는다 — `pk_position` 0만으로는 "PK 없음"과 "못 읽음"을 구분할 수 없어서 PK 부재는
+이 값이 참일 때만 확정한다. 값이 거짓이면 키를 생략하므로 옛 그래프와 같은 모양이다.
 
 ## 어댑터 등급 — "JDBC 전부"가 성립하는 방식
 
@@ -121,7 +124,7 @@ schemagraph rules                              # 레이어·규칙 검사
 schemagraph stats                              # 수집된 사용 통계 열람 (그래프 위의 질의)
 schemagraph diff <old.json> <new.json>         # 마이그레이션 전후 델타
 schemagraph merge <catalog-a.json> <catalog-b.json>  # source namespace를 보존해 병합
-schemagraph lint                                # FK ordered-prefix와 구조화 진단 검사
+schemagraph lint                                # FK prefix·타입, PK 부재, 중복 인덱스 후보, 구조화 진단
 schemagraph serve --graph graph.json            # 고정 그래프를 읽기 전용 MCP stdio로 제공
 schemagraph skill                              # 에이전트 스킬 설치 (계열 전통)
 ```

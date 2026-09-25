@@ -99,6 +99,9 @@ the catalog actually exposed and are not inferred by the engine. Routine
 document inputs for parser analysis and are not copied into `graph.schema_metadata`.
 The structural column/index/FK facts are projected into graph v2's optional
 `schema_metadata` maps and retain their string vertex IDs for codec validation.
+When the collection context declares `catalog_complete`, the graph also carries
+`schema_metadata.catalog_complete: true`; the key is omitted otherwise. PostgreSQL
+readers fill `pk_position` from the primary-key constraint's key order.
 
 `context` identifies a collection with `source_id`, optional `database` and
 `schema_filter`, and `catalog_complete`. `dependencies` carries source and

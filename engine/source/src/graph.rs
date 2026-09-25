@@ -49,6 +49,7 @@ fn attach_schema_metadata(graph: &mut Graph, doc: &CatalogDocument) {
     for schema in &doc.schemas {
         for object in &schema.objects {
             let table = VertexId::object(&schema.name, &object.name);
+            let primary_key = declared_primary_key(object);
             for column in &object.columns {
                 if let Some(id) = member_id(graph, &table, &column.name, VertexKind::Column) {
                     metadata.columns.insert(
@@ -57,7 +58,7 @@ fn attach_schema_metadata(graph: &mut Graph, doc: &CatalogDocument) {
                             data_type: column.data_type.clone(),
                             nullable: column.nullable,
                             ordinal: column.ordinal,
-                            pk_position: column.pk_position,
+                            pk_position: pk_position(column, primary_key),
                         },
                     );
                 }
@@ -106,20 +107,22 @@ fn attach_schema_metadata(graph: &mut Graph, doc: &CatalogDocument) {
                     .iter()
                     .filter_map(|name| member_id(graph, &table, name, VertexKind::Column))
                     .collect::<Vec<_>>();
-                let (target_table, target_columns) = match &constraint.referenced {
+                let (target_table, target_columns, expected_targets) = match &constraint.referenced
+                {
                     Some(reference) => {
                         let target_schema = reference.schema.as_deref().unwrap_or(&schema.name);
                         let table_id = VertexId::object(target_schema, &reference.table);
-                        let target_columns = reference
-                            .columns
+                        let names = referenced_column_names(doc, target_schema, reference);
+                        let target_columns = names
                             .iter()
                             .filter_map(|name| {
                                 member_id(graph, &table_id, name, VertexKind::Column)
                             })
                             .collect::<Vec<_>>();
-                        (graph.vertex(&table_id).map(|_| table_id), target_columns)
+                        let table = graph.vertex(&table_id).map(|_| table_id);
+                        (table, target_columns, names.len())
                     }
-                    None => (None, Vec::new()),
+                    None => (None, Vec::new(), 0),
                 };
                 let complete = doc
                     .context
@@ -133,11 +136,8 @@ fn attach_schema_metadata(graph: &mut Graph, doc: &CatalogDocument) {
                             .is_some_and(|vertex| vertex.kind == VertexKind::Column)
                     })
                     && target_table.is_some()
-                    && target_columns.len()
-                        == constraint
-                            .referenced
-                            .as_ref()
-                            .map_or(0, |reference| reference.columns.len())
+                    && target_columns.len() == expected_targets
+                    && target_columns.len() == columns.len()
                     && target_columns.iter().all(|column| {
                         graph
                             .vertex(column)
@@ -156,7 +156,71 @@ fn attach_schema_metadata(graph: &mut Graph, doc: &CatalogDocument) {
             }
         }
     }
+    metadata.catalog_complete = doc
+        .context
+        .as_ref()
+        .is_some_and(|context| context.catalog_complete);
     graph.set_schema_metadata(metadata);
+}
+
+/// FK가 가리키는 대상 컬럼 이름이다.
+///
+/// 대상 컬럼을 생략한 참조(`REFERENCES parent`)는 SQL 규칙대로 대상 테이블의
+/// PK 키 순서를 쓴다. SQLite 수집기는 이 경우 빈 이름을 옮기므로, 이름이 모두
+/// 비었을 때만 PK로 해석한다. 대상 테이블이나 PK를 모르면 빈 목록이다.
+fn referenced_column_names(
+    doc: &CatalogDocument,
+    schema: &str,
+    reference: &ReferencedDoc,
+) -> Vec<String> {
+    if reference.columns.iter().any(|name| !name.is_empty()) {
+        return reference.columns.clone();
+    }
+    let Some(target) = doc
+        .schemas
+        .iter()
+        .filter(|candidate| candidate.name == schema)
+        .flat_map(|candidate| &candidate.objects)
+        .find(|object| object.name == reference.table)
+    else {
+        return Vec::new();
+    };
+    let primary_key = declared_primary_key(target);
+    let mut keyed: Vec<_> = target
+        .columns
+        .iter()
+        .map(|column| (pk_position(column, primary_key), column.name.clone()))
+        .filter(|(position, _)| *position > 0)
+        .collect();
+    keyed.sort();
+    keyed.into_iter().map(|(_, name)| name).collect()
+}
+
+/// 컬럼의 PK 위치를 정하는 근거가 될 PK 제약이다.
+///
+/// 생산자가 `pk_position`을 하나라도 채웠으면 그 값을 믿고 `None`이다. 모두 0인데
+/// PK 제약이 있으면 제약의 키 순서를 쓴다 — 옛 PostgreSQL 수집기처럼 위치를 빠뜨린
+/// 문서도 "PK 없음"으로 오판하지 않게 판정 권위인 엔진에서 한 번 더 보정한다.
+fn declared_primary_key(object: &ObjectDoc) -> Option<&ConstraintDoc> {
+    if object.columns.iter().any(|column| column.pk_position > 0) {
+        return None;
+    }
+    object
+        .constraints
+        .iter()
+        .find(|constraint| constraint.kind == "pk")
+}
+
+/// 문서 값 또는 PK 제약 키 순서에서 컬럼의 1-based PK 위치를 구한다.
+fn pk_position(column: &ColumnDoc, primary_key: Option<&ConstraintDoc>) -> u32 {
+    primary_key
+        .and_then(|constraint| {
+            constraint
+                .columns
+                .iter()
+                .position(|name| *name == column.name)
+        })
+        .map_or(column.pk_position, |index| index as u32 + 1)
 }
 
 fn member_id(graph: &Graph, table: &VertexId, name: &str, kind: VertexKind) -> Option<VertexId> {
@@ -695,14 +759,72 @@ mod tests {
         );
         let fk_id = VertexId::member("main", "orders", "orders_fk_0");
         assert!(metadata.foreign_keys[&fk_id].complete);
+        assert!(metadata.catalog_complete);
         doc.context.as_mut().unwrap().catalog_complete = false;
-        assert!(
-            !document_to_graph(&doc)
-                .schema_metadata()
-                .unwrap()
-                .foreign_keys[&fk_id]
-                .complete
+        let incomplete = document_to_graph(&doc);
+        let incomplete = incomplete.schema_metadata().unwrap();
+        assert!(!incomplete.foreign_keys[&fk_id].complete);
+        // PK 부재를 확정할 근거가 사라진다.
+        assert!(!incomplete.catalog_complete);
+    }
+
+    /// 옛 PostgreSQL 수집기처럼 pk_position을 빠뜨린 문서도 PK 제약 순서로 보정한다.
+    #[test]
+    fn pk_position이_없으면_pk_제약의_키_순서로_보정한다() {
+        let mut doc = doc_with_fk();
+        let customers = doc.schemas[0]
+            .objects
+            .iter_mut()
+            .find(|object| object.name == "customers")
+            .expect("fixture has customers");
+        for column in &mut customers.columns {
+            column.pk_position = 0;
+        }
+        customers.constraints.push(ConstraintDoc {
+            name: "customers_pkey".into(),
+            kind: "pk".into(),
+            columns: vec!["id".into()],
+            referenced: None,
+        });
+        doc.context = Some(CollectionContext {
+            source_id: "test".into(),
+            database: None,
+            schema_filter: None,
+            catalog_complete: true,
+        });
+        let graph = document_to_graph(&doc);
+        let metadata = graph.schema_metadata().expect("schema metadata");
+        assert_eq!(
+            metadata.columns[&VertexId::member("main", "customers", "id")].pk_position,
+            1
         );
+    }
+
+    /// `REFERENCES customers`처럼 대상 컬럼을 생략한 FK는 대상 PK로 해석해 완전한 FK가 된다.
+    #[test]
+    fn 대상_컬럼을_생략한_fk는_대상_pk로_해석한다() {
+        let mut doc = doc_with_fk();
+        doc.context = Some(CollectionContext {
+            source_id: "test".into(),
+            database: None,
+            schema_filter: None,
+            catalog_complete: true,
+        });
+        for object in &mut doc.schemas[0].objects {
+            for constraint in &mut object.constraints {
+                if let Some(reference) = constraint.referenced.as_mut() {
+                    reference.columns = vec![String::new()];
+                }
+            }
+        }
+        let graph = document_to_graph(&doc);
+        let metadata = graph.schema_metadata().expect("schema metadata");
+        let fk = &metadata.foreign_keys[&VertexId::member("main", "orders", "orders_fk_0")];
+        assert_eq!(
+            fk.target_columns,
+            vec![VertexId::member("main", "customers", "id")]
+        );
+        assert!(fk.complete);
     }
 
     #[test]

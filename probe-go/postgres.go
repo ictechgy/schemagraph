@@ -29,6 +29,7 @@ func (h *harvester) postgresSchema(schema string) SchemaDoc {
 		obj := &objects[i]
 		obj.Columns = h.postgresColumns(schema, obj.Name)
 		obj.Constraints = h.postgresConstraints(schema, obj.Name)
+		applyPrimaryKeyPositions(obj)
 		obj.Indexes = h.postgresIndexes(schema, obj.Name)
 		obj.Triggers = h.postgresTriggers(schema, obj.Name)
 	}
@@ -197,6 +198,24 @@ func (h *harvester) postgresObjects(schema string) []ObjectDoc {
 		return nil
 	})
 	return objects
+}
+
+// applyPrimaryKeyPositions는 PK 제약의 키 순서를 컬럼의 PkPosition에 옮긴다.
+// 0으로 남으면 엔진이 "PK 없음"과 "못 읽음"을 구분하지 못한다 — 엔진 native와 같은 규칙이다.
+func applyPrimaryKeyPositions(obj *ObjectDoc) {
+	for _, constraint := range obj.Constraints {
+		if constraint.Kind != "pk" {
+			continue
+		}
+		for i := range obj.Columns {
+			for position, name := range constraint.Columns {
+				if name == obj.Columns[i].Name {
+					obj.Columns[i].PkPosition = position + 1
+				}
+			}
+		}
+		return
+	}
 }
 
 // postgresColumns는 엔진과 같은 SQL 파일로 테이블·뷰·materialized view 컬럼을 읽는다.

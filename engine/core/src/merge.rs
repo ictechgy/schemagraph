@@ -31,7 +31,15 @@ pub fn merge_graphs(mut inputs: Vec<(String, Graph)>) -> Result<Graph, String> {
         .iter()
         .all(|(_, graph)| graph.schema_metadata().is_some());
     let mut combined = Graph::new();
-    let mut metadata = SchemaMetadata::default();
+    // 병합 결과는 모든 입력이 완전할 때만 완전하다.
+    let mut metadata = SchemaMetadata {
+        catalog_complete: inputs.iter().all(|(_, graph)| {
+            graph
+                .schema_metadata()
+                .is_some_and(|metadata| metadata.catalog_complete)
+        }),
+        ..SchemaMetadata::default()
+    };
     for (name, graph) in inputs {
         let id = |old: &VertexId| namespaced_id(&name, old);
         for vertex in graph.vertices() {
@@ -99,6 +107,33 @@ mod tests {
             kind: VertexKind::Table,
         });
         graph
+    }
+
+    /// 한 입력이라도 수집 완전성을 선언하지 않았으면 병합 결과도 완전하지 않다.
+    #[test]
+    fn merged_metadata_is_complete_only_when_every_source_is() {
+        let with_metadata = |complete: bool| {
+            let mut graph = fixture();
+            graph.set_schema_metadata(SchemaMetadata {
+                catalog_complete: complete,
+                ..SchemaMetadata::default()
+            });
+            graph
+        };
+        let complete = |graphs: Vec<(String, Graph)>| {
+            merge_graphs(graphs)
+                .unwrap()
+                .schema_metadata()
+                .is_some_and(|metadata| metadata.catalog_complete)
+        };
+        assert!(complete(vec![
+            ("a".into(), with_metadata(true)),
+            ("b".into(), with_metadata(true)),
+        ]));
+        assert!(!complete(vec![
+            ("a".into(), with_metadata(true)),
+            ("b".into(), with_metadata(false)),
+        ]));
     }
 
     #[test]

@@ -986,6 +986,7 @@
     }
   ],
   "schema_metadata": {
+    "catalog_complete": true,
     "columns": {
       "sgfix.a.b_id": {
         "data_type": "int",

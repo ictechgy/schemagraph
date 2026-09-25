@@ -98,7 +98,7 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 | `explain <name>` | 이웃 간선과 카탈로그·SQL 근거를 보여줍니다. |
 | `path <from> <to>` | 탐색 예산 안에서 최단 의존 경로를 찾습니다. |
 | `review <before> <after>` | 카탈로그 변경과 의존자 영향·비교 가능 여부를 함께 보고합니다. |
-| `lint` | FK 인덱스 prefix와 미해결·모호한 참조 사실을 검사합니다. |
+| `lint` | FK 인덱스 prefix와 선언 타입, PK 없는 테이블, 중복 인덱스 후보, 미해결·모호한 참조 사실을 검사합니다. |
 | `merge <documents>…` | source ID별로 구분한 DB 카탈로그를 통합합니다. |
 | `facts --document <path>` | 카탈로그 선언을 isthmus persistence bridge-facts 문서(`relation-decl`, platform `sql`)로 보냅니다. |
 | `serve` | 미리 읽은 그래프 하나를 조회하는 MCP 도구와 리소스를 제공합니다. |

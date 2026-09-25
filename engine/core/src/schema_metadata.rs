@@ -39,4 +39,9 @@ pub struct SchemaMetadata {
     pub columns: BTreeMap<VertexId, ColumnMetadata>,
     pub indexes: BTreeMap<VertexId, IndexMetadata>,
     pub foreign_keys: BTreeMap<VertexId, ForeignKeyMetadata>,
+    /// 수집기가 요청 범위의 카탈로그를 빠짐없이 읽었다고 선언했는지 여부.
+    ///
+    /// `pk_position` 0은 "PK 아님"과 "못 읽음"을 구분하지 못하므로, 이 값이
+    /// 참일 때만 PK 부재를 사실로 확정한다. 이 필드가 없던 옛 그래프는 거짓이다.
+    pub catalog_complete: bool,
 }
