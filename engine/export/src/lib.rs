@@ -21,6 +21,7 @@ pub mod mermaid;
 pub mod review;
 pub mod sarif;
 pub mod schema_metadata;
+pub mod search;
 pub mod stream;
 
 /// graph.json의 와이어 버전. 형식이 깨지는 변경은 올린다.
@@ -48,7 +49,27 @@ fn vertex_kind_str(kind: VertexKind) -> &'static str {
     }
 }
 
-fn vertex_kind_parse(s: &str) -> Option<VertexKind> {
+/// 정점 종류의 와이어 라벨 전체 — MCP 입력 스키마가 허용 값을 알리는 데 쓴다.
+pub const VERTEX_KIND_LABELS: &[&str] = &[
+    "schema",
+    "table",
+    "view",
+    "materialized-view",
+    "sequence",
+    "type",
+    "synonym",
+    "column",
+    "index",
+    "constraint",
+    "trigger",
+    "function",
+    "procedure",
+    "package",
+    "query",
+];
+
+/// 와이어 종류 라벨을 해석한다 — CLI·MCP의 종류 필터가 공유한다.
+pub fn vertex_kind_parse(s: &str) -> Option<VertexKind> {
     Some(match s {
         "schema" => VertexKind::Schema,
         "table" => VertexKind::Table,
@@ -390,6 +411,29 @@ pub fn query_to_value(report: &QueryReport) -> serde_json::Value {
     value
 }
 
+/// 스냅샷 요약 — 종류별 정점·간선 수, 스키마, 수집 한계를 싣는다.
+///
+/// 에이전트가 첫 요청에서 그래프의 크기와 사각지대를 알고 나서 탐색 범위를
+/// 정하도록 한다. 키 순서가 정렬된 맵이라 같은 그래프면 같은 문서다.
+pub fn graph_summary_value(g: &Graph) -> serde_json::Value {
+    let mut vertices = std::collections::BTreeMap::<&str, usize>::new();
+    let mut schemas = std::collections::BTreeSet::<&str>::new();
+    for vertex in g.vertices() {
+        *vertices.entry(vertex_kind_str(vertex.kind)).or_default() += 1;
+        schemas.insert(vertex.schema.as_str());
+    }
+    let mut edges = std::collections::BTreeMap::<&str, usize>::new();
+    for edge in g.edges() {
+        *edges.entry(edge_kind_str(edge.kind)).or_default() += 1;
+    }
+    serde_json::json!({
+        "edges": edges,
+        "limitations": g.limitations(),
+        "schemas": schemas,
+        "vertices": vertices,
+    })
+}
+
 /// 대상을 못 찾은 경우의 notFound 응답 — limitations도 싣는다.
 pub fn not_found_value(
     name: &str,
@@ -644,6 +688,15 @@ pub fn rules_to_value(report: &RulesReport) -> serde_json::Value {
 mod tests {
     use super::*;
     use schemagraph_core::{Evidence, VertexId};
+
+    /// 라벨 목록이 해석기·출력기와 어긋나면 MCP가 받을 수 없는 값을 광고하게 된다.
+    #[test]
+    fn vertex_kind_labels_round_trip() {
+        for label in VERTEX_KIND_LABELS {
+            let kind = vertex_kind_parse(label).expect("advertised label must parse");
+            assert_eq!(vertex_kind_str(kind), *label);
+        }
+    }
 
     fn sample() -> Graph {
         let mut g = Graph::new();

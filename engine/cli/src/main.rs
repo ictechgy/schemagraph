@@ -109,6 +109,22 @@ enum Command {
         #[arg(long, value_enum)]
         level: Option<LevelArg>,
     },
+    /// Find vertices by name substring or `*`/`?` glob (case-insensitive).
+    Search {
+        /// Substring of an id or name, or a glob over the whole id.
+        pattern: String,
+        #[arg(short, long, default_value = "graph.json")]
+        graph: PathBuf,
+        /// Restrict matches to one vertex kind (for example table, view, column).
+        #[arg(long)]
+        kind: Option<String>,
+        /// `names` lists ids; `summary` adds kind, schema, name, and neighbor counts.
+        #[arg(long, value_enum, default_value_t = DetailArg::Names)]
+        detail: DetailArg,
+        /// Max matches before `truncated` is reported.
+        #[arg(long, default_value_t = 100)]
+        max: usize,
+    },
     /// Who depends on this object / what does it depend on (agent JSON).
     Query {
         /// Object name or qualified id (schema.object[.member]).
@@ -256,6 +272,15 @@ enum Command {
     Serve {
         #[arg(short, long, default_value = "graph.json")]
         graph: PathBuf,
+        /// Retention policy for the `dead` tool; schemagraph.toml is not read implicitly.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Retention roots for the `dead` tool, as with `dead --retain`.
+        #[arg(long, value_delimiter = ',')]
+        retain: Vec<String>,
+        /// Date for expiring suppressions, as with `dead --as-of`.
+        #[arg(long)]
+        as_of: Option<String>,
     },
     /// Merge catalog documents under their explicit source-id namespaces.
     Merge {
@@ -309,6 +334,28 @@ enum GraphFormat {
     Json,
     Dot,
     Html,
+}
+
+/// `search --detail`의 CLI 값 — 와이어 라벨은 export가 소유한다.
+#[derive(Clone, Copy, ValueEnum)]
+enum DetailArg {
+    Names,
+    Summary,
+}
+
+impl DetailArg {
+    /// export의 공개 단계로 바꾼다.
+    fn detail(self) -> export::search::SearchDetail {
+        match self {
+            Self::Names => export::search::SearchDetail::Names,
+            Self::Summary => export::search::SearchDetail::Summary,
+        }
+    }
+}
+
+/// MCP가 CLI `--level`과 같은 라벨·같은 대응으로 레벨을 해석하게 한다.
+pub(crate) fn parse_level_label(label: &str) -> Option<Level> {
+    LevelArg::from_str(label, false).ok().map(|arg| arg.level())
 }
 
 #[derive(Clone, ValueEnum)]
@@ -425,6 +472,13 @@ async fn run(cli: Cli) -> Result<i32> {
             format,
             level,
         } => render_graph(&graph, format, level.map(|level| level.level())),
+        Command::Search {
+            pattern,
+            graph,
+            kind,
+            detail,
+            max,
+        } => search(&pattern, &graph, kind.as_deref(), detail.detail(), max),
         Command::Query {
             name,
             graph,
@@ -516,9 +570,24 @@ async fn run(cli: Cli) -> Result<i32> {
             as_of: as_of.as_deref(),
             write_baseline: write_baseline.as_deref(),
         }),
-        Command::Serve { graph } => {
+        Command::Serve {
+            graph,
+            config,
+            retain,
+            as_of,
+        } => {
+            // 정책은 운영자가 시작 시 명시한다 — 도구 인자나 실행 위치의 파일에 좌우되지 않는다.
+            let retention = policy::load_explicit(config.as_deref(), &retain, as_of.as_deref())?;
             let graph = load_graph(&graph)?;
-            mcp::serve(&graph, BufReader::new(std::io::stdin()), std::io::stdout())?;
+            let snapshot = mcp::Snapshot {
+                graph: &graph,
+                retention: &retention,
+            };
+            mcp::serve(
+                &snapshot,
+                BufReader::new(std::io::stdin()),
+                std::io::stdout(),
+            )?;
             Ok(0)
         }
         Command::Merge { documents, output } => {
@@ -914,6 +983,49 @@ fn impact(
             Ok(1)
         }
     }
+}
+
+/// 이름 패턴으로 정점을 찾아 출력한다. 일치가 없어도 성공(0)이다 —
+/// 빈 결과는 유효한 답이고, 수집 공백은 `limitations`로 따로 전달된다.
+fn search(
+    pattern: &str,
+    path: &std::path::Path,
+    kind: Option<&str>,
+    detail: export::search::SearchDetail,
+    max: usize,
+) -> Result<i32> {
+    let kind = parse_search_filters(pattern, kind)?;
+    let graph = load_graph(path)?;
+    let query = analysis::search::SearchQuery {
+        pattern,
+        kind,
+        max,
+        count_neighbors: detail == export::search::SearchDetail::Summary,
+    };
+    let report = analysis::search::search(&graph, query);
+    let value = export::search::to_value(&report, pattern, kind, detail, graph.limitations());
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(0)
+}
+
+/// 검색 패턴과 종류 필터를 검증한다. CLI와 MCP가 같은 규칙으로 거절하도록 한곳에 둔다.
+/// 종류 라벨은 패턴처럼 대소문자를 무시한다.
+pub(crate) fn parse_search_filters(
+    pattern: &str,
+    kind: Option<&str>,
+) -> Result<Option<schemagraph_core::VertexKind>> {
+    if pattern.trim().is_empty() {
+        bail!("search pattern must be nonempty; pass a name fragment or a glob such as 'public.*'");
+    }
+    kind.map(|kind| {
+        export::vertex_kind_parse(&kind.to_ascii_lowercase()).ok_or_else(|| {
+            anyhow!(
+                "unknown vertex kind '{kind}'; use one of {}",
+                export::VERTEX_KIND_LABELS.join(", ")
+            )
+        })
+    })
+    .transpose()
 }
 
 fn dead(

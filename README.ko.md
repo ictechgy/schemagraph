@@ -89,6 +89,7 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 | `scan <url>` | 카탈로그를 수집해 의존성 그래프를 만듭니다. |
 | `scan --document <path>` | JSON 또는 NDJSON catalog document에서 그래프를 만듭니다. |
 | `graph --format mermaid\|json\|dot\|html` | 그래프를 렌더링합니다. `--level schema\|object\|column`으로 단위를 선택합니다. |
+| `search <pattern>` | 대소문자를 구분하지 않는 이름 부분 일치나 `*`/`?` 글롭으로 정점을 찾습니다. `--detail summary`는 종류와 이웃 수를 더합니다. |
 | `query <name> --depth N` | 의존 대상과 의존자를 근거 간선과 함께 조회합니다. |
 | `impact <name>` | 변경의 영향을 받을 수 있는 의존자를 추적합니다. |
 | `cycles` | 의존성 순환과 자기루프를 보고합니다. |
@@ -100,7 +101,7 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 | `lint` | FK 인덱스 prefix와 미해결·모호한 참조 사실을 검사합니다. |
 | `merge <documents>…` | source ID별로 구분한 DB 카탈로그를 통합합니다. |
 | `facts --document <path>` | 카탈로그 선언을 isthmus persistence bridge-facts 문서(`relation-decl`, platform `sql`)로 보냅니다. |
-| `serve` | 미리 읽은 그래프 하나를 조회하는 MCP 도구를 제공합니다. |
+| `serve` | 미리 읽은 그래프 하나를 조회하는 MCP 도구와 리소스를 제공합니다. |
 | `stats` | 수집된 사용 통계와 수집 범위를 보여줍니다. |
 | `rules --config <path>` | TOML 규칙으로 의존 간선을 검사합니다. |
 | `diff <old> <new>` | 그래프 스냅샷 두 개 또는 JSON/NDJSON catalog document 두 개를 비교합니다. |
