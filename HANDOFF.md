@@ -4,28 +4,36 @@ _최종 갱신: 2026-09-25 KST · Claude_
 
 ## 목표
 
-v0.5.0 공개 배포·설치 검증을 마쳤다. 이후 `facts` 명령(#18)에 실DB·isthmus 검증을 붙였고,
-그 과정에서 찾은 PG materialized view 수집 결함을 고쳐 main에 머지했다(#20). **아직 배포하지 않았다.**
+`facts` 명령(#18)에 실DB·isthmus 검증을 붙이고, 그 과정에서 찾은 PG materialized view 수집 결함을
+고쳐(#20) **v0.5.1로 공개 배포·설치 검증까지 완료**했다. 남은 승인 작업은 없다.
 
 ## 현재 상태
 
 - 프로젝트: `/Users/jinhongan/Desktop/schemagraph`.
-- 공개 버전: [v0.5.0](https://github.com/ictechgy/schemagraph/releases/tag/v0.5.0).
-  태그·배포 소스·6개 crate의 내장 커밋은 `94d1db89a563549e6df697b7ca27933624305a18`.
-- 확인한 main: `e5795c0` (2026-09-25, #20 머지 커밋).
-  v0.5.0 태그 이후 **미배포 변경**이 머지돼 있다:
+- 공개 버전: [v0.5.1](https://github.com/ictechgy/schemagraph/releases/tag/v0.5.1) (2026-09-25).
+  태그·배포 소스·6개 crate·Go 바이너리의 내장 커밋은 `fce98ec61dacabb99fa9e626cc17760771eb0554`
+  ([PR #22](https://github.com/ictechgy/schemagraph/pull/22) 머지 커밋). 이전 v0.5.0(`94d1db8`)은 보존했다.
+- v0.5.0 이후 v0.5.1에 포함된 변경:
   - [PR #17](https://github.com/ictechgy/schemagraph/pull/17): README 마스코트 아이콘(`icon.png`).
   - [PR #18](https://github.com/ictechgy/schemagraph/pull/18): `facts --document` 명령.
     카탈로그의 table/view/materialized-view와 컬럼을 isthmus bridge-facts v1
     `relation-decl`로 내보낸다(`engine/source/src/bridge_facts.rs`). 계약 정본은
-    `../isthmus/docs/GRAPH-EXCHANGE.md`이며, 공개 설치본에는 아직 없다.
+    `../isthmus/docs/GRAPH-EXCHANGE.md`다.
   - [PR #19](https://github.com/ictechgy/schemagraph/pull/19): 이 HANDOFF 정리.
   - [PR #20](https://github.com/ictechgy/schemagraph/pull/20): 아래 "facts 검증과 MV 수정" 참고.
 - isthmus 쪽 명령 표기 수정([isthmus#113](https://github.com/ictechgy/isthmus/pull/113),
   `facts --graph` → `facts --document`)도 머지됐다.
-- 승인된 구현에 미완료 항목은 없다. **v0.5.1 패치 릴리스 여부가 사용자 결정 대기**다.
+- 승인된 구현·배포에 미완료 항목이나 알려진 blocker는 없다. 다음 제품 과제는 미정이다.
 
 ## 완료한 일
+
+- **v0.5.1 배포** ([PR #22](https://github.com/ictechgy/schemagraph/pull/22) → 태그 `v0.5.1`):
+  [crates.io](https://crates.io/crates/schemagraph-cli/0.5.1) 6개 crate, GitHub Linux x86_64/macOS arm64
+  CLI·Go·JDBC JAR([릴리스 빌드](https://github.com/ictechgy/schemagraph/actions/runs/36078769834)),
+  [Pages Maven](https://github.com/ictechgy/schemagraph/actions/runs/36079124114),
+  [Maven Central](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.5.1)
+  ([실행](https://github.com/ictechgy/schemagraph/actions/runs/36079380750), deployment
+  `3599605e-7a80-4660-a464-e9d750831def` **PUBLISHED**). 릴리스 본문은 RELEASE-NOTES 0.5.1 항목이다.
 
 - [PR #14](https://github.com/ictechgy/schemagraph/pull/14): 정책·기준선·만료 예외·SARIF/Action,
   정적 DML 컬럼 계보·임시 심벌, dbt/query-log import, 제한 권한 PG 수집,
@@ -39,7 +47,7 @@ v0.5.0 공개 배포·설치 검증을 마쳤다. 이후 `facts` 명령(#18)에 
   [Maven Central](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.5.0)을 게시했다.
   Central deployment `8d7ddc68-e0ac-4d8c-a06c-bdf65bbb51b0`는 **PUBLISHED**다.
 
-## facts 검증과 MV 수정 (#20, 2026-09-25)
+## facts 검증과 MV 수정 (#20, 2026-09-25 · v0.5.1로 배포)
 
 - **결함 (v0.5.0 공개본에도 있음):** native·Go 수집기가 PG materialized view 컬럼을 비워 두었다.
   공유 가시성 검사(`sql/visibility-postgres.sql`)는 MV 컬럼을 세므로, MV가 있는 DB는 소유자 scan에서도
@@ -71,6 +79,10 @@ v0.5.0 공개 배포·설치 검증을 마쳤다. 이후 `facts` 명령(#18)에 
 
 로컬 근거 루트는 `~/Library/Application Support/schemagraph/verification/`이다.
 
+- `v0.5.1-20260925/`: `plan.json`(complete), `publish.log`, `public-crates.json`,
+  `installed-features/result.json`(registry 설치본 12개 검사), `public-verification.json`,
+  `registry-bridge-facts-isthmus.json`, 검증 스크립트 `verify-{crates,installed,public}.py`.
+  `registry-install/bin/schemagraph`는 crates.io에서 별도 설치한 0.5.1이다.
 - `v0.5.0-20260922/`: `plan.json`(complete), `release-source-ci.json`, `public-crates.json`,
   `installed-features/result.json`, `public-verification.json`, `central-publication.json`.
   `registry-install/bin/schemagraph`는 crates.io에서 별도로 설치해 검증한 0.5.0이다.
@@ -122,9 +134,8 @@ HANDOFF만 바뀌었는지 확인하는 검사를 통과했다. 런타임 검사
 
 ## Blocker와 열린 질문
 
-blocker 없음. **열린 질문: v0.5.1 패치 릴리스 여부.** MV 결함이 v0.5.0 공개본에 있고,
-미배포 `facts` 명령도 함께 나간다. 릴리스한다면 v0.5.0과 같은 절차(태그에서 Pages·Central 수동 게시,
-공개 설치본 검증)를 따른다. 다음 제품 작업도 미정이다.
+없음. v0.5.1 배포 완료 상태이며 추가 게시나 실패 CI 재실행이 남아 있지 않다. 다음 제품 작업은 미정이다.
+isthmus의 persistence 조인이 npm에 배포되면 CI의 `verify-bridge-facts.py`에 `--isthmus`를 붙일 수 있다.
 
 ## 효과가 있었던 방법
 
@@ -147,12 +158,14 @@ blocker 없음. **열린 질문: v0.5.1 패치 릴리스 여부.** MV 결함이 
 1. `git status --short`, `git branch --show-current`로 위 상태와 로컬 HANDOFF 변경을 확인한다.
 2. 다음 요청이 문서 반영이면 diff·문서 참조를 검증해 개발 브랜치에서 처리한다. 현재 배포는 반복하지 않는다.
 3. 새 기능 요청이면 해당 정본 문서와 코드부터 읽고 범위를 정한다. 기존 승인에 미완료 구현은 없다.
-4. v0.5.1 릴리스를 승인받으면 [RELEASE-NOTES.md](RELEASE-NOTES.md)·버전·설치 문서를 먼저 준비하고 v0.5.0 절차를 따른다.
+4. 다음 릴리스는 v0.5.1 절차를 따른다: 버전·문서 PR → CI → merge commit 머지 → 병합 커밋 main CI →
+   lightweight 태그 push(GitHub Release) → `cargo publish --workspace`(별도 target) → Pages → Central →
+   `verify-{crates,installed,public}.py`. 근거 스크립트는 `v0.5.1-20260925/`에 있다.
 
 ## 재개 프롬프트
 
 ```text
 /Users/jinhongan/Desktop/schemagraph에서 HANDOFF.md와 AGENTS.md를 읽어줘.
-v0.5.0 배포는 완료됐고, 이후 main에 facts 명령(#18)·PG MV 컬럼 수정(#20)이 미배포로 머지돼 있어.
+v0.5.1 배포·공개 설치 검증은 완료됐어.
 먼저 git 상태를 확인하고 로컬 변경을 보존한 뒤, 내가 추가로 요청하는 작업부터 이어가줘.
 ```
