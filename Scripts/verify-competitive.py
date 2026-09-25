@@ -687,7 +687,7 @@ def check_mcp_parity(engine: Path, graph_path: Path) -> None:
     if not expected["dead"].get("candidates"):
         fail(f"dead fixture has no candidates to compare: {expected['dead']}")
     names = [item["name"] for item in responses[-1]["result"]["tools"]]
-    if not {"search", "dead", "cycles", "lint", "stats", "unused"} <= set(names):
+    if names[-6:] != ["search", "dead", "cycles", "lint", "stats", "unused"]:
         fail(f"MCP tools/list lacks the discovery tools: {names}")
     check_mcp_retention(engine, graph_path, expected["dead"])
     check_mcp_resources(engine, graph_path)

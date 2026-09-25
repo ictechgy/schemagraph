@@ -34,13 +34,18 @@ CREATE INDEX idle_parent ON idle (parent_id);
 CREATE TABLE ionly (id integer PRIMARY KEY, v integer);
 CREATE INDEX ionly_v ON ionly (v);
 CREATE TABLE writeonly (id integer PRIMARY KEY);
+CREATE TABLE queue (id integer PRIMARY KEY);
+CREATE TABLE events (id integer, at date) PARTITION BY RANGE (at);
+CREATE TABLE events_2026 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+CREATE INDEX events_at ON events (at);
 CREATE VIEW idle_view AS SELECT v FROM idle;
 INSERT INTO hot SELECT g, g FROM generate_series(1, 1000) g;
 INSERT INTO ionly SELECT g, g FROM generate_series(1, 1000) g;
 '''
 
 # 리셋 이후 실행하는 유일한 사용 — hot는 seq scan, hot_v·ionly_v는 인덱스 scan,
-# writeonly는 쓰기만 한다. idle과 그 인덱스는 건드리지 않는다.
+# writeonly는 쓰기만 한다. queue는 비어 있는 채로 스캔만 받고(튜플 0), events는
+# 파티션 부모라 스캔이 리프(events_2026)에 세어진다. idle과 그 인덱스는 건드리지 않는다.
 WORKLOAD = '''
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
@@ -49,6 +54,9 @@ SELECT id FROM hot WHERE v = 7;
 RESET enable_seqscan;
 SELECT count(*) FROM hot;
 INSERT INTO writeonly VALUES (1), (2);
+SELECT * FROM queue;
+SELECT * FROM queue;
+SELECT * FROM events;
 '''
 
 
@@ -60,6 +68,8 @@ def expected_candidates(fk_name):
         'public.idle.idle_v': {},
         'public.idle.idle_w': {'enforcesUniqueness': True},
         'public.idle.idle_parent': {'coversForeignKeys': [f'public.idle.{fk_name}']},
+        # 리프의 인덱스는 통계에 있고 seq scan만 받아 idx_scan 0이다.
+        'public.events_2026.events_2026_at_idx': {},
     }
 
 
@@ -93,6 +103,10 @@ def workload_stats(psql, env):
     index = dict(line.split('|') for line in rows.splitlines())
     # ionly는 index-only scan만 받아 테이블 읽기가 0이고 인덱스 scan은 양수여야 한다.
     assert int(tables['hot']) > 0 and int(tables['ionly']) == 0 and int(index['ionly_v']) > 0, (tables, index)
+    # queue는 튜플 0인데 스캔은 쌓였고, 파티션 부모 events는 모든 카운터가 0이다.
+    rows = ACCURACY.run(psql + ['-Atc', "SELECT relname, seq_tup_read, seq_scan FROM pg_stat_user_tables WHERE relname IN ('queue', 'events') ORDER BY 1"], env=env)
+    stats = {name: (int(read), int(scan)) for name, read, scan in (line.split('|') for line in rows.splitlines())}
+    assert stats['queue'][0] == 0 and stats['queue'][1] > 0 and stats['events'] == (0, 0), stats
 
 
 def producer_graph(engine, url, work, env, go_probe, jdbc_jar, java, name):
@@ -142,6 +156,8 @@ def postgres_case(engine, bindir, work, go_probe, jdbc_jar, java):
         results = {}
         report = unused(engine, graph, env, expected_exit=1, strict=True)
         check_candidates('native', report, wanted)
+        # 파티션 부모 events와 그 파티션 인덱스는 통계가 없어 미관측이다.
+        assert report['unobserved'] == {'tables': 1, 'indexes': 1}, report['unobserved']
         results['native'] = len(report['candidates'])
         if go_probe:
             report = unused(engine, producer_graph(engine, url, work, env, go_probe, jdbc_jar, java, 'go'), env)
@@ -152,7 +168,29 @@ def postgres_case(engine, bindir, work, go_probe, jdbc_jar, java):
             report = unused(engine, producer_graph(engine, url, work, env, go_probe, jdbc_jar, java, 'jdbc'), env)
             check_candidates('jdbc', report, wanted | unscanned_primary_keys(psql, env))
             results['jdbc'] = len(report['candidates'])
+        results['track_counts_off'] = counters_disabled_case(engine, url, psql, work, env, go_probe, jdbc_jar, java)
         return results
+
+
+def counters_disabled_case(engine, url, psql, work, env, go_probe, jdbc_jar, java):
+    """track_counts=off면 0행은 관측이 아니므로 모든 수집기에서 후보 없이 미관측이고 limitation이 붙는다."""
+    admin = list(psql)
+    admin[admin.index('-U') + 1], admin[admin.index('-d') + 1] = 'postgres', 'postgres'
+    ACCURACY.run(admin + ['-qc', 'ALTER DATABASE corpus SET track_counts = off'], env=env)
+    (work / 'off').mkdir(exist_ok=True)
+    graphs = {'native': work / 'counters-off.graph.json'}
+    ACCURACY.run([engine, 'scan', url, '--schema', 'public', '-o', graphs['native']], env=env)
+    for name, enabled in (('go', go_probe), ('jdbc', jdbc_jar)):
+        if enabled:
+            graphs[name] = producer_graph(engine, url, work / 'off', env, go_probe, jdbc_jar, java, name)
+    observed = {}
+    for name, graph in graphs.items():
+        report = unused(engine, graph, env)
+        assert report['candidates'] == [], {name: report['candidates']}
+        assert any('track_counts=off' in note for note in report['limitations']), {name: report['limitations']}
+        assert report['unobserved']['tables'] >= 6, {name: report['unobserved']}
+        observed[name] = report['unobserved']
+    return observed
 
 
 def sqlite_case(engine, work):

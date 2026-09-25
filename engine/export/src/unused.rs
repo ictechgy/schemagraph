@@ -1,7 +1,7 @@
 //! 미사용 후보 보고서를 에이전트 출력 계약의 JSON으로 만든다.
 
-use crate::UsageDoc;
 use schemagraph_analysis::unused::{UnusedCandidate, UnusedReport};
+use schemagraph_core::Usage;
 
 /// 보고서를 JSON 값으로 만든다. 거짓·빈 사실은 키를 생략한다.
 ///
@@ -20,27 +20,32 @@ pub fn to_value(report: &UnusedReport, limitations: &[String]) -> serde_json::Va
     })
 }
 
-/// 후보 한 건 — usage는 since 생략 계약을 지키도록 UsageDoc으로 직렬화한다.
+/// 사용 카운터 — 없는 선택 값은 키를 생략한다(since가 없으면 창을 모른다는 뜻).
+fn usage_value(usage: &Usage) -> serde_json::Value {
+    let mut value = serde_json::json!({"reads": usage.reads, "writes": usage.writes});
+    if let Some(since) = &usage.since {
+        value["since"] = serde_json::json!(since);
+    }
+    if let Some(scans) = usage.scans {
+        value["scans"] = serde_json::json!(scans);
+    }
+    value
+}
+
+/// 후보 한 건.
 fn candidate(candidate: &UnusedCandidate) -> serde_json::Value {
-    let usage = candidate.usage;
     let mut value = serde_json::json!({
         "id": candidate.vertex.id.as_str(),
         "kind": super::vertex_kind_str(candidate.vertex.kind),
-        "usage": serde_json::to_value(UsageDoc {
-            since: usage.since.clone(),
-            reads: usage.reads,
-            writes: usage.writes,
-            scans: usage.scans,
-            total_ms: usage.total_ms,
-            self_ms: usage.self_ms,
-        })
-        .unwrap_or(serde_json::Value::Null),
+        "usage": usage_value(candidate.usage),
     });
     let flags = [
         ("enforcesUniqueness", candidate.enforces_uniqueness),
         ("backsConstraint", candidate.backs_constraint),
+        ("metadataUnavailable", candidate.metadata_unavailable),
         ("indexWithoutUsage", candidate.index_without_usage),
-        ("windowUnknown", usage.since.is_none()),
+        ("scanCountUnavailable", candidate.scan_count_unavailable),
+        ("windowUnknown", candidate.usage.since.is_none()),
     ];
     for (key, present) in flags {
         if present {

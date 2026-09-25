@@ -82,21 +82,30 @@ schemagraph unused --graph graph.json
 
 `unused` looks at collected usage counters instead of reachability. It reports
 tables and indexes whose read counter is zero since `usage.since` (the
-statistics reset or server start). A table is not reported when any of its
-indexes was read, because index-only scans do not count as table reads. Objects
-without a usage record are counted under `unobserved`, never as candidates.
+statistics reset or server start). Table `reads` count tuples, so a table is
+also required to have no recorded scans (`usage.scans`): a queue polled while
+empty reads zero tuples but accumulates scans. A table is not reported when any
+of its indexes was read, because index-only scans do not count as table reads.
+Objects without a usage record are counted under `unobserved`, never as
+candidates.
 
 Each candidate carries the facts that weaken a removal reading when they apply:
-`enforcesUniqueness`, `backsConstraint`, `coversForeignKeys`, `bodyDependents`
-(SQL bodies that reference the table), `indexWithoutUsage` (index-only reads
-cannot be ruled out), and `windowUnknown`. Writes stay visible in `usage`. The
+`enforcesUniqueness`, `backsConstraint` (a PK/UNIQUE-style constraint of the same
+name), `coversForeignKeys` (only for unfiltered, complete indexes),
+`metadataUnavailable` (index facts could not be checked), `bodyDependents` (SQL
+bodies outside the table that reference it), `indexWithoutUsage` (index-only
+reads cannot be ruled out), `scanCountUnavailable` (the collector did not record
+scans), and `windowUnknown`. Writes stay visible in `usage`. The
 counters only cover their window and never include use by other databases,
 replicas, or periods before a reset. `--strict` exits 1 when any candidate
 exists.
 
 Coverage depends on the collector. PostgreSQL provides table and index counters
-(`pg_stat_user_*`); this path is verified against a real workload, including the
-index-only-scan case. MySQL/MariaDB provide table counters and record only the
+(`pg_stat_user_*`) plus table scans, skips partitioned parents (their scans are
+counted on the leaf partitions), and records no table/index usage when
+`track_counts` is off, reporting a limitation instead. The native, Go, and JDBC
+PostgreSQL collectors are verified against a real workload, including polled
+empty tables, index-only scans, partitions, and disabled counters. MySQL/MariaDB provide table counters and record only the
 indexes that `sys.schema_unused_indexes` lists, so indexes that were used stay
 unobserved and their tables carry `indexWithoutUsage`. SQLite has no counters,
 so everything is unobserved.

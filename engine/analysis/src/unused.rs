@@ -6,8 +6,9 @@
 //! 싣고, 삭제 가능 여부는 말하지 않는다. 사용 기록이 없는 객체는 "관측된 0"과
 //! 다르므로 후보가 아니라 미관측으로 센다.
 
-use schemagraph_core::{Graph, SchemaMetadata, Usage, Vertex, VertexId, VertexKind};
-use std::collections::BTreeSet;
+use crate::schema_lint::backs_constraint;
+use schemagraph_core::{EdgeKind, Graph, SchemaMetadata, Usage, Vertex, VertexId, VertexKind};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 후보 하나와 판정을 흔드는 관찰 사실.
 #[derive(Debug, Clone, PartialEq)]
@@ -18,14 +19,18 @@ pub struct UnusedCandidate<'a> {
     pub usage: &'a Usage,
     /// 유일 인덱스라 읽히지 않아도 제약을 강제할 수 있다.
     pub enforces_uniqueness: bool,
-    /// 같은 이름의 제약을 받치는 인덱스다.
+    /// 같은 이름의 PK·UNIQUE 계열 제약을 받치는 인덱스다.
     pub backs_constraint: bool,
-    /// 이 인덱스가 키 prefix로 덮는 FK 제약.
+    /// 조건 없고 완전한 이 인덱스가 키 prefix로 덮는 FK 제약.
     pub covers_foreign_keys: Vec<VertexId>,
-    /// 이 테이블을 참조하는 SQL 몸체(뷰·루틴·질의) 정점 수.
+    /// 인덱스 메타데이터가 없어 위 세 사실을 판정하지 못했다("해당 없음"이 아니다).
+    pub metadata_unavailable: bool,
+    /// 이 테이블을 참조하는 SQL 몸체 정점 수(테이블 자신의 트리거·멤버는 제외).
     pub body_dependents: usize,
     /// 이 테이블의 인덱스 중 사용 기록이 없는 것이 있다 — index-only 읽기를 배제하지 못한다.
     pub index_without_usage: bool,
+    /// 스캔 횟수를 수집하지 않은 테이블이다 — 늘 비어 있는 채로 폴링되는 테이블도 읽기 0으로 보인다.
+    pub scan_count_unavailable: bool,
 }
 
 /// 미관측 객체 수 — 사용 기록이 없어 판정 대상에서 뺀 테이블·인덱스.
@@ -51,110 +56,127 @@ pub struct UnusedReport<'a> {
 }
 
 /// 읽힌 기록이 없는 테이블·인덱스를 id 순으로 최대 `max`개 보고한다.
+///
+/// 후보 여부는 모든 객체에 대해 싸게 판정하고, 사실은 담을 후보에만 붙인다.
 pub fn unused(graph: &Graph, max: usize) -> UnusedReport<'_> {
-    let mut report = UnusedReport {
-        candidates: Vec::new(),
-        total: 0,
-        truncated: false,
-        unobserved: Unobserved::default(),
-    };
+    let mut unobserved = Unobserved::default();
+    let mut selected = Vec::new();
     let targets = graph
         .vertices()
         .filter(|vertex| matches!(vertex.kind, VertexKind::Table | VertexKind::Index));
     for vertex in targets {
-        let Some(usage) = graph.usage(&vertex.id) else {
-            count_unobserved(&mut report.unobserved, vertex.kind);
-            continue;
-        };
-        if let Some(candidate) = candidate(graph, vertex, usage) {
-            report.total += 1;
-            if report.candidates.len() < max {
-                report.candidates.push(candidate);
-            }
+        match graph.usage(&vertex.id) {
+            None if vertex.kind == VertexKind::Table => unobserved.tables += 1,
+            None => unobserved.indexes += 1,
+            Some(usage) if is_candidate(graph, vertex, usage) => selected.push((vertex, usage)),
+            Some(_) => {}
         }
     }
-    report.truncated = report.total > report.candidates.len();
-    report
-}
-
-/// 사용 기록이 없는 객체를 종류별로 센다.
-fn count_unobserved(unobserved: &mut Unobserved, kind: VertexKind) {
-    match kind {
-        VertexKind::Table => unobserved.tables += 1,
-        _ => unobserved.indexes += 1,
+    let total = selected.len();
+    let covering = foreign_keys_by_table(graph.schema_metadata());
+    let candidates: Vec<_> = selected
+        .into_iter()
+        .take(max)
+        .map(|(vertex, usage)| describe(graph, &covering, vertex, usage))
+        .collect();
+    UnusedReport {
+        truncated: total > candidates.len(),
+        candidates,
+        total,
+        unobserved,
     }
 }
 
-/// 읽기 0인 객체를 후보로 만든다. 인덱스로 읽힌 테이블은 후보가 아니다.
-fn candidate<'a>(
+/// 읽기 0인지 판정한다. 테이블은 스캔이 있었거나 인덱스가 읽혔으면 후보가 아니다 —
+/// 튜플 수인 reads는 빈 테이블 폴링과 index-only scan을 세지 못한다.
+fn is_candidate(graph: &Graph, vertex: &Vertex, usage: &Usage) -> bool {
+    if usage.reads > 0 {
+        return false;
+    }
+    if vertex.kind != VertexKind::Table {
+        return true;
+    }
+    if usage.scans.is_some_and(|scans| scans > 0) {
+        return false;
+    }
+    !table_indexes(graph, &vertex.id)
+        .iter()
+        .any(|index| graph.usage(index).is_some_and(|u| u.reads > 0))
+}
+
+/// 후보에 삭제 해석을 흔드는 사실을 붙인다.
+fn describe<'a>(
     graph: &'a Graph,
+    covering: &BTreeMap<&VertexId, Vec<(&VertexId, &[VertexId])>>,
     vertex: &'a Vertex,
     usage: &'a Usage,
-) -> Option<UnusedCandidate<'a>> {
-    if usage.reads > 0 {
-        return None;
-    }
+) -> UnusedCandidate<'a> {
     let mut candidate = UnusedCandidate {
         vertex,
         usage,
         enforces_uniqueness: false,
         backs_constraint: false,
         covers_foreign_keys: Vec::new(),
+        metadata_unavailable: false,
         body_dependents: 0,
         index_without_usage: false,
+        scan_count_unavailable: false,
     };
     if vertex.kind == VertexKind::Table {
-        // index-only scan은 테이블 튜플을 가져오지 않아 테이블 읽기 카운터에 잡히지 않는다.
         let indexes = table_indexes(graph, &vertex.id);
-        if indexes
-            .iter()
-            .any(|index| graph.usage(index).is_some_and(|u| u.reads > 0))
-        {
-            return None;
-        }
         candidate.index_without_usage = indexes.iter().any(|index| graph.usage(index).is_none());
+        candidate.scan_count_unavailable = usage.scans.is_none();
         candidate.body_dependents = body_dependents(graph, &vertex.id);
     } else {
-        describe_index(graph, vertex, &mut candidate);
+        describe_index(graph, covering, vertex, &mut candidate);
     }
-    Some(candidate)
+    candidate
+}
+
+/// 테이블이 `contains`로 소유한 정점(테이블 자신 포함).
+fn owned(graph: &Graph, table: &VertexId) -> BTreeSet<VertexId> {
+    std::iter::once(table.clone())
+        .chain(
+            graph
+                .outgoing(table)
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::Contains)
+                .map(|edge| edge.to.clone()),
+        )
+        .collect()
 }
 
 /// 테이블이 소유한 인덱스 정점.
 fn table_indexes(graph: &Graph, table: &VertexId) -> Vec<VertexId> {
-    graph
-        .outgoing(table)
-        .iter()
-        .filter(|edge| {
+    owned(graph, table)
+        .into_iter()
+        .filter(|id| {
             graph
-                .vertex(&edge.to)
+                .vertex(id)
                 .is_some_and(|v| v.kind == VertexKind::Index)
         })
-        .map(|edge| edge.to.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect()
 }
 
-/// 테이블 또는 그 컬럼을 의존 간선으로 참조하는 SQL 몸체 정점 수.
+/// 테이블 또는 그 멤버를 의존 간선으로 참조하는 SQL 몸체 정점 수.
+/// 테이블이 소유한 정점(자기 트리거 등)은 세지 않는다 — 외부 참조만 삭제 해석을 흔든다.
 fn body_dependents(graph: &Graph, table: &VertexId) -> usize {
+    let owned = owned(graph, table);
     let is_body = |id: &VertexId| {
-        graph.vertex(id).is_some_and(|v| {
-            matches!(
-                v.kind,
-                VertexKind::View
-                    | VertexKind::MaterializedView
-                    | VertexKind::Function
-                    | VertexKind::Procedure
-                    | VertexKind::Package
-                    | VertexKind::Query
-                    | VertexKind::Trigger
-            )
-        })
+        !owned.contains(id)
+            && graph.vertex(id).is_some_and(|v| {
+                matches!(
+                    v.kind,
+                    VertexKind::View
+                        | VertexKind::MaterializedView
+                        | VertexKind::Function
+                        | VertexKind::Procedure
+                        | VertexKind::Package
+                        | VertexKind::Query
+                        | VertexKind::Trigger
+                )
+            })
     };
-    let owned: Vec<VertexId> = std::iter::once(table.clone())
-        .chain(graph.outgoing(table).iter().map(|edge| edge.to.clone()))
-        .collect();
     owned
         .iter()
         .flat_map(|id| graph.incoming(id))
@@ -164,37 +186,48 @@ fn body_dependents(graph: &Graph, table: &VertexId) -> usize {
         .len()
 }
 
-/// 인덱스 후보에 유일성·제약·FK 지원 사실을 붙인다.
-fn describe_index(graph: &Graph, vertex: &Vertex, candidate: &mut UnusedCandidate) {
-    let Some(metadata) = graph.schema_metadata() else {
-        return;
-    };
-    let Some(index) = metadata.indexes.get(&vertex.id) else {
+/// FK를 테이블별로 한 번 묶는다 — 인덱스마다 전체 FK를 훑지 않기 위해서다.
+fn foreign_keys_by_table(
+    metadata: Option<&SchemaMetadata>,
+) -> BTreeMap<&VertexId, Vec<(&VertexId, &[VertexId])>> {
+    let mut by_table = BTreeMap::<&VertexId, Vec<(&VertexId, &[VertexId])>>::new();
+    for (id, fk) in metadata.map(|m| &m.foreign_keys).into_iter().flatten() {
+        if !fk.columns.is_empty() {
+            by_table
+                .entry(&fk.table)
+                .or_default()
+                .push((id, &fk.columns));
+        }
+    }
+    by_table
+}
+
+/// 인덱스 후보에 유일성·제약·FK 지원 사실을 붙인다. 메타데이터가 없으면 모른다고 표시한다.
+fn describe_index(
+    graph: &Graph,
+    covering: &BTreeMap<&VertexId, Vec<(&VertexId, &[VertexId])>>,
+    vertex: &Vertex,
+    candidate: &mut UnusedCandidate,
+) {
+    let Some(index) = graph
+        .schema_metadata()
+        .and_then(|metadata| metadata.indexes.get(&vertex.id))
+    else {
+        candidate.metadata_unavailable = true;
         return;
     };
     candidate.enforces_uniqueness = index.unique;
-    candidate.backs_constraint = graph.outgoing(&index.table).iter().any(|edge| {
-        graph
-            .vertex(&edge.to)
-            .is_some_and(|v| v.kind == VertexKind::Constraint && v.name == vertex.name)
-    });
-    candidate.covers_foreign_keys = covered_foreign_keys(metadata, &index.table, &index.columns);
-}
-
-/// 인덱스 키가 prefix로 덮는 같은 테이블의 FK 제약.
-fn covered_foreign_keys(
-    metadata: &SchemaMetadata,
-    table: &VertexId,
-    columns: &[VertexId],
-) -> Vec<VertexId> {
-    metadata
-        .foreign_keys
-        .iter()
-        .filter(|(_, fk)| {
-            &fk.table == table && !fk.columns.is_empty() && columns.starts_with(&fk.columns)
-        })
-        .map(|(id, _)| id.clone())
-        .collect()
+    candidate.backs_constraint = backs_constraint(graph, &index.table, &vertex.id);
+    // 조건부·불완전 인덱스는 FK 검사를 덮는다고 말할 수 없다 — lint와 같은 기준이다.
+    if index.complete && !index.has_predicate {
+        candidate.covers_foreign_keys = covering
+            .get(&index.table)
+            .into_iter()
+            .flatten()
+            .filter(|(_, columns)| index.columns.starts_with(columns))
+            .map(|(id, _)| (*id).clone())
+            .collect();
+    }
 }
 
 #[cfg(test)]
@@ -351,5 +384,80 @@ mod tests {
             (report.candidates.len(), report.total, report.truncated),
             (1, 3, true)
         );
+    }
+
+    /// 늘 비어 있는 채 폴링되는 테이블은 튜플 0이어도 스캔이 쌓이므로 후보가 아니다.
+    #[test]
+    fn scanned_empty_table_is_not_a_candidate_and_missing_scans_are_flagged() {
+        let mut graph = fixture();
+        let mut polled = usage(0, 0);
+        polled.scans = Some(5);
+        graph.set_usage(id("s.idle"), polled);
+        assert!(!ids(&unused(&graph, 10)).contains(&"s.idle".to_owned()));
+        let mut unknown = usage(0, 0);
+        unknown.scans = None;
+        graph.set_usage(id("s.idle"), unknown);
+        let report = unused(&graph, 10);
+        let table = report
+            .candidates
+            .iter()
+            .find(|c| c.vertex.id.as_str() == "s.idle")
+            .unwrap();
+        assert!(table.scan_count_unavailable);
+    }
+
+    /// FK 대상 테이블을 읽는 뷰와 테이블 자신의 트리거는 이 테이블의 SQL 참조가 아니다.
+    #[test]
+    fn body_dependents_ignore_fk_targets_and_own_triggers() {
+        let mut graph = fixture();
+        for (raw, kind) in [
+            ("s.child", VertexKind::Table),
+            ("s.child.audit", VertexKind::Trigger),
+            ("s.read_report", VertexKind::View),
+        ] {
+            graph.add_vertex(Vertex {
+                id: id(raw),
+                kind,
+                name: raw.rsplit('.').next().unwrap().into(),
+                schema: "s".into(),
+            });
+        }
+        graph.add_edge(edge("s.child", "s.read", EdgeKind::References));
+        graph.add_edge(edge("s.read_report", "s.read", EdgeKind::Reads));
+        graph.add_edge(edge("s.child", "s.child.audit", EdgeKind::Contains));
+        graph.add_edge(edge("s.child.audit", "s.child", EdgeKind::Fires));
+        graph.set_usage(id("s.child"), usage(0, 0));
+        let report = unused(&graph, 10);
+        let child = report
+            .candidates
+            .iter()
+            .find(|c| c.vertex.id.as_str() == "s.child")
+            .unwrap();
+        assert_eq!(child.body_dependents, 0);
+    }
+
+    /// 조건부 인덱스는 FK를 덮는다고 말하지 않고, 메타데이터가 없으면 모른다고 표시한다.
+    #[test]
+    fn partial_index_does_not_cover_fk_and_missing_metadata_is_explicit() {
+        let mut graph = fixture();
+        let mut metadata = graph.schema_metadata().unwrap().clone();
+        metadata
+            .indexes
+            .get_mut(&id("s.idle.idle_u"))
+            .unwrap()
+            .has_predicate = true;
+        metadata.indexes.remove(&id("s.idle.idle_v"));
+        graph.set_schema_metadata(metadata);
+        let report = unused(&graph, 10);
+        let by_id = |raw: &str| {
+            report
+                .candidates
+                .iter()
+                .find(|c| c.vertex.id.as_str() == raw)
+                .unwrap()
+        };
+        assert!(by_id("s.idle.idle_u").covers_foreign_keys.is_empty());
+        let unknown = by_id("s.idle.idle_v");
+        assert!(unknown.metadata_unavailable && !unknown.enforces_uniqueness);
     }
 }
