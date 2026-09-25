@@ -4,8 +4,8 @@ _최종 갱신: 2026-09-25 KST · Claude_
 
 ## 목표
 
-`facts` 명령(#18)에 실DB·isthmus 검증을 붙이고, 그 과정에서 찾은 PG materialized view 수집 결함을
-고쳐(#20) **v0.5.1로 공개 배포·설치 검증까지 완료**했다. 남은 승인 작업은 없다.
+v0.5.1 배포 이후, 경쟁 재조사(2026-09-25)에서 정한 보강 네 가지를 구현·리뷰·머지했다(#24~#27).
+**main에는 있지만 아직 배포하지 않았다.** 다음 릴리스 여부는 사용자 결정 대기다.
 
 ## 현재 상태
 
@@ -23,7 +23,19 @@ _최종 갱신: 2026-09-25 KST · Claude_
   - [PR #20](https://github.com/ictechgy/schemagraph/pull/20): 아래 "facts 검증과 MV 수정" 참고.
 - isthmus 쪽 명령 표기 수정([isthmus#113](https://github.com/ictechgy/isthmus/pull/113),
   `facts --graph` → `facts --document`)도 머지됐다.
-- 승인된 구현·배포에 미완료 항목이나 알려진 blocker는 없다. 다음 제품 과제는 미정이다.
+- 확인한 main: `2e940be`(#27 머지). v0.5.1 이후 **미배포 변경**(각 PR에 리뷰 처리 내역 코멘트가 있다):
+  - [#24](https://github.com/ictechgy/schemagraph/pull/24): `search`(점진 공개)와 MCP `search`·`dead`·`cycles`·
+    `lint`·`stats`·스냅샷 resources. `serve`는 명시한 `--config/--retain/--as-of`만 읽는다.
+  - [#25](https://github.com/ictechgy/schemagraph/pull/25): lint `fk-type-mismatch`(blocking)·
+    `table-without-primary-key`·`duplicate-index`(둘 다 advisory, `blockingCount`로 strict 판정),
+    PG native·Go의 `pk_position` 미수집 결함 수정과 엔진 보정, `schema_metadata.catalog_complete`.
+  - [#26](https://github.com/ictechgy/schemagraph/pull/26): `unused`, `usage.scans`(테이블 스캔 수 — 빈 채로
+    폴링되는 테이블 판별), 파티션 부모 usage 제외, `track_counts=off`면 테이블·인덱스 usage 미수집.
+  - [#27](https://github.com/ictechgy/schemagraph/pull/27): `openlineage`(RunEvent 2-0-2). INDIRECT는 뷰의
+    JOIN·FILTER만, 부분 분석은 `schemagraphAnalysis` job facet, 공식 스키마는 `schemas/openlineage`에 고정.
+- 새 CI 단계: `verify-schema-lint.py`, `verify-unused.py`, `verify-openlineage.py`(모두 실제 PG, 앞의 둘은
+  native·Go·JDBC). 수집기 변경으로 JDBC JAR·Go 프로브도 달라졌다.
+- 로컬 Colima는 이번 fixture 검증을 위해 켰다가 작업 종료 시 다시 껐다(원래 꺼져 있었다).
 
 ## 완료한 일
 
@@ -134,7 +146,9 @@ HANDOFF만 바뀌었는지 확인하는 검사를 통과했다. 런타임 검사
 
 ## Blocker와 열린 질문
 
-없음. v0.5.1 배포 완료 상태이며 추가 게시나 실패 CI 재실행이 남아 있지 않다. 다음 제품 작업은 미정이다.
+blocker 없음. **열린 질문: #24~#27을 담은 다음 릴리스.** 새 명령·공개 Rust API·카탈로그/그래프
+선택 필드(`catalog_complete`, `usage.scans`)가 추가됐으므로 0.6.0(minor)이 맞아 보인다(판단, 미확정).
+남은 경쟁 공백과 하지 않을 것은 [COMPETITIVE-ANALYSIS.md](COMPETITIVE-ANALYSIS.md)의 2026-09-25 절에 있다.
 isthmus의 persistence 조인이 npm에 배포되면 CI의 `verify-bridge-facts.py`에 `--isthmus`를 붙일 수 있다.
 
 ## 효과가 있었던 방법
@@ -158,6 +172,7 @@ isthmus의 persistence 조인이 npm에 배포되면 CI의 `verify-bridge-facts.
 1. `git status --short`, `git branch --show-current`로 위 상태와 로컬 HANDOFF 변경을 확인한다.
 2. 다음 요청이 문서 반영이면 diff·문서 참조를 검증해 개발 브랜치에서 처리한다. 현재 배포는 반복하지 않는다.
 3. 새 기능 요청이면 해당 정본 문서와 코드부터 읽고 범위를 정한다. 기존 승인에 미완료 구현은 없다.
+   수집기(native·Go·JDBC)를 바꾸면 PG fixture golden과 세 수집기 검증(`verify-collection-scope.py` 등)을 함께 돌린다.
 4. 다음 릴리스는 v0.5.1 절차를 따른다: 버전·문서 PR → CI → merge commit 머지 → 병합 커밋 main CI →
    lightweight 태그 push(GitHub Release) → `cargo publish --workspace`(별도 target) → Pages → Central →
    `verify-{crates,installed,public}.py`. 근거 스크립트는 `v0.5.1-20260925/`에 있다.
@@ -166,6 +181,6 @@ isthmus의 persistence 조인이 npm에 배포되면 CI의 `verify-bridge-facts.
 
 ```text
 /Users/jinhongan/Desktop/schemagraph에서 HANDOFF.md와 AGENTS.md를 읽어줘.
-v0.5.1 배포·공개 설치 검증은 완료됐어.
+v0.5.1 배포 후 #24~#27(search·MCP 확장, lint 규칙, unused, openlineage)이 main에 미배포로 머지돼 있어.
 먼저 git 상태를 확인하고 로컬 변경을 보존한 뒤, 내가 추가로 요청하는 작업부터 이어가줘.
 ```

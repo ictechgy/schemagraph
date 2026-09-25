@@ -1,6 +1,8 @@
 # 경쟁 비교와 검증 중심 보강 계획
 
-확인일: 2026-09-22. 공개 기준 버전: **v0.4.3**.
+확인일: 2026-09-25(재조사). 공개 기준 버전: **v0.5.1**, 이후 main에 아래
+"2026-09-25 보강"이 미배포로 머지돼 있다. 2026-09-22(v0.4.3) 조사의 G1~G6은
+v0.5.0에서 완료됐고 아래 표는 이력으로 남긴다.
 아래 기능 비교는 공식 문서와 저장소 구현을 대조한 결과다. 경쟁 제품을 같은
 입력으로 실행한 정확도·속도 순위가 아니다. 에디션·권한·DB 버전에 따라 기능
 범위가 달라진다. 이전 v0.3.0 진단은 [v0.4.3 태그의 조사 문서](https://github.com/ictechgy/schemagraph/blob/v0.4.3/COMPETITIVE-ANALYSIS.md)에
@@ -31,6 +33,38 @@
 [Azimutt path](https://azimutt.app/docs/find-path),
 [SQL Dependency Tracker](https://www.red-gate.com/products/sql-dependency-tracker/).
 
+## 2026-09-25 재조사와 보강
+
+공식 문서·릴리스 노트로 확인한 시장 변화다(경쟁 제품을 같은 입력으로 실행한 비교가 아니다).
+
+- 컬럼 계보 export가 유료 기능으로 이동했다. Atlas는 컬럼 계보와
+  `atlas cloud repo lingraph`(node/edge JSON·OpenLineage, 2026-06-18)를 Cloud에서,
+  dbt는 컬럼 계보를 Enterprise 또는 dbt v2 strict 정적 분석에서 제공한다. dbt 문서는
+  "select만 반영하고 join·filter는 반영하지 않는다"고 명시한다
+  ([Atlas changelog](https://atlasgo.io/changelog/lineage-cli-export),
+  [dbt CLL](https://docs.getdbt.com/docs/explore/column-level-lineage)).
+- 에이전트용 DB MCP 서버(DBHub, Google MCP Toolbox, Supabase, Neon, SQLcl)는
+  목록·설명·SQL 실행 중심이고, 전이적 impact/path를 결정적 JSON으로 주는 곳은
+  확인하지 못했다. 점진 공개(DBHub `search_objects`)와 결정적 advisor(Supabase
+  splinter)가 공통 기대치가 됐다.
+- 미사용 인덱스·테이블 보고(PgHero, Supabase, PlanetScale)와 스키마 lint
+  (SchemaCrawler, Bytebase)는 기본 기대치다.
+
+이 조사로 main에 넣은 보강(모두 실제 DB 검증과 CI 단계 포함):
+
+| PR | 보강 | 경계 |
+| --- | --- | --- |
+| #24 | `search`(점진 공개), MCP `search`·`dead`·`cycles`·`lint`·`stats`, 스냅샷 resources | `serve`는 암묵적 정책 파일을 읽지 않고 `review`는 노출하지 않는다 |
+| #25 | lint `fk-type-mismatch`·`table-without-primary-key`·`duplicate-index`, PG `pk_position` 수집 결함 수정, `schema_metadata.catalog_complete` | PK 부재·중복 인덱스는 advisory(strict 실패 사유 아님), 중복 인덱스는 access method 미수집이라 항상 미확인 |
+| #26 | `unused`(통계 창 안 읽기 0), `usage.scans`, 파티션 부모 제외, `track_counts=off` 처리 | 관측이지 삭제 판정이 아니며, 카운터 없는 객체는 unobserved |
+| #27 | `openlineage`(RunEvent, 스키마·컬럼 계보 facet) | DIRECT subtype 없음, INDIRECT는 뷰의 JOIN·FILTER만, 부분 분석은 job facet |
+
+남은 공백(우선순위순): migration 파일의 lock·rewrite 위험과 의존 영향 결합
+(Squawk·Atlas·pgfence 대비), PR에서 컬럼 단위 변경 등급(Recce·parrant 대비),
+저장 스냅샷 대 라이브 scan drift 워크플로 포장, 웨어하우스 방언, 문서 사이트·ERD,
+권한 그래프, 중복 인덱스 확정을 위한 access method 수집. 라이브 SQL 실행·data diff·
+쓰기 MCP는 "엔진은 DB를 만지지 않는다" 원칙과 맞지 않아 하지 않는다.
+
 ## v0.4.3에서 이미 제공하는 것
 
 - 스키마·스코프 기반 view 컬럼 해석과 값 계보: CTE, wildcard, 파생 테이블,
@@ -47,10 +81,9 @@
 [PERFORMANCE.md](PERFORMANCE.md), [HANDOFF.md](HANDOFF.md)를 따른다.
 이 기능들을 다시 미구현 과제로 잡지 않는다.
 
-## 승인된 후속 작업과 완료 조건
+## 2026-09-22 승인 작업과 완료 조건 (v0.5.0에서 완료, 이력)
 
-사용자가 아래 후속 구현을 승인했다. 이 표는 작업 계약이며 완료 주장으로
-사용하지 않는다. 진행 상태와 실제 실행 근거는 HANDOFF에 기록한다.
+아래 G1~G6은 v0.5.0에서 구현·배포됐다. 당시의 작업 계약으로 남기며 현재 할 일이 아니다.
 
 | 단계 | 보강 범위 | 검증할 완료 조건 |
 | --- | --- | --- |
