@@ -101,7 +101,7 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 | `lint` | FK 인덱스 prefix와 선언 타입, PK 없는 테이블, 중복 인덱스 후보, 미해결·모호한 참조 사실을 검사합니다. |
 | `merge <documents>…` | source ID별로 구분한 DB 카탈로그를 통합합니다. |
 | `openlineage --namespace <uri>` | 컬럼 계보를 데이터 카탈로그용 OpenLineage RunEvent(NDJSON)로 내보냅니다. |
-| `facts --document <path>` | 카탈로그 선언을 isthmus persistence bridge-facts 문서(`relation-decl`, platform `sql`)로 보냅니다. |
+| `facts --document <path>` | 카탈로그 선언을 isthmus persistence bridge-facts 문서(`relation-decl`, platform `sql`)로 보냅니다. 각 `symbol.usr`는 그래프 정점 id입니다. |
 | `serve` | 미리 읽은 그래프 하나를 조회하는 MCP 도구와 리소스를 제공합니다. |
 | `unused` | 통계 창 시작 이후 읽힌 기록이 없는 테이블·인덱스를, 삭제 판단을 흔드는 사실과 함께 보고합니다. |
 | `stats` | 수집된 사용 통계와 수집 범위를 보여줍니다. |
@@ -200,6 +200,12 @@ schemagraph scan --document catalog.json -o graph.json
 - **부분 결과:** `query`, `impact`, `dead`는 결과 제한으로 잘리면 `truncated`를
   보고합니다. 탐색 예산이 있는 질의는 `complete`, 방문·검사 간선 수,
   `truncationReasons`도 보고하므로 `limitations`와 함께 확인해야 합니다.
+- **보고서 식별:** `query`와 `impact` JSON에는 `format`(`schemagraph-query`,
+  `schemagraph-impact`)과 `version`이 실려 있어 저장된 보고서를 읽기 전에 종류와
+  버전을 확인할 수 있습니다.
+- **전파 경로:** `query`와 `impact`의 이웃마다 subject에서 온 최단 경로의 직전
+  정점이 `via`로 실립니다. `via`를 거슬러 올라가면 그 객체에 닿은 이유를 복원할 수
+  있습니다.
 - **출력의 일관성:** 같은 입력 문서는 같은 그래프를 만듭니다. 실제 DB를 다시
   스캔하면 카탈로그와 사용 통계의 변화에 따라 출력이 달라질 수 있습니다.
 - **본문 분석 범위:** 뷰·트리거에서 테이블·컬럼 의존성을 추출합니다. SQL 루틴,

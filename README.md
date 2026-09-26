@@ -107,7 +107,7 @@ read that file by default; use `--graph <path>` to select another snapshot.
 | `lint` | Inspect FK index prefixes and declared types, missing primary keys, duplicate-index candidates, and unresolved/ambiguous references. |
 | `merge <documents>…` | Combine independently parsed DB catalogs under distinct source IDs. |
 | `openlineage --namespace <uri>` | Export column lineage as OpenLineage RunEvents (NDJSON) for data catalogs. |
-| `facts --document <path>` | Export catalog declarations as an isthmus persistence bridge-facts document (`relation-decl`, platform `sql`). |
+| `facts --document <path>` | Export catalog declarations as an isthmus persistence bridge-facts document (`relation-decl`, platform `sql`); each `symbol.usr` is the graph vertex id. |
 | `serve` | Expose read-only MCP tools and resources over one preloaded graph. |
 | `unused` | Report tables and indexes with zero observed reads since the statistics window began, with facts that weaken a removal reading. |
 | `stats` | List collected usage evidence and collection coverage. |
@@ -212,6 +212,12 @@ views, functions, procedures, and packages can be.
   results are cut short by a result limit. Check it alongside `limitations`
   before treating a result as complete. Budgeted traversals separately report
   `complete`, visited/edge counts, and `truncationReasons`.
+- **Report identity:** `query` and `impact` JSON carry `format`
+  (`schemagraph-query`, `schemagraph-impact`) and `version`, so saved reports
+  can be checked before they are read.
+- **Propagation paths:** each `query` and `impact` neighbor names its `via`
+  vertex, the one before it on a shortest path from the subject. Follow `via`
+  back to reconstruct why an object was reached.
 - **Stable output:** the same input document produces the same graph.
   Live scans can differ as catalog contents and usage statistics change.
 - **Body coverage:** views and triggers yield table and column dependencies.

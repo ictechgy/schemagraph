@@ -5,8 +5,8 @@
 //! 끝내고 `complete`를 false로 만든다. 따라서 예산이 소진된 보고서는
 //! "없다"를 증명하는 보고서로 소비하면 안 된다.
 
-use crate::Neighbor;
-use schemagraph_core::{Edge, EdgeKind, Graph, VertexId};
+use crate::{Neighbor, Reach};
+use schemagraph_core::{Edge, Graph, VertexId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -68,7 +68,9 @@ pub struct BudgetedReport {
 /// `contains`와 `inferred`를 포함한 비의존성 간선은 검사 대상에서 제외한다.
 /// 같은 이웃에 여러 경로가 닿으면 최단 거리를 유지하면서 그 이웃에
 /// 도착하는 모든 의존성 간선 종류를 모은다. 자기 간선은 이웃에서 제외해
-/// 기존 `query`의 `self_edges` 처리와 겹치지 않게 한다.
+/// 기존 `query`의 `self_edges` 처리와 겹치지 않게 한다. 이웃의 `via`는 같은
+/// 최단 거리의 부모 중 사전식 최소 id다. 예산 소진·취소로 끝난 탐색에서는
+/// 검사하지 못한 간선의 부모가 후보에서 빠지므로, 완료된 탐색의 via와 다를 수 있다.
 ///
 /// `max_results`는 출력만 제한한다. 이 값 때문에 탐색을 중단하지 않으며,
 /// 결과가 잘리면 `result-limit`을 기록해도 `complete`는 true로 남을 수 있다.
@@ -99,9 +101,9 @@ pub fn walk(
         return report(Vec::new(), 0, 0, reasons, false, true);
     }
 
-    let mut seen: BTreeMap<VertexId, (u32, BTreeSet<EdgeKind>)> = BTreeMap::new();
+    let mut seen: BTreeMap<VertexId, Reach> = BTreeMap::new();
     let mut queue = VecDeque::new();
-    seen.insert(root.clone(), (0, BTreeSet::new()));
+    seen.insert(root.clone(), Reach::root(root));
     queue.push_back(root.clone());
     let mut visited = 1usize;
     let mut examined_edges = 0usize;
@@ -111,7 +113,7 @@ pub fn walk(
             reasons.insert("cancelled");
             break;
         }
-        let distance = seen[&id].0;
+        let distance = seen[&id].distance();
         if distance >= depth {
             continue;
         }
@@ -170,25 +172,22 @@ pub fn walk(
                 continue;
             }
 
-            let candidate_distance = distance + 1;
-            if let Some((_, kinds)) = seen.get_mut(next) {
-                kinds.insert(edge.kind);
+            if let Some(reach) = seen.get_mut(next) {
+                reach.observe(&id, distance, edge.kind);
                 continue;
             }
             if seen.len() >= budget.max_visited {
                 reasons.insert("visited-limit");
                 break 'walk;
             }
-            let mut kinds = BTreeSet::new();
-            kinds.insert(edge.kind);
-            seen.insert(next.clone(), (candidate_distance, kinds));
+            seen.insert(next.clone(), Reach::discovered(&id, distance, edge.kind));
             visited += 1;
             queue.push_back(next.clone());
         }
     }
 
     let mut neighbors = Vec::new();
-    for (id, (distance, edges)) in seen {
+    for (id, reach) in seen {
         if cancelled(cancel) {
             reasons.insert("cancelled");
             break;
@@ -197,11 +196,7 @@ pub fn walk(
             continue;
         }
         if let Some(vertex) = graph.vertex(&id) {
-            neighbors.push(Neighbor {
-                vertex: vertex.clone(),
-                edges: edges.into_iter().collect(),
-                distance,
-            });
+            neighbors.push(reach.into_neighbor(vertex.clone()));
         }
     }
     neighbors.sort_by(|a, b| a.vertex.id.cmp(&b.vertex.id));
@@ -243,7 +238,7 @@ fn report(
 mod tests {
     use super::*;
     use crate::query;
-    use schemagraph_core::{Edge, Vertex, VertexKind};
+    use schemagraph_core::{Edge, EdgeKind, Vertex, VertexKind};
 
     fn vertex(name: &str) -> Vertex {
         Vertex {
@@ -315,6 +310,7 @@ mod tests {
             assert_eq!(actual.vertex.id, expected.vertex.id);
             assert_eq!(actual.edges, expected.edges);
             assert_eq!(actual.distance, expected.distance);
+            assert_eq!(actual.via, expected.via);
         }
         assert_eq!(
             report.neighbors[0].edges,
@@ -341,6 +337,50 @@ mod tests {
         assert_eq!(report.neighbors[0].distance, 1);
         assert_eq!(report.neighbors[1].distance, 1);
         assert_eq!(report.neighbors[2].distance, 2);
+        // c는 a를 거쳐서만 d에 닿는다(c -> a -> d).
+        assert_eq!(report.neighbors[0].via.as_str(), "s.d");
+        assert_eq!(report.neighbors[1].via.as_str(), "s.d");
+        assert_eq!(report.neighbors[2].via.as_str(), "s.a");
+    }
+
+    /// walk는 인접 간선을 정렬해 큐에 넣으므로 동률 부모 중 사전식으로 큰 쪽에서
+    /// 먼저 발견할 수 있다(w는 q1에서 먼저 발견된다). 그래도 via는 query와 같은
+    /// 사전식 최소 부모여야 한다.
+    #[test]
+    fn walk의_via는_발견_순서와_무관하게_legacy_impact와_같다() {
+        use crate::tests::{via_fixture, via_triples, VIA_EXPECTED};
+        for reversed in [false, true] {
+            let graph = via_fixture(reversed);
+            let report = walk(
+                &graph,
+                &VertexId::object("s", "s"),
+                u32::MAX,
+                usize::MAX,
+                true,
+                Budget::unlimited(),
+                None,
+            );
+            assert!(report.complete);
+            assert_eq!(via_triples(&report.neighbors), VIA_EXPECTED, "{reversed}");
+        }
+    }
+
+    /// 결과 개수 제한은 출력만 자르므로 남은 이웃의 via가 잘린 정점을 가리킬 수 있다.
+    #[test]
+    fn result_limit은_via를_바꾸지_않는다() {
+        use crate::tests::{via_fixture, via_triples, VIA_EXPECTED};
+        let graph = via_fixture(false);
+        let report = walk(
+            &graph,
+            &VertexId::object("s", "s"),
+            u32::MAX,
+            1,
+            true,
+            Budget::unlimited(),
+            None,
+        );
+        assert_eq!(report.truncation_reasons, vec!["result-limit"]);
+        assert_eq!(via_triples(&report.neighbors), &VIA_EXPECTED[..1]);
     }
 
     #[test]

@@ -1,3 +1,41 @@
+# Unreleased
+
+These changes are not yet in a published release.
+
+## Traversal output for downstream joins
+
+- `query` and `impact` JSON (CLI and MCP) now carry top-level `format`
+  (`schemagraph-query`, `schemagraph-impact`) and `version: 1`. New keys,
+  including ones inside nested objects, do not change the version; it increases
+  only when an existing key changes meaning or type. Earlier reports have no
+  `format` key. `notFound`
+  responses are unchanged and carry no `format`.
+- Each `query` and `impact` neighbor now carries `via`, the vertex before it on
+  a shortest path from the subject. Direct neighbors have the subject as `via`;
+  when several parents are equally close, the lexicographically smallest id is
+  chosen, so output stays deterministic. `review` findings list impacted
+  objects with the same field. Existing fields keep their meaning.
+
+## isthmus facts
+
+- `facts` now sets `symbol.usr` on every `relation-decl` to the same vertex id
+  as `symbol.qualifiedName` (kept unchanged). isthmus treats `usr` as the
+  producer's stable identifier, so a relation found through a persistence join
+  can be passed to `schemagraph query` or `impact` without a platform-specific
+  lookup. CI checks that every `usr` resolves as the `impact` subject in the
+  graph from the same SQLite and PostgreSQL scans.
+
+## Upgrade notes
+
+- `schemagraph_analysis::Neighbor` gains a public `via` field. Code that builds
+  `Neighbor` with a struct literal must set it.
+- The unbudgeted library functions `analysis::query` and `analysis::impact` no
+  longer traverse edges whose endpoint is not a registered vertex, matching the
+  budgeted traversal used by the CLI and MCP. Reading `graph.json` already
+  drops such edges.
+
+---
+
 # schemagraph 0.6.0
 
 This release adds agent-facing discovery tools, catalog lint rules, an

@@ -27,6 +27,29 @@ the right branch determines which rows are excluded and contributes read
 dependencies, while values retain their left-branch sources. Window partition
 and order expressions contribute to the corresponding window output's lineage.
 
+`query` and `impact` JSON reports carry top-level `format` (`schemagraph-query` or
+`schemagraph-impact`) and `version` (currently `1`), so a saved file identifies
+the command that produced it. New keys, including keys added inside nested
+objects such as neighbors, may be added without a version change; the version
+increases only when an existing key changes meaning or type. Reports written
+before this header existed carry no `format` key. A
+`notFound` response (`found: false`; CLI exit code 1) is a separate shape and carries
+no `format`.
+
+Each `query` and `impact` neighbor carries `distance`, every dependency edge
+kind that reaches it (`edges`), and `via`: the vertex before it on a shortest
+path from the subject. Direct neighbors have the subject as `via`. When several
+parents are equally close, `via` is the lexicographically smallest id, so the
+same graph always gives the same report. Following `via` back to the subject
+reconstructs one shortest path without calling `path` for each neighbor. The
+`via` vertex can be missing from a list cut by `--max`, and an incomplete
+traversal only chooses among the edges it examined. `edges` is not limited to
+the edge toward `via`: it collects every dependency edge kind the traversal saw
+between the neighbor and an expanded vertex. A trigger that writes the subject
+and fires on one of its dependents lists both `writes` and `fires`; use `path`
+for the edge kinds along one specific path. `review` findings list their
+impacted objects in the same form.
+
 Check `complete`, `truncated`, `truncationReasons`, and `limitations` before
 treating a missing result as evidence. `--max` limits displayed results after
 traversal. The separate vertex and edge budgets can stop traversal itself.
@@ -260,6 +283,23 @@ byte-for-byte reproducible and re-ingestion idempotent. This is a static
 snapshot, not an observed run. Events are validated against the pinned official
 schemas in `schemas/openlineage`, including their formats; ingestion by a
 specific catalog (Marquez, DataHub, OpenMetadata) has not been tested.
+
+## Export declarations to isthmus
+
+```sh
+schemagraph scan postgres://… --emit-document catalog.json -o graph.json
+schemagraph facts --document catalog.json --project /path/to/repo -o schema.facts.json
+schemagraph impact "$(jq -r '.facts[0].symbol.usr' schema.facts.json)" --graph graph.json
+```
+
+`facts` writes an isthmus bridge-facts v1 document (`platform: "sql"`,
+`target: "persistence"`) with one `relation-decl` per table, view, materialized
+view, and column. Each fact's `symbol.qualifiedName` and `symbol.usr` hold the
+same value: the vertex id in the graph built from the same catalog. A consumer
+that joins code-side relation uses to these declarations can pass `symbol.usr`
+directly to `query` or `impact` (check that `subject.id` equals it) to continue
+into in-database dependents. Graphs and facts from different catalogs do not
+share ids reliably; build both from one `--emit-document` output.
 
 ## Share or serve a snapshot
 

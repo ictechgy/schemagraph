@@ -61,10 +61,79 @@ pub fn resolve(graph: &Graph, name: &str) -> Resolve {
 #[derive(Debug, Clone)]
 pub struct Neighbor {
     pub vertex: Vertex,
-    /// subject와 이 이웃 사이의 간선 종류(정렬·중복 제거).
+    /// 탐색 중 이 이웃에 닿은 모든 의존 간선의 종류(정렬·중복 제거) — via 간선 하나만을
+    /// 뜻하지 않고, 확장된 어느 정점에서 온 간선이든 거리와 무관하게 모은다.
     pub edges: Vec<EdgeKind>,
     /// subject로부터의 최단 의존 거리.
     pub distance: u32,
+    /// subject에서 이 이웃까지 최단 경로의 직전 정점(BFS 부모)이다.
+    ///
+    /// 거리 1 이웃은 subject 자신이다. 같은 최단 거리의 부모가 여럿이면 id의
+    /// 사전식(바이트) 최소를 고른다 — 그래프 삽입 순서에 따라 달라지면 같은
+    /// 그래프가 다른 리포트가 되어 diff와 캐시가 무의미해진다. via를 따라
+    /// 거슬러 올라가면 subject에 닿는 최단 경로 하나가 복원된다. 결과 개수
+    /// 제한으로 잘린 목록에서는 via 정점이 목록에 없을 수 있다.
+    pub via: VertexId,
+}
+
+/// BFS가 발견한 정점 하나의 누적 기록 — `bfs`와 `budget::walk`가 공유한다.
+///
+/// 두 탐색이 같은 규칙으로 거리·간선 종류·via를 쌓아야 예산 없는 walk가
+/// query와 같은 이웃을 낸다(budget 테스트가 이 동치를 고정한다).
+#[derive(Debug)]
+pub(crate) struct Reach {
+    distance: u32,
+    edges: BTreeSet<EdgeKind>,
+    via: VertexId,
+}
+
+impl Reach {
+    /// 탐색 루트의 기록이다. 루트는 이웃으로 내보내지 않으므로 via는 자기 자신이다.
+    pub(crate) fn root(root: &VertexId) -> Self {
+        Self {
+            distance: 0,
+            edges: BTreeSet::new(),
+            via: root.clone(),
+        }
+    }
+
+    /// `parent`에서 `kind` 간선으로 처음 발견한 정점의 기록이다.
+    ///
+    /// BFS는 거리 순으로 정점을 꺼내므로 첫 발견 거리가 곧 최단 거리다.
+    pub(crate) fn discovered(parent: &VertexId, parent_distance: u32, kind: EdgeKind) -> Self {
+        Self {
+            distance: parent_distance + 1,
+            edges: BTreeSet::from([kind]),
+            via: parent.clone(),
+        }
+    }
+
+    /// 이미 발견한 정점에 `parent`의 `kind` 간선이 또 닿았을 때 기록을 갱신한다.
+    ///
+    /// 간선 종류는 거리와 무관하게 모두 모은다(기존 `edges` 계약). via는 같은
+    /// 최단 거리의 부모끼리만 비교해 사전식 최소 id를 남긴다 — 더 먼 부모를
+    /// 거치는 경로는 최단 경로가 아니다.
+    pub(crate) fn observe(&mut self, parent: &VertexId, parent_distance: u32, kind: EdgeKind) {
+        self.edges.insert(kind);
+        if parent_distance + 1 == self.distance && *parent < self.via {
+            self.via = parent.clone();
+        }
+    }
+
+    /// 루트로부터의 최단 거리.
+    pub(crate) fn distance(&self) -> u32 {
+        self.distance
+    }
+
+    /// 누적 기록을 출력용 이웃으로 바꾼다.
+    pub(crate) fn into_neighbor(self, vertex: Vertex) -> Neighbor {
+        Neighbor {
+            vertex,
+            edges: self.edges.into_iter().collect(),
+            distance: self.distance,
+            via: self.via,
+        }
+    }
 }
 
 /// `query` 결과 보고.
@@ -292,8 +361,8 @@ fn bfs(
     max_neighbors: usize,
     direction: Direction,
 ) -> (Vec<Neighbor>, bool) {
-    // 정점 → (최단 거리, 그 방향 간선 종류 집합)
-    let mut seen: BTreeMap<VertexId, (u32, BTreeSet<EdgeKind>)> = BTreeMap::new();
+    // 정점 → (최단 거리, 그 방향 간선 종류 집합, 최단 경로 부모)
+    let mut seen: BTreeMap<VertexId, Reach> = BTreeMap::new();
     let mut queue: VecDeque<(VertexId, u32)> = VecDeque::new();
     queue.push_back((root.clone(), 0));
     let mut visited = BTreeSet::new();
@@ -319,10 +388,17 @@ fn bfs(
             if next == *root {
                 continue;
             }
-            seen.entry(next.clone())
-                .or_insert_with(|| (dist + 1, BTreeSet::new()))
-                .1
-                .insert(edge.kind);
+            // 등록되지 않은 id를 가리키는 간선은 따라가지 않는다 — 유령 정점이
+            // 다른 이웃의 via로 노출되면 안 된다(budget::walk와 같은 규칙).
+            if graph.vertex(&next).is_none() {
+                continue;
+            }
+            match seen.get_mut(&next) {
+                Some(reach) => reach.observe(&id, dist, edge.kind),
+                None => {
+                    seen.insert(next.clone(), Reach::discovered(&id, dist, edge.kind));
+                }
+            }
             if visited.insert(next.clone()) {
                 queue.push_back((next, dist + 1));
             }
@@ -331,13 +407,7 @@ fn bfs(
 
     let mut neighbors: Vec<Neighbor> = seen
         .into_iter()
-        .filter_map(|(id, (distance, kinds))| {
-            graph.vertex(&id).map(|v| Neighbor {
-                vertex: v.clone(),
-                edges: kinds.into_iter().collect(),
-                distance,
-            })
-        })
+        .filter_map(|(id, reach)| graph.vertex(&id).map(|v| reach.into_neighbor(v.clone())))
         .collect();
     neighbors.sort_by(|a, b| (&a.vertex.id, a.distance).cmp(&(&b.vertex.id, b.distance)));
     if neighbors.len() > max_neighbors {
@@ -743,6 +813,107 @@ mod tests {
         // a를 바꾸면 아무것도 안 깨진다.
         let report_a = impact(&g, &VertexId::object("s", "a"), 256);
         assert!(report_a.impacted.is_empty());
+    }
+
+    /// via 규칙(최단 거리 부모만, 동률이면 사전식 최소)을 가르는 그래프다.
+    /// `reversed`면 간선을 반대 순서로 넣어 삽입 순서와 무관한지 본다.
+    ///
+    /// ```text
+    /// z_near, a_near -> s               거리 1
+    /// x -> z_near, x -> a_near          거리 2, 부모 동률 → a_near
+    /// q1 -> a_near, b1 -> z_near        거리 2
+    /// w -> q1, w -> b1                  거리 3, 부모 동률 → b1 (walk는 q1에서 먼저 발견)
+    /// a_far -> x                        거리 3
+    /// y -> z_near, y -> a_far           거리 2 — a_far가 사전식으로 작아도 더 멀다
+    /// ```
+    pub(crate) fn via_fixture(reversed: bool) -> Graph {
+        let mut g = Graph::new();
+        for name in ["s", "a_near", "z_near", "x", "q1", "b1", "w", "a_far", "y"] {
+            g.add_vertex(table("s", name));
+        }
+        let mut edges = vec![
+            ("z_near", "s"),
+            ("a_near", "s"),
+            ("x", "z_near"),
+            ("x", "a_near"),
+            ("q1", "a_near"),
+            ("b1", "z_near"),
+            ("w", "q1"),
+            ("w", "b1"),
+            ("a_far", "x"),
+            ("y", "z_near"),
+            ("y", "a_far"),
+        ];
+        if reversed {
+            edges.reverse();
+        }
+        for (from, to) in edges {
+            g.add_edge(dep(
+                &VertexId::object("s", from),
+                &VertexId::object("s", to),
+            ));
+        }
+        g
+    }
+
+    /// via_fixture에서 s의 impact가 내야 할 (id, distance, via)다 — 손으로 도출했다.
+    pub(crate) const VIA_EXPECTED: &[(&str, u32, &str)] = &[
+        ("s.a_far", 3, "s.x"),
+        ("s.a_near", 1, "s.s"),
+        ("s.b1", 2, "s.z_near"),
+        ("s.q1", 2, "s.a_near"),
+        ("s.w", 3, "s.b1"),
+        ("s.x", 2, "s.a_near"),
+        ("s.y", 2, "s.z_near"),
+        ("s.z_near", 1, "s.s"),
+    ];
+
+    /// 이웃 목록을 (id, distance, via)로 줄인다.
+    pub(crate) fn via_triples(neighbors: &[Neighbor]) -> Vec<(&str, u32, &str)> {
+        neighbors
+            .iter()
+            .map(|n| (n.vertex.id.as_str(), n.distance, n.via.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn impact의_via는_최단_부모_중_사전식_최소이고_삽입_순서와_무관하다() {
+        for reversed in [false, true] {
+            let g = via_fixture(reversed);
+            let report = impact(&g, &VertexId::object("s", "s"), 256);
+            assert_eq!(via_triples(&report.impacted), VIA_EXPECTED, "{reversed}");
+        }
+    }
+
+    #[test]
+    fn query의_via는_방향마다_subject에서_거슬러_올라간다() {
+        let g = chain();
+        let report = query(&g, &VertexId::object("s", "a"), 2, 256);
+        // a -> b -> c: 의존 방향으로 b의 부모는 a, c의 부모는 b다.
+        assert_eq!(
+            via_triples(&report.dependencies),
+            [("s.b", 1, "s.a"), ("s.c", 2, "s.b")]
+        );
+        let report = query(&g, &VertexId::object("s", "c"), 2, 256);
+        assert_eq!(
+            via_triples(&report.dependents),
+            [("s.a", 2, "s.b"), ("s.b", 1, "s.c")]
+        );
+    }
+
+    #[test]
+    fn 등록되지_않은_정점은_via로_노출되지_않는다() {
+        let mut g = chain();
+        g.add_vertex(table("s", "x"));
+        // ghost는 정점 없이 간선에만 있는 id다. x는 ghost를 거쳐야만 c에 닿는다.
+        let ghost = VertexId::object("s", "ghost");
+        g.add_edge(dep(&ghost, &VertexId::object("s", "c")));
+        g.add_edge(dep(&VertexId::object("s", "x"), &ghost));
+        let report = impact(&g, &VertexId::object("s", "c"), 256);
+        assert_eq!(
+            via_triples(&report.impacted),
+            [("s.a", 2, "s.b"), ("s.b", 1, "s.c")]
+        );
     }
 
     #[test]

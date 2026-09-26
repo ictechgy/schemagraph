@@ -29,6 +29,20 @@ pub mod unused;
 /// graph.json의 와이어 버전. 형식이 깨지는 변경은 올린다.
 pub const GRAPH_VERSION: u32 = 2;
 
+/// `query` JSON 문서의 `format` 값 — 저장된 파일만 받은 소비자도 어느 명령의
+/// 결과인지 구분할 수 있게 한다. 계열의 `kartograph-impact`와 같은 작명이다.
+pub const QUERY_FORMAT: &str = "schemagraph-query";
+
+/// `query` JSON 문서의 와이어 버전. 키 추가는 그대로 두고, 기존 키의 의미나
+/// 형태가 바뀔 때만 올린다.
+pub const QUERY_VERSION: u32 = 1;
+
+/// `impact` JSON 문서의 `format` 값.
+pub const IMPACT_FORMAT: &str = "schemagraph-impact";
+
+/// `impact` JSON 문서의 와이어 버전. `QUERY_VERSION`과 같은 규칙으로 올린다.
+pub const IMPACT_VERSION: u32 = 1;
+
 // ---------- kind 문자열 (와이어 계약) ----------
 
 fn vertex_kind_str(kind: VertexKind) -> &'static str {
@@ -370,7 +384,8 @@ pub fn to_pretty_json<T: Serialize>(value: &T) -> serde_json::Result<String> {
 // ---------- query/cycles 보고의 와이어 표현 ----------
 
 /// 이웃 목록의 공통 직렬화 — query의 dependents/dependencies와 impact의
-/// impacted가 같은 형태다.
+/// impacted가 같은 형태다. `via`는 subject에서 온 최단 경로의 직전 정점이라
+/// 소비자가 이웃마다 경로를 따로 묻지 않고도 전파 경로를 복원할 수 있다.
 fn neighbors_value(ns: &[schemagraph_analysis::Neighbor]) -> serde_json::Value {
     serde_json::Value::Array(
         ns.iter()
@@ -380,6 +395,7 @@ fn neighbors_value(ns: &[schemagraph_analysis::Neighbor]) -> serde_json::Value {
                     "edges": n.edges.iter().map(|k| edge_kind_str(*k)).collect::<Vec<_>>(),
                     "id": n.vertex.id.as_str(),
                     "kind": vertex_kind_str(n.vertex.kind),
+                    "via": n.via.as_str(),
                 })
             })
             .collect(),
@@ -402,9 +418,11 @@ pub fn query_to_value(report: &QueryReport) -> serde_json::Value {
         "dependencies": neighbors_value(&report.dependencies),
         "dependents": neighbors_value(&report.dependents),
         "depth": report.depth,
+        "format": QUERY_FORMAT,
         "limitations": report.limitations,
         "subject": subject_value(&report.subject),
         "truncated": report.truncated,
+        "version": QUERY_VERSION,
     });
     // 자기 참조 간선이 있을 때만 selfEdges를 싣는다 — 빈 선택 필드는 키를
     // 빼는 것이 계약이다.
@@ -458,10 +476,12 @@ pub fn not_found_value(
 /// ImpactReport → JSON Value.
 pub fn impact_to_value(report: &ImpactReport) -> serde_json::Value {
     serde_json::json!({
+        "format": IMPACT_FORMAT,
         "impacted": neighbors_value(&report.impacted),
         "limitations": report.limitations,
         "subject": subject_value(&report.subject),
         "truncated": report.truncated,
+        "version": IMPACT_VERSION,
     })
 }
 
@@ -482,6 +502,8 @@ pub fn budgeted_query_to_value(
         "dependencies": neighbors_value(&dependencies.neighbors),
         "dependents": neighbors_value(&dependents.neighbors),
         "depth": depth,
+        "format": QUERY_FORMAT,
+        "version": QUERY_VERSION,
         "limitations": limitations,
         "subject": subject_value(subject),
         "truncated": !reasons.is_empty(),
@@ -510,6 +532,8 @@ pub fn budgeted_impact_to_value(
     limitations: &[String],
 ) -> serde_json::Value {
     serde_json::json!({
+        "format": IMPACT_FORMAT,
+        "version": IMPACT_VERSION,
         "impacted": neighbors_value(&report.neighbors),
         "limitations": limitations,
         "subject": subject_value(subject),
@@ -763,6 +787,205 @@ mod tests {
         let mut sorted_keys = keys.clone();
         sorted_keys.sort();
         assert_eq!(keys, sorted_keys);
+    }
+
+    /// sample(a -> b)에 c -> a를 더해 b <- a <- c 의존 체인을 만든다.
+    fn chain_sample() -> Graph {
+        let mut g = sample();
+        g.add_vertex(Vertex {
+            id: VertexId::object("main", "c"),
+            kind: VertexKind::View,
+            name: "c".into(),
+            schema: "main".into(),
+        });
+        g.add_edge(Edge {
+            from: VertexId::object("main", "c"),
+            to: VertexId::object("main", "a"),
+            kind: EdgeKind::Reads,
+            evidence: vec![],
+        });
+        g
+    }
+
+    /// 이웃 JSON 배열을 (id, via) 쌍으로 줄인다.
+    fn id_via_pairs(neighbors: &serde_json::Value) -> Vec<(String, String)> {
+        neighbors
+            .as_array()
+            .expect("neighbors are an array")
+            .iter()
+            .map(|n| {
+                (
+                    n["id"].as_str().expect("id").to_owned(),
+                    n["via"].as_str().expect("via").to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(id, via)| ((*id).to_owned(), (*via).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn impact_이웃은_subject까지의_최단_경로_부모를_via로_싣는다() {
+        use schemagraph_analysis::budget::{walk, Budget};
+        let g = chain_sample();
+        let b = VertexId::object("main", "b");
+        let report = walk(
+            &g,
+            &b,
+            u32::MAX,
+            usize::MAX,
+            true,
+            Budget::unlimited(),
+            None,
+        );
+        let value = budgeted_impact_to_value(g.vertex(&b).unwrap(), &report, g.limitations());
+        let expected = pairs(&[("main.a", "main.b"), ("main.c", "main.a")]);
+        assert_eq!(id_via_pairs(&value["impacted"]), expected);
+        // 예산 없는 legacy 직렬화도 같은 이웃 계약을 쓴다.
+        let legacy = impact_to_value(&schemagraph_analysis::impact(&g, &b, usize::MAX));
+        assert_eq!(id_via_pairs(&legacy["impacted"]), expected);
+    }
+
+    #[test]
+    fn query_이웃은_방향마다_via를_싣는다() {
+        use schemagraph_analysis::budget::{walk, Budget};
+        let g = chain_sample();
+        let a = VertexId::object("main", "a");
+        let dependents = walk(&g, &a, 2, usize::MAX, true, Budget::unlimited(), None);
+        let dependencies = walk(&g, &a, 2, usize::MAX, false, Budget::unlimited(), None);
+        let value = budgeted_query_to_value(
+            g.vertex(&a).unwrap(),
+            &dependents,
+            &dependencies,
+            2,
+            &[],
+            g.limitations(),
+        );
+        assert_eq!(
+            id_via_pairs(&value["dependents"]),
+            pairs(&[("main.c", "main.a")])
+        );
+        assert_eq!(
+            id_via_pairs(&value["dependencies"]),
+            pairs(&[("main.b", "main.a")])
+        );
+        let legacy = query_to_value(&schemagraph_analysis::query(&g, &a, 2, usize::MAX));
+        assert_eq!(
+            id_via_pairs(&legacy["dependents"]),
+            id_via_pairs(&value["dependents"])
+        );
+    }
+
+    /// JSON 객체의 최상위 키 목록(정렬됨).
+    fn keys(value: &serde_json::Value) -> Vec<&str> {
+        value
+            .as_object()
+            .expect("report is an object")
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// 머리 키는 추가일 뿐이다 — 기존 키 집합은 그대로 두고 format·version만
+    /// 더해졌는지 키 목록 전체로 고정한다. 키가 빠지거나 바뀌면 소비자가 깨진다.
+    #[test]
+    fn query와_impact_문서는_기존_키에_format과_version만_더한다() {
+        use schemagraph_analysis::budget::{walk, Budget};
+        let g = chain_sample();
+        let a = VertexId::object("main", "a");
+        let subject = g.vertex(&a).unwrap();
+        let dependents = walk(&g, &a, 1, usize::MAX, true, Budget::unlimited(), None);
+        let dependencies = walk(&g, &a, 1, usize::MAX, false, Budget::unlimited(), None);
+        let query =
+            budgeted_query_to_value(subject, &dependents, &dependencies, 1, &[], g.limitations());
+        assert_eq!(
+            keys(&query),
+            [
+                "complete",
+                "dependencies",
+                "dependents",
+                "depth",
+                "examinedEdges",
+                "format",
+                "limitations",
+                "subject",
+                "traversals",
+                "truncated",
+                "truncationReasons",
+                "version",
+                "visited",
+            ]
+        );
+        assert_eq!(
+            (&query["format"], &query["version"]),
+            (
+                &serde_json::json!("schemagraph-query"),
+                &serde_json::json!(1)
+            )
+        );
+        assert_eq!(
+            keys(&query["dependents"][0]),
+            ["distance", "edges", "id", "kind", "via"]
+        );
+
+        let impact = budgeted_impact_to_value(subject, &dependents, g.limitations());
+        assert_eq!(
+            keys(&impact),
+            [
+                "complete",
+                "examinedEdges",
+                "format",
+                "impacted",
+                "limitations",
+                "subject",
+                "truncated",
+                "truncationReasons",
+                "version",
+                "visited",
+            ]
+        );
+        assert_eq!(
+            (&impact["format"], &impact["version"]),
+            (
+                &serde_json::json!("schemagraph-impact"),
+                &serde_json::json!(1)
+            )
+        );
+
+        // 예산 없는 legacy 직렬화도 같은 머리를 싣는다.
+        let legacy_query = query_to_value(&schemagraph_analysis::query(&g, &a, 1, usize::MAX));
+        assert_eq!(
+            keys(&legacy_query),
+            [
+                "dependencies",
+                "dependents",
+                "depth",
+                "format",
+                "limitations",
+                "subject",
+                "truncated",
+                "version",
+            ]
+        );
+        assert_eq!(legacy_query["format"], QUERY_FORMAT);
+        let legacy_impact = impact_to_value(&schemagraph_analysis::impact(&g, &a, usize::MAX));
+        assert_eq!(
+            keys(&legacy_impact),
+            [
+                "format",
+                "impacted",
+                "limitations",
+                "subject",
+                "truncated",
+                "version"
+            ]
+        );
+        assert_eq!(legacy_impact["version"], IMPACT_VERSION);
     }
 
     #[test]

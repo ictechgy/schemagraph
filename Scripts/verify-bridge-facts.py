@@ -3,6 +3,7 @@
 
 기대값은 엔진 출력이 아니라 각 DB의 시스템 카탈로그를 직접 읽어 만든다.
 같은 scan의 그래프 정점 id와 양방향으로 대조해 유령 id가 없음을 확인하고,
+모든 `symbol.usr`를 실제 `impact`에 넘겨 조인 키로 그대로 쓰이는지 본다.
 `--isthmus`를 주면 실제 isthmus check가 문서를 소비한 결과까지 검사한다.
 """
 
@@ -121,21 +122,47 @@ def check_contract(document, project, version):
     assert document['target'] == ('persistence' if document['facts'] else None), document['target']
     for fact in document['facts']:
         assert fact['kind'] == 'relation-decl' and fact['dynamic'] is False and 'location' not in fact, fact
+        # usr는 qualifiedName과 같은 정점 id다 — 다른 키가 섞이면 계약 위반이다.
+        qualified = fact['symbol']['qualifiedName']
+        assert fact['symbol'] == {'qualifiedName': qualified, 'usr': qualified}, fact
     keys = [(fact['channel'], fact.get('method') or '') for fact in document['facts']]
     assert keys == sorted(keys) and len(keys) == len(set(keys)), 'facts must be sorted and unique'
     assert document['limitations'] == sorted(set(document['limitations'])), document['limitations']
 
 
 def check_graph_ids(document, graph):
-    """모든 qualifiedName이 같은 scan 그래프의 관계·컬럼 정점이고, 그 반대도 성립하는지 본다."""
+    """모든 usr(= qualifiedName)가 같은 scan 그래프의 관계·컬럼 정점이고, 그 반대도 성립하는지 본다."""
     kinds = {vertex['id']: vertex['kind'] for vertex in graph['vertices']}
-    for _, method, qualified in actual_facts(document):
-        kind = kinds.get(qualified)
-        valid = kind == 'column' if method else kind in RELATION_KINDS
-        assert valid, f'ghost or wrong-kind id {qualified}: {kind}'
-    declared = {qualified for _, _, qualified in actual_facts(document)}
+    for fact in document['facts']:
+        usr = fact['symbol']['usr']
+        kind = kinds.get(usr)
+        valid = kind == 'column' if fact.get('method') else kind in RELATION_KINDS
+        assert valid, f'ghost or wrong-kind usr {usr}: {kind}'
+    declared = {fact['symbol']['usr'] for fact in document['facts']}
     graph_ids = {vid for vid, kind in kinds.items() if kind in RELATION_KINDS | {'column'}}
     assert declared == graph_ids, {'graph_only': sorted(graph_ids-declared), 'facts_only': sorted(declared-graph_ids)}
+
+
+def check_usr_impact(engine, document, graph_path, env):
+    """모든 usr를 실제 impact에 그대로 넘겨 subject로 해석되는지 본다.
+
+    isthmus 체인은 facts의 usr를 schemagraph impact의 입력으로 쓴다. 해석이
+    이름 추측(말단 이름 일치)으로 우연히 성공하지 않도록 subject.id가 usr와
+    정확히 같아야 한다. 결과가 잘리지 않았으면 via가 subject나 목록 안의 한 걸음
+    가까운 정점을 가리키는지도 확인한다 — via를 따라가면 subject에 닿아야 한다.
+    """
+    usrs = sorted({fact['symbol']['usr'] for fact in document['facts']})
+    for usr in usrs:
+        report = json.loads(ACCURACY.run([engine, 'impact', usr, '--graph', graph_path], env=env))
+        assert (report['format'], report['version']) == ('schemagraph-impact', 1), report
+        assert report['subject']['id'] == usr, (usr, report['subject'])
+        if report['truncated']:
+            continue
+        distance = {item['id']: item['distance'] for item in report['impacted']}
+        distance[usr] = 0
+        for item in report['impacted']:
+            assert distance.get(item['via']) == item['distance']-1, (usr, item)
+    return len(usrs)
 
 
 def compare(label, document, relations):
@@ -181,7 +208,9 @@ def sqlite_case(engine, work, version):
     document = check_outputs(engine, catalog, work, None, version)
     check_graph_ids(document, json.loads(graph.read_text()))
     assert not any(note.startswith(COVERAGE_PREFIX) for note in document['limitations']), document['limitations']
-    return dict(compare('sqlite', document, sqlite_relations(database)), sqlite=sqlite3.sqlite_version)
+    resolved = check_usr_impact(engine, document, graph, None)
+    return dict(compare('sqlite', document, sqlite_relations(database)), sqlite=sqlite3.sqlite_version,
+                usr_impact_resolved=resolved)
 
 
 def postgres_relations(psql, env):
@@ -264,6 +293,7 @@ def postgres_case(engine, bindir, work, version):
         check_graph_ids(document, json.loads(graph.read_text()))
         assert not any(note.startswith(COVERAGE_PREFIX) for note in document['limitations']), document['limitations']
         summary = compare('postgres', document, postgres_relations(psql, env))
+        summary['usr_impact_resolved'] = check_usr_impact(engine, document, graph, env)
         restricted = restricted_case(engine, url, psql, work, env, version, document)
         missing_schema_case(engine, url, work, env, version)
         server = ACCURACY.run(psql+['-Atqc', 'SHOW server_version'], env=env).strip()
