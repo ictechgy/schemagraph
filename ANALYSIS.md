@@ -27,6 +27,13 @@ the right branch determines which rows are excluded and contributes read
 dependencies, while values retain their left-branch sources. Window partition
 and order expressions contribute to the corresponding window output's lineage.
 
+`query` and `impact` JSON reports carry top-level `format` (`schemagraph-query` or
+`schemagraph-impact`) and `version` (currently `1`), so a saved file identifies
+the command that produced it. New keys may be added without a version change;
+the version increases only when an existing key changes meaning or shape. A
+`notFound` response (`found: false`; CLI exit code 1) is a separate shape and carries
+no `format`.
+
 Each `query` and `impact` neighbor carries `distance`, every dependency edge
 kind that reaches it (`edges`), and `via`: the vertex before it on a shortest
 path from the subject. Direct neighbors have the subject as `via`. When several

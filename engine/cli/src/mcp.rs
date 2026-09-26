@@ -1729,6 +1729,8 @@ mod tests {
         let responses = run(&input);
         let report = &responses[1]["result"]["structuredContent"];
         assert_eq!(report["subject"]["id"], "public.orders");
+        assert_eq!(report["format"], "schemagraph-query");
+        assert_eq!(report["version"], 1);
         // 직접 이웃의 via는 subject다 — CLI와 같은 직렬화기를 쓴다.
         assert_eq!(report["dependents"][0]["id"], "public.report");
         assert_eq!(report["dependents"][0]["via"], "public.orders");
@@ -1736,6 +1738,37 @@ mod tests {
         assert_eq!(report["dependencies"][0]["via"], "public.orders");
         assert_eq!(responses[2]["result"]["isError"], true);
         assert_eq!(responses[2]["result"]["structuredContent"]["found"], false);
+        // notFound는 impact 보고가 아니라 별도 모양이다 — 형식 머리를 싣지 않는다.
+        assert!(responses[2]["result"]["structuredContent"]
+            .get("format")
+            .is_none());
+    }
+
+    #[test]
+    fn impact_report_carries_format_header_and_via() {
+        let input = format!(
+            "{}{}\n",
+            handshake(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"impact","arguments":{"name":"customers"}}}"#
+        );
+        let responses = run(&input);
+        let report = &responses[1]["result"]["structuredContent"];
+        assert_eq!(report["format"], "schemagraph-impact");
+        assert_eq!(report["version"], 1);
+        // report -> orders -> customers: orders는 subject에서, report는 orders에서 온다.
+        let impacted: Vec<(&str, &str)> = report["impacted"]
+            .as_array()
+            .expect("impacted is an array")
+            .iter()
+            .map(|n| (n["id"].as_str().unwrap(), n["via"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            impacted,
+            [
+                ("public.orders", "public.customers"),
+                ("public.report", "public.orders")
+            ]
+        );
     }
 
     #[test]

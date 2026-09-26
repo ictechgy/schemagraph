@@ -200,6 +200,9 @@ schemagraph scan --document catalog.json -o graph.json
 - **부분 결과:** `query`, `impact`, `dead`는 결과 제한으로 잘리면 `truncated`를
   보고합니다. 탐색 예산이 있는 질의는 `complete`, 방문·검사 간선 수,
   `truncationReasons`도 보고하므로 `limitations`와 함께 확인해야 합니다.
+- **보고서 식별:** `query`와 `impact` JSON에는 `format`(`schemagraph-query`,
+  `schemagraph-impact`)과 `version`이 실려 있어 저장된 보고서를 읽기 전에 종류와
+  버전을 확인할 수 있습니다.
 - **전파 경로:** `query`와 `impact`의 이웃마다 subject에서 온 최단 경로의 직전
   정점이 `via`로 실립니다. `via`를 거슬러 올라가면 그 객체에 닿은 이유를 복원할 수
   있습니다.

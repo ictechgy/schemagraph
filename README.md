@@ -212,6 +212,9 @@ views, functions, procedures, and packages can be.
   results are cut short by a result limit. Check it alongside `limitations`
   before treating a result as complete. Budgeted traversals separately report
   `complete`, visited/edge counts, and `truncationReasons`.
+- **Report identity:** `query` and `impact` JSON carry `format`
+  (`schemagraph-query`, `schemagraph-impact`) and `version`, so saved reports
+  can be checked before they are read.
 - **Propagation paths:** each `query` and `impact` neighbor names its `via`
   vertex, the one before it on a shortest path from the subject. Follow `via`
   back to reconstruct why an object was reached.

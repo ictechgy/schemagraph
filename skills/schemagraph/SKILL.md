@@ -78,6 +78,9 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   for `summary` only for candidates; `total` and `truncated` say what was cut.
 - `query <x>` — direct neighbors both directions + reachability context.
 - `impact <x>` — transitive dependents that may be affected if `x` changed.
+- `query`/`impact` reports carry `format` (`schemagraph-query` /
+  `schemagraph-impact`) and `version`; check both before reading a saved report.
+  `notFound` responses have no `format`.
 - Every `query`/`impact` neighbor has `via`: the vertex before it on a shortest
   path from the subject (the subject itself for direct neighbors; ties pick the
   lexicographically smallest id). Follow `via` back to explain a propagation
