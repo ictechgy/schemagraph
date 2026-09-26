@@ -61,7 +61,8 @@ pub fn resolve(graph: &Graph, name: &str) -> Resolve {
 #[derive(Debug, Clone)]
 pub struct Neighbor {
     pub vertex: Vertex,
-    /// subject와 이 이웃 사이의 간선 종류(정렬·중복 제거).
+    /// 탐색 중 이 이웃에 닿은 모든 의존 간선의 종류(정렬·중복 제거) — via 간선 하나만을
+    /// 뜻하지 않고, 확장된 어느 정점에서 온 간선이든 거리와 무관하게 모은다.
     pub edges: Vec<EdgeKind>,
     /// subject로부터의 최단 의존 거리.
     pub distance: u32,
