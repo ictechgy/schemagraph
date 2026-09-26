@@ -41,8 +41,12 @@ parents are equally close, `via` is the lexicographically smallest id, so the
 same graph always gives the same report. Following `via` back to the subject
 reconstructs one shortest path without calling `path` for each neighbor. The
 `via` vertex can be missing from a list cut by `--max`, and an incomplete
-traversal only chooses among the edges it examined. `review` findings list
-their impacted objects in the same form.
+traversal only chooses among the edges it examined. `edges` is not limited to
+the edge toward `via`: it collects every dependency edge kind the traversal saw
+between the neighbor and an expanded vertex. A trigger that writes the subject
+and fires on one of its dependents lists both `writes` and `fires`; use `path`
+for the edge kinds along one specific path. `review` findings list their
+impacted objects in the same form.
 
 Check `complete`, `truncated`, `truncationReasons`, and `limitations` before
 treating a missing result as evidence. `--max` limits displayed results after

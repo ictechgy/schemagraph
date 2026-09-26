@@ -84,7 +84,9 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
 - Every `query`/`impact` neighbor has `via`: the vertex before it on a shortest
   path from the subject (the subject itself for direct neighbors; ties pick the
   lexicographically smallest id). Follow `via` back to explain a propagation
-  path. A `via` may be absent from a list cut by `max`.
+  path. A `via` may be absent from a list cut by `max`. `edges` is not only the
+  `via` edge: it lists every dependency kind seen between the neighbor and any
+  expanded vertex; use `path` for the kinds on one specific path.
 - Version 0.4.2 and later support Ctrl+C for `query`, `impact`, `path`, and
   `review` (exit 130). A traversal stopped by cancellation reports `cancelled`
   in `truncationReasons`; partial results never establish absence. MCP clients
