@@ -1,3 +1,26 @@
+# Unreleased
+
+These changes are not yet in a published release.
+
+## Traversal output for downstream joins
+
+- Each `query` and `impact` neighbor now carries `via`, the vertex before it on
+  a shortest path from the subject. Direct neighbors have the subject as `via`;
+  when several parents are equally close, the lexicographically smallest id is
+  chosen, so output stays deterministic. `review` findings list impacted
+  objects with the same field. Existing fields keep their meaning.
+
+## Upgrade notes
+
+- `schemagraph_analysis::Neighbor` gains a public `via` field. Code that builds
+  `Neighbor` with a struct literal must set it.
+- The unbudgeted library functions `analysis::query` and `analysis::impact` no
+  longer traverse edges whose endpoint is not a registered vertex, matching the
+  budgeted traversal used by the CLI and MCP. Reading `graph.json` already
+  drops such edges.
+
+---
+
 # schemagraph 0.6.0
 
 This release adds agent-facing discovery tools, catalog lint rules, an

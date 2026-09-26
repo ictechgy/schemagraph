@@ -1727,10 +1727,13 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"impact","arguments":{"name":"missing"}}}"#
         );
         let responses = run(&input);
-        assert_eq!(
-            responses[1]["result"]["structuredContent"]["subject"]["id"],
-            "public.orders"
-        );
+        let report = &responses[1]["result"]["structuredContent"];
+        assert_eq!(report["subject"]["id"], "public.orders");
+        // 직접 이웃의 via는 subject다 — CLI와 같은 직렬화기를 쓴다.
+        assert_eq!(report["dependents"][0]["id"], "public.report");
+        assert_eq!(report["dependents"][0]["via"], "public.orders");
+        assert_eq!(report["dependencies"][0]["id"], "public.customers");
+        assert_eq!(report["dependencies"][0]["via"], "public.orders");
         assert_eq!(responses[2]["result"]["isError"], true);
         assert_eq!(responses[2]["result"]["structuredContent"]["found"], false);
     }

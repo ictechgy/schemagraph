@@ -27,6 +27,16 @@ the right branch determines which rows are excluded and contributes read
 dependencies, while values retain their left-branch sources. Window partition
 and order expressions contribute to the corresponding window output's lineage.
 
+Each `query` and `impact` neighbor carries `distance`, every dependency edge
+kind that reaches it (`edges`), and `via`: the vertex before it on a shortest
+path from the subject. Direct neighbors have the subject as `via`. When several
+parents are equally close, `via` is the lexicographically smallest id, so the
+same graph always gives the same report. Following `via` back to the subject
+reconstructs one shortest path without calling `path` for each neighbor. The
+`via` vertex can be missing from a list cut by `--max`, and an incomplete
+traversal only chooses among the edges it examined. `review` findings list
+their impacted objects in the same form.
+
 Check `complete`, `truncated`, `truncationReasons`, and `limitations` before
 treating a missing result as evidence. `--max` limits displayed results after
 traversal. The separate vertex and edge budgets can stop traversal itself.
