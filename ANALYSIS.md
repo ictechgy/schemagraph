@@ -29,8 +29,10 @@ and order expressions contribute to the corresponding window output's lineage.
 
 `query` and `impact` JSON reports carry top-level `format` (`schemagraph-query` or
 `schemagraph-impact`) and `version` (currently `1`), so a saved file identifies
-the command that produced it. New keys may be added without a version change;
-the version increases only when an existing key changes meaning or shape. A
+the command that produced it. New keys, including keys added inside nested
+objects such as neighbors, may be added without a version change; the version
+increases only when an existing key changes meaning or type. Reports written
+before this header existed carry no `format` key. A
 `notFound` response (`found: false`; CLI exit code 1) is a separate shape and carries
 no `format`.
 

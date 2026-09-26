@@ -416,3 +416,59 @@ fn malformed_policy_is_a_cli_error_and_sarif_has_logical_locations() {
     assert!(result["locations"][0]["logicalLocations"].is_array());
     assert!(result.get("physicalLocation").is_none());
 }
+
+/// review finding의 impacted도 query·impact와 같은 `via`를 싣는다.
+///
+/// RELEASE-NOTES와 ANALYSIS가 이 계약을 약속하므로, review 직렬화가 공용 이웃
+/// 직렬화를 거치지 않게 바뀌면 여기서 드러나야 한다.
+#[test]
+fn review_findings_carry_via_on_impacted_objects() {
+    let directory = tempfile::tempdir().unwrap();
+    let before = directory.path().join("before.json");
+    let after = directory.path().join("after.json");
+    document(&before, "prod", false);
+    document(&after, "prod", true);
+    for path in [&before, &after] {
+        edit_document(path, |doc| {
+            doc["schemas"][0]["objects"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "name": "user_names",
+                    "kind": "view",
+                    "body": "CREATE VIEW user_names AS SELECT name FROM users",
+                    "columns": [{"name": "name", "data_type": "text", "nullable": true,
+                                 "ordinal": 1, "pk_position": 0}],
+                    "constraints": [],
+                    "indexes": [],
+                    "triggers": []
+                }))
+        });
+    }
+    let output = run(&before, &after, &[]);
+    let report = json_output(&output);
+    let changes = report["changes"].as_array().unwrap();
+    let with_impacted: Vec<&Value> = changes
+        .iter()
+        .filter(|change| {
+            change["impacted"]
+                .as_array()
+                .is_some_and(|impacted| !impacted.is_empty())
+        })
+        .collect();
+    assert!(
+        !with_impacted.is_empty(),
+        "fixture must produce a finding with impacted objects: {report}"
+    );
+    for change in with_impacted {
+        for neighbor in change["impacted"].as_array().unwrap() {
+            let via = neighbor["via"]
+                .as_str()
+                .unwrap_or_else(|| panic!("impacted entry without via: {neighbor}"));
+            assert!(!via.is_empty());
+            if neighbor["distance"] == 1 {
+                assert_eq!(via, change["id"].as_str().unwrap(), "{change}");
+            }
+        }
+    }
+}

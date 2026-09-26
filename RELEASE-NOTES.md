@@ -5,8 +5,10 @@ These changes are not yet in a published release.
 ## Traversal output for downstream joins
 
 - `query` and `impact` JSON (CLI and MCP) now carry top-level `format`
-  (`schemagraph-query`, `schemagraph-impact`) and `version: 1`. The version
-  increases only when an existing key changes meaning or shape. `notFound`
+  (`schemagraph-query`, `schemagraph-impact`) and `version: 1`. New keys,
+  including ones inside nested objects, do not change the version; it increases
+  only when an existing key changes meaning or type. Earlier reports have no
+  `format` key. `notFound`
   responses are unchanged and carry no `format`.
 - Each `query` and `impact` neighbor now carries `via`, the vertex before it on
   a shortest path from the subject. Direct neighbors have the subject as `via`;
