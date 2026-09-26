@@ -7,6 +7,9 @@
 //! 카탈로그 객체에는 소스 위치가 없으므로 relation-decl의 location을
 //! 생략하고 `symbol.qualifiedName`에 정규 id(`schema.object[.member]`)를
 //! 싣는다 — 이 id는 그래프 정점 id와 같아 소비자가 두 문서를 잇는다.
+//! 같은 id를 `symbol.usr`에도 싣는다. 계약상 usr는 생산자의 안정 정점
+//! 식별자 자리이고, 다른 생산자 문서도 usr를 impact 질의 id로 쓰므로 소비자가
+//! 플랫폼별 예외 없이 usr를 그대로 `query`·`impact`에 넘길 수 있어야 한다.
 
 use schemagraph_core::VertexId;
 use serde_json::{json, Value};
@@ -90,12 +93,16 @@ pub fn bridge_facts_document(
 }
 
 /// relation-decl 사실 하나를 만든다. `method`가 있으면 컬럼 선언이다.
-fn declaration_fact(channel: &str, method: Option<&str>, qualified_name: &str) -> Value {
+///
+/// `vertex_id`는 같은 카탈로그로 만든 그래프의 정점 id다. qualifiedName(사람이
+/// 읽는 정규 이름)과 usr(조인에 쓰는 안정 식별자)에 같은 값을 싣는다 — 카탈로그
+/// 정점의 정규 이름이 곧 정점 id이기 때문이다.
+fn declaration_fact(channel: &str, method: Option<&str>, vertex_id: &str) -> Value {
     let mut fact = json!({
         "kind": "relation-decl",
         "channel": channel,
         "dynamic": false,
-        "symbol": { "qualifiedName": qualified_name },
+        "symbol": { "qualifiedName": vertex_id, "usr": vertex_id },
     });
     if let Some(column) = method {
         fact["method"] = json!(column);
@@ -120,7 +127,8 @@ fn escape_channel_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{CollectionContext, ColumnDoc, ObjectDoc, SchemaDoc};
+    use crate::document::{CollectionContext, ColumnDoc, IndexDoc, ObjectDoc, SchemaDoc};
+    use schemagraph_core::VertexKind;
 
     fn catalog() -> CatalogDocument {
         CatalogDocument {
@@ -203,11 +211,43 @@ mod tests {
         for fact in facts {
             assert_eq!(fact["kind"], "relation-decl");
             assert_eq!(fact["dynamic"], false);
+            // usr는 qualifiedName과 같은 정점 id다 — symbol에는 두 키만 있다.
+            let qualified = &fact["symbol"]["qualifiedName"];
+            assert_eq!(
+                fact["symbol"],
+                json!({ "qualifiedName": qualified, "usr": qualified })
+            );
             // 카탈로그 객체에는 소스 위치가 없다 — 키가 아예 없어야 한다.
             assert!(fact.get("location").is_none(), "{fact:?}");
         }
         // 완전한 카탈로그에는 catalog-coverage limitation이 없다.
         assert_eq!(value["limitations"].as_array().unwrap().len(), 0);
+    }
+
+    /// usr는 조인 키라서 같은 카탈로그 그래프의 실제 정점이어야 한다. 컬럼과 같은
+    /// 이름의 인덱스가 `@index`로 분리돼도 컬럼 선언의 usr는 컬럼 정점을 가리킨다.
+    #[test]
+    fn every_usr_is_a_vertex_of_the_graph_from_the_same_catalog() {
+        let mut doc = catalog();
+        doc.schemas[0].objects[0].indexes.push(IndexDoc {
+            has_predicate: None,
+            definition_complete: None,
+            predicate: None,
+            name: "id".into(),
+            unique: true,
+            columns: vec!["id".into()],
+            usage: None,
+        });
+        let graph = crate::graph::document_to_graph(&doc);
+        let value = bridge_facts_document(&doc, "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        for fact in value["facts"].as_array().unwrap() {
+            let usr = fact["symbol"]["usr"].as_str().expect("usr is a string");
+            let vertex = graph
+                .vertex(&VertexId::from_raw(usr))
+                .unwrap_or_else(|| panic!("ghost usr {usr}"));
+            let expected_column = fact.get("method").is_some();
+            assert_eq!(vertex.kind == VertexKind::Column, expected_column, "{usr}");
+        }
     }
 
     #[test]
@@ -246,6 +286,33 @@ mod tests {
         let facts = value["facts"].as_array().unwrap();
         // 이름 안의 점은 escape되고 한정자는 그대로다.
         assert_eq!(facts[0]["channel"], "public.a%2Eb");
+    }
+
+    #[test]
+    fn usr_follows_vertex_id_escaping_not_channel_escaping() {
+        let mut doc = catalog();
+        // `@`·`(`는 channel escape 대상이 아니지만 정점 id 컴포넌트에서는 escape된다.
+        doc.schemas[0].objects[0].name = "odd@name(1)".into();
+        let value = bridge_facts_document(&doc, "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        let facts = value["facts"].as_array().unwrap();
+        let relation = facts
+            .iter()
+            .find(|fact| fact["channel"] == "public.odd@name(1)" && fact.get("method").is_none())
+            .expect("relation fact keeps the raw channel");
+        // usr는 그래프 정점 id와 같아야 query·impact가 그대로 해석한다.
+        assert_eq!(relation["symbol"]["usr"], "public.odd%40name%281%29");
+        assert_eq!(
+            relation["symbol"]["usr"],
+            VertexId::object("public", "odd@name(1)").as_str()
+        );
+        let column = facts
+            .iter()
+            .find(|fact| fact["method"] == "id")
+            .expect("column fact exists");
+        assert_eq!(
+            column["symbol"]["usr"],
+            VertexId::member("public", "odd@name(1)", "id").as_str()
+        );
     }
 
     #[test]

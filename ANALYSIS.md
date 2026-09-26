@@ -278,6 +278,23 @@ snapshot, not an observed run. Events are validated against the pinned official
 schemas in `schemas/openlineage`, including their formats; ingestion by a
 specific catalog (Marquez, DataHub, OpenMetadata) has not been tested.
 
+## Export declarations to isthmus
+
+```sh
+schemagraph scan postgres://… --emit-document catalog.json -o graph.json
+schemagraph facts --document catalog.json --project /path/to/repo -o schema.facts.json
+schemagraph impact "$(jq -r '.facts[0].symbol.usr' schema.facts.json)" --graph graph.json
+```
+
+`facts` writes an isthmus bridge-facts v1 document (`platform: "sql"`,
+`target: "persistence"`) with one `relation-decl` per table, view, materialized
+view, and column. Each fact's `symbol.qualifiedName` and `symbol.usr` hold the
+same value: the vertex id in the graph built from the same catalog. A consumer
+that joins code-side relation uses to these declarations can pass `symbol.usr`
+directly to `query` or `impact` (check that `subject.id` equals it) to continue
+into in-database dependents. Graphs and facts from different catalogs do not
+share ids reliably; build both from one `--emit-document` output.
+
 ## Share or serve a snapshot
 
 ```sh

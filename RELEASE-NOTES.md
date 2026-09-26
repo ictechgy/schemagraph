@@ -14,6 +14,15 @@ These changes are not yet in a published release.
   chosen, so output stays deterministic. `review` findings list impacted
   objects with the same field. Existing fields keep their meaning.
 
+## isthmus facts
+
+- `facts` now sets `symbol.usr` on every `relation-decl` to the same vertex id
+  as `symbol.qualifiedName` (kept unchanged). isthmus treats `usr` as the
+  producer's stable identifier, so a relation found through a persistence join
+  can be passed to `schemagraph query` or `impact` without a platform-specific
+  lookup. CI checks that every `usr` resolves as the `impact` subject in the
+  graph from the same SQLite and PostgreSQL scans.
+
 ## Upgrade notes
 
 - `schemagraph_analysis::Neighbor` gains a public `via` field. Code that builds
