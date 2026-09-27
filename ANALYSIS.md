@@ -315,6 +315,11 @@ instead of the command's own JSON. `impact` always reports `dependents`; `query`
 reports the one direction chosen with `--direction` (required with this format)
 up to `--depth`. Both accept several subjects and traverse them together in one
 multi-root pass under a single `--max-visited`/`--max-examined-edges` budget.
+`--max` caps the combined `reached` list across all subjects (not per subject
+or per direction) and keeps the nearest entries. With one subject and no cut,
+`reached` holds the same vertices, depths, and `via` as the default JSON; when
+`--max` cuts, the two formats keep different prefixes, since the default JSON
+sorts by id and language-traversal by depth, then id.
 The default `--format json` output is unchanged and still takes exactly one
 subject; `--direction`, `--project`, `--revision`, and `--generated-at` are
 rejected without `--format language-traversal`. MCP tools keep the default JSON.
@@ -377,9 +382,12 @@ rejected without `--format language-traversal`. MCP tools keep the default JSON.
 - A subject that does not resolve (unknown name, or a short name matching
   several vertices) keeps its position as `{"id": "<given text>"}` without
   `symbol`, adds a `root-not-found:` limitation naming the index and any
-  candidates, and adds `root-not-found` to `truncationReasons`. The other roots
-  are still traversed and the document is written, but the command exits **1**,
-  as with `notFound`.
+  candidates, and adds `root-not-found` to `truncationReasons` (so `truncated`
+  is true). The other roots are still traversed and the document is written,
+  but the command exits **1**, as with `notFound`. `truncated` alone does not
+  say which root failed: use a root entry without `symbol`, or the
+  `root-not-found: roots[i]` limitation, as the precise per-root signal. Results
+  for the resolved roots are complete unless another reason is also listed.
 - `truncated` is true when any `truncationReasons` exist (`result-limit`,
   `visited-limit`, `edge-limit`, `cancelled`, `root-not-found`);
   `truncationReasons` is omitted when empty. After a budget stop or

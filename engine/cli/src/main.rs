@@ -135,7 +135,9 @@ enum Command {
         graph: PathBuf,
         #[arg(long, default_value_t = 1)]
         depth: u32,
-        /// Max neighbors per direction before `truncated` is reported.
+        /// Max neighbors per direction before `truncated` is reported. With
+        /// --format language-traversal: max entries in the combined `reached` list
+        /// across all subjects, keeping the nearest (depth, then id).
         #[arg(long, default_value_t = 256)]
         max: usize,
         /// Max vertices visited by each directional traversal.
@@ -159,7 +161,9 @@ enum Command {
         names: Vec<String>,
         #[arg(short, long, default_value = "graph.json")]
         graph: PathBuf,
-        /// Max impacted objects before `truncated` is reported.
+        /// Max impacted objects before `truncated` is reported. With
+        /// --format language-traversal: max entries in the combined `reached` list
+        /// across all subjects, keeping the nearest (depth, then id).
         #[arg(long, default_value_t = 1024)]
         max: usize,
         /// Max vertices visited by the reverse traversal.

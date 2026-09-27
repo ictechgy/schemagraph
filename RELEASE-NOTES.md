@@ -38,7 +38,11 @@ These changes are not yet in a published release.
   graph.json bytes read.
 - An unresolved subject keeps its index without `symbol`, adds a
   `root-not-found:` limitation and truncation reason, and the command exits 1
-  after writing the document.
+  after writing the document. The missing `symbol` (or the limitation) is the
+  per-root signal; `truncated` only says the document is not complete.
+- `--max` caps the combined `reached` list across all subjects, keeping the
+  nearest (depth, then id). The default JSON sorts by id before cutting, so with
+  one subject the two formats agree only when nothing is cut.
 - The default JSON output of `query` and `impact` is byte-for-byte unchanged and
   still takes one subject; the new options are rejected without
   `--format language-traversal`. MCP tools are unchanged.
