@@ -5,10 +5,14 @@
 //! 가장 가까운 루트로부터의 최단 거리, `via`를 구한다. 그다음 BFS가 검사한 간선만
 //! 다시 써서 "어느 루트가 이 정점에 닿는가"(루트 집합)를 전파한다. 그래프를 두 번
 //! 읽지 않으므로 루트 집합 계산은 예산이 허락한 부분 그래프 안에서만 일어난다.
+//!
+//! 다른 루트가 닿는 루트도 도달 정점이다. 테이블 전부를 루트로 넘기면 FK 의존자도
+//! 모두 루트라서, 루트를 빼면 결과가 비어 버린다. 그런 루트의 거리·via·루트 집합은
+//! 자기 자신을 뺀 다른 루트 기준이고, 같은 전파에서 함께 구한다.
 
 use crate::budget::Budget;
 use crate::{Neighbor, Reach};
-use schemagraph_core::{Edge, Graph, VertexId};
+use schemagraph_core::{Edge, EdgeKind, Graph, VertexId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,9 +28,10 @@ pub struct ReachedVertex {
     /// 정점과 거리·간선 종류·via. `distance`는 가장 가까운 루트로부터의 최단 거리이고,
     /// `via`는 그 최단 경로의 직전 정점(루트이거나 다른 도달 정점)이다. 같은 최단 거리의
     /// 부모가 여럿이면 id의 사전식 최소를 고른다 — 단일 루트 탐색과 같은 규칙이다.
+    /// 이 정점이 루트이면 거리·via는 자기를 뺀 다른 루트 기준이다.
     pub neighbor: Neighbor,
     /// 이 정점에 닿는 모든 루트의 입력 순번(오름차순). 가장 가까운 루트만이 아니다.
-    /// 최대 [`MAX_ROOTS_PER_VERTEX`]개다.
+    /// 자기 자신을 가리키는 순번은 넣지 않는다. 최대 [`MAX_ROOTS_PER_VERTEX`]개다.
     pub roots: Vec<usize>,
     /// 루트 번호가 상한을 넘어 잘렸는가.
     pub roots_truncated: bool,
@@ -39,7 +44,7 @@ pub struct ReachedVertex {
 /// 얻은 하한이다.
 #[derive(Debug, Clone)]
 pub struct MultiRootReport {
-    /// 도달 정점들. 루트 자신은 싣지 않는다. (거리, id) 순이다.
+    /// 도달 정점들 — 자기가 아닌 루트에서 닿은 정점 전부(루트 포함). (거리, id) 순이다.
     pub reached: Vec<ReachedVertex>,
     /// 방문해 기록한 정점 수(서로 다른 루트 포함).
     pub visited: usize,
@@ -59,12 +64,15 @@ pub struct MultiRootReport {
 /// 루트의 순번은 입력 위치 그대로 유지한다 — 소비자가 루트 번호로 자기 입력을 찾는다.
 /// 해석하지 못했거나 그래프에 없는 루트가 있으면 `root-not-found`를 기록한다.
 ///
-/// 방향·간선 필터·자기 간선·유령 정점 처리와 `max_results`의 의미는 `budget::walk`와
-/// 같고, 루트가 하나면 같은 이웃(거리·간선 종류·via)과 같은 탐색 수치를 낸다. 예산은
-/// 루트마다가 아니라 탐색 전체에 한 번 적용된다. 한 루트가 다른 루트에 닿아도 그
-/// 루트는 도달 정점으로 다시 싣지 않지만, 그 너머 정점의 루트 집합에는 반영된다.
-/// `depth`는 루트 집합에도 적용된다 — 어떤 루트에서 `depth` 걸음 안에 닿는 정점만
-/// 그 루트의 번호를 받는다.
+/// 방향·간선 필터·자기 간선·유령 정점 처리는 `budget::walk`와 같고, 루트가 하나면
+/// 같은 이웃 집합(거리·간선 종류·via)과 같은 탐색 수치를 낸다. 다만 정렬이 (거리, id)라
+/// `max_results`로 자르면 id 순으로 자르는 walk와 남는 이웃이 다를 수 있다. 예산과
+/// `max_results`는 루트마다가 아니라 탐색 전체(합친 목록)에 한 번 적용된다.
+///
+/// 루트 B가 다른 루트에서 닿으면 B도 도달 정점이다. B의 루트 집합에는 자기 순번이
+/// 없고, 거리·via는 자기를 뺀 루트들로부터의 최단 경로 기준이다(via가 다른 루트일 수
+/// 있다). 자기에게서만 닿는 루트(순환)는 싣지 않는다. `depth`는 루트 집합에도
+/// 적용된다 — 어떤 루트에서 `depth` 걸음 안에 닿는 정점만 그 루트의 번호를 받는다.
 pub fn walk_roots(
     graph: &Graph,
     roots: &[Option<VertexId>],
@@ -97,18 +105,13 @@ pub fn walk_roots(
     };
     let explored = search.run(&mut reasons);
     let sets = RootSets::propagate(&explored, roots, depth, cancel, &mut reasons);
-    let mut reached = collect(graph, explored.seen, &seeds, &sets, cancel, &mut reasons);
+    let (visited, examined_edges) = (explored.visited, explored.examined_edges);
+    let mut reached = collect(graph, explored, &seeds, &sets, cancel, &mut reasons);
     if reached.len() > max_results {
         reasons.insert("result-limit");
         reached.truncate(max_results);
     }
-    finish(
-        reached,
-        explored.visited,
-        explored.examined_edges,
-        reasons,
-        true,
-    )
+    finish(reached, visited, examined_edges, reasons, true)
 }
 
 /// 그래프에 실제로 있는 루트 id만 모은다. 빠진 루트가 있으면 이유를 남긴다.
@@ -168,6 +171,8 @@ struct Search<'a> {
 struct Explored {
     seen: BTreeMap<VertexId, Reach>,
     arcs: Vec<(VertexId, VertexId)>,
+    /// 다른 정점에서 루트로 들어온 의존 간선 종류 — 루트가 도달 정점일 때의 관계다.
+    root_edges: BTreeMap<VertexId, BTreeSet<EdgeKind>>,
     visited: usize,
     examined_edges: usize,
 }
@@ -181,6 +186,7 @@ impl Search<'_> {
         let mut explored = Explored {
             seen: BTreeMap::new(),
             arcs: Vec::new(),
+            root_edges: BTreeMap::new(),
             visited: self.seeds.len(),
             examined_edges: 0,
         };
@@ -252,8 +258,9 @@ impl Search<'_> {
 
     /// 간선 하나를 검사한다. 탐색을 멈춰야 하면 false다.
     ///
-    /// 루트로 들어오는 간선은 거리를 바꾸지 않지만(루트는 이웃이 아니다) 루트 집합
-    /// 전파를 위해 arc로 남긴다 — 루트 B를 거쳐 가는 정점도 루트 A에서 닿기 때문이다.
+    /// 루트로 들어오는 간선은 BFS 거리를 바꾸지 않는다(루트는 거리 0이다). 대신 arc와
+    /// 간선 종류를 남겨, 전파 단계에서 다른 루트 기준의 거리·via와 루트 집합을 구하고
+    /// 루트 B를 거쳐 가는 정점도 루트 A의 순번을 받게 한다.
     fn visit(
         &self,
         parent: &VertexId,
@@ -278,7 +285,11 @@ impl Search<'_> {
             return true;
         }
         if self.seeds.contains(next) {
-            explored.arcs.push((parent.clone(), next.clone()));
+            if next != parent {
+                explored.arcs.push((parent.clone(), next.clone()));
+                let kinds = explored.root_edges.entry(next.clone()).or_default();
+                kinds.insert(edge.kind);
+            }
             return true;
         }
         if let Some(reach) = explored.seen.get_mut(next) {
@@ -302,7 +313,13 @@ impl Search<'_> {
 /// 기록된 정점마다 "닿는 루트 순번"의 비트 집합.
 struct RootSets {
     index: BTreeMap<VertexId, usize>,
+    /// 정점 번호 → id. `index`가 id 순으로 번호를 매겨 번호 순서가 곧 id 순서다.
+    ids: Vec<VertexId>,
     bits: Vec<Vec<u64>>,
+    /// 루트 정점마다 자기 자신을 가리키는 순번 비트(중복 루트면 여럿).
+    own: BTreeMap<usize, Vec<u64>>,
+    /// 다른 루트의 비트가 처음 들어온 루트 정점 → (걸음 수, 그 걸음에 비트를 넘긴 부모들).
+    first_other: BTreeMap<usize, (u32, Vec<usize>)>,
 }
 
 impl RootSets {
@@ -327,8 +344,11 @@ impl RootSets {
             .collect();
         let words = roots.len().div_ceil(64);
         let mut sets = Self {
+            ids: index.keys().cloned().collect(),
             bits: vec![vec![0; words]; index.len()],
             index,
+            own: BTreeMap::new(),
+            first_other: BTreeMap::new(),
         };
         let children = sets.children(&explored.arcs);
         let mut delta = sets.seed(roots);
@@ -338,8 +358,8 @@ impl RootSets {
                 reasons.insert("cancelled");
                 break;
             }
-            delta = sets.step(&children, delta);
             steps += 1;
+            delta = sets.step(&children, delta, steps);
         }
         sets
     }
@@ -372,20 +392,23 @@ impl RootSets {
             self.bits[node][word] |= bit;
             let words = self.bits[node].len();
             delta.entry(node).or_insert_with(|| vec![0; words])[word] |= bit;
+            self.own.entry(node).or_insert_with(|| vec![0; words])[word] |= bit;
         }
         delta
     }
 
     /// 한 걸음 전파한다 — 이번 델타를 자식에게 넘기고, 자식에게 새로 켜진 비트를 다음
-    /// 델타로 돌려준다.
+    /// 델타로 돌려준다. `step`은 1부터 센 걸음 수다.
     fn step(
         &mut self,
         children: &[Vec<usize>],
         delta: BTreeMap<usize, Vec<u64>>,
+        step: u32,
     ) -> BTreeMap<usize, Vec<u64>> {
         let mut next: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
         for (node, incoming) in delta {
             for &child in &children[node] {
+                self.note_other_root(node, child, &incoming, step);
                 for (word, value) in incoming.iter().enumerate() {
                     let added = value & !self.bits[child][word];
                     if added != 0 {
@@ -399,11 +422,50 @@ impl RootSets {
         next
     }
 
-    /// 정점에 닿는 루트 순번을 오름차순으로 최대 상한까지 돌려준다. 잘렸으면 true다.
+    /// 루트 정점 `child`에 다른 루트의 비트가 들어오면 그 걸음과 부모를 기록한다.
+    ///
+    /// 델타는 그 걸음에 처음 들어온 비트라서, 부모의 델타에 자기 아닌 루트 비트가 있으면
+    /// 부모는 그 루트에서 `step - 1` 걸음이다. 따라서 처음 기록된 걸음이 다른 루트
+    /// 기준의 최단 거리이고, 같은 걸음의 부모 전부가 via 후보다. 이미 켜진 비트를 다른
+    /// 부모가 먼저 넘겼어도 후보에서 빠지지 않도록 `added`가 아니라 델타 자체를 본다.
+    fn note_other_root(&mut self, parent: usize, child: usize, incoming: &[u64], step: u32) {
+        let Some(own) = self.own.get(&child) else {
+            return;
+        };
+        if !incoming
+            .iter()
+            .zip(own)
+            .any(|(value, own)| value & !own != 0)
+        {
+            return;
+        }
+        match self.first_other.get_mut(&child) {
+            None => {
+                self.first_other.insert(child, (step, vec![parent]));
+            }
+            Some((first, parents)) if *first == step => parents.push(parent),
+            Some(_) => {}
+        }
+    }
+
+    /// 다른 루트에서 닿은 루트 정점의 (거리, via). 자기에게서만 닿으면 None이다.
+    fn reached_root(&self, id: &VertexId) -> Option<(u32, VertexId)> {
+        let (step, parents) = self.first_other.get(&self.index[id])?;
+        let via = parents
+            .iter()
+            .min()
+            .map(|parent| self.ids[*parent].clone())?;
+        Some((*step, via))
+    }
+
+    /// 정점에 닿는 루트 순번을 오름차순으로 최대 상한까지 돌려준다. 자기 자신을 가리키는
+    /// 순번(루트 정점일 때)은 뺀다. 잘렸으면 true다.
     fn roots_of(&self, id: &VertexId) -> (Vec<usize>, bool) {
+        let node = self.index[id];
+        let own = self.own.get(&node);
         let mut roots = Vec::new();
-        for (word, value) in self.bits[self.index[id]].iter().enumerate() {
-            let mut rest = *value;
+        for (word, value) in self.bits[node].iter().enumerate() {
+            let mut rest = *value & !own.map_or(0, |own| own[word]);
             while rest != 0 {
                 if roots.len() == MAX_ROOTS_PER_VERTEX {
                     return (roots, true);
@@ -416,33 +478,45 @@ impl RootSets {
     }
 }
 
-/// 루트가 아닌 기록 정점을 (거리, id) 순의 도달 정점으로 만든다.
+/// 기록 정점을 (거리, id) 순의 도달 정점으로 만든다. 루트는 다른 루트에서 닿았을
+/// 때만 싣는다.
 ///
-/// 거리 순을 먼저 두는 이유: 결과 개수 제한으로 잘려도 가까운 정점이 남고, 남은 정점의
-/// via는 항상 루트이거나 목록 안의 더 가까운 정점이다.
+/// 거리 순을 먼저 두는 이유: 결과 개수 제한으로 잘려도 가까운 정점이 남고, 루트가 아닌
+/// 정점의 via는 항상 루트이거나 목록 안의 더 가까운 정점이다.
 fn collect(
     graph: &Graph,
-    seen: BTreeMap<VertexId, Reach>,
+    explored: Explored,
     seeds: &BTreeSet<VertexId>,
     sets: &RootSets,
     cancel: Option<&AtomicBool>,
     reasons: &mut BTreeSet<&'static str>,
 ) -> Vec<ReachedVertex> {
     let mut reached = Vec::new();
-    for (id, reach) in seen {
+    for (id, reach) in explored.seen {
         if cancelled(cancel) {
             reasons.insert("cancelled");
             break;
         }
-        if seeds.contains(&id) {
-            continue;
-        }
         let Some(vertex) = graph.vertex(&id) else {
             continue;
         };
+        let neighbor = if seeds.contains(&id) {
+            let Some((distance, via)) = sets.reached_root(&id) else {
+                continue;
+            };
+            let edges = explored.root_edges.get(&id);
+            Neighbor {
+                vertex: vertex.clone(),
+                edges: edges.map_or_else(Vec::new, |kinds| kinds.iter().copied().collect()),
+                distance,
+                via,
+            }
+        } else {
+            reach.into_neighbor(vertex.clone())
+        };
         let (roots, roots_truncated) = sets.roots_of(&id);
         reached.push(ReachedVertex {
-            neighbor: reach.into_neighbor(vertex.clone()),
+            neighbor,
             roots,
             roots_truncated,
         });
@@ -572,28 +646,150 @@ mod tests {
         // report는 products에서 1걸음, customers에서 2걸음이다 — via는 가까운 쪽이다.
     }
 
-    /// 루트 B가 루트 A에 의존하면 B는 도달 정점으로 다시 나오지 않지만, B 너머 정점은
-    /// A에서도 닿으므로 A의 순번을 받는다.
+    /// 루트 B가 루트 A에 의존하면 B도 도달 정점이다 — roots에는 자기 순번 없이 A만,
+    /// depth·via는 A 기준이다. B 너머 정점은 A에서도 닿으므로 두 순번을 모두 받는다.
     #[test]
-    fn 다른_루트를_거쳐_닿는_정점도_그_루트의_순번을_받는다() {
+    fn 다른_루트가_닿는_루트는_그_루트_기준으로_실린다() {
         use EdgeKind::*;
         let g = graph(&[("b", "a", Reads), ("y", "b", Reads), ("x", "a", Reads)]);
         let report = dependents(&g, &roots(&["a", "b"]), u32::MAX);
         assert_eq!(
             rows(&report),
-            [row("x", 1, "a", &[0]), row("y", 1, "b", &[0, 1])]
+            [
+                row("b", 1, "a", &[0]),
+                row("x", 1, "a", &[0]),
+                row("y", 1, "b", &[0, 1])
+            ]
         );
+        assert_eq!(report.reached[0].neighbor.edges, [Reads]);
+        // 입력 순서를 바꾸면 순번만 바뀐다 — B는 여전히 A의 순번(이제 1)만 받는다.
+        let swapped = dependents(&g, &roots(&["b", "a"]), u32::MAX);
+        assert_eq!(swapped.reached[0].roots, [1]);
     }
 
     /// depth는 루트 집합에도 적용된다 — y는 b에서 1걸음이지만 a에서는 2걸음이다.
     #[test]
     fn depth_안에_닿는_루트만_순번을_받는다() {
         use EdgeKind::*;
-        let g = graph(&[("b", "a", Reads), ("y", "b", Reads)]);
+        let g = graph(&[("b", "a", Reads), ("y", "b", Reads), ("c", "y", Reads)]);
         let one = dependents(&g, &roots(&["a", "b"]), 1);
-        assert_eq!(rows(&one), [row("y", 1, "b", &[1])]);
+        assert_eq!(rows(&one), [row("b", 1, "a", &[0]), row("y", 1, "b", &[1])]);
         let two = dependents(&g, &roots(&["a", "b"]), 2);
-        assert_eq!(rows(&two), [row("y", 1, "b", &[0, 1])]);
+        assert_eq!(
+            rows(&two),
+            [
+                row("b", 1, "a", &[0]),
+                row("y", 1, "b", &[0, 1]),
+                row("c", 2, "y", &[1])
+            ]
+        );
+        // 루트 c는 b에서 2걸음, a에서 3걸음이다 — depth 2면 b의 순번만 받는다.
+        let rooted_c = dependents(&g, &roots(&["a", "b", "c"]), 2);
+        let c = rooted_c
+            .reached
+            .iter()
+            .find(|v| v.neighbor.vertex.id == id("c"))
+            .expect("c is reached from b within depth 2");
+        assert_eq!((c.neighbor.distance, c.roots.clone()), (2, vec![1]));
+    }
+
+    /// 자기에게서만 닿는 루트(순환)는 싣지 않는다. 다른 루트가 순환 너머에서 닿으면
+    /// depth·via는 그 다른 루트 기준이다 — 자기에게서 온 더 짧은 경로가 아니다.
+    #[test]
+    fn 순환으로_자기에게만_닿는_루트는_싣지_않고_다른_루트_기준으로_잰다() {
+        use EdgeKind::*;
+        let cycle = graph(&[("a", "b", Reads), ("b", "a", Reads), ("c", "z", Reads)]);
+        let alone = dependents(&cycle, &roots(&["a", "z"]), u32::MAX);
+        assert_eq!(
+            rows(&alone),
+            [row("b", 1, "a", &[0]), row("c", 1, "z", &[1])]
+        );
+        // x1 -> A, x2 -> x1, p -> x2, B -> p, p -> B. p는 B에서 1걸음, A에서 3걸음이고
+        // B는 A에서 4걸음(p 경유)이다.
+        let g = graph(&[
+            ("x1", "big_a", Reads),
+            ("x2", "x1", Reads),
+            ("p", "x2", Reads),
+            ("big_b", "p", Calls),
+            ("p", "big_b", Writes),
+        ]);
+        let report = dependents(&g, &roots(&["big_a", "big_b"]), u32::MAX);
+        assert_eq!(
+            rows(&report),
+            [
+                row("p", 1, "big_b", &[0, 1]),
+                row("x1", 1, "big_a", &[0]),
+                row("x2", 2, "x1", &[0]),
+                row("big_b", 4, "p", &[0]),
+            ]
+        );
+        assert_eq!(report.reached[3].neighbor.edges, [Calls]);
+        let near = dependents(&g, &roots(&["big_a", "big_b"]), 3);
+        assert!(near
+            .reached
+            .iter()
+            .all(|v| v.neighbor.vertex.id != id("big_b")));
+    }
+
+    /// 모든 정점이 루트여도 정보가 사라지지 않는다 — 루트마다 따로 돈 walk와 비교해,
+    /// 순번 i를 가진 정점 집합은 루트 i의 이웃 전부이고 depth는 자기를 뺀 다른 루트
+    /// 거리의 최솟값이다.
+    #[test]
+    fn 모든_정점이_루트여도_루트별_walk와_같은_정보를_싣는다() {
+        use crate::tests::via_fixture;
+        for (g, reverse) in [(shop(), true), (via_fixture(false), true), (shop(), false)] {
+            let names: Vec<VertexId> = g.vertices().map(|v| v.id.clone()).collect();
+            let root_list: Vec<Option<VertexId>> = names.iter().cloned().map(Some).collect();
+            let report = walk_roots(
+                &g,
+                &root_list,
+                u32::MAX,
+                usize::MAX,
+                reverse,
+                Budget::unlimited(),
+                None,
+            );
+            assert!(report.complete);
+            let mut members: BTreeMap<usize, BTreeSet<VertexId>> = BTreeMap::new();
+            let mut nearest: BTreeMap<VertexId, u32> = BTreeMap::new();
+            for (index, root) in names.iter().enumerate() {
+                let single = walk(
+                    &g,
+                    root,
+                    u32::MAX,
+                    usize::MAX,
+                    reverse,
+                    Budget::unlimited(),
+                    None,
+                );
+                for n in single.neighbors {
+                    members
+                        .entry(index)
+                        .or_default()
+                        .insert(n.vertex.id.clone());
+                    let d = nearest.entry(n.vertex.id).or_insert(n.distance);
+                    *d = (*d).min(n.distance);
+                }
+            }
+            let mut actual: BTreeMap<usize, BTreeSet<VertexId>> = BTreeMap::new();
+            for vertex in &report.reached {
+                let own = names.iter().position(|n| *n == vertex.neighbor.vertex.id);
+                assert!(!vertex.roots.contains(&own.unwrap()), "own index listed");
+                for &index in &vertex.roots {
+                    actual
+                        .entry(index)
+                        .or_default()
+                        .insert(vertex.neighbor.vertex.id.clone());
+                }
+            }
+            assert_eq!(actual, members);
+            let depths: BTreeMap<VertexId, u32> = report
+                .reached
+                .iter()
+                .map(|v| (v.neighbor.vertex.id.clone(), v.neighbor.distance))
+                .collect();
+            assert_eq!(depths, nearest);
+        }
     }
 
     /// 같은 거리의 두 루트가 부모 후보면 사전식으로 작은 루트가 via다. via를 따라가면

@@ -332,3 +332,31 @@ fn 기본_json은_그대로이고_새_옵션을_섞으면_거절한다() {
         assert!(stderr.contains(message), "{args:?}: {stderr}");
     }
 }
+
+/// 루트가 다른 루트에 의존하면 그 루트도 reached에 실린다 — FK 의존자가 모두 루트인
+/// 실제 사용(테이블 전부를 루트로)에서 결과가 비지 않아야 한다.
+#[test]
+fn 다른_루트가_닿는_루트도_reached에_실린다() {
+    let directory = tempfile::tempdir().unwrap();
+    let graph = directory.path().join("shop.graph.json");
+    shop_graph(&graph);
+    let output = traversal(
+        &graph,
+        directory.path(),
+        &["impact", "app.customers", "app.orders"],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document = json_of(&output);
+    assert_eq!(
+        rows(&document),
+        [
+            row("app.order_report", 1, "app.orders", &[0, 1]),
+            row("app.orders", 1, "app.customers", &[0]),
+            row("app.audit_report", 2, "app.order_report", &[0, 1]),
+        ]
+    );
+    assert_eq!(
+        document["reached"][1]["relationships"],
+        json!(["references"])
+    );
+}
