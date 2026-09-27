@@ -177,14 +177,16 @@ TRAVERSAL_ROOTS_PER_RUN = 64
 def check_language_traversal(engine, document, reports, graph_path, work, env):
     """usr 묶음을 다중 루트 language-traversal로 돌려 루트별 단일 impact와 대조한다.
 
-    묶음은 두 가지다 — 모든 usr, 그리고 관계 usr만. 루트 집합이 달라지면 루트였던
-    컬럼이 도달 정점이 되므로 "루트는 다시 싣지 않는다" 규칙을 다른 조합에서도 본다.
+    묶음은 두 가지다 — 모든 usr, 그리고 관계 usr만. 모든 usr 묶음에서는 도달 정점이
+    대부분 다른 루트라서 "다른 루트가 닿는 루트도 싣는다" 규칙을 실제 FK·뷰·컬럼
+    간선으로 본다.
 
     기대값은 엔진의 다른 경로(루트마다 따로 돈 impact)에서 온다. 루트 i의 순번을 가진
-    도달 정점 집합은 그 루트의 impacted에서 묶음의 다른 루트를 뺀 것과 같아야 하고
-    (루트는 도달 정점으로 다시 싣지 않는다), depth는 묶음 루트들의 거리 중 최솟값이다.
-    via는 묶음의 루트이거나 한 걸음 가까운 도달 정점이어야 한다. graphRevision은
-    graph.json 바이트의 SHA-256이다.
+    도달 정점 집합은 그 루트의 impacted 전부(다른 루트 포함)와 같아야 하고, 루트인 도달
+    정점은 자기 순번을 갖지 않는다. depth는 자기를 뺀 묶음 루트들의 거리 중 최솟값이다
+    (impacted는 subject 자신을 담지 않으므로 루트별 거리의 최솟값이 곧 그 값이다). via는
+    묶음의 루트이거나 도달 정점이어야 하고, 루트가 아닌 정점의 via는 한 걸음 가깝다.
+    graphRevision은 graph.json 바이트의 SHA-256이다.
     """
     usrs = sorted(usr for usr, report in reports.items() if not report['truncated'])
     relations = {fact['symbol']['usr'] for fact in document['facts'] if 'method' not in fact}
@@ -204,18 +206,23 @@ def check_language_traversal(engine, document, reports, graph_path, work, env):
         assert [root['id'] for root in traversal['roots']] == chunk, traversal['roots']
         assert all(root['symbol'] == {'usr': root['id'], 'qualifiedName': root['id']} for root in traversal['roots'])
         depth = {item['symbol']['usr']: item['depth'] for item in traversal['reached']}
-        for item in traversal['reached']:
-            assert item['via'] in chunk or depth.get(item['via']) == item['depth']-1, item
         roots = set(chunk)
+        for item in traversal['reached']:
+            usr = item['symbol']['usr']
+            if usr in roots:
+                # 루트의 via는 다른 루트 기준이라, via 자신의 depth(자기 포함 최단)는 더 짧을 수 있다.
+                assert item['via'] in roots or depth.get(item['via'], item['depth']) <= item['depth']-1, item
+                assert chunk.index(usr) not in item['roots'], item
+            else:
+                assert item['via'] in roots or depth.get(item['via']) == item['depth']-1, item
         for index, usr in enumerate(chunk):
-            expected = {item['id'] for item in reports[usr]['impacted']} - roots
+            expected = {item['id'] for item in reports[usr]['impacted']}
             actual = {item['symbol']['usr'] for item in traversal['reached'] if index in item['roots']}
             assert actual == expected, {usr: {'missing': sorted(expected-actual), 'unexpected': sorted(actual-expected)}}
         nearest = {}
         for usr in chunk:
             for item in reports[usr]['impacted']:
-                if item['id'] not in roots:
-                    nearest[item['id']] = min(nearest.get(item['id'], item['distance']), item['distance'])
+                nearest[item['id']] = min(nearest.get(item['id'], item['distance']), item['distance'])
         assert depth == nearest, {'engine': depth, 'single-impact': nearest}
         compared += len(chunk)
     return compared
