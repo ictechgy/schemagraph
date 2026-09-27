@@ -372,7 +372,9 @@ rejected without `--format language-traversal`. MCP tools keep the default JSON.
   vertex). It is capped at 64 indices per vertex (the smallest are kept); a cap
   sets top-level `rootsTruncated: true`, otherwise the key is absent.
 - `relationships` lists every dependency edge kind the traversal saw arriving
-  at the vertex, with the same meaning as a neighbor's `edges`.
+  at the vertex, with the same meaning as a neighbor's `edges`: the union over
+  all examined edges into it, not only the edge from `via`. This also holds for
+  a listed root (every examined edge into it from another vertex).
 - `graphRevision` is the lowercase hex SHA-256 of the graph.json bytes that were
   read, so a consumer can detect a report made from a different snapshot.
   `project` is canonicalized like `facts --project` (default: current
