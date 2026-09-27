@@ -92,7 +92,9 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   subjects in one pass and writes an isthmus `language-traversal` v1 document.
   `reached[].roots` lists every subject index that reaches the vertex (capped at
   64, then `rootsTruncated: true`); `via`/`depth` follow the nearest subject.
-  Subjects themselves are never repeated in `reached`. An unresolved subject
+  A subject reached from another subject is listed too, with only the other
+  subjects in its `roots` and `depth`/`via` measured from them; a subject
+  reached only from itself is not listed. An unresolved subject
   stays in `roots` without `symbol`, adds a `root-not-found:` limitation, and
   exits 1. Compare `graphRevision` (SHA-256 of graph.json) before trusting a
   saved document against the current graph.

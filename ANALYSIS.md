@@ -346,17 +346,26 @@ rejected without `--format language-traversal`. MCP tools keep the default JSON.
   `roots[].id` is the resolved vertex id even when the subject was given as a
   short name, and `roots` keeps the command-line order: `reached[].roots`
   refers to those positions.
+- `reached` lists every vertex reached from at least one root other than
+  itself, **including roots**. `impact public.User public.Account` lists
+  `Account` when it references `User`, and passing every table of a database
+  keeps each FK dependent even though all of them are roots. A root reached
+  only from itself (through a cycle) is not listed.
 - `depth` is the shortest distance from the nearest root and `via` is the
   vertex before it on that path: a root id for depth 1, otherwise a reached
   vertex at `depth - 1`. Ties pick the lexicographically smallest id, as for
-  `query`/`impact` neighbors. `reached` is ordered by `depth`, then id, so a
-  list cut by `--max` keeps the nearest vertices and every kept `via`.
+  `query`/`impact` neighbors. For a root listed in `reached`, `depth` and
+  `via` are measured from the *other* roots only (`via` may be another root
+  id). Its `via` is still an adjacent vertex, but that vertex's own `depth` may
+  be smaller than `depth - 1` when the listed root reaches it more directly;
+  use `path` for the exact chain from another root. `reached` is ordered by
+  `depth`, then id, so a list cut by `--max` keeps the nearest vertices and
+  every kept `via`.
 - `reached[].roots` lists every root that reaches the vertex within the
-  requested depth, not only the nearest one, in ascending order. It is capped
-  at 64 indices per vertex (the smallest are kept); a cap sets top-level
-  `rootsTruncated: true`, otherwise the key is absent.
-- A root is never repeated in `reached`, even when another root reaches it;
-  vertices beyond it still receive both roots' indices.
+  requested depth, not only the nearest one, in ascending order. A root never
+  lists its own index (nor the index of a duplicate subject naming the same
+  vertex). It is capped at 64 indices per vertex (the smallest are kept); a cap
+  sets top-level `rootsTruncated: true`, otherwise the key is absent.
 - `relationships` lists every dependency edge kind the traversal saw arriving
   at the vertex, with the same meaning as a neighbor's `edges`.
 - `graphRevision` is the lowercase hex SHA-256 of the graph.json bytes that were

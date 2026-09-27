@@ -28,6 +28,10 @@ These changes are not yet in a published release.
   `relationships` (edge kinds seen), and `roots`: every subject index that
   reaches it within the depth, capped at 64 per vertex with top-level
   `rootsTruncated`. Output is ordered by depth, then id.
+- A subject reached from another subject is listed in `reached` too, with only
+  the other subjects in its `roots` and `depth`/`via` measured from them, so
+  passing every table of a database keeps each FK dependent. A subject reached
+  only from itself is not listed.
 - The header records `tool`, `generatedAt` (`--generated-at` pins it),
   `platform: "sql"`, `project` (`--project`, canonicalized like `facts`),
   optional `revision` (`--revision`), and `graphRevision`, the SHA-256 of the
