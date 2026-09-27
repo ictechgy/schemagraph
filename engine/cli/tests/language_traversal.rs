@@ -420,3 +420,19 @@ fn subject가_하나면_기본_json과_같은_집합이고_max는_각자의_정�
         assert_eq!(document["truncationReasons"], json!(["result-limit"]));
     }
 }
+
+/// subject가 모두 해석되지 않아도 문서를 내고 truncated: true, root-not-found, 종료 코드
+/// 1로 알린다 — "도달 정점 없음"을 완전한 부재로 읽지 않게 한다(SKILL.md 계약).
+#[test]
+fn 모든_subject를_찾지_못해도_truncated와_root_not_found를_싣는다() {
+    let directory = tempfile::tempdir().unwrap();
+    let graph = directory.path().join("shop.graph.json");
+    shop_graph(&graph);
+    let output = traversal(&graph, directory.path(), &["impact", "missing"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let document = json_of(&output);
+    assert_eq!(document["roots"], json!([{"id": "missing"}]));
+    assert_eq!(document["reached"], json!([]));
+    assert_eq!(document["truncated"], true);
+    assert_eq!(document["truncationReasons"], json!(["root-not-found"]));
+}
