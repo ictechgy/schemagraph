@@ -92,6 +92,7 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 | `search <pattern>` | 대소문자를 구분하지 않는 이름 부분 일치나 `*`/`?` 글롭으로 정점을 찾습니다. `--detail summary`는 종류와 이웃 수를 더합니다. |
 | `query <name> --depth N` | 의존 대상과 의존자를 근거 간선과 함께 조회합니다. |
 | `impact <name>` | 변경의 영향을 받을 수 있는 의존자를 추적합니다. |
+| `impact <name>… --format language-traversal` | 여러 subject를 한 번에 탐색해 isthmus `language-traversal` 문서로 냅니다(한 방향은 `query --direction`). |
 | `cycles` | 의존성 순환과 자기루프를 보고합니다. |
 | `dead` | 보존 루트·예외를 적용해 도달할 수 없는 뷰·루틴 후보를 보고합니다. |
 | `diagnostics` | SQL 분석 상태와 위치가 있는 미해결·미지원 진단을 보고합니다. |
@@ -206,6 +207,11 @@ schemagraph scan --document catalog.json -o graph.json
 - **전파 경로:** `query`와 `impact`의 이웃마다 subject에서 온 최단 경로의 직전
   정점이 `via`로 실립니다. `via`를 거슬러 올라가면 그 객체에 닿은 이유를 복원할 수
   있습니다.
+- **언어 경계 조인:** `--format language-traversal`은 isthmus `trace`를 위해 여러
+  subject를 한 번에 보고합니다. 도달 정점마다 `via`, `depth`, 그 정점에 닿는 모든
+  subject의 순번이 실리고, 문서에는 그래프 파일의 SHA-256이 `graphRevision`으로
+  실립니다. 영어 정본인
+  [ANALYSIS.md](ANALYSIS.md#trace-several-subjects-as-a-language-traversal-document)를 참고하세요.
 - **출력의 일관성:** 같은 입력 문서는 같은 그래프를 만듭니다. 실제 DB를 다시
   스캔하면 카탈로그와 사용 통계의 변화에 따라 출력이 달라질 수 있습니다.
 - **본문 분석 범위:** 뷰·트리거에서 테이블·컬럼 의존성을 추출합니다. SQL 루틴,

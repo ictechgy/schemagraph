@@ -98,6 +98,7 @@ read that file by default; use `--graph <path>` to select another snapshot.
 | `search <pattern>` | Find vertices by case-insensitive name substring or `*`/`?` glob; `--detail summary` adds kind and neighbor counts. |
 | `query <name> --depth N` | List dependencies and dependents, with supporting edges. |
 | `impact <name>` | Trace dependents that may be affected by a change. |
+| `impact <name>… --format language-traversal` | Trace several subjects in one pass as an isthmus `language-traversal` document (`query --direction` for one direction). |
 | `cycles` | Report dependency cycles and self-loops. |
 | `dead` | Report unreachable view/routine candidates, with declared retention roots and suppressions. |
 | `diagnostics` | Report SQL analysis state and located unresolved or unsupported constructs. |
@@ -218,6 +219,11 @@ views, functions, procedures, and packages can be.
 - **Propagation paths:** each `query` and `impact` neighbor names its `via`
   vertex, the one before it on a shortest path from the subject. Follow `via`
   back to reconstruct why an object was reached.
+- **Cross-language joins:** `--format language-traversal` reports several
+  subjects at once for isthmus `trace`: every reached vertex carries `via`,
+  `depth`, and the indices of all subjects that reach it, and the document
+  records the graph file's SHA-256 as `graphRevision`. See
+  [ANALYSIS.md](ANALYSIS.md#trace-several-subjects-as-a-language-traversal-document).
 - **Stable output:** the same input document produces the same graph.
   Live scans can differ as catalog contents and usage statistics change.
 - **Body coverage:** views and triggers yield table and column dependencies.
