@@ -360,3 +360,63 @@ fn 다른_루트가_닿는_루트도_reached에_실린다() {
         json!(["references"])
     );
 }
+
+/// subject가 하나면 language-traversal의 도달 집합은 기본 impact JSON의 impacted와 같다.
+/// 단 `--max`로 자르면 남는 이웃이 다르다 — 기본 JSON은 id 순으로, language-traversal은
+/// (depth, id) 순으로 정렬한 뒤 자르기 때문이다. 둘 다 자기 정렬의 앞부분이고
+/// result-limit로 잘렸다고 알린다는 것을 고정한다(동치 주장은 제한 없는 경우에만 한다).
+#[test]
+fn subject가_하나면_기본_json과_같은_집합이고_max는_각자의_정렬로_자른다() {
+    let directory = tempfile::tempdir().unwrap();
+    let graph = directory.path().join("shop.graph.json");
+    shop_graph(&graph);
+    let default = json_of(&run(&graph, &["impact", "app.customers"]));
+    let unlimited = json_of(&traversal(
+        &graph,
+        directory.path(),
+        &["impact", "app.customers"],
+    ));
+    let by_id: Vec<(String, u64, String)> = default["impacted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            (
+                n["id"].as_str().unwrap().to_owned(),
+                n["distance"].as_u64().unwrap(),
+                n["via"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let by_depth: Vec<(String, u64, String)> = rows(&unlimited)
+        .into_iter()
+        .map(|(usr, depth, via, _)| (usr, depth, via))
+        .collect();
+    let mut sorted = by_depth.clone();
+    sorted.sort();
+    assert_eq!(sorted, by_id);
+    assert_eq!(
+        by_depth.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+        ["app.orders", "app.order_report", "app.audit_report"]
+    );
+
+    let default_cut = json_of(&run(&graph, &["impact", "app.customers", "--max", "1"]));
+    let traversal_cut = json_of(&traversal(
+        &graph,
+        directory.path(),
+        &["impact", "app.customers", "--max", "1"],
+    ));
+    assert_eq!(default_cut["impacted"][0]["id"], json!(by_id[0].0));
+    assert_eq!(
+        traversal_cut["reached"][0]["symbol"]["usr"],
+        json!(by_depth[0].0)
+    );
+    assert_ne!(
+        by_id[0].0, by_depth[0].0,
+        "the fixture must separate the two orders"
+    );
+    for document in [&default_cut, &traversal_cut] {
+        assert_eq!(document["truncated"], true);
+        assert_eq!(document["truncationReasons"], json!(["result-limit"]));
+    }
+}
