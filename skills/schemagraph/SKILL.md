@@ -87,6 +87,18 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   path. A `via` may be absent from a list cut by `max`. `edges` is not only the
   `via` edge: it lists every dependency kind seen between the neighbor and any
   expanded vertex; use `path` for the kinds on one specific path.
+- `impact <x> <y>… --format language-traversal` (or `query … --direction
+  dependencies|dependents --format language-traversal`) traverses several
+  subjects in one pass and writes an isthmus `language-traversal` v1 document.
+  `reached[].roots` lists every subject index that reaches the vertex (capped at
+  64, then `rootsTruncated: true`); `via`/`depth` follow the nearest subject.
+  A subject reached from another subject is listed too, with only the other
+  subjects in its `roots` and `depth`/`via` measured from them; a subject
+  reached only from itself is not listed. `--max` caps the combined `reached`
+  list, nearest first. An unresolved subject stays in `roots` without `symbol`,
+  adds a `root-not-found:` limitation (and `truncated: true`), and exits 1;
+  identify which subject failed from the missing `symbol`, not from `truncated`. Compare `graphRevision` (SHA-256 of graph.json) before trusting a
+  saved document against the current graph.
 - Version 0.4.2 and later support Ctrl+C for `query`, `impact`, `path`, and
   `review` (exit 130). A traversal stopped by cancellation reports `cancelled`
   in `truncationReasons`; partial results never establish absence. MCP clients

@@ -127,13 +127,17 @@ enum Command {
     },
     /// Who depends on this object / what does it depend on (agent JSON).
     Query {
-        /// Object name or qualified id (schema.object[.member]).
-        name: String,
+        /// Object name or qualified id (schema.object[.member]); several only with
+        /// --format language-traversal.
+        #[arg(required = true, num_args = 1..)]
+        names: Vec<String>,
         #[arg(short, long, default_value = "graph.json")]
         graph: PathBuf,
         #[arg(long, default_value_t = 1)]
         depth: u32,
-        /// Max neighbors per direction before `truncated` is reported.
+        /// Max neighbors per direction before `truncated` is reported. With
+        /// --format language-traversal: max entries in the combined `reached` list
+        /// across all subjects, keeping the nearest (depth, then id).
         #[arg(long, default_value_t = 256)]
         max: usize,
         /// Max vertices visited by each directional traversal.
@@ -142,14 +146,24 @@ enum Command {
         /// Max dependency edges examined by each directional traversal.
         #[arg(long, default_value_t = 1_000_000)]
         max_examined_edges: usize,
+        /// Traversal direction; required with --format language-traversal, which
+        /// reports one direction.
+        #[arg(long, value_enum)]
+        direction: Option<DirectionArg>,
+        #[command(flatten)]
+        report: ReportArgs,
     },
     /// What breaks if this object is changed or dropped (reverse transitive closure).
     Impact {
-        /// Object name or qualified id (schema.object[.member]).
-        name: String,
+        /// Object name or qualified id (schema.object[.member]); several only with
+        /// --format language-traversal.
+        #[arg(required = true, num_args = 1..)]
+        names: Vec<String>,
         #[arg(short, long, default_value = "graph.json")]
         graph: PathBuf,
-        /// Max impacted objects before `truncated` is reported.
+        /// Max impacted objects before `truncated` is reported. With
+        /// --format language-traversal: max entries in the combined `reached` list
+        /// across all subjects, keeping the nearest (depth, then id).
         #[arg(long, default_value_t = 1024)]
         max: usize,
         /// Max vertices visited by the reverse traversal.
@@ -158,6 +172,8 @@ enum Command {
         /// Max dependency edges examined by the reverse traversal.
         #[arg(long, default_value_t = 1_000_000)]
         max_examined_edges: usize,
+        #[command(flatten)]
+        report: ReportArgs,
     },
     /// Dead-object candidates: consumers nothing in the database references.
     Dead {
@@ -356,6 +372,59 @@ enum Command {
     },
 }
 
+/// `query`·`impact`의 출력 형식과 `language-traversal` 머리 값.
+///
+/// 머리 값(project·revision·generatedAt)은 language-traversal 문서에만 실린다. 기본
+/// JSON에 주면 조용히 버려지는 대신 오류로 알린다 — 사용자는 값이 실렸다고 믿는다.
+#[derive(clap::Args)]
+struct ReportArgs {
+    /// Output format: the command's own JSON, or an isthmus language-traversal
+    /// document (accepts several subjects).
+    #[arg(long, value_enum, default_value_t = ReportFormat::Json)]
+    format: ReportFormat,
+    /// Project root recorded in language-traversal output (canonicalized like
+    /// `facts --project`; default: current directory).
+    #[arg(long)]
+    project: Option<PathBuf>,
+    /// Source revision recorded as `revision` in language-traversal output
+    /// (for example a git commit).
+    #[arg(long)]
+    revision: Option<String>,
+    /// RFC 3339 `generatedAt` for language-traversal output; defaults to now.
+    /// Fix it for reproducible output.
+    #[arg(long)]
+    generated_at: Option<String>,
+}
+
+/// `query`·`impact`의 `--format` 값. 변형의 문서 주석은 `--help`에 그대로 보이므로
+/// 사용자 출력 규칙에 따라 영어로 쓴다.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReportFormat {
+    /// The command's own JSON (schemagraph-query or schemagraph-impact).
+    Json,
+    /// isthmus language-traversal v1 document.
+    LanguageTraversal,
+}
+
+/// `query --direction`의 CLI 값 — 와이어 라벨은 export가 소유한다.
+#[derive(Clone, Copy, ValueEnum)]
+enum DirectionArg {
+    /// What the subjects depend on (outgoing edges).
+    Dependencies,
+    /// What depends on the subjects (incoming edges).
+    Dependents,
+}
+
+impl DirectionArg {
+    /// export의 방향으로 바꾼다.
+    fn direction(self) -> export::language_traversal::Direction {
+        match self {
+            Self::Dependencies => export::language_traversal::Direction::Dependencies,
+            Self::Dependents => export::language_traversal::Direction::Dependents,
+        }
+    }
+}
+
 #[derive(Clone, ValueEnum)]
 enum GraphFormat {
     Mermaid,
@@ -508,20 +577,70 @@ async fn run(cli: Cli) -> Result<i32> {
             max,
         } => search(&pattern, &graph, kind.as_deref(), detail.detail(), max),
         Command::Query {
-            name,
+            names,
             graph,
             depth,
             max,
             max_visited,
             max_examined_edges,
-        } => query(&name, &graph, depth, max, max_visited, max_examined_edges),
+            direction,
+            report,
+        } => {
+            let budget = analysis::budget::Budget {
+                max_visited,
+                max_examined_edges,
+            };
+            match report.format {
+                ReportFormat::Json => {
+                    let name = single_json_subject("query", &names, &report)?;
+                    if direction.is_some() {
+                        bail!("--direction applies only to --format language-traversal; the default query JSON reports both directions");
+                    }
+                    query(name, &graph, depth, max, max_visited, max_examined_edges)
+                }
+                ReportFormat::LanguageTraversal => {
+                    let direction = direction.ok_or_else(|| {
+                        anyhow!("--format language-traversal reports one direction; pass --direction dependencies or --direction dependents")
+                    })?;
+                    let request = TraversalRequest {
+                        names: &names,
+                        graph: &graph,
+                        direction: direction.direction(),
+                        depth,
+                        max,
+                        budget,
+                    };
+                    language_traversal(&request, &report)
+                }
+            }
+        }
         Command::Impact {
-            name,
+            names,
             graph,
             max,
             max_visited,
             max_examined_edges,
-        } => impact(&name, &graph, max, max_visited, max_examined_edges),
+            report,
+        } => match report.format {
+            ReportFormat::Json => {
+                let name = single_json_subject("impact", &names, &report)?;
+                impact(name, &graph, max, max_visited, max_examined_edges)
+            }
+            ReportFormat::LanguageTraversal => {
+                let request = TraversalRequest {
+                    names: &names,
+                    graph: &graph,
+                    direction: export::language_traversal::Direction::Dependents,
+                    depth: u32::MAX,
+                    max,
+                    budget: analysis::budget::Budget {
+                        max_visited,
+                        max_examined_edges,
+                    },
+                };
+                language_traversal(&request, &report)
+            }
+        },
         Command::Dead {
             graph,
             max,
@@ -1060,6 +1179,46 @@ fn load_document(path: &std::path::Path) -> Result<source::CatalogDocument> {
 fn load_graph(path: &std::path::Path) -> Result<Graph> {
     let doc: GraphDoc = serde_json::from_reader(open_reader(path)?)
         .with_context(|| format!("graph.json 파싱 실패: {}", path.display()))?;
+    graph_from_checked_doc(doc)
+}
+
+/// graph.json을 읽으면서 같은 바이트의 SHA-256(소문자 16진수)을 함께 구한다.
+///
+/// 해시를 따로 한 번 더 읽으면 그 사이에 파일이 바뀌어 해시와 그래프가 어긋날 수 있다.
+/// 파서가 읽는 바이트를 그대로 해시에 흘리고, 파서가 멈춘 뒤 남은 바이트(끝 공백)까지
+/// 읽어 파일 전체의 해시가 되게 한다.
+fn load_graph_with_sha256(path: &std::path::Path) -> Result<(Graph, String)> {
+    use sha2::{Digest, Sha256};
+    let mut reader = HashingReader {
+        inner: open_reader(path)?,
+        hasher: Sha256::new(),
+    };
+    let doc: GraphDoc = serde_json::from_reader(&mut reader)
+        .with_context(|| format!("graph.json 파싱 실패: {}", path.display()))?;
+    std::io::copy(&mut reader, &mut std::io::sink())
+        .with_context(|| format!("cannot finish reading {}; check the file", path.display()))?;
+    let digest = reader.hasher.finalize();
+    let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok((graph_from_checked_doc(doc)?, hex))
+}
+
+/// 읽은 바이트를 해시에 흘리는 reader.
+struct HashingReader<R> {
+    inner: R,
+    hasher: sha2::Sha256,
+}
+
+impl<R: std::io::Read> std::io::Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        let count = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..count]);
+        Ok(count)
+    }
+}
+
+/// graph.json 버전을 확인하고 그래프로 바꾼다.
+fn graph_from_checked_doc(doc: GraphDoc) -> Result<Graph> {
     if !matches!(doc.version, 1 | export::GRAPH_VERSION) {
         bail!(
             "graph.json 버전 {}는 이 바이너리({})와 다르다 — 다시 scan해라",
@@ -1200,6 +1359,147 @@ fn impact(
             Ok(1)
         }
     }
+}
+
+/// 기본 JSON 형식의 subject 하나를 꺼낸다.
+///
+/// 기본 `schemagraph-query`·`schemagraph-impact` 문서는 subject가 하나인 계약이라 여러
+/// 이름을 받지 않는다. language-traversal 전용 머리 값도 여기서 거절한다.
+fn single_json_subject<'a>(
+    command: &str,
+    names: &'a [String],
+    report: &ReportArgs,
+) -> Result<&'a str> {
+    let unused = [
+        ("--project", report.project.is_some()),
+        ("--revision", report.revision.is_some()),
+        ("--generated-at", report.generated_at.is_some()),
+    ];
+    if let Some((flag, _)) = unused.iter().find(|(_, given)| *given) {
+        bail!("{flag} applies only to --format language-traversal; add --format language-traversal or drop {flag}");
+    }
+    match names {
+        [name] => Ok(name),
+        _ => bail!(
+            "{command} JSON reports one subject but {} were given; pass one name, or add --format language-traversal for several",
+            names.len()
+        ),
+    }
+}
+
+/// `language-traversal` 요청의 탐색 입력.
+struct TraversalRequest<'a> {
+    names: &'a [String],
+    graph: &'a Path,
+    direction: export::language_traversal::Direction,
+    depth: u32,
+    max: usize,
+    budget: analysis::budget::Budget,
+}
+
+/// 여러 subject를 한 번의 다중 루트 탐색으로 돌려 language-traversal 문서를 출력한다.
+///
+/// 해석하지 못한 subject가 있어도 문서를 낸다 — 그 루트는 `symbol` 없이 자리를 지키고
+/// limitation과 `root-not-found`로 보고된다. 종료 코드는 기존 notFound 계약처럼 1이다.
+fn language_traversal(request: &TraversalRequest, options: &ReportArgs) -> Result<i32> {
+    let cancel = cancellation::install()?;
+    let project = canonical_project(options.project.as_deref().unwrap_or(Path::new(".")))?;
+    let generated_at = traversal_generated_at(options.generated_at.as_deref())?;
+    let (graph, graph_revision) = load_graph_with_sha256(request.graph)?;
+    let resolved = resolve_roots(&graph, request.names);
+    let ids: Vec<Option<schemagraph_core::VertexId>> =
+        resolved.iter().map(|(id, _)| id.clone()).collect();
+    let report = analysis::traversal::walk_roots(
+        &graph,
+        &ids,
+        request.depth,
+        request.max,
+        request.direction.is_reverse(),
+        request.budget,
+        Some(cancel),
+    );
+    let (roots, notes) = root_inputs(request.names, &resolved);
+    let mut limitations = graph.limitations().to_vec();
+    limitations.extend(notes);
+    let header = export::language_traversal::Header {
+        tool_version: env!("CARGO_PKG_VERSION"),
+        generated_at: &generated_at,
+        project: &project,
+        revision: options.revision.as_deref(),
+        graph_revision: &graph_revision,
+        direction: request.direction,
+    };
+    let value = export::language_traversal::to_value(&header, &roots, &report, &limitations);
+    println!("{}", export::to_pretty_json(&value)?);
+    Ok(if roots.iter().any(|root| root.resolved.is_none()) {
+        1
+    } else {
+        0
+    })
+}
+
+/// `generatedAt` 값 — 주어졌으면 RFC 3339인지 확인하고, 없으면 현재 시각이다.
+fn traversal_generated_at(given: Option<&str>) -> Result<String> {
+    match given {
+        Some(time) => validate_rfc3339(time).map(str::to_owned).map_err(|_| {
+            anyhow!("--generated-at must be RFC 3339, such as 2026-09-27T00:00:00Z; got '{time}'")
+        }),
+        None => rfc3339_utc_now(),
+    }
+}
+
+/// 해석 결과를 문서의 루트 항목과, 해석하지 못한 루트의 limitation 문구로 나눈다.
+/// 루트 항목은 입력 순서 그대로라 순번이 명령행 위치와 같다.
+fn root_inputs<'a>(
+    names: &'a [String],
+    resolved: &'a [(
+        Option<schemagraph_core::VertexId>,
+        Vec<schemagraph_core::VertexId>,
+    )],
+) -> (Vec<export::language_traversal::RootInput<'a>>, Vec<String>) {
+    let mut roots = Vec::new();
+    let mut notes = Vec::new();
+    for (index, (name, (id, candidates))) in names.iter().zip(resolved).enumerate() {
+        if id.is_none() {
+            notes.push(export::language_traversal::root_not_found_limitation(
+                index, name, candidates,
+            ));
+        }
+        roots.push(export::language_traversal::RootInput {
+            requested: name,
+            resolved: id.as_ref(),
+        });
+    }
+    (roots, notes)
+}
+
+/// subject마다 `resolve`를 적용한다. 해석하지 못하면 (None, 후보)다.
+fn resolve_roots(
+    graph: &Graph,
+    names: &[String],
+) -> Vec<(
+    Option<schemagraph_core::VertexId>,
+    Vec<schemagraph_core::VertexId>,
+)> {
+    names
+        .iter()
+        .map(|name| match analysis::resolve(graph, name) {
+            Resolve::Found(id) => (Some(id), Vec::new()),
+            Resolve::NotFound { candidates } => (None, candidates),
+        })
+        .collect()
+}
+
+/// project 루트를 realpath로 정규화한다 — `facts --project`와 같은 규칙이라 두 문서의
+/// `project`가 문자열로 일치한다.
+fn canonical_project(project: &Path) -> Result<String> {
+    let path = std::fs::canonicalize(project).with_context(|| {
+        format!(
+            "cannot resolve --project {}; pass an existing directory",
+            project.display()
+        )
+    })?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// 이름 패턴으로 정점을 찾아 출력한다. 일치가 없어도 성공(0)이다 —

@@ -301,6 +301,101 @@ directly to `query` or `impact` (check that `subject.id` equals it) to continue
 into in-database dependents. Graphs and facts from different catalogs do not
 share ids reliably; build both from one `--emit-document` output.
 
+### Trace several subjects as a language-traversal document
+
+```sh
+schemagraph impact app.customers app.products --graph graph.json \
+  --format language-traversal --project /path/to/repo --revision "$(git rev-parse HEAD)"
+schemagraph query app.order_report --graph graph.json --depth 2 \
+  --format language-traversal --direction dependencies --project /path/to/repo
+```
+
+`--format language-traversal` writes an isthmus `language-traversal` v1 document
+instead of the command's own JSON. `impact` always reports `dependents`; `query`
+reports the one direction chosen with `--direction` (required with this format)
+up to `--depth`. Both accept several subjects and traverse them together in one
+multi-root pass under a single `--max-visited`/`--max-examined-edges` budget.
+`--max` caps the combined `reached` list across all subjects (not per subject
+or per direction) and keeps the nearest entries. With one subject and no cut,
+`reached` holds the same vertices, depths, and `via` as the default JSON; when
+`--max` cuts, the two formats keep different prefixes, since the default JSON
+sorts by id and language-traversal by depth, then id.
+The default `--format json` output is unchanged and still takes exactly one
+subject; `--direction`, `--project`, `--revision`, and `--generated-at` are
+rejected without `--format language-traversal`. MCP tools keep the default JSON.
+
+```json
+{
+  "format": "language-traversal", "version": 1,
+  "tool": {"name": "schemagraph", "version": "0.6.0"},
+  "generatedAt": "2026-09-27T00:00:00Z", "platform": "sql",
+  "project": "/path/to/repo", "revision": "0123abc",
+  "graphRevision": "8e214d10…", "direction": "dependents",
+  "roots": [
+    {"id": "app.customers", "symbol": {"usr": "app.customers", "qualifiedName": "app.customers"}},
+    {"id": "app.products", "symbol": {"usr": "app.products", "qualifiedName": "app.products"}}
+  ],
+  "reached": [
+    {"symbol": {"usr": "app.order_report", "qualifiedName": "app.order_report"},
+     "via": "app.products", "depth": 1, "roots": [0, 1], "relationships": ["reads"]},
+    {"symbol": {"usr": "app.audit_report", "qualifiedName": "app.audit_report"},
+     "via": "app.order_report", "depth": 2, "roots": [0, 1], "relationships": ["reads"]}
+  ],
+  "truncated": false,
+  "limitations": []
+}
+```
+
+- Every id is a graph vertex id, the same string `facts` writes as
+  `symbol.usr`; `symbol.usr` and `symbol.qualifiedName` hold the same value.
+  `roots[].id` is the resolved vertex id even when the subject was given as a
+  short name, and `roots` keeps the command-line order: `reached[].roots`
+  refers to those positions.
+- `reached` lists every vertex reached from at least one root other than
+  itself, **including roots**. `impact public.User public.Account` lists
+  `Account` when it references `User`, and passing every table of a database
+  keeps each FK dependent even though all of them are roots. A root reached
+  only from itself (through a cycle) is not listed.
+- `depth` is the shortest distance from the nearest root and `via` is the
+  vertex before it on that path: a root id for depth 1, otherwise a reached
+  vertex at `depth - 1`. Ties pick the lexicographically smallest id, as for
+  `query`/`impact` neighbors. For a root listed in `reached`, `depth` and
+  `via` are measured from the *other* roots only (`via` may be another root
+  id). Its `via` is still an adjacent vertex, but that vertex's own `depth` may
+  be smaller than `depth - 1` when the listed root reaches it more directly;
+  use `path` for the exact chain from another root. `reached` is ordered by
+  `depth`, then id, so a list cut by `--max` keeps the nearest vertices and
+  every kept `via`.
+- `reached[].roots` lists every root that reaches the vertex within the
+  requested depth, not only the nearest one, in ascending order. A root never
+  lists its own index (nor the index of a duplicate subject naming the same
+  vertex). It is capped at 64 indices per vertex (the smallest are kept); a cap
+  sets top-level `rootsTruncated: true`, otherwise the key is absent.
+- `relationships` lists every dependency edge kind the traversal saw arriving
+  at the vertex, with the same meaning as a neighbor's `edges`: the union over
+  all examined edges into it, not only the edge from `via`. This also holds for
+  a listed root (every examined edge into it from another vertex).
+- `graphRevision` is the lowercase hex SHA-256 of the graph.json bytes that were
+  read, so a consumer can detect a report made from a different snapshot.
+  `project` is canonicalized like `facts --project` (default: current
+  directory). `revision` is copied from `--revision` and omitted when not given.
+  `generatedAt` defaults to the current time; pass `--generated-at` (RFC 3339)
+  for byte-identical reruns.
+- A subject that does not resolve (unknown name, or a short name matching
+  several vertices) keeps its position as `{"id": "<given text>"}` without
+  `symbol`, adds a `root-not-found:` limitation naming the index and any
+  candidates, and adds `root-not-found` to `truncationReasons` (so `truncated`
+  is true). The other roots are still traversed and the document is written,
+  but the command exits **1**, as with `notFound`. `truncated` alone does not
+  say which root failed: use a root entry without `symbol`, or the
+  `root-not-found: roots[i]` limitation, as the precise per-root signal. Results
+  for the resolved roots are complete unless another reason is also listed.
+- `truncated` is true when any `truncationReasons` exist (`result-limit`,
+  `visited-limit`, `edge-limit`, `cancelled`, `root-not-found`);
+  `truncationReasons` is omitted when empty. After a budget stop or
+  cancellation, `reached`, `roots`, `relationships`, and `via` are lower bounds
+  built from the edges examined.
+
 ## Share or serve a snapshot
 
 ```sh
@@ -317,7 +412,8 @@ metadata; share it with the same audience as the graph snapshot.
 one graph at startup and exposes no database connection or arbitrary file-reading
 tools. Configure the MCP client to launch the command above. The tool results
 preserve the CLI analysis contract and explicit result/traversal limits; each
-tool returns the same JSON as the CLI command with the same options.
+tool returns the same JSON as the CLI command with the same options. `query` and
+`impact` return their default JSON; `--format language-traversal` is CLI-only.
 
 Start with `search` when the exact id is unknown. Its default `names` detail
 lists ids only; request `summary` for the candidates you need. The `dead` tool

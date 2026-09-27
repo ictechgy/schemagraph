@@ -16,6 +16,40 @@ These changes are not yet in a published release.
   chosen, so output stays deterministic. `review` findings list impacted
   objects with the same field. Existing fields keep their meaning.
 
+## language-traversal output
+
+- `impact` and `query` accept `--format language-traversal`, which writes an
+  isthmus `language-traversal` v1 document for cross-language `trace` joins.
+  `impact` reports `dependents`; `query` requires `--direction dependencies` or
+  `--direction dependents` and honors `--depth`. Both accept several subjects
+  and traverse them in one multi-root pass under a single visited/edge budget.
+- Each reached vertex carries `symbol` (`usr` and `qualifiedName`, both the
+  vertex id that `facts` writes), `via`, `depth` from the nearest subject,
+  `relationships` (edge kinds seen), and `roots`: every subject index that
+  reaches it within the depth, capped at 64 per vertex with top-level
+  `rootsTruncated`. Output is ordered by depth, then id.
+- A subject reached from another subject is listed in `reached` too, with only
+  the other subjects in its `roots` and `depth`/`via` measured from them, so
+  passing every table of a database keeps each FK dependent. A subject reached
+  only from itself is not listed.
+- The header records `tool`, `generatedAt` (`--generated-at` pins it),
+  `platform: "sql"`, `project` (`--project`, canonicalized like `facts`),
+  optional `revision` (`--revision`), and `graphRevision`, the SHA-256 of the
+  graph.json bytes read.
+- An unresolved subject keeps its index without `symbol`, adds a
+  `root-not-found:` limitation and truncation reason, and the command exits 1
+  after writing the document. The missing `symbol` (or the limitation) is the
+  per-root signal; `truncated` only says the document is not complete.
+- `--max` caps the combined `reached` list across all subjects, keeping the
+  nearest (depth, then id). The default JSON sorts by id before cutting, so with
+  one subject the two formats agree only when nothing is cut.
+- The default JSON output of `query` and `impact` is byte-for-byte unchanged and
+  still takes one subject; the new options are rejected without
+  `--format language-traversal`. MCP tools are unchanged.
+- CI's bridge-facts check now runs every `facts` usr from real SQLite and
+  PostgreSQL scans through multi-root `language-traversal` and compares each
+  subject's reached set and depths with separate single-subject `impact` runs.
+
 ## isthmus facts
 
 - `facts` now sets `symbol.usr` on every `relation-decl` to the same vertex id
@@ -26,6 +60,10 @@ These changes are not yet in a published release.
   graph from the same SQLite and PostgreSQL scans.
 
 ## Upgrade notes
+
+- The CLI `query` and `impact` subject argument is now variadic (`<NAMES>...`).
+  With the default `--format json`, passing more than one name is a usage error
+  (exit 2), as before.
 
 - `schemagraph_analysis::Neighbor` gains a public `via` field. Code that builds
   `Neighbor` with a struct literal must set it.

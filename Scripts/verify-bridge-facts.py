@@ -4,6 +4,8 @@
 기대값은 엔진 출력이 아니라 각 DB의 시스템 카탈로그를 직접 읽어 만든다.
 같은 scan의 그래프 정점 id와 양방향으로 대조해 유령 id가 없음을 확인하고,
 모든 `symbol.usr`를 실제 `impact`에 넘겨 조인 키로 그대로 쓰이는지 본다.
+같은 usr들을 `impact --format language-traversal`의 다중 루트로 넘겨 루트마다 따로
+돈 impact와 같은 도달 집합·거리가 나오는지도 본다.
 `--isthmus`를 주면 실제 isthmus check가 문서를 소비한 결과까지 검사한다.
 """
 
@@ -152,17 +154,78 @@ def check_usr_impact(engine, document, graph_path, env):
     가까운 정점을 가리키는지도 확인한다 — via를 따라가면 subject에 닿아야 한다.
     """
     usrs = sorted({fact['symbol']['usr'] for fact in document['facts']})
+    reports = {}
     for usr in usrs:
         report = json.loads(ACCURACY.run([engine, 'impact', usr, '--graph', graph_path], env=env))
         assert (report['format'], report['version']) == ('schemagraph-impact', 1), report
         assert report['subject']['id'] == usr, (usr, report['subject'])
+        reports[usr] = report
         if report['truncated']:
             continue
         distance = {item['id']: item['distance'] for item in report['impacted']}
         distance[usr] = 0
         for item in report['impacted']:
             assert distance.get(item['via']) == item['distance']-1, (usr, item)
-    return len(usrs)
+    return reports
+
+
+# language-traversal은 도달 정점마다 루트 순번을 64개까지 싣는다. 검사는 이 상한 안의
+# 묶음으로 나눠 돌려 순번이 잘리지 않은 상태에서 단일 impact와 정확히 비교한다.
+TRAVERSAL_ROOTS_PER_RUN = 64
+
+
+def check_language_traversal(engine, document, reports, graph_path, work, env):
+    """usr 묶음을 다중 루트 language-traversal로 돌려 루트별 단일 impact와 대조한다.
+
+    묶음은 두 가지다 — 모든 usr, 그리고 관계 usr만. 모든 usr 묶음에서는 도달 정점이
+    대부분 다른 루트라서 "다른 루트가 닿는 루트도 싣는다" 규칙을 실제 FK·뷰·컬럼
+    간선으로 본다.
+
+    기대값은 엔진의 다른 경로(루트마다 따로 돈 impact)에서 온다. 루트 i의 순번을 가진
+    도달 정점 집합은 그 루트의 impacted 전부(다른 루트 포함)와 같아야 하고, 루트인 도달
+    정점은 자기 순번을 갖지 않는다. depth는 자기를 뺀 묶음 루트들의 거리 중 최솟값이다
+    (impacted는 subject 자신을 담지 않으므로 루트별 거리의 최솟값이 곧 그 값이다). via는
+    묶음의 루트이거나 도달 정점이어야 하고, 루트가 아닌 정점의 via는 한 걸음 가깝다.
+    graphRevision은 graph.json 바이트의 SHA-256이다.
+    """
+    usrs = sorted(usr for usr, report in reports.items() if not report['truncated'])
+    relations = {fact['symbol']['usr'] for fact in document['facts'] if 'method' not in fact}
+    graph_sha = hashlib.sha256(Path(graph_path).read_bytes()).hexdigest()
+    compared = 0
+    groups = [usrs, [usr for usr in usrs if usr in relations]]
+    chunks = [group[start:start+TRAVERSAL_ROOTS_PER_RUN]
+              for group in groups for start in range(0, len(group), TRAVERSAL_ROOTS_PER_RUN)]
+    for chunk in chunks:
+        output = ACCURACY.run([engine, 'impact', *chunk, '--graph', graph_path,
+                               '--format', 'language-traversal', '--project', work,
+                               '--generated-at', '2026-09-27T00:00:00Z'], env=env)
+        traversal = json.loads(output)
+        assert (traversal['format'], traversal['version'], traversal['direction']) == \
+            ('language-traversal', 1, 'dependents'), traversal
+        assert traversal['graphRevision'] == graph_sha and traversal['truncated'] is False, traversal
+        assert [root['id'] for root in traversal['roots']] == chunk, traversal['roots']
+        assert all(root['symbol'] == {'usr': root['id'], 'qualifiedName': root['id']} for root in traversal['roots'])
+        depth = {item['symbol']['usr']: item['depth'] for item in traversal['reached']}
+        roots = set(chunk)
+        for item in traversal['reached']:
+            usr = item['symbol']['usr']
+            if usr in roots:
+                # 루트의 via는 다른 루트 기준이라, via 자신의 depth(자기 포함 최단)는 더 짧을 수 있다.
+                assert item['via'] in roots or depth.get(item['via'], item['depth']) <= item['depth']-1, item
+                assert chunk.index(usr) not in item['roots'], item
+            else:
+                assert item['via'] in roots or depth.get(item['via']) == item['depth']-1, item
+        for index, usr in enumerate(chunk):
+            expected = {item['id'] for item in reports[usr]['impacted']}
+            actual = {item['symbol']['usr'] for item in traversal['reached'] if index in item['roots']}
+            assert actual == expected, {usr: {'missing': sorted(expected-actual), 'unexpected': sorted(actual-expected)}}
+        nearest = {}
+        for usr in chunk:
+            for item in reports[usr]['impacted']:
+                nearest[item['id']] = min(nearest.get(item['id'], item['distance']), item['distance'])
+        assert depth == nearest, {'engine': depth, 'single-impact': nearest}
+        compared += len(chunk)
+    return compared
 
 
 def compare(label, document, relations):
@@ -208,9 +271,10 @@ def sqlite_case(engine, work, version):
     document = check_outputs(engine, catalog, work, None, version)
     check_graph_ids(document, json.loads(graph.read_text()))
     assert not any(note.startswith(COVERAGE_PREFIX) for note in document['limitations']), document['limitations']
-    resolved = check_usr_impact(engine, document, graph, None)
+    reports = check_usr_impact(engine, document, graph, None)
+    traversal = check_language_traversal(engine, document, reports, graph, work, None)
     return dict(compare('sqlite', document, sqlite_relations(database)), sqlite=sqlite3.sqlite_version,
-                usr_impact_resolved=resolved)
+                usr_impact_resolved=len(reports), language_traversal_roots=traversal)
 
 
 def postgres_relations(psql, env):
@@ -293,7 +357,9 @@ def postgres_case(engine, bindir, work, version):
         check_graph_ids(document, json.loads(graph.read_text()))
         assert not any(note.startswith(COVERAGE_PREFIX) for note in document['limitations']), document['limitations']
         summary = compare('postgres', document, postgres_relations(psql, env))
-        summary['usr_impact_resolved'] = check_usr_impact(engine, document, graph, env)
+        reports = check_usr_impact(engine, document, graph, env)
+        summary['usr_impact_resolved'] = len(reports)
+        summary['language_traversal_roots'] = check_language_traversal(engine, document, reports, graph, work, env)
         restricted = restricted_case(engine, url, psql, work, env, version, document)
         missing_schema_case(engine, url, work, env, version)
         server = ACCURACY.run(psql+['-Atqc', 'SHOW server_version'], env=env).strip()
