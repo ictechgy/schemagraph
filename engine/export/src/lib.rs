@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 pub mod diagnostics;
 pub mod explain;
 pub mod html;
+pub mod language_traversal;
 pub mod lint;
 pub mod mermaid;
 pub mod openlineage;
