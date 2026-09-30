@@ -327,7 +327,7 @@ rejected without `--format language-traversal`. MCP tools keep the default JSON.
 ```json
 {
   "format": "language-traversal", "version": 1,
-  "tool": {"name": "schemagraph", "version": "0.6.0"},
+  "tool": {"name": "schemagraph", "version": "0.7.0"},
   "generatedAt": "2026-09-27T00:00:00Z", "platform": "sql",
   "project": "/path/to/repo", "revision": "0123abc",
   "graphRevision": "8e214d10…", "direction": "dependents",
