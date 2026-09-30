@@ -1,6 +1,21 @@
-# Unreleased
+# schemagraph 0.7.0
 
-These changes are not yet in a published release.
+This release makes `query` and `impact` output joinable by downstream tools:
+versioned JSON with a `via` parent on every neighbor, a multi-subject isthmus
+`language-traversal` format for cross-language `trace`, and a stable
+`symbol.usr` on every `facts` relation. Existing JSON fields keep their
+meaning; only new keys are added.
+
+## Behavior changes
+
+- `query`/`impact --format language-traversal` exits 1 when any subject cannot
+  be resolved, **after** writing the document. Scripts that treat any nonzero
+  exit as "no output" should read the document and check each root's `symbol`
+  (or the `root-not-found:` limitation) instead.
+- `query` and `impact` JSON gain top-level `format`/`version` and a `via` field
+  on each neighbor. Consumers that reject unknown keys must accept them.
+- The unbudgeted library functions `analysis::query` and `analysis::impact` no
+  longer follow edges to unregistered vertices (see Upgrade notes).
 
 ## Traversal output for downstream joins
 
@@ -43,8 +58,8 @@ These changes are not yet in a published release.
 - `--max` caps the combined `reached` list across all subjects, keeping the
   nearest (depth, then id). The default JSON sorts by id before cutting, so with
   one subject the two formats agree only when nothing is cut.
-- The default JSON output of `query` and `impact` is byte-for-byte unchanged and
-  still takes one subject; the new options are rejected without
+- The new options do not affect the default JSON output of `query` and
+  `impact`, which still takes one subject; they are rejected without
   `--format language-traversal`. MCP tools are unchanged.
 - CI's bridge-facts check now runs every `facts` usr from real SQLite and
   PostgreSQL scans through multi-root `language-traversal` and compares each
@@ -71,6 +86,22 @@ These changes are not yet in a published release.
   longer traverse edges whose endpoint is not a registered vertex, matching the
   budgeted traversal used by the CLI and MCP. Reading `graph.json` already
   drops such edges.
+
+## Upgrade and validation
+
+Install the CLI with `cargo install schemagraph-cli --version 0.7.0 --locked`,
+or use the Linux x86_64/macOS arm64 release archives. The Action can be
+referenced as `ictechgy/schemagraph@v0.7.0`.
+
+All six Rust crates move to 0.7.0 because `Neighbor` gains a public field and
+the CLI gains new options. The JDBC and Go probes have no code changes; the
+probe version moves to 0.7.0 only to stay aligned with the engine
+(`io.github.ictechgy:schemagraph-probe:0.7.0`). Catalog and graph document
+formats are unchanged.
+
+The `language-traversal` output is consumed by isthmus `trace`, which needs an
+isthmus release that includes language-traversal input (isthmus-cli 0.9.0 does
+not).
 
 ---
 
