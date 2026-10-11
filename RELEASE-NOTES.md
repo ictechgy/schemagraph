@@ -1,3 +1,44 @@
+# schemagraph 0.7.1
+
+This patch protects local inputs and saved snapshots during file exports.
+Catalog/graph formats, graph semantics, and probe collection behavior are unchanged.
+
+## Safer file output
+
+- `scan`, `merge`, `facts`, and `openlineage` finish and sync a temporary file
+  before atomically replacing the destination. A write or serialization failure
+  preserves the previous snapshot. OpenLineage file output streams its events.
+- Output preflight rejects overwriting catalog/graph inputs, the source SQLite
+  database, and collected `--sql-dir` files. SQLite URL encoding and `file:` URIs,
+  canonical path aliases, and Unix hard links are checked. Encoded `:memory:`
+  SQLite URLs remain supported.
+- Symlink, special-file, and read-only output destinations are rejected. Two
+  output filenames in the same directory must differ by more than letter case.
+  Existing file permissions are preserved; new files are private (`0600` on Unix).
+- `scan --emit-document` stages both outputs before publishing either. The two
+  renames are independent, not a multi-file transaction; stdout and shell
+  redirection do not have the atomic-file guarantee.
+
+## Container exports
+
+For host-readable bind-mounted files, use `docker run --user "$(id -u):$(id -g)"`.
+The image still defaults to non-root UID/GID `65532:65532`; private files owned by
+that user must be read by the same user. The container smoke checks both paths.
+See [installation instructions](INSTALLATION.md#docker-with-host-readable-output).
+
+## Upgrade and validation
+
+Install with `cargo install schemagraph-cli --version 0.7.1 --locked`, or use the
+Linux x86_64/macOS arm64 release archives. The Action pin is
+`ictechgy/schemagraph@v0.7.1`. All six Rust crate versions and the unchanged JDBC
+probe publication align at 0.7.1; third-party dependency versions are unchanged.
+The implementation is covered by 440 Rust tests, a regression that fails with
+the old writer, real SQLite output-contract checks, and container command tests.
+Release artifacts and platform/container end-to-end checks remain the release
+CI gates; the version bump does not itself publish an artifact.
+
+---
+
 # schemagraph 0.7.0
 
 This release makes `query` and `impact` output joinable by downstream tools:

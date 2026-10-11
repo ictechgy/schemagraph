@@ -1,5 +1,23 @@
 # HANDOFF.md
 
+## 0.7.1 릴리스 준비 (2026-10-11, release/0.7.1)
+
+- 입력·스냅샷 보호 및 컨테이너 host UID 보정 이후의 patch 버전이다.
+- Rust workspace·내부 의존·Cargo.lock의 자기 패키지 6개와 JDBC probe,
+  Maven 도구/수동 게시 기본값, 설치 예제를 0.7.1로 맞췄다. 외부 의존은 갱신하지 않았다.
+- 원본 fix 브랜치를 보존한 별도 worktree에서 준비했으며, 태그·crate·바이너리·
+  Maven 게시는 하지 않았다. PR35 CI/머지 뒤 릴리스 PR과 태그를 진행한다.
+- release workflow의 버전 guard를 PR/nonpublishing 모드로 실행했고 Cargo
+  metadata·locked/offline CLI build·fmt·CLI 버전/skill·scan/query·facts/traversal
+  버전 표기, 컨테이너 명령 회귀 4개를 확인했다. 6개 crate를 offline으로
+  package(`--no-verify`)한 뒤 정규화 manifest·라이선스·번들 skill을 대조했다.
+  외부 lock 항목은 모두 동일하다. 기존 `yoke-derive 0.8.3` yanked 경고는
+  유지되며 Gradle 부재로 JDBC JAR·Maven artifact 빌드는 CI 확인 대상이다.
+- 원본 수정의 원격 `2302809e21ce1613201c6b70777c0c82e03c4e6b`
+  [CI 실행](https://github.com/ictechgy/schemagraph/actions/runs/38157944067)에서
+  container consumer smoke는 통과했다. DB/package 본 작업은 확인 당시 진행 중이며,
+  이 원본 수정 검증과 별도로 0.7.1 릴리스 산출물 CI는 아직 실행·확인 전이다.
+
 _최종 갱신: 2026-09-25 KST · Claude_
 
 ## 파일 출력 보호 보강 (2026-10-11, fix/atomic-snapshot-output)
