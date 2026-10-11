@@ -6,6 +6,7 @@
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::document::*;
@@ -14,9 +15,7 @@ use crate::SourceError;
 /// `sqlite:경로`·`sqlite://경로`·베어 파일 경로를 받아 카탈로그를 읽는다.
 pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
     let path = strip_sqlite_url(url);
-    let options = SqliteConnectOptions::from_str(&format!("sqlite:{path}"))
-        .map_err(|e| SourceError::Connect(format!("sqlite 경로 해석 실패: {e}")))?
-        .read_only(true);
+    let options = connect_options(&path)?;
     let pool = SqlitePoolOptions::new()
         .connect_with(options)
         .await
@@ -45,6 +44,54 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         catalog_complete: doc.limitations.is_empty(),
     });
     Ok(doc)
+}
+
+/// CLI가 SQLite 입력 파일을 출력으로 덮어쓰지 않도록 실제 접속과 같은 경로를 돌려준다.
+/// URL 인코딩도 sqlx의 해석을 공유하며, 메모리 DB에는 보호할 파일이 없다.
+pub fn database_path(url: &str) -> Result<Option<PathBuf>, SourceError> {
+    let path = strip_sqlite_url(url);
+    if path == ":memory:" {
+        return Ok(None);
+    }
+    let options = connect_options(&path)?;
+    let filename = options.get_filename();
+    if filename == std::path::Path::new(":memory:") {
+        return Ok(None);
+    }
+    let Some(uri) = filename
+        .to_str()
+        .and_then(|name| name.strip_prefix("file:"))
+    else {
+        return Ok(Some(filename.to_owned()));
+    };
+    // sqlx는 SQLITE_OPEN_URI로 열므로 file: 접두는 실제 파일 이름의 일부가 아니다.
+    // SQLite가 URI의 경로를 한 번 더 디코딩하는 의미를 같은 sqlx 파서로 재사용한다.
+    let uri_path = uri.split(['?', '#']).next().unwrap_or(uri);
+    let uri_path = match uri_path.strip_prefix("//") {
+        Some(authority_path) => {
+            let (authority, path) = authority_path
+                .split_once('/')
+                .unwrap_or((authority_path, ""));
+            if !matches!(authority, "" | "localhost") {
+                return Err(SourceError::Connect(
+                    "SQLite file URI must use an empty or localhost authority".into(),
+                ));
+            }
+            format!("/{path}")
+        }
+        None => uri_path.to_owned(),
+    };
+    if uri_path == ":memory:" || uri_path.is_empty() {
+        return Ok(None);
+    }
+    let decoded = connect_options(&uri_path)?.get_filename().to_owned();
+    Ok((decoded != std::path::Path::new(":memory:")).then_some(decoded))
+}
+
+fn connect_options(path: &str) -> Result<SqliteConnectOptions, SourceError> {
+    SqliteConnectOptions::from_str(&format!("sqlite:{path}"))
+        .map(|options| options.read_only(true))
+        .map_err(|e| SourceError::Connect(format!("sqlite 경로 해석 실패: {e}")))
 }
 
 /// `sqlite:`/`sqlite://` 접두와 쿼리스트링을 벗긴다.
@@ -321,6 +368,23 @@ async fn read_indexes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn encoded_memory_urls_are_readable_without_a_local_input_file() {
+        for url in [
+            "sqlite::memory:",
+            "sqlite:%3Amemory%3A",
+            "sqlite:file:%253Amemory%253A",
+        ] {
+            assert_eq!(database_path(url).unwrap(), None, "{url}");
+            let document = read(url).await.unwrap();
+            assert_eq!(document.dialect, "sqlite");
+            assert!(document
+                .schemas
+                .iter()
+                .all(|schema| schema.objects.is_empty()));
+        }
+    }
 
     /// fixture SQL을 적용한 임시 DB를 만들어 document를 읽는다.
     async fn fixture_doc(sql: &str) -> CatalogDocument {

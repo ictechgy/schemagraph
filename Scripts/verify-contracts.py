@@ -80,6 +80,32 @@ def fixture(path: Path) -> None:
         )
 
 
+def verify_snapshot_output_safety(engine: Path, work: Path, database: Path) -> None:
+    """실제 SQLite 입력을 잘못 지정한 산출물이 덮어쓰지 못하는지 바이트로 확인한다."""
+    before = database.read_bytes()
+    reference_graph = json.loads(run(engine, "scan", f"sqlite:{database}", "-o", "-"))
+    for url in (f"sqlite:{database}", f"file:{database}?mode=ro", f"sqlite:{database.as_uri()}?mode=rwc"):
+        if json.loads(run(engine, "scan", url, "-o", "-")) != reference_graph:
+            fail(f"SQLite URI resolved to a different database: {url}")
+        for option in ("-o", "--emit-document"):
+            command = [str(engine), "scan", url, option, str(database)]
+            if option == "--emit-document":
+                command.extend(["-o", str(work / "must-not-exist.json")])
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode != 2 or "must be distinct" not in result.stderr:
+                fail(f"scan accepted a database/output collision: {result}")
+            if database.read_bytes() != before:
+                fail("scan modified the source SQLite database")
+    if (work / "must-not-exist.json").exists():
+        fail("scan published an output despite its database/output collision")
+    with sqlite3.connect(database) as connection:
+        if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+            fail("SQLite integrity check failed after rejected output collision")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if tables != {"customers", "orders"}:
+            fail(f"SQLite declarations changed after rejected output collision: {tables}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate schemagraph JSON contracts.")
     parser.add_argument("--engine", required=True, type=Path)
@@ -94,6 +120,7 @@ def main() -> int:
             work = Path(directory)
             database = work / "fixture.db"
             fixture(database)
+            verify_snapshot_output_safety(engine, work, database)
             v1_document = work / "catalog-v1.json"
             v1_graph = work / "graph-v2.json"
             run(engine, "scan", f"sqlite:{database}", "--emit-document", v1_document, "-o", v1_graph)

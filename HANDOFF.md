@@ -2,6 +2,24 @@
 
 _최종 갱신: 2026-09-25 KST · Claude_
 
+## 파일 출력 보호 보강 (2026-10-11, fix/atomic-snapshot-output)
+
+- `scan`·`merge`·`facts`·`openlineage` 파일 출력을 임시 파일 기록·동기화 후
+  원자적 교체로 바꿨다. 기존 파일 권한은 유지하고, 새 파일은 Unix에서 private다.
+- catalog·graph·원본 SQLite DB(`file:` URI·인코딩 포함)·수집된 `--sql-dir`
+  파일과 출력의 충돌을 쓰기 전에 거절한다. SQL 파일 집합은 source 수집기를
+  공유하며, 실제 출력 파일의 canonical 경로와 Unix hard link도 대조한다.
+- symlink·특수 파일·읽기 전용 출력과 대소문자만 다른 산출물 이름을 거절한다.
+  `scan --emit-document`는 두 파일을 모두 준비한 뒤 공개한다. 두 rename을
+  하나의 트랜잭션이나 전원 장애까지 견디는 다중 파일 커밋으로 주장하지 않는다.
+- Rust workspace 440개 테스트·fmt·실제 SQLite JSON 계약·경쟁 CLI·취소 검증을
+  실행했다. 이전 main으로 catalog 보존 회귀가 실패하는 것을 확인했다.
+  `clippy --all-targets`는 통과하나 기존 경고가 있어 `-D warnings`는 실패한다
+  (첫 기존 지적: `core/src/merge.rs`의 needless borrow). 수집 의미론·DB 드라이버·
+  probe는 바꾸지 않았고 외부 DB 컨테이너 fixture는 이번 환경에서 실행하지 않았다.
+- 공개 배포·태그·버전 변경은 이 브랜치에서 하지 않았다. 변경된 CLI 파일 계약은
+  ANALYSIS.md의 “Preserve snapshots when updating files”에 있다.
+
 ## 목표
 
 경쟁 재조사(2026-09-25)에서 정한 보강 네 가지를 구현·리뷰·머지하고 **v0.6.0으로 공개

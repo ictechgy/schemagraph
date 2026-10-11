@@ -14,6 +14,25 @@ const MAX_RELATIVE_PATH_BYTES: usize = 16 * 1024;
 
 const IGNORED_DIRECTORY_NAMES: &[&str] = &[".git", "target", "build", "node_modules"];
 
+/// 경로 사전 검사와 실제 수집이 같은 파일 집합을 사용하게 한다. SQL 원문은 보관하지 않는다.
+pub struct SqlFiles {
+    files: Vec<(String, PathBuf)>,
+}
+
+impl SqlFiles {
+    /// 출력이 입력을 덮어쓰는지 검사할 때 수집기의 제외 규칙을 다시 구현하지 않는다.
+    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.files.iter().map(|(_, path)| path.as_path())
+    }
+}
+
+/// symlink·빌드 디렉터리 제외와 상대 경로 검사를 한 번 수행해 파일 집합을 고정한다.
+pub fn collect(directory: &Path) -> Result<SqlFiles, String> {
+    Ok(SqlFiles {
+        files: collect_files(directory)?,
+    })
+}
+
 /// SQL 파일을 수집해 `default_schema`의 외부 query routine으로 추가한다.
 ///
 /// 모든 파일을 먼저 읽고 충돌을 검증한 뒤 document를 바꾸므로, 실패한
@@ -24,17 +43,25 @@ pub fn attach(
     directory: &Path,
     default_schema: &str,
 ) -> Result<usize, String> {
+    attach_collected(document, &collect(directory)?, default_schema)
+}
+
+/// 출력 사전 검사를 마친 파일 집합에서 SQL 원문을 읽어 document에 붙인다.
+pub fn attach_collected(
+    document: &mut CatalogDocument,
+    files: &SqlFiles,
+    default_schema: &str,
+) -> Result<usize, String> {
     let schema_index = document
         .schemas
         .iter()
         .position(|schema| schema.name == default_schema)
         .ok_or_else(|| format!("SQL file default schema '{default_schema}' was not collected"))?;
 
-    let files = collect_files(directory)?;
-    let routines = read_routines(&files)?;
+    let routines = read_routines(&files.files)?;
     validate_conflicts(document, schema_index, &routines)?;
     apply_routines(document, schema_index, routines);
-    Ok(files.len())
+    Ok(files.files.len())
 }
 
 struct CollectedRoutine {
