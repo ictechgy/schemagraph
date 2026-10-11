@@ -19,6 +19,10 @@ _최종 갱신: 2026-09-25 KST · Claude_
   probe는 바꾸지 않았고 외부 DB 컨테이너 fixture는 이번 환경에서 실행하지 않았다.
 - 공개 배포·태그·버전 변경은 이 브랜치에서 하지 않았다. 변경된 CLI 파일 계약은
   ANALYSIS.md의 “Preserve snapshots when updating files”에 있다.
+- 컨테이너 smoke의 host bind-mount 경로는 `--user <host uid>:<host gid>`로
+  실행한다. 기본 65532 사용자는 컨테이너 안에서 0600 파일 쓰기·읽기를 별도로
+  검증하며 private 기본값은 유지한다. Docker가 없는 로컬에서 실행 구성 회귀
+  4개와 실제 host CLI 0600 scan/query를 확인했고 컨테이너 end-to-end는 CI에서 확인한다.
 
 ## 목표
 

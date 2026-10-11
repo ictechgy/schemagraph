@@ -70,6 +70,7 @@ jobs:
           python3 Scripts/test-benchmark-scale.py
           python3 Scripts/test-probe-sqlite-benchmark.py
           python3 Scripts/test-review-action.py
+          python3 Scripts/test-container.py
           python3 Scripts/test-dml-accuracy.py
 
       - name: Build and test the Rust workspace

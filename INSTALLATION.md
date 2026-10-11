@@ -52,6 +52,30 @@ selected reader supports it; use a catalog document from a JDBC or Go probe
 with `schemagraph scan --document` when the engine should remain separate from
 the database connection.
 
+## Docker with host-readable output
+
+The image defaults to non-root user `65532:65532`. New output files are private
+(`0600` on Linux), so a different host user cannot read files owned by that
+container user. For a bind-mounted export, run as your host UID and GID and keep
+the output directory owned by that user. On Linux or macOS:
+
+```sh
+docker build -t schemagraph:local .
+mkdir -p output
+docker run --rm --user "$(id -u):$(id -g)" \
+  --network none --read-only --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --mount "type=bind,src=$(pwd)/catalog.json,dst=/input/catalog.json,readonly" \
+  --mount "type=bind,src=$(pwd)/output,dst=/output" \
+  schemagraph:local scan --document /input/catalog.json -o /output/graph.json
+```
+
+The catalog must be readable by the selected user. Run this from a non-root
+host account to keep the container non-root too. The exported file stays private
+and is readable by the host account; there is no need to make it world-readable.
+When keeping the default container user, read its private output from the same
+container or another container using the same UID and authorized storage.
+
 ## JDBC probe
 
 The standalone JAR is useful for JDBC databases and can be run without a Gradle
