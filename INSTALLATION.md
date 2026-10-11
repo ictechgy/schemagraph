@@ -1,5 +1,7 @@
 # Installing schemagraph
 
+For the 0.7.1 release, replace `VERSION` below with `0.7.1`.
+
 Version 0.5.0 includes [a consumer GitHub Action](REVIEW-ACTION.md)
 and [a reproducible Docker build](SUPPORT-MATRIX.md#runtime-and-distribution).
 Policy/SARIF and external SQL import require the 0.5.0 CLI.
