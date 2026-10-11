@@ -5,6 +5,28 @@ that snapshot without opening a database connection. Collection context and SQL
 analysis coverage are separate facts: a complete catalog can contain unsupported
 routine bodies.
 
+## Preserve snapshots when updating files
+
+`scan`, `merge`, `facts`, and `openlineage` stage file output in the destination
+directory, finish and sync the file, then replace the destination atomically.
+A serialization or write failure preserves the previous file. Existing file
+permissions are retained; new files are private to the current user on Unix.
+Output directories must already exist. Symlink, read-only, and special-file
+destinations are rejected; use `-o -` for stdout and shell pipes.
+
+An output must be distinct from every input and other output of that command.
+Two output filenames in the same directory must differ by more than letter
+case, so the command is safe to repeat on case-insensitive filesystems.
+This also protects the source SQLite database and collected `--sql-dir` files
+from `-o` or `--emit-document`, including encoded SQLite URLs and canonical path
+aliases. Existing hard-link aliases are additionally rejected on Unix; on other
+platforms atomic replacement preserves the content under the other hard links.
+`scan --emit-document` stages both
+files before publishing either. The two renames are independent, not a
+multi-file transaction: a failure during publication can leave the new catalog
+beside the previous graph. Retry after fixing the reported destination problem.
+Stdout and shell redirection do not provide the file replacement guarantee.
+
 ## Trace a dependency
 
 ```sh

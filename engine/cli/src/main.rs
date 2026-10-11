@@ -21,6 +21,7 @@ mod cancellation;
 mod import;
 mod mcp;
 mod merge;
+mod output;
 mod policy;
 mod review;
 
@@ -739,6 +740,12 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Merge { documents, output } => {
+            output::validate_paths(
+                &documents.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+                &output::file_path(Some(&output))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )?;
             write_graph_output(&output, &merge::run(&documents)?)?;
             Ok(0)
         }
@@ -813,6 +820,27 @@ async fn scan(
     query_schema: Option<&str>,
     cache_dir: Option<&std::path::Path>,
 ) -> Result<i32> {
+    let graph_output = output::file_path(Some(output));
+    let database_input = url.map(source::local_database_path).transpose()?.flatten();
+    let sql_files = sql_dir
+        .map(source::sql_files::collect)
+        .transpose()
+        .map_err(|error| anyhow!(error))?;
+    output::validate_paths(
+        &document
+            .into_iter()
+            .chain(database_input.as_deref())
+            .chain(
+                sql_files
+                    .iter()
+                    .flat_map(source::sql_files::SqlFiles::paths),
+            )
+            .collect::<Vec<_>>(),
+        &graph_output
+            .into_iter()
+            .chain(emit_document)
+            .collect::<Vec<_>>(),
+    )?;
     if let Some(id) = source_id {
         source::context::validate_source_id(id).map_err(|e| anyhow!(e))?;
     }
@@ -828,7 +856,7 @@ async fn scan(
         (Some(_), Some(_)) => bail!("URL과 --document는 같이 쓸 수 없다 — 둘 중 하나만"),
     };
     source::context::annotate(&mut doc, source_id, schemas).map_err(|e| anyhow!(e))?;
-    if let Some(directory) = sql_dir {
+    if let Some(files) = &sql_files {
         let schema = match query_schema {
             Some(schema) => schema.to_owned(),
             None if doc.schemas.len() == 1 => doc.schemas[0].name.clone(),
@@ -836,15 +864,19 @@ async fn scan(
                 bail!("--query-schema is required when the catalog contains multiple or no schemas")
             }
         };
-        source::sql_files::attach(&mut doc, directory, &schema).map_err(|e| anyhow!(e))?;
+        source::sql_files::attach_collected(&mut doc, files, &schema).map_err(|e| anyhow!(e))?;
     }
-    if let Some(path) = emit_document {
+    let staged_document = if let Some(path) = emit_document {
         let value = source::codec::document_to_value(&doc, document_version)
             .map_err(|error| anyhow!(error))?;
-        let json = export::to_pretty_json(&value)?;
-        std::fs::write(path, format!("{json}\n"))
-            .with_context(|| format!("catalog document 쓰기 실패: {}", path.display()))?;
-    }
+        Some(output::StagedOutput::new(path, |writer| {
+            serde_json::to_writer_pretty(&mut *writer, &value)?;
+            writer.write_all(b"\n")?;
+            Ok(())
+        })?)
+    } else {
+        None
+    };
     let mut cache = cache_dir
         .map(|directory| cache::DiskBodyCache::new(directory, &doc))
         .transpose()
@@ -865,7 +897,17 @@ async fn scan(
     }
     // 그래프는 원문을 소유하지 않으므로 출력 전에 큰 카탈로그를 해제한다.
     drop(doc);
-    write_graph_output(output, &graph)?;
+    // 두 파일 모두 직렬화한 뒤 공개한다. rename 두 번이 하나의 트랜잭션은 아니다.
+    let staged_graph = graph_output
+        .map(|path| output::StagedOutput::new(path, |writer| write_graph(writer, &graph)))
+        .transpose()?;
+    if let Some(document) = staged_document {
+        document.publish()?;
+    }
+    match staged_graph {
+        Some(graph) => graph.publish()?,
+        None => write_graph_output(output, &graph)?,
+    }
     Ok(0)
 }
 
@@ -899,6 +941,10 @@ fn analyze_document_with_cache(
 /// `project`는 호출 측 문서와 공유하는 realpath라 canonicalize로 정규화한다
 /// — 다른 표기의 같은 경로가 조인에서 갈라지지 않게 한다.
 fn facts(document: &Path, project: &Path, output: Option<&str>) -> Result<i32> {
+    output::validate_paths(
+        &[document],
+        &output::file_path(output).into_iter().collect::<Vec<_>>(),
+    )?;
     let doc = load_document(document)?;
     let project = std::fs::canonicalize(project).with_context(|| {
         format!(
@@ -916,8 +962,10 @@ fn facts(document: &Path, project: &Path, output: Option<&str>) -> Result<i32> {
     let json = export::to_pretty_json(&value)?;
     match output {
         Some(path) if path != "-" => {
-            std::fs::write(path, format!("{json}\n"))
-                .with_context(|| format!("bridge-facts 쓰기 실패: {path}"))?;
+            output::atomic_write(Path::new(path), |writer| {
+                writeln!(writer, "{json}")?;
+                Ok(())
+            })?;
         }
         _ => println!("{json}"),
     }
@@ -934,6 +982,10 @@ fn openlineage(
     event_time: Option<&str>,
     output: Option<&str>,
 ) -> Result<i32> {
+    output::validate_paths(
+        &[path],
+        &output::file_path(output).into_iter().collect::<Vec<_>>(),
+    )?;
     if namespace.trim().is_empty() {
         bail!(
             "--namespace must be nonempty; use the data source URI, such as postgres://host:5432"
@@ -975,21 +1027,17 @@ fn lineage_events(
 
 /// 이벤트를 한 줄에 하나씩 쓴다. `-`나 생략은 stdout이다.
 fn write_ndjson(events: &[serde_json::Value], output: Option<&str>) -> Result<()> {
-    let mut text = String::new();
-    for event in events {
-        text.push_str(&serde_json::to_string(event)?);
-        text.push('\n');
-    }
-    match output {
-        Some(path) if path != "-" => std::fs::write(path, text).with_context(|| {
-            format!(
-                "cannot write OpenLineage events to {path}; check the directory and permissions"
-            )
-        }),
-        _ => {
-            print!("{text}");
-            Ok(())
+    let write = |writer: &mut dyn Write| -> Result<()> {
+        for event in events {
+            serde_json::to_writer(&mut *writer, event)?;
+            writer.write_all(b"\n")?;
         }
+        writer.flush()?;
+        Ok(())
+    };
+    match output::file_path(output) {
+        Some(path) => output::atomic_write(path, write),
+        None => write(&mut BufWriter::new(std::io::stdout().lock())),
     }
 }
 
@@ -1827,20 +1875,18 @@ fn rules(path: &std::path::Path, config: &std::path::Path, strict: bool) -> Resu
 }
 
 fn write_graph_output(output: &str, graph: &Graph) -> Result<()> {
-    fn write(mut writer: impl Write, graph: &Graph) -> Result<()> {
-        export::stream::write_graph(&mut writer, graph)?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-        Ok(())
-    }
     if output == "-" {
-        write(BufWriter::new(std::io::stdout().lock()), graph)
+        write_graph(BufWriter::new(std::io::stdout().lock()), graph)
     } else {
-        let file = std::fs::File::create(output).with_context(|| {
-            format!("cannot create graph output {output}; check the directory and permissions")
-        })?;
-        write(BufWriter::new(file), graph)
+        output::atomic_write(Path::new(output), |writer| write_graph(writer, graph))
     }
+}
+
+fn write_graph(mut writer: impl Write, graph: &Graph) -> Result<()> {
+    export::stream::write_graph(&mut writer, graph)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]

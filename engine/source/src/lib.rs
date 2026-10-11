@@ -19,6 +19,18 @@ pub mod sqlite;
 
 pub use document::CatalogDocument;
 
+/// 출력 파일 보호가 접속 URL을 임의로 재해석하지 않도록 로컬 DB 경로를 제공한다.
+pub fn local_database_path(url: &str) -> Result<Option<std::path::PathBuf>, SourceError> {
+    if ["postgres://", "postgresql://", "mysql://", "mysqlx://"]
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
+    {
+        Ok(None)
+    } else {
+        sqlite::database_path(url)
+    }
+}
+
 /// URL 스킴으로 네이티브 reader를 고른다. 지원 안 하는 스킴은 명확한 오류 —
 /// 조용히 다른 reader로 돌리지 않는다(엉뚱한 DB를 읽는 것보다 낫다).
 pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
@@ -63,6 +75,43 @@ pub enum SourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_database_path_uses_the_reader_url_semantics() {
+        for url in [
+            "fixture.db",
+            "sqlite:fixture.db",
+            "sqlite://fixture.db?mode=ro",
+        ] {
+            assert_eq!(local_database_path(url).unwrap(), Some("fixture.db".into()));
+        }
+        assert_eq!(
+            local_database_path("sqlite:my%20db.db").unwrap(),
+            Some("my db.db".into())
+        );
+        for url in [
+            "file:my%20db.db?mode=ro",
+            "sqlite:file:my%20db.db?mode=ro",
+            "sqlite://file:my%2520db.db?mode=rwc",
+        ] {
+            assert_eq!(local_database_path(url).unwrap(), Some("my db.db".into()));
+        }
+        for url in ["file:///tmp/fixture.db", "file://localhost/tmp/fixture.db"] {
+            assert_eq!(
+                local_database_path(url).unwrap(),
+                Some("/tmp/fixture.db".into())
+            );
+        }
+        for url in [
+            "sqlite::memory:",
+            "postgres://localhost/db",
+            "postgresql://localhost/db",
+            "mysql://localhost/db",
+            "mysqlx://localhost/db",
+        ] {
+            assert_eq!(local_database_path(url).unwrap(), None);
+        }
+    }
 
     /// mysql://는 mysql reader로, mysqlx://는 명시적 미지원 오류로 간다 —
     /// 어떤 스킴도 조용히 sqlite로 돌지 않는다는 계약을 고정한다.

@@ -4,7 +4,9 @@
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
 import uuid
@@ -26,16 +28,21 @@ def verify(image):
         inputs, outputs = directory/'inputs', directory/'outputs'
         FIXTURE.fixtures(inputs)
         inputs.chmod(0o755)
-        outputs.mkdir(mode=0o777)
-        outputs.chmod(0o777)
+        outputs.mkdir(mode=0o700)
+        host_user = f'{os.getuid()}:{os.getgid()}'
 
-        def run(arguments, expected):
+        def run(arguments, expected, *, as_host=False, entrypoint=None):
             name = 'schemagraph-check-'+uuid.uuid4().hex[:12]
             command = ['docker', 'run', '--rm', '--name', name, '--network', 'none', '--read-only',
                        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
                        '--tmpfs', '/tmp:rw,noexec,nosuid,size=16m',
-                       '--mount', f'type=bind,src={inputs},dst=/input,readonly',
-                       '--mount', f'type=bind,src={outputs},dst=/output', image, *arguments]
+                       '--mount', f'type=bind,src={inputs},dst=/input,readonly']
+            if as_host:
+                # private 산출물을 호스트가 읽어야 하므로 파일 소유자를 호출자에 맞춘다.
+                command.extend(['--user', host_user, '--mount', f'type=bind,src={outputs},dst=/output'])
+            if entrypoint:
+                command.extend(['--entrypoint', entrypoint])
+            command.extend([image, *arguments])
             try:
                 result = subprocess.run(command, capture_output=True, text=True, timeout=120)
             except (subprocess.TimeoutExpired, KeyboardInterrupt):
@@ -45,11 +52,22 @@ def verify(image):
             return result.stdout
 
         version = run(['--version'], 0).strip()
-        run(['scan', '--document', '/input/before.json', '-o', '/output/graph.json'], 0)
+        # 기본 비루트 사용자의 private 파일은 같은 컨테이너 안에서 검증한다.
+        default_query = json.loads(run(['-ec',
+            'test "$(id -u):$(id -g)" = "65532:65532"; '
+            'schemagraph scan --document /input/before.json -o /tmp/graph.json; '
+            'test "$(stat -c \'%a:%u\' /tmp/graph.json)" = "600:65532"; '
+            'schemagraph query main.customers --graph /tmp/graph.json'],
+            0, entrypoint='/bin/sh'))
+        assert default_query['subject']['id'] == 'main.customers'
+        run(['scan', '--document', '/input/before.json', '-o', '/output/graph.json'], 0, as_host=True)
+        output_stat = (outputs/'graph.json').stat()
+        assert output_stat.st_uid == os.getuid()
+        assert stat.S_IMODE(output_stat.st_mode) == 0o600
         graph = json.loads((outputs/'graph.json').read_text())
         assert {v['id'] for v in graph['vertices']} == {
             'main', 'main.customers', 'main.customers.id', 'main.customers.email'}
-        query = json.loads(run(['query', 'main.customers', '--graph', '/output/graph.json'], 0))
+        query = json.loads(run(['query', 'main.customers', '--graph', '/output/graph.json'], 0, as_host=True))
         assert query['subject']['id'] == 'main.customers'
         review = json.loads(run(['review', '/input/before.json', '/input/after.json', '--strict',
                                  '--require-complete', '--policy', '/input/policy.toml'], 1))
@@ -59,8 +77,10 @@ def verify(image):
         assert sarif['version'] == '2.1.0' and len(sarif['runs'][0]['results']) == 1
         return {'status': 'ok', 'image_id': metadata['Id'], 'architecture': metadata['Architecture'],
                 'os': metadata['Os'], 'user': metadata['Config']['User'], 'version': version,
+                'bind_mount_user': host_user, 'output_mode': '0600',
                 'network': 'none', 'read_only_root': True,
-                'checks': ['scan', 'query', 'policy-exit-1', 'sarif']}
+                'checks': ['default-user-private-roundtrip', 'host-user-scan', 'host-user-query',
+                           'policy-exit-1', 'sarif']}
 
 
 def main():
