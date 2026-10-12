@@ -129,6 +129,7 @@ func (h *harvester) sqliteObjects(schema string) []sqliteObject {
 // table_info보다 네이티브 reader의 컬럼 집합과 맞는다.
 func (h *harvester) sqliteColumns(schema, table string) []ColumnDoc {
 	columns := []ColumnDoc{}
+	initialLimitations := len(h.limitations)
 	query := fmt.Sprintf("PRAGMA %s.table_xinfo(%s)", sqliteQuoteIdent(schema), sqliteQuoteIdent(table))
 	h.bestEffort("sqlite columns", query, func(rows *sql.Rows) error {
 		v, err := sqliteRow(rows)
@@ -138,12 +139,35 @@ func (h *harvester) sqliteColumns(schema, table string) []ColumnDoc {
 		pk := sqliteInt(v, "pk")
 		columns = append(columns, ColumnDoc{
 			Name: sqliteString(v, "name"), DataType: sqliteString(v, "type"),
-			Nullable: sqliteInt(v, "notnull") == 0 && pk == 0,
+			Nullable: sqliteInt(v, "notnull") == 0,
 			Default:  sqliteStringPtr(v, "dflt_value"), Ordinal: len(columns) + 1,
 			PkPosition: int(pk),
 		})
 		return nil
 	})
+	// rowid 별칭은 PK 인덱스가 없다. INTEGER PRIMARY KEY DESC와 복합 키는
+	// 인덱스를 가지며, STRICT/WITHOUT ROWID의 NOT NULL은 xinfo에서 온다.
+	hasPKIndex := false
+	query = fmt.Sprintf("PRAGMA %s.index_list(%s)", sqliteQuoteIdent(schema), sqliteQuoteIdent(table))
+	h.bestEffort("sqlite primary key index", query, func(rows *sql.Rows) error {
+		v, err := sqliteRow(rows)
+		if err != nil {
+			return err
+		}
+		hasPKIndex = hasPKIndex || sqliteString(v, "origin") == "pk"
+		return nil
+	})
+	pkCount := 0
+	for _, column := range columns {
+		if column.PkPosition > 0 {
+			pkCount++
+		}
+	}
+	for i := range columns {
+		if len(h.limitations) == initialLimitations && columns[i].PkPosition > 0 && pkCount == 1 && !hasPKIndex && strings.EqualFold(columns[i].DataType, "INTEGER") {
+			columns[i].Nullable = false
+		}
+	}
 	return columns
 }
 

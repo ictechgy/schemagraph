@@ -180,3 +180,21 @@ Use the engine's document reader for compatibility checks rather than
 rewriting fields in a producer. In particular, do not remove an unknown
 required feature or downgrade a v2 document to v1 when its required semantics
 are not understood.
+
+
+### SQLite primary-key nullability
+
+SQLite primary keys on ordinary rowid tables can contain NULL. The collectors
+preserve that fact for TEXT, INT, composite keys, and the historical column-level
+`INTEGER PRIMARY KEY DESC` case. A single INTEGER primary key without a separate
+PK index aliases the rowid and is non-null; explicit NOT NULL, STRICT, and
+WITHOUT ROWID requirements are taken from `PRAGMA table_xinfo`.
+
+Native, Go, and JDBC use the same catalog evidence. A failed metadata query is
+not evidence that a PK index is absent. The regression fixture and
+`Scripts/verify-sqlite-nullability.py` also verify that adding or removing NOT NULL
+produces a `column-nullability-changed` review finding. A generic DDL change could
+already trigger review before this correction; the missing detail was the
+column-level nullability change.
+
+Reference: [SQLite CREATE TABLE](https://www.sqlite.org/lang_createtable.html).

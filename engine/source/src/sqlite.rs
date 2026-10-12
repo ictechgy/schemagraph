@@ -226,13 +226,31 @@ async fn read_columns(
     .fetch_all(pool)
     .await
     .map_err(SourceError::Query)?;
+    // INTEGER rowid 별칭만 별도 PK 인덱스가 없다. DESC 열 제약은
+    // 인덱스가 있으므로 일반 nullable PK이며, STRICT/WITHOUT ROWID는
+    // table_xinfo.notnull이 이미 강제 nullability를 보고한다.
+    let indexes = sqlx::query(&format!("PRAGMA {}.index_list({})", qi(schema), qi(table)))
+        .fetch_all(pool)
+        .await
+        .map_err(SourceError::Query)?;
+    let has_pk_index = indexes
+        .iter()
+        .any(|row| row.get::<String, _>("origin") == "pk");
+    let pk_count = rows
+        .iter()
+        .filter(|row| row.get::<i64, _>("pk") > 0)
+        .count();
     Ok(rows
         .iter()
         .enumerate()
         .map(|(i, r)| ColumnDoc {
             name: r.get::<String, _>("name"),
             data_type: r.get::<String, _>("type"),
-            nullable: r.get::<i64, _>("notnull") == 0 && r.get::<i64, _>("pk") == 0,
+            nullable: r.get::<i64, _>("notnull") == 0
+                && !(r.get::<i64, _>("pk") > 0
+                    && pk_count == 1
+                    && !has_pk_index
+                    && r.get::<String, _>("type").eq_ignore_ascii_case("INTEGER")),
             default: r.get::<Option<String>, _>("dflt_value"),
             ordinal: (i + 1) as u32,
             pk_position: r.get::<i64, _>("pk") as u32,
@@ -368,6 +386,24 @@ async fn read_indexes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn primary_key_nullability_matches_sqlite_storage() {
+        let doc = fixture_doc(include_str!("../../../Fixtures/sqlite-nullability.sql")).await;
+        assert_eq!(doc.schemas[0].objects.len(), 9);
+        for object in &doc.schemas[0].objects {
+            for column in &object.columns {
+                assert_eq!(
+                    column.nullable,
+                    object.name.starts_with("nullable_"),
+                    "{}.{}",
+                    object.name,
+                    column.name
+                );
+                assert!(column.pk_position > 0);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn encoded_memory_urls_are_readable_without_a_local_input_file() {
