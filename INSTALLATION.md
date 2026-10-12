@@ -1,6 +1,10 @@
 # Installing schemagraph
 
-For the 0.7.1 release, replace `VERSION` below with `0.7.1`.
+For the published [v0.7.0 release](https://github.com/ictechgy/schemagraph/releases/tag/v0.7.0),
+replace `VERSION` below with `0.7.0`. The main branch prepares 0.7.1;
+its development version does not identify a published binary release.
+Use a version listed on the [release page](https://github.com/ictechgy/schemagraph/releases)
+with the matching artifacts and `SHA256SUMS`.
 
 Version 0.5.0 includes [a consumer GitHub Action](REVIEW-ACTION.md)
 and [a reproducible Docker build](SUPPORT-MATRIX.md#runtime-and-distribution).
