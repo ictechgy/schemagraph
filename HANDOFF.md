@@ -1,5 +1,23 @@
 # HANDOFF.md
 
+## 0.7.1 릴리스 검증 순서 보강 (2026-10-12 UTC)
+
+- DML accuracy·IBM fixtures·SQL Server/Oracle accuracy의 push를 모든 브랜치로
+  한정한다. 기존 paths·PR·수동 실행·검증 본문·권한은 유지하며, 릴리스 태그는
+  `Release binaries`만 시작한다. 별도 DB 컨테이너 검증을 태그 게시와 함께
+  부수적으로 시작하지 않도록 실행 시점을 명시한 변경이다.
+- 태그 전에는 선택한 **최종 병합 소스 커밋**의 `CI`와 위 세 fixture workflow가
+  모두 성공했는지 run URL·`head_sha`·conclusion으로 기록한다. PR의 합성 merge
+  커밋이나 부모 커밋 결과를 최종 병합 커밋의 실행으로 대신 표기하지 않는다.
+  해당 SHA의 검증이 없으면 적용되는 브랜치/수동 검증을 확보할 때까지 태그를
+  보류한다. 소스를 다시 바꾸면 새 커밋을 기준으로 같은 확인을 반복한다.
+- `Release binaries`의 산출물·플랫폼 검증과 체크섬 확인은 별도 릴리스 관문으로
+  유지한다. 태그/바이너리 성공을 crate·Maven Central·Pages 게시 성공으로
+  간주하지 않는다. 각 게시와 설치 소비자 확인은 기존 분리된 절차를 따른다.
+- 0.7.1에는 파일 출력 보호뿐 아니라 native·Go·JDBC의 SQLite PK nullability
+  보정도 포함된다. RELEASE-NOTES의 수집 동작 불변 문구를 바로잡았다.
+  이 날짜는 준비 기록이며 실제 공개 날짜나 게시 완료를 뜻하지 않는다.
+
 ## 0.7.1 릴리스 준비 (2026-10-11, release/0.7.1)
 
 - 입력·스냅샷 보호 및 컨테이너 host UID 보정 이후의 patch 버전이다.

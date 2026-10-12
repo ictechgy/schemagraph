@@ -2,6 +2,8 @@ name: SQL Server and Oracle accuracy
 
 on:
   push:
+    # Fixture jobs keep branch/PR coverage; release tags run release-binaries only.
+    branches: ["**"]
     paths:
       - ".github/workflows/sqlserver-oracle-accuracy.yml"
       - "Scripts/AccuracySql.java"

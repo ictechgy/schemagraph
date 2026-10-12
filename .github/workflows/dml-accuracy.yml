@@ -2,6 +2,8 @@ name: DML producer accuracy
 
 on:
   push:
+    # Fixture jobs keep branch/PR coverage; release tags run release-binaries only.
+    branches: ["**"]
     paths:
       - ".github/workflows/dml-accuracy.yml"
       - "Fixtures/accuracy/dml-cases.json"

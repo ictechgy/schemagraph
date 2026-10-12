@@ -1,7 +1,22 @@
 # schemagraph 0.7.1
 
 This patch protects local inputs and saved snapshots during file exports.
-Catalog/graph formats, graph semantics, and probe collection behavior are unchanged.
+It also corrects SQLite primary-key nullability in the native, Go, and JDBC
+collectors. Catalog and graph document formats are unchanged.
+
+## SQLite primary-key nullability
+
+- A primary key does not always make a SQLite column non-nullable. Ordinary
+  rowid-table text/composite keys, `INT PRIMARY KEY`, and the column constraint
+  `INTEGER PRIMARY KEY DESC` now retain nullable metadata unless explicitly
+  constrained. Actual `INTEGER PRIMARY KEY` rowid aliases, `STRICT` and
+  `WITHOUT ROWID` primary keys, and explicit `NOT NULL` remain non-nullable.
+- Recollect SQLite snapshots to obtain the corrected metadata. Compared with
+  older snapshots, `nullable` values can change; adding or removing `NOT NULL`
+  is reported by `review` as `column-nullability-changed` (`review-required`).
+  This changes collected metadata, not the database schema or stored data.
+- The shared fixture checks 9 table shapes and 11 columns against actual SQLite
+  storage, all three collectors, and bidirectional `NOT NULL` review results.
 
 ## Safer file output
 
@@ -28,14 +43,20 @@ See [installation instructions](INSTALLATION.md#docker-with-host-readable-output
 
 ## Upgrade and validation
 
-Install with `cargo install schemagraph-cli --version 0.7.1 --locked`, or use the
-Linux x86_64/macOS arm64 release archives. The Action pin is
-`ictechgy/schemagraph@v0.7.1`. All six Rust crate versions and the unchanged JDBC
-probe publication align at 0.7.1; third-party dependency versions are unchanged.
-The implementation is covered by 440 Rust tests, a regression that fails with
-the old writer, real SQLite output-contract checks, and container command tests.
-Release artifacts and platform/container end-to-end checks remain the release
-CI gates; the version bump does not itself publish an artifact.
+Planned release coordinates are `schemagraph-cli` 0.7.1 (with `--locked`),
+the Linux x86_64/macOS arm64 archives, Action pin `ictechgy/schemagraph@v0.7.1`,
+and JDBC artifact `io.github.ictechgy:schemagraph-probe:0.7.1`. All six Rust crate
+versions and the JDBC manifest align at 0.7.1; third-party dependency versions
+are unchanged. These are targets, not availability claims: each tag/binary,
+crate, and Maven publication lane must complete its own publication and clean
+consumer verification. Until then, use the verified pins in [INSTALLATION.md](INSTALLATION.md).
+
+The original file-output regression run recorded 440 Rust tests, a regression
+that fails with the old writer, real SQLite output-contract checks, and container
+command tests. That count is historical evidence for the file-output change,
+not the current full-suite total. The selected release source must pass source
+and fixture checks; release artifacts and platform/container end-to-end checks
+remain additional release CI gates. A version bump does not publish an artifact.
 
 ---
 
