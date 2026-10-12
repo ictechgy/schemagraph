@@ -226,6 +226,13 @@ jobs:
             --go-probe probe-go/schemagraph-probe-go \
             --jdbc-jar probe/build/libs/schemagraph-probe-all.jar
 
+      - name: Verify SQLite primary-key nullability across collectors
+        run: |
+          python3 Scripts/verify-sqlite-nullability.py \
+            --engine engine/target/debug/schemagraph \
+            --go-probe probe-go/schemagraph-probe-go \
+            --jdbc-jar probe/build/libs/schemagraph-probe-all.jar
+
       - name: Verify restricted PostgreSQL collection and comparison scope
         env:
           PGBIN: /usr/lib/postgresql/16/bin

@@ -260,6 +260,7 @@ class Extractor(
     }
 
     private fun columnsOf(obj: RawObject): List<ColumnDoc> = runCatching {
+        if (dialect == "sqlite") return@runCatching sqliteCatalogColumns(conn, obj.schema, obj.name)
         meta.getColumns(obj.catalog, obj.schemaName, obj.name, null).use { rs ->
             buildList {
                 while (rs.next()) {

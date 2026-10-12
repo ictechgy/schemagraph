@@ -1,7 +1,14 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"io"
+	"os"
+	"strings"
+	"sync"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -56,4 +63,84 @@ func sqliteTestObject(t *testing.T, objects []ObjectDoc, name string) ObjectDoc 
 	}
 	t.Fatalf("object %q not found", name)
 	return ObjectDoc{}
+}
+
+func TestSQLitePrimaryKeyNullability(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	fixture, err := os.ReadFile("../Fixtures/sqlite-nullability.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(fixture)); err != nil {
+		t.Fatal(err)
+	}
+	h := &harvester{db: db, dialect: "sqlite", schemaFilter: map[string]bool{}}
+	doc := h.extractSQLite()
+	if len(doc.Schemas) != 1 || len(doc.Schemas[0].Objects) != 9 {
+		t.Fatalf("unexpected catalog: %#v", doc)
+	}
+	for _, object := range doc.Schemas[0].Objects {
+		for _, column := range object.Columns {
+			if column.Nullable != strings.HasPrefix(object.Name, "nullable_") || column.PkPosition == 0 {
+				t.Errorf("%s.%s incorrect nullability/PK: %#v", object.Name, column.Name, column)
+			}
+		}
+	}
+}
+
+// PK 인덱스 수집 실패는 rowid 별칭이라는 긍정 증거가 아니다.
+var registerSQLiteNullabilityDriver sync.Once
+
+func TestSQLiteIndexFailureKeepsPrimaryKeyNullable(t *testing.T) {
+	registerSQLiteNullabilityDriver.Do(func() { sql.Register("sqlite-nullability-index-failure", sqliteNullabilityDriver{}) })
+	db, err := sql.Open("sqlite-nullability-index-failure", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	h := &harvester{db: db}
+	columns := h.sqliteColumns("main", "items")
+	if len(columns) != 1 || !columns[0].Nullable || !h.catalogIncomplete || len(h.limitations) != 1 {
+		t.Fatalf("incomplete metadata was treated as a rowid alias: %#v, %#v", columns, h.limitations)
+	}
+}
+
+type sqliteNullabilityDriver struct{}
+
+func (sqliteNullabilityDriver) Open(string) (driver.Conn, error) { return sqliteNullabilityConn{}, nil }
+
+type sqliteNullabilityConn struct{}
+
+func (sqliteNullabilityConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("unsupported prepare")
+}
+func (sqliteNullabilityConn) Close() error { return nil }
+func (sqliteNullabilityConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("unsupported transaction")
+}
+func (sqliteNullabilityConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if strings.Contains(query, "index_list") {
+		return nil, errors.New("injected index metadata failure")
+	}
+	return &sqliteNullabilityRows{}, nil
+}
+
+type sqliteNullabilityRows struct{ sent bool }
+
+func (*sqliteNullabilityRows) Columns() []string {
+	return []string{"cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"}
+}
+func (*sqliteNullabilityRows) Close() error { return nil }
+func (rows *sqliteNullabilityRows) Next(values []driver.Value) error {
+	if rows.sent {
+		return io.EOF
+	}
+	copy(values, []driver.Value{int64(0), "id", "INTEGER", int64(0), nil, int64(1), int64(0)})
+	rows.sent = true
+	return nil
 }
