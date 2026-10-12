@@ -10,6 +10,8 @@ on:
         type: choice
         options: [all, db2, informix]
   push:
+    # Fixture jobs keep branch/PR coverage; release tags run release-binaries only.
+    branches: ["**"]
     paths:
       - ".github/workflows/ibm-fixtures.yml"
       - "Fixtures/db2/**"
