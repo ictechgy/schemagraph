@@ -1,8 +1,7 @@
 # Installing schemagraph
 
-For the published [v0.7.0 release](https://github.com/ictechgy/schemagraph/releases/tag/v0.7.0),
-replace `VERSION` below with `0.7.0`. The main branch prepares 0.7.1;
-its development version does not identify a published binary release.
+For the published [v0.7.1 binary release](https://github.com/ictechgy/schemagraph/releases/tag/v0.7.1),
+replace `VERSION` below with `0.7.1` (published and verified on 2026-10-13 UTC).
 Use a version listed on the [release page](https://github.com/ictechgy/schemagraph/releases)
 with the matching artifacts and `SHA256SUMS`.
 
