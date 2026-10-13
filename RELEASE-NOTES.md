@@ -43,13 +43,19 @@ See [installation instructions](INSTALLATION.md#docker-with-host-readable-output
 
 ## Upgrade and validation
 
-Planned release coordinates are `schemagraph-cli` 0.7.1 (with `--locked`),
-the Linux x86_64/macOS arm64 archives, Action pin `ictechgy/schemagraph@v0.7.1`,
-and JDBC artifact `io.github.ictechgy:schemagraph-probe:0.7.1`. All six Rust crate
-versions and the JDBC manifest align at 0.7.1; third-party dependency versions
-are unchanged. These are targets, not availability claims: each tag/binary,
-crate, and Maven publication lane must complete its own publication and clean
-consumer verification. Until then, use the verified pins in [INSTALLATION.md](INSTALLATION.md).
+The [v0.7.1 GitHub binary release](https://github.com/ictechgy/schemagraph/releases/tag/v0.7.1)
+was published and verified on 2026-10-13 UTC. The Linux x86_64/macOS arm64
+archives, standalone JDBC JAR and `SHA256SUMS` passed the
+[release workflow](https://github.com/ictechgy/schemagraph/actions/runs/38450161095)
+and public-download checksum checks. Clean Linux CLI/Go and Java 21 JDBC
+consumer checks passed. Use the verified binary pin in [INSTALLATION.md](INSTALLATION.md).
+
+Other release coordinates remain targets: `schemagraph-cli` 0.7.1 (with
+`--locked`), Action pin `ictechgy/schemagraph@v0.7.1`, and JDBC artifact
+`io.github.ictechgy:schemagraph-probe:0.7.1`. This binary release does not verify
+crates.io or Maven Central/GitHub Maven Packages publication, Action consumer
+installation, or Pages deployment. All six Rust crate versions and the JDBC
+manifest align at 0.7.1; third-party dependency versions are unchanged.
 
 The original file-output regression run recorded 440 Rust tests, a regression
 that fails with the old writer, real SQLite output-contract checks, and container
