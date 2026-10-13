@@ -77,7 +77,9 @@ jobs:
         run: cargo fmt --manifest-path engine/Cargo.toml --all -- --check
 
       - name: Verify database startup failure paths
-        run: python3 Scripts/test-mysql-ready.py
+        run: |
+          python3 Scripts/test-mysql-ready.py
+          python3 Scripts/test-fixture-ports.py
 
       - name: Verify accuracy and scale measurement invariants
         run: |

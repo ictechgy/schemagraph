@@ -9,6 +9,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source Scripts/docker-fixture-port.sh
 
 FIX="Fixtures/sqlite"
 BIN="${1:-engine/target/debug/schemagraph}"
@@ -304,16 +305,16 @@ if [ -n "${SG_MYSQL_URL:-}" ]; then
     fi
 elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     my_container="sg-verify-mysql-$$"
-    my_port=$((33400 + RANDOM % 90))
     docker run -d --name "$my_container" \
         -e MYSQL_ALLOW_EMPTY_PASSWORD=1 -e MYSQL_DATABASE=sgfix \
-        -p "$my_port":3306 mysql:8.4 >/dev/null
+        -p 127.0.0.1::3306 mysql:8.4 >/dev/null
     my_own=1
     trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
+    my_port=$(fixture_port "$my_container" 3306)
     # 초기화 서버는 소켓만 열기 때문에 최종 서버의 TCP와 DB를 함께 확인한다.
     python3 Scripts/wait-mysql-ready.py "$my_container" mysql
     docker exec -i "$my_container" mysql -uroot sgfix < "$MYFIX/basic.sql"
-    my_url="mysql://root@localhost:$my_port/sgfix"
+    my_url="mysql://root@127.0.0.1:$my_port/sgfix"
 fi
 
 if [ -n "$my_url" ]; then
@@ -404,7 +405,9 @@ maria_up() {  # $*=추가 mysqld 옵션
     docker rm -f "$maria_container" >/dev/null 2>&1 || true
     docker run -d --name "$maria_container" \
         -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1 -e MARIADB_DATABASE=sgfix \
-        -p "$maria_port":3306 mariadb:11.4 "$@" >/dev/null
+        -p 127.0.0.1::3306 mariadb:11.4 "$@" >/dev/null
+    maria_port=$(fixture_port "$maria_container" 3306)
+    maria_url="mysql://root@127.0.0.1:$maria_port/sgfix"
     python3 Scripts/wait-mysql-ready.py "$maria_container" mariadb
     docker exec -i "$maria_container" mariadb -uroot sgfix < "$MYFIX/basic.sql"
 }
@@ -417,14 +420,12 @@ if [ -n "${SG_MARIADB_URL:-}" ]; then
     fi
 elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     maria_container="sg-verify-mariadb-$$"
-    maria_port=$((33500 + RANDOM % 90))
     maria_own=1
     trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; [ -n "${maria_own:-}" ] && docker rm -f "${maria_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
 
     # 1단계: 기본값(PFS OFF) — 통계 미수집이 limitation으로 보고돼야 하고
     # usage가 붙은 정점이 없어야 한다(0행을 관측된 0으로 읽지 않는 계약).
     maria_up
-    maria_url="mysql://root@localhost:$maria_port/sgfix"
     "$BIN" scan "$maria_url" -o "$tmp/graph-maria-off.json"
     verify_go_versions "$maria_url" "$tmp/graph-maria-off.json" mariadb-off
     python3 - "$tmp/graph-maria-off.json" <<'EOF'
@@ -715,11 +716,12 @@ EOF
         mssql_jdbc="$SG_MSSQL_URL"
     elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
         mssql_container="sg-verify-mssql-$$"
-        ms_port=$((33600 + RANDOM % 90))
         docker run -d --name "$mssql_container" \
             -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD="$ms_pass" \
-            -p "$ms_port":1433 mcr.microsoft.com/azure-sql-edge:latest >/dev/null
+            -p 127.0.0.1::1433 mcr.microsoft.com/azure-sql-edge:latest >/dev/null
         trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; [ -n "${maria_own:-}" ] && docker rm -f "${maria_container:-}" >/dev/null 2>&1; docker rm -f "${mssql_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
+
+        ms_port=$(fixture_port "$mssql_container" 1433)
 
         # 기동 대기 — sqlcmd가 없어 SELECT 1 한 장으로 tcp가 열릴 때까지 본다.
         # ApplySql은 ServiceLoader로 드라이버를 찾으므로 fat jar을 -cp로 준다
@@ -729,7 +731,7 @@ EOF
         ms_ready=""
         for _ in $(seq 1 120); do
             if "$JAVABIN" -cp "$JAR" "$PWD/Scripts/ApplySql.java" \
-                "jdbc:sqlserver://localhost:$ms_port;encrypt=false" \
+                "jdbc:sqlserver://127.0.0.1:$ms_port;encrypt=false" \
                 "$ms_user" "$ms_pass" "$tmp/ms-ping.sql" >/dev/null 2>&1; then
                 ms_ready=1
                 break
@@ -742,9 +744,9 @@ EOF
             # 폐기용 DB를 만들고 fixture를 적용한다.
             echo "IF DB_ID('sgfix') IS NULL CREATE DATABASE sgfix;" > "$tmp/ms-ddl.sql"
             "$JAVABIN" -cp "$JAR" "$PWD/Scripts/ApplySql.java" \
-                "jdbc:sqlserver://localhost:$ms_port;encrypt=false" \
+                "jdbc:sqlserver://127.0.0.1:$ms_port;encrypt=false" \
                 "$ms_user" "$ms_pass" "$tmp/ms-ddl.sql"
-            mssql_jdbc="jdbc:sqlserver://localhost:$ms_port;databaseName=sgfix;encrypt=false"
+            mssql_jdbc="jdbc:sqlserver://127.0.0.1:$ms_port;databaseName=sgfix;encrypt=false"
         fi
     fi
 
@@ -849,19 +851,20 @@ EOF
         oracle_jdbc="$SG_ORACLE_URL"
     elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
         oracle_container="sg-verify-oracle-$$"
-        or_port=$((33700 + RANDOM % 90))
         docker run -d --name "$oracle_container" \
             -e ORACLE_PASSWORD="$oracle_pass" \
             -e APP_USER="$oracle_user" -e APP_USER_PASSWORD="$oracle_pass" \
-            -p "$or_port":1521 gvenzl/oracle-free:slim >/dev/null
+            -p 127.0.0.1::1521 gvenzl/oracle-free:slim >/dev/null
         trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; [ -n "${maria_own:-}" ] && docker rm -f "${maria_container:-}" >/dev/null 2>&1; [ -n "${mssql_container:-}" ] && docker rm -f "${mssql_container:-}" >/dev/null 2>&1; docker rm -f "${oracle_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
+
+        or_port=$(fixture_port "$oracle_container" 1521)
 
         # 기동 대기 — 첫 기동은 DB 초기화라 몇 분 걸릴 수 있다.
         echo "SELECT 1 FROM DUAL" > "$tmp/or-ping.sql"
         or_ready=""
         for _ in $(seq 1 90); do
             if "$JAVABIN" -cp "$OJAR" "$PWD/Scripts/ApplySql.java" \
-                "jdbc:oracle:thin:@localhost:$or_port/FREEPDB1" \
+                "jdbc:oracle:thin:@127.0.0.1:$or_port/FREEPDB1" \
                 "$oracle_user" "$oracle_pass" "$tmp/or-ping.sql" >/dev/null 2>&1; then
                 or_ready=1
                 break
@@ -871,7 +874,7 @@ EOF
         if [ -z "$or_ready" ]; then
             echo "주의: Oracle 컨테이너가 기동하지 않아 probe-Oracle 검증 건너뜀" >&2
         else
-            oracle_jdbc="jdbc:oracle:thin:@localhost:$or_port/FREEPDB1"
+            oracle_jdbc="jdbc:oracle:thin:@127.0.0.1:$or_port/FREEPDB1"
         fi
     fi
 
