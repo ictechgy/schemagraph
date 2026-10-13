@@ -24,6 +24,21 @@ env:
   RUST_TOOLCHAIN: "1.96.0"
 
 jobs:
+  release-assets:
+    name: Offline release publication (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify additive release publication without credentials
+        run: /bin/bash Scripts/test-publish-release-assets.sh
+
   verify:
     name: Build, package, and database fixtures
     runs-on: ubuntu-24.04

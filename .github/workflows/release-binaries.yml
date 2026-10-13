@@ -10,6 +10,10 @@ on:
       - "probe/**"
       - "probe-go/**"
       - "INSTALLATION.md"
+      - "RELEASING.md"
+      - "Scripts/publish-release-assets.sh"
+      - "Scripts/test-publish-release-assets.sh"
+      - "Scripts/tests/gh-release-mock.sh"
       - ".github/workflows/release-binaries.yml"
   workflow_dispatch:
 
@@ -363,6 +367,12 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
       - name: Download the validated bundle
         run: |
           set -euo pipefail
@@ -379,14 +389,8 @@ jobs:
           test "$(sed -n 's/^version=//p' RELEASE-METADATA.txt)" = "$VERSION"
           test "$(sed -n 's/^commit=//p' RELEASE-METADATA.txt)" = "$GITHUB_SHA"
 
-      - name: Create the release and upload assets
+      - name: Publish or verify release assets without replacing existing files
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "schemagraph $VERSION" \
-            --generate-notes \
-            "$RUNNER_TEMP/release/schemagraph-$VERSION-x86_64-unknown-linux-gnu.tar.gz" \
-            "$RUNNER_TEMP/release/schemagraph-$VERSION-aarch64-apple-darwin.tar.gz" \
-            "$RUNNER_TEMP/release/schemagraph-probe-$VERSION-all.jar" \
-            "$RUNNER_TEMP/release/SHA256SUMS"
+          cd "$RUNNER_TEMP/release"
+          bash "$GITHUB_WORKSPACE/Scripts/publish-release-assets.sh" "$GITHUB_REF_NAME" "$GITHUB_SHA"
