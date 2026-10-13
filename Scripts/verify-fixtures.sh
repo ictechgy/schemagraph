@@ -10,6 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source Scripts/docker-fixture-port.sh
+source Scripts/postgres-fixture-diagnostics.sh
 
 FIX="Fixtures/sqlite"
 BIN="${1:-engine/target/debug/schemagraph}"
@@ -605,10 +606,13 @@ EOF
     # 네이티브와 같은 판정 간선이 나오는지 확인한다.
     if [ -n "${pg_url:-}" ]; then
         if [[ "$pg_url" =~ (postgres|postgresql)://([^:/@]+)(:([^@]*))?@([^:/]+)(:([0-9]+))?/([^?]+) ]]; then
-            jdbc_pg="jdbc:postgresql://${BASH_REMATCH[5]}:${BASH_REMATCH[7]:-5432}/${BASH_REMATCH[8]}"
+            jdbc_pg_host="${BASH_REMATCH[5]}"
+            jdbc_pg_port="${BASH_REMATCH[7]:-5432}"
+            jdbc_pg="jdbc:postgresql://$jdbc_pg_host:$jdbc_pg_port/${BASH_REMATCH[8]}"
             probe_pg_args=(--url "$jdbc_pg" --user "${BASH_REMATCH[2]}")
             [ -n "${BASH_REMATCH[4]:-}" ] && probe_pg_args+=(--password "${BASH_REMATCH[4]}")
-            "$JAVABIN" -jar "$JAR" "${probe_pg_args[@]}" -o "$tmp/probe-pg-doc.json"
+            fixture_postgres_jdbc "$jdbc_pg_host" "$jdbc_pg_port" \
+                "$JAVABIN" -jar "$JAR" "${probe_pg_args[@]}" -o "$tmp/probe-pg-doc.json"
             "$BIN" scan --document "$tmp/probe-pg-doc.json" -o "$tmp/probe-pg-graph.json"
             verify_jdbc_versions "$tmp/probe-pg-graph.json" postgres "${probe_pg_args[@]}"
             python3 Scripts/verify-dynamic-sql.py "$tmp/probe-pg-graph.json" postgres

@@ -80,6 +80,7 @@ jobs:
         run: |
           python3 Scripts/test-mysql-ready.py
           python3 Scripts/test-fixture-ports.py
+          python3 Scripts/test-postgres-fixture-diagnostics.py
 
       - name: Verify accuracy and scale measurement invariants
         run: |
@@ -314,6 +315,8 @@ jobs:
           name: fixture-graphs
           path: |
             ${{ runner.temp }}/fixture-artifacts/*.graph.json
+            ${{ runner.temp }}/fixture-artifacts/postgres-jdbc-status.log
+            ${{ runner.temp }}/fixture-artifacts/postgres-server.log
             ${{ runner.temp }}/html-smoke.png
             ${{ runner.temp }}/accuracy.json
             ${{ runner.temp }}/mysql-accuracy.json
