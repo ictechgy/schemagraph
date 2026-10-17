@@ -125,6 +125,26 @@ impl<'a> CatalogIndex<'a> {
         self.vertices.lookup(ci)
     }
 
+    /// Binder와 캐시 footprint가 같은 규칙으로 관계 키를 만든다.
+    ///
+    /// `parts`는 `name` 규칙으로 정규화한 이름 부분이다. 한 부분이면 기본 스키마를
+    /// 붙이고, 세 부분이면 수집 database와 같을 때만 로컬 관계로 본다. database
+    /// 부분도 수집 database와 같은 `database_key`로 접는다 — SQL Server의
+    /// `MyDb.dbo.t`를 소문자로 접힌 수집 database와 비교해야 하기 때문이다.
+    fn relation_key(&self, parts: &[String], default_schema: &str) -> Option<(String, String)> {
+        match parts {
+            [table] => Some((catalog_key(self.dialect, default_schema), table.clone())),
+            [schema, table] => Some((schema.clone(), table.clone())),
+            [database, schema, table]
+                if self.database.as_deref()
+                    == Some(database_key(self.dialect, database).as_str()) =>
+            {
+                Some((schema.clone(), table.clone()))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn local_qualified_relation(
         &self,
         name: &ObjectName,
@@ -469,24 +489,17 @@ impl<'a> CatalogIndex<'a> {
     /// 몸체가 참조한 관계마다 후보 객체의 모양을, 후보가 없으면 그 사실을 담는다.
     fn relation_footprint(
         &self,
-        index: &FootprintIndex<'_>,
+        index: &FootprintIndex<'a>,
         owner_schema: &str,
         statements: &[Statement],
         footprint: &mut Vec<String>,
     ) {
         for parts in relation_names(self.dialect, statements) {
-            let (ref_schema, ref_name) = match parts.as_slice() {
-                [name] => (owner_schema.to_owned(), name.clone()),
-                [schema, name] => (schema.clone(), name.clone()),
-                [database, schema, name] if self.database.as_deref() == Some(database.as_str()) => {
-                    (schema.clone(), name.clone())
-                }
-                _ => {
-                    footprint.push(format!("cross-database={}", parts.join(".")));
-                    continue;
-                }
+            let Some((ref_schema, ref_name)) = self.relation_key(&parts, owner_schema) else {
+                footprint.push(format!("cross-database={}", parts.join(".")));
+                continue;
             };
-            let candidates = index.objects(self.dialect, &ref_schema, &ref_name);
+            let candidates = self.relation_candidates(index, &ref_schema, &ref_name);
             if candidates.is_empty() {
                 footprint.push(format!("missing-object={ref_schema}.{ref_name}"));
             }
@@ -500,6 +513,21 @@ impl<'a> CatalogIndex<'a> {
                 )
             }));
         }
+    }
+
+    /// Binder가 고를 관계 후보. ci 방언은 DML 경로의 vertex_hit가 대소문자 무시
+    /// 단일 후보도 고르므로, Binder 후보를 포함하는 접힌 후보 전체를 담는다.
+    fn relation_candidates(
+        &self,
+        index: &FootprintIndex<'a>,
+        schema: &str,
+        name: &str,
+    ) -> Vec<(&'a str, &'a ObjectDoc)> {
+        if matches!(self.dialect, "oracle" | "db2") {
+            return index.objects(self.dialect, schema, name);
+        }
+        let key = (schema.to_owned(), name.to_owned());
+        self.tables.get(&key).cloned().unwrap_or_default()
     }
 
     /// owner 메타데이터가 없을 때 쓰는 전체 스키마 표현의 해시를 한 번만 만든다.
@@ -544,27 +572,14 @@ fn wraps_definition_or_dynamic_sql(body: &str) -> bool {
     .any(|keyword| uppercase.contains(keyword))
 }
 
-/// 몸체가 참조한 관계 이름. database 부분은 database 규칙으로, 나머지는 방언
-/// 식별자 규칙으로 정규화한다.
+/// 몸체가 참조한 관계 이름을 Binder::parts와 같은 `name` 규칙으로 정규화한다.
+/// 같은 규칙이어야 footprint 후보가 Binder가 해석할 후보와 같아진다.
 fn relation_names(dialect: &str, statements: &[Statement]) -> BTreeSet<Vec<String>> {
     let mut relation_names = BTreeSet::new();
     for statement in statements {
-        let _ = visit_relations(statement, |name| {
-            let idents: Vec<_> = name.0.iter().filter_map(|part| part.as_ident()).collect();
-            let count = idents.len();
-            relation_names.insert(
-                idents
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, ident)| {
-                        if index == 0 && count == 3 {
-                            database_ident_key(dialect, ident)
-                        } else {
-                            name_for_dialect(dialect, ident)
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            );
+        let _ = visit_relations(statement, |relation| {
+            let parts = relation.0.iter().filter_map(|part| part.as_ident());
+            relation_names.insert(parts.map(|ident| name(dialect, ident)).collect::<Vec<_>>());
             ControlFlow::<()>::Continue(())
         });
     }
@@ -1568,24 +1583,19 @@ impl Binder<'_, '_> {
     }
 
     fn table(&mut self, parts: &[String], source: Option<SourceLocation>) -> Relation {
-        let (schema, table) = match parts {
-            [table] => (
-                catalog_key(self.catalog.dialect, self.schema),
-                table.clone(),
-            ),
-            [schema, table] => (schema.clone(), table.clone()),
-            [database, schema, table]
-                if self.catalog.database.as_deref() == Some(database.as_str()) =>
-            {
-                (schema.clone(), table.clone())
-            }
-            _ => {
-                self.note("SG_CROSS_DATABASE",format!("relation '{}' needs a database/catalog namespace; no local target inferred",parts.join(".")),source);
-                return Relation {
-                    unknown: true,
-                    ..Relation::default()
-                };
-            }
+        let Some((schema, table)) = self.catalog.relation_key(parts, self.schema) else {
+            self.note(
+                "SG_CROSS_DATABASE",
+                format!(
+                    "relation '{}' needs a database/catalog namespace; no local target inferred",
+                    parts.join(".")
+                ),
+                source,
+            );
+            return Relation {
+                unknown: true,
+                ..Relation::default()
+            };
         };
         let matches = self
             .catalog

@@ -583,6 +583,80 @@ mod tests {
         }
     }
 
+    /// context 지문별로 저장하는 캐시 — CLI 디스크 캐시의 scoped 키처럼 동작한다.
+    #[derive(Default)]
+    struct ScopedMemoryCache(BTreeMap<(VertexId, String), BodyResult>);
+    impl BodyCache for ScopedMemoryCache {
+        fn load(&mut self, _: &VertexId, _: &str) -> Option<BodyResult> {
+            None
+        }
+        fn store(&mut self, _: &VertexId, _: &str, _: &BodyResult) {}
+        fn load_scoped(
+            &mut self,
+            owner: &VertexId,
+            _: &str,
+            context: &CacheContext,
+        ) -> Option<BodyResult> {
+            self.0
+                .get(&(owner.clone(), context.fingerprint.clone()))
+                .cloned()
+        }
+        fn store_scoped(
+            &mut self,
+            owner: &VertexId,
+            _: &str,
+            result: &BodyResult,
+            context: &CacheContext,
+        ) {
+            self.0
+                .insert((owner.clone(), context.fingerprint.clone()), result.clone());
+        }
+    }
+
+    #[test]
+    fn sqlite_schema_qualifiers_scope_cached_results_like_the_binder() {
+        let mut doc: CatalogDocument = serde_json::from_value(serde_json::json!({
+            "version":1,"dialect":"sqlite","reader":"test","limitations":[],
+            "schemas":[{"name":"main","routines":[],"objects":[
+                {"name":"t","kind":"table","columns":[{"name":"id","data_type":"INTEGER","nullable":true,"ordinal":1,"pk_position":0}],"constraints":[],"indexes":[],"triggers":[]},
+                {"name":"u","kind":"table","columns":[{"name":"other","data_type":"INTEGER","nullable":true,"ordinal":1,"pk_position":0}],"constraints":[],"indexes":[],"triggers":[]},
+                {"name":"v","kind":"view","body":"SELECT id FROM MAIN.t, MAIN.u","columns":[{"name":"id","data_type":"INTEGER","nullable":true,"ordinal":1,"pk_position":0}],"constraints":[],"indexes":[],"triggers":[]}
+            ]}]
+        }))
+        .unwrap();
+        let owner = VertexId::object("main", "v");
+        let body = "SELECT id FROM MAIN.t, MAIN.u";
+        let graph = schemagraph_source::graph::document_to_graph(&doc);
+        let first = crate::scope::cache_context(&doc, &graph, &owner, body);
+        let mut cache = ScopedMemoryCache::default();
+        crate::enrich_with_cache(
+            &mut schemagraph_source::graph::document_to_graph(&doc),
+            &doc,
+            Some(&mut cache),
+        );
+
+        // MAIN.u에 id가 생기면 뷰의 id는 모호해진다. Binder가 해석한 main.u의
+        // 모양이 지문에 들어 있어야 낡은 complete 결과를 복원하지 않는다.
+        doc.schemas[0].objects[1].columns.push(
+            serde_json::from_value(serde_json::json!({"name":"id","data_type":"INTEGER","nullable":true,"ordinal":2,"pk_position":0}))
+                .unwrap(),
+        );
+        let graph = schemagraph_source::graph::document_to_graph(&doc);
+        let changed = crate::scope::cache_context(&doc, &graph, &owner, body);
+        assert!(first.trusted && changed.trusted);
+        assert_ne!(first.fingerprint, changed.fingerprint);
+        let mut expected = schemagraph_source::graph::document_to_graph(&doc);
+        crate::enrich_from_document(&mut expected, &doc);
+        let mut warm = schemagraph_source::graph::document_to_graph(&doc);
+        crate::enrich_with_cache(&mut warm, &doc, Some(&mut cache));
+        assert!(!expected
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::DerivesFrom));
+        assert_eq!(warm.edges(), expected.edges());
+        assert_eq!(warm.analysis(), expected.analysis());
+    }
+
     #[test]
     fn conservative_context_keeps_its_fingerprint_and_tracks_unrelated_changes() {
         use sha2::{Digest, Sha256};
