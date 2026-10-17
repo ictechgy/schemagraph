@@ -128,16 +128,7 @@ func (h *harvester) postgresSchemas() []string {
 		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("schemas unavailable — %s", oneLine(err.Error())))
 	}
-	found := map[string]bool{}
-	for _, schema := range out {
-		found[schema] = true
-	}
-	for schema := range h.schemaFilter {
-		if !found[schema] {
-			h.catalogIncomplete = true
-			h.limitations = append(h.limitations, fmt.Sprintf("requested schema '%s' was not collected; verify existence and metadata permissions", schema))
-		}
-	}
+	h.checkRequestedSchemas(out)
 	return out
 }
 

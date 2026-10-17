@@ -120,6 +120,10 @@ type RoutineDoc struct {
 
 func boolValue(value bool) *bool { return &value }
 
+// oracleNoObjectsLimitation — Oracle 카탈로그가 테이블·뷰를 주지 않았다는 limitation 원문.
+// 권한 공백의 신호라 남길 때는 항상 markIncomplete로 미완전 표시와 함께 남긴다.
+const oracleNoObjectsLimitation = "카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라"
+
 // Oracle 카탈로그가 노출하는 시스템 스키마 — probe/Extractor.kt의 목록과 동일.
 // PUBLIC은 시노님이 수천 개라 커서를 고갈시킨다 — 항상 억제한다.
 // DVF/DVSYS(Database Vault)는 실검증에서 잡음으로 확인돼 추가됐다.
@@ -173,6 +177,29 @@ func (h *harvester) bestEffortArgs(label, query string, args []any, row func(row
 		h.catalogIncomplete = true
 		h.limitations = append(h.limitations,
 			fmt.Sprintf("%s 원문 미수확(%s) — 간선이 빠질 수 있다", label, oneLine(err.Error())))
+	}
+}
+
+// markIncomplete — 수집 누락 limitation과 미완전 표시를 함께 남긴다. 한쪽만 남으면
+// limitation은 누락을 말하는데 catalog_complete=true인 모순 문서가 되고, review는
+// context만 보고 그 문서를 완전한 스냅샷으로 비교한다.
+func (h *harvester) markIncomplete(limitation string) {
+	h.catalogIncomplete = true
+	h.limitations = append(h.limitations, limitation)
+}
+
+// checkRequestedSchemas — 요청한 스키마가 방언의 스키마 목록에 없으면 미완전으로 신고한다.
+// Kotlin checkRequestedSchemas·엔진 context::annotate와 같은 문구다. 방출한 스키마가 아니라
+// 발견한 목록과 비교해, 존재하지만 비어 있는 스키마는 완전한 수집으로 남긴다.
+func (h *harvester) checkRequestedSchemas(discovered []string) {
+	found := make(map[string]bool, len(discovered))
+	for _, schema := range discovered {
+		found[schema] = true
+	}
+	for schema := range h.schemaFilter {
+		if !found[schema] {
+			h.markIncomplete(fmt.Sprintf("requested schema '%s' was not collected; verify existence and metadata permissions", schema))
+		}
 	}
 }
 
@@ -325,7 +352,12 @@ func (h *harvester) extractCatalog() CatalogDocument {
 	if h.dialect == "sqlserver" {
 		return h.extractMSSQL()
 	}
+	// 스트리밍과 같은 스키마 목록으로 요청 스키마 누락을 신고한다.
+	h.oracleSchemas()
 	objects := h.collectObjects()
+	if len(objects) == 0 {
+		h.markIncomplete(oracleNoObjectsLimitation)
+	}
 	views := h.collectViews()
 	triggers := h.collectTriggers()
 	routines := h.collectRoutines()
@@ -439,10 +471,6 @@ func (h *harvester) collectObjects() map[string][]ObjectDoc {
 	}
 	for s := range out {
 		sort.Slice(out[s], func(i, j int) bool { return out[s][i].Name < out[s][j].Name })
-	}
-	if len(out) == 0 {
-		h.limitations = append(h.limitations,
-			"카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라")
 	}
 	return out
 }

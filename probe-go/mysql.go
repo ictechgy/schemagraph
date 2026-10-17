@@ -65,10 +65,12 @@ func (h *harvester) mysqlSchemaAllowed(schema string) bool {
 	}
 }
 
+// mysqlSchemas — 목록을 끝까지 읽지 못하면 스키마가 빠졌을 수 있으므로 미완전으로 표시한다.
+// 실패 처리와 요청 스키마 대조는 postgresSchemas와 같다.
 func (h *harvester) mysqlSchemas() []string {
 	rows, err := h.db.Query(`SELECT CAST(schema_name AS CHAR) FROM information_schema.schemata ORDER BY schema_name`)
 	if err != nil {
-		h.limitations = append(h.limitations, fmt.Sprintf("schemas unavailable — %s", oneLine(err.Error())))
+		h.markIncomplete(fmt.Sprintf("schemas unavailable — %s", oneLine(err.Error())))
 		return []string{}
 	}
 	defer rows.Close()
@@ -76,7 +78,7 @@ func (h *harvester) mysqlSchemas() []string {
 	for rows.Next() {
 		var schema string
 		if err := rows.Scan(&schema); err != nil {
-			h.limitations = append(h.limitations, fmt.Sprintf("schema row read failed — %s", oneLine(err.Error())))
+			h.markIncomplete(fmt.Sprintf("schema row read failed — %s", oneLine(err.Error())))
 			break
 		}
 		if h.mysqlSchemaAllowed(schema) {
@@ -84,8 +86,9 @@ func (h *harvester) mysqlSchemas() []string {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		h.limitations = append(h.limitations, fmt.Sprintf("schemas unavailable — %s", oneLine(err.Error())))
+		h.markIncomplete(fmt.Sprintf("schemas unavailable — %s", oneLine(err.Error())))
 	}
+	h.checkRequestedSchemas(out)
 	return out
 }
 

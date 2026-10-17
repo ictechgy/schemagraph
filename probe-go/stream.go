@@ -186,11 +186,11 @@ func (h *harvester) oracleSchemas() []string {
 		}
 		return nil
 	})
+	h.checkRequestedSchemas(names)
 	return names
 }
 
 func (h *harvester) oracleSchema(schema string) SchemaDoc {
-	limitationsStart := len(h.limitations)
 	objects := h.collectObjects()[schema]
 	views := h.collectViews()
 	triggers := h.collectTriggers()
@@ -205,14 +205,9 @@ func (h *harvester) oracleSchema(schema string) SchemaDoc {
 		}
 	}
 	routines := h.collectRoutines()[schema]
-	if len(objects) == 0 && len(routines) > 0 {
-		kept := h.limitations[:limitationsStart]
-		for _, limitation := range h.limitations[limitationsStart:] {
-			if limitation != "카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라" {
-				kept = append(kept, limitation)
-			}
-		}
-		h.limitations = kept
+	// 목록에는 있었는데 객체도 routine도 받지 못했다. routine만 있는 스키마는 정상이다.
+	if len(objects) == 0 && len(routines) == 0 {
+		h.markIncomplete(oracleNoObjectsLimitation)
 	}
 	sd := SchemaDoc{Name: schema, Objects: objects, Routines: routines}
 	normalizeSchema(&sd)
@@ -241,7 +236,7 @@ func (h *harvester) streamOracle(stream *ndjsonStreamWriter) error {
 		}
 	}
 	if objects == 0 {
-		h.limitations = append(h.limitations, "카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라")
+		h.markIncomplete(oracleNoObjectsLimitation)
 	}
 	return nil
 }
