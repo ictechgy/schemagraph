@@ -18,6 +18,8 @@ type scriptedServer struct {
 	reply  func(query string, args []driver.NamedValue) scriptedReply
 	calls  []scriptedCall
 	opened int
+	// brokenThrough 이하 번호의 연결은 끊겼다. 끊긴 연결로 보낸 질의는 서버에 닿지 않는다.
+	brokenThrough int
 }
 
 // scriptedReply는 질의 하나의 응답이다. err는 질의 자체의 실패이고, rowsErr는 행을
@@ -61,9 +63,26 @@ func (s *scriptedServer) recorded() []scriptedCall {
 	return append([]scriptedCall(nil), s.calls...)
 }
 
+// breakOpenConnections는 지금까지 연 물리 연결을 모두 끊는다. 프록시나 서버가 유휴 연결을
+// 닫은 상황이고, 이후 새로 여는 연결은 정상이다.
+func (s *scriptedServer) breakOpenConnections() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.brokenThrough = s.opened
+}
+
+func (s *scriptedServer) isBroken(conn int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return conn <= s.brokenThrough
+}
+
 func (s *scriptedServer) run(conn int, query string, args []driver.NamedValue) scriptedReply {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if conn <= s.brokenThrough {
+		return scriptedReply{err: driver.ErrBadConn}
+	}
 	s.calls = append(s.calls, scriptedCall{conn: conn, query: query, args: append([]driver.NamedValue(nil), args...)})
 	if s.reply == nil {
 		return scriptedReply{}
@@ -112,6 +131,15 @@ func (c *scriptedConn) Close() error { return nil }
 
 func (c *scriptedConn) Begin() (driver.Tx, error) {
 	return nil, errors.New("scripted connection does not support transactions")
+}
+
+// ResetSession은 pgx·mysql 드라이버처럼, 풀에서 다시 꺼낸 연결이 끊겼으면 ErrBadConn으로 알린다.
+// database/sql 풀은 이 신호를 받으면 새 물리 연결을 열어 같은 질의를 다시 시도한다.
+func (c *scriptedConn) ResetSession(context.Context) error {
+	if c.server.isBroken(c.id) {
+		return driver.ErrBadConn
+	}
+	return nil
 }
 
 func (c *scriptedConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {

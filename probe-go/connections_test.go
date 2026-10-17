@@ -1,12 +1,46 @@
 package main
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	goora "github.com/sijms/go-ora/v2"
 )
+
+// 읽기 전용·search_path 설정은 물리 연결에 걸린다. 풀은 유휴 중 끊긴 연결을 새 물리 연결로
+// 몰래 바꿔 설정 없는 세션에서 수집을 이어 간다. 고정 세션은 끊기면 교체하지 않으므로, 이후
+// 조회는 설정을 건 연결에서만 실행되거나 실패해 미완전으로 기록돼야 한다.
+func TestPinnedSessionNeverRunsCatalogQueriesOnUnconfiguredConnection(t *testing.T) {
+	for _, dialect := range []string{"postgres", "mysql"} {
+		t.Run(dialect, func(t *testing.T) {
+			db, server := newScriptedDB(nil)
+			defer db.Close()
+			session, err := pinSession(db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			h := &harvester{db: session, dialect: dialect, schemaFilter: map[string]bool{}}
+			h.configureReadOnly()
+			server.breakOpenConnections()
+			h.bestEffort("objects", "SELECT 1", func(*sql.Rows) error { return nil })
+			calls := server.recorded()
+			if len(calls) == 0 || !strings.HasPrefix(calls[0].query, "SET ") {
+				t.Fatalf("session setup was not issued: %#v", calls)
+			}
+			for _, call := range calls {
+				if call.conn != calls[0].conn {
+					t.Fatalf("%q ran on connection %d without the session setup of connection %d", call.query, call.conn, calls[0].conn)
+				}
+			}
+			if !h.catalogIncomplete || len(h.limitations) != 1 {
+				t.Fatalf("a lost session must be reported as incomplete: %q", h.limitations)
+			}
+		})
+	}
+}
 
 // go-ora가 실제로 해석한 접속 설정 — 프로브가 덧붙인 옵션과 원래 값이 함께 살아 있는지 본다.
 func parseOracleDSN(t *testing.T, raw string) (connectionSpec, int, string) {

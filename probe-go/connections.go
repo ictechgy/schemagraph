@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"net/url"
@@ -141,10 +143,50 @@ func sqliteConnection(raw string) (connectionSpec, error) {
 	return connectionSpec{driver: "sqlite", dialect: "sqlite", dsn: u.String()}, nil
 }
 
-// 연결 하나로 고정해 읽기 전용 세션 설정이 모든 카탈로그 조회에 적용되게 한다.
+// catalogSession — 수확기가 쓰는 조회 연산이다. 운영 경로는 pinSession이 만든 고정 연결이고,
+// 단위 테스트는 단일 연결 풀(*sql.DB)을 그대로 넘긴다.
+type catalogSession interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// pinnedSession — 모든 카탈로그 조회를 물리 연결 하나로 보낸다. *sql.Conn에는 context 없는
+// 조회 메서드가 없어 수확기 호출 모양에 맞춰 감싼다.
+type pinnedSession struct{ conn *sql.Conn }
+
+// pinSession — 수집 전체를 연결 하나에 고정한다. database/sql 풀은 끊긴 연결을 새 물리 연결로
+// 몰래 바꾸는데(ErrBadConn 재시도), 새 연결에는 configureReadOnly의 search_path·읽기 전용 설정이
+// 없다. 고정 연결은 끊기면 교체되지 않아 이후 조회가 오류가 되고, bestEffort가 그 사실을
+// limitation과 미완전으로 남긴다. JDBC 프로브가 Connection 하나로 수집하는 것과 같다.
+func pinSession(db *sql.DB) (*pinnedSession, error) {
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &pinnedSession{conn: conn}, nil
+}
+
+func (s *pinnedSession) Query(query string, args ...any) (*sql.Rows, error) {
+	return s.conn.QueryContext(context.Background(), query, args...)
+}
+
+func (s *pinnedSession) QueryRow(query string, args ...any) *sql.Row {
+	return s.conn.QueryRowContext(context.Background(), query, args...)
+}
+
+func (s *pinnedSession) Exec(query string, args ...any) (sql.Result, error) {
+	return s.conn.ExecContext(context.Background(), query, args...)
+}
+
+// Close는 고정 연결을 풀에 돌려 db.Close가 서버 세션을 정상 종료하게 한다.
+func (s *pinnedSession) Close() error {
+	return s.conn.Close()
+}
+
+// 고정 세션(pinSession)에 읽기 전용 설정을 건다. 같은 물리 연결이 이후 모든 카탈로그 조회를 실행한다.
 func (h *harvester) configureReadOnly() {
 	if h.dialect == "postgres" {
-		h.db.SetMaxOpenConns(1)
 		// 서버가 반환하는 뷰 정의를 스키마 한정 이름으로 고정한다.
 		if _, err := h.db.Exec("SET search_path = pg_catalog"); err != nil {
 			h.catalogIncomplete = true
@@ -153,9 +195,6 @@ func (h *harvester) configureReadOnly() {
 	}
 	var statements []string
 	switch h.dialect {
-	case "sqlite":
-		h.db.SetMaxOpenConns(1)
-		return
 	case "postgres":
 		statements = []string{"SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"}
 	case "mysql":
@@ -163,7 +202,6 @@ func (h *harvester) configureReadOnly() {
 	default:
 		return
 	}
-	h.db.SetMaxOpenConns(1)
 	for _, statement := range statements {
 		if _, err := h.db.Exec(statement); err == nil {
 			return

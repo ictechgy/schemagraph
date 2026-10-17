@@ -138,7 +138,7 @@ var systemSchemas = map[string]bool{
 }
 
 type harvester struct {
-	db                  *sql.DB
+	db                  catalogSession
 	dialect             string
 	schemaFilter        map[string]bool
 	limitations         []string
@@ -263,7 +263,13 @@ func main() {
 	if err := db.Ping(); err != nil {
 		fatal("database connection failed", err)
 	}
-	h := &harvester{db: db, dialect: spec.dialect, schemaFilter: map[string]bool{}, catalogDependencies: *catalogDependencies, sourceID: *sourceID}
+	session, err := pinSession(db)
+	if err != nil {
+		fatal("database connection failed", err)
+	}
+	// db.Close보다 먼저 돌아 고정 연결을 풀에 돌려준다(defer는 역순이다).
+	defer session.Close()
+	h := &harvester{db: session, dialect: spec.dialect, schemaFilter: map[string]bool{}, catalogDependencies: *catalogDependencies, sourceID: *sourceID}
 	h.configureReadOnly()
 	if *schemaArg == "" && spec.schema != "" {
 		h.schemaFilter[spec.schema] = true
