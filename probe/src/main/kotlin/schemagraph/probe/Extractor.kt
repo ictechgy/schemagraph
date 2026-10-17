@@ -161,8 +161,8 @@ class Extractor(
                 columns = columns.map { it.copy(pkPosition = pkPos[it.name] ?: 0) }
                     .sortedBy { it.ordinal },
                 constraints = constraints,
-                // view에 getIndexInfo를 부르면 Oracle이 ORA-20000(DBMS_STATS)을
-                // 던진다 — 인덱스는 테이블·물화뷰에만 있는 게 보통이라 거기만 수확.
+                // 인덱스는 테이블·물화뷰에만 있는 게 보통이라 거기만 수확한다(정확한
+                // 통계를 요구하던 때 view에 getIndexInfo를 부르면 Oracle이 ORA-20000(DBMS_STATS)을 던졌다).
                 indexes = if (raw.kind == "table" || raw.kind == "materialized-view")
                     indexesOf(raw).map { idx ->
                         idx.copy(usage = usage.indexes[Triple(schema, raw.name, idx.name)])
@@ -354,7 +354,11 @@ class Extractor(
             }
         }
         return runCatching {
-        meta.getIndexInfo(obj.catalog, obj.schemaName, obj.name, false, false).use { rs ->
+        // approximate=true — ojdbc는 false일 때 정확한 통계를 주려고 테이블마다
+        // ANALYZE TABLE … COMPUTE STATISTICS(19.3)나 DBMS_STATS.GATHER_TABLE_STATS(23.x)를
+        // 먼저 실행한다. 데이터 크기만큼 스캔하고 운영 통계를 바꾸며 권한이 없으면 인덱스가
+        // 통째로 빠진다. 프로브는 tableIndexStatistic 행과 CARDINALITY·PAGES를 버리므로 결과는 같다.
+        meta.getIndexInfo(obj.catalog, obj.schemaName, obj.name, false, true).use { rs ->
             val groups = linkedMapOf<String, Pair<Boolean, MutableList<Pair<Int, String>>>>()
             while (rs.next()) {
                 if (rs.getShort("TYPE") == DatabaseMetaData.tableIndexStatistic.toShort()) continue
