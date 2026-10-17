@@ -31,6 +31,13 @@ private val INFORMIX_SYSTEM_SCHEMAS = setOf(
     "sysmaster", "sysutils", "sysadmin", "sysuser", "syscdr", "syscdcv1",
 )
 
+/** Oracle 조회의 왕복당 행 수. ALL_SOURCE는 소스 한 줄이 한 행이라 ojdbc 기본값(10행)이면
+ *  대형 PL/SQL 스키마의 수집 시간을 왕복 지연이 정한다. 행 최대 약 4KB라 1000행도 버퍼가
+ *  작다. LONG 열(ALL_VIEWS.TEXT 등) 조회는 ojdbc가 여전히 행 단위로 받는다 —
+ *  useFetchSizeWithLongColumn은 LONG 값 크기만큼 버퍼를 잡아 메모리 판단이 따로 필요하다.
+ *  Go 프로브의 oraclePrefetchRows와 같은 값이다. */
+internal const val ORACLE_FETCH_ROWS = 1000
+
 private fun ResultSet.strOrNull(col: String): String? =
     try { getString(col) } catch (_: Exception) { null }
 
@@ -969,6 +976,8 @@ class Extractor(
     private fun bestEffort(label: String, sql: String, vararg params: String, row: (ResultSet) -> Unit) {
         runCatching {
             conn.prepareStatement(sql).use { st ->
+                // 연결 속성(defaultRowPrefetch) 없이 넘어온 연결에서도 원문 조회는 큰 묶음으로 받는다.
+                if (dialect == "oracle") st.fetchSize = ORACLE_FETCH_ROWS
                 params.forEachIndexed { index, value -> st.setString(index + 1, value) }
                 st.executeQuery().use { rs -> while (rs.next()) row(rs) }
             }

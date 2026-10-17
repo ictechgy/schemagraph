@@ -47,7 +47,7 @@ func parseConnection(raw string) (connectionSpec, error) {
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "oracle":
-		return connectionSpec{driver: "oracle", dialect: "oracle", dsn: raw}, nil
+		return oracleConnection(raw, u), nil
 	case "postgres", "postgresql":
 		return connectionSpec{driver: "pgx", dialect: "postgres", dsn: raw}, nil
 	case "mysql", "mariadb":
@@ -63,6 +63,37 @@ func parseConnection(raw string) (connectionSpec, error) {
 	default:
 		return connectionSpec{}, fmt.Errorf("unsupported database URL; use sqlite:, postgres://, mysql://, oracle://, or sqlserver://")
 	}
+}
+
+// oraclePrefetchRows는 사용자가 PREFETCH_ROWS를 정하지 않았을 때 왕복당 받을 행 수다.
+// ALL_SOURCE는 소스 한 줄이 한 행이라, go-ora 기본값(25를 행 크기로 다시 계산해 원문
+// 조회는 왕복당 약 31행)이면 대형 PL/SQL 스키마의 수집 시간을 RTT가 정한다.
+// 행 최대 약 4KB × 1000행이라 버퍼 상한은 작다. JDBC 프로브의 ORACLE_FETCH_ROWS와 같다.
+const oraclePrefetchRows = "1000"
+
+// Oracle URL은 원문 바이트(비밀번호 인코딩 포함)를 그대로 두고 PREFETCH_ROWS가 없을 때만
+// 질의 끝에 덧붙인다. go-ora는 질의 키를 대문자로 바꿔 비교하므로 키는 대소문자 없이 찾는다.
+func oracleConnection(raw string, u *url.URL) connectionSpec {
+	spec := connectionSpec{driver: "oracle", dialect: "oracle", dsn: raw}
+	for key := range u.Query() {
+		if strings.EqualFold(key, "PREFETCH_ROWS") {
+			return spec
+		}
+	}
+	// url.Parse처럼 첫 '#' 앞이 질의를 담는 부분이다.
+	base, fragment, hasFragment := strings.Cut(raw, "#")
+	separator := "&"
+	switch {
+	case !strings.Contains(base, "?"):
+		separator = "?"
+	case strings.HasSuffix(base, "?") || strings.HasSuffix(base, "&"):
+		separator = ""
+	}
+	spec.dsn = base + separator + "PREFETCH_ROWS=" + oraclePrefetchRows
+	if hasFragment {
+		spec.dsn += "#" + fragment
+	}
+	return spec
 }
 
 func mysqlConnection(u *url.URL) (connectionSpec, error) {

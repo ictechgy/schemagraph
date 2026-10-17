@@ -105,6 +105,8 @@ internal fun connectionProperties(dialect: String, user: String?, password: Stri
         // 않고, 연결을 닫을 때 -wal을 원본 파일에 체크포인트하지 않는다. 연결 속성이 URL의
         // 같은 키보다 우선한다. sqlite-jdbc는 runtimeOnly라 SQLiteConfig 대신 문자열 키를 쓴다.
         "sqlite" -> props["open_mode"] = "1"
+        // 드라이버 메타데이터 조회(getTables·getIndexInfo 등)까지 왕복당 행 수를 늘린다.
+        "oracle" -> props["defaultRowPrefetch"] = ORACLE_FETCH_ROWS.toString()
     }
     return props
 }
