@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"sort"
 	"strings"
 )
 
@@ -214,19 +215,46 @@ func (h *harvester) oracleSchema(schema string) SchemaDoc {
 	return sd
 }
 
-func (h *harvester) streamOracle(stream *ndjsonStreamWriter) error {
-	schemas := h.oracleSchemas()
-	original := h.schemaFilter
-	originalActive := h.activeSchema
-	defer func() {
-		h.schemaFilter = original
-		h.activeSchema = originalActive
-	}()
+// oracleScopedSchema — 질의의 OWNER를 이 스키마로 바인딩해 수확하고 원래 범위로 되돌린다.
+// JSON과 NDJSON이 이 함수로 수확해 같은 질의와 같은 0객체 규칙을 쓴다.
+func (h *harvester) oracleScopedSchema(schema string) SchemaDoc {
+	original, originalActive := h.schemaFilter, h.activeSchema
+	defer func() { h.schemaFilter, h.activeSchema = original, originalActive }()
+	h.schemaFilter = map[string]bool{schema: true}
+	h.activeSchema = &schema
+	return h.oracleSchema(schema)
+}
+
+// checkOracleObjects — 수집한 스키마 전체에 테이블·뷰가 없으면 권한 공백으로 신고한다.
+func (h *harvester) checkOracleObjects(objects int) {
+	if objects == 0 {
+		h.markIncomplete(oracleNoObjectsLimitation)
+	}
+}
+
+// extractOracle — JSON 모드도 스키마마다 OWNER를 바인딩해 수확한다. 바인딩 없이 ALL_*를
+// 읽으면 --schema와 무관하게 SYS·PUBLIC 사전까지 받아 클라이언트에서 버린다.
+func (h *harvester) extractOracle() CatalogDocument {
+	doc := CatalogDocument{
+		Version: documentVersion, Dialect: h.dialect, Reader: "probe-go",
+		Schemas: []SchemaDoc{}, Limitations: []string{},
+	}
 	objects := 0
-	for _, schema := range schemas {
-		h.schemaFilter = map[string]bool{schema: true}
-		h.activeSchema = &schema
-		document := h.oracleSchema(schema)
+	for _, schema := range h.oracleSchemas() {
+		document := h.oracleScopedSchema(schema)
+		objects += len(document.Objects)
+		doc.Schemas = append(doc.Schemas, document)
+	}
+	h.checkOracleObjects(objects)
+	sort.Slice(doc.Schemas, func(i, j int) bool { return doc.Schemas[i].Name < doc.Schemas[j].Name })
+	doc.Limitations = append(doc.Limitations, h.limitations...)
+	return doc
+}
+
+func (h *harvester) streamOracle(stream *ndjsonStreamWriter) error {
+	objects := 0
+	for _, schema := range h.oracleSchemas() {
+		document := h.oracleScopedSchema(schema)
 		objects += len(document.Objects)
 		if err := stream.schema(document); err != nil {
 			return err
@@ -235,8 +263,6 @@ func (h *harvester) streamOracle(stream *ndjsonStreamWriter) error {
 			return err
 		}
 	}
-	if objects == 0 {
-		h.markIncomplete(oracleNoObjectsLimitation)
-	}
+	h.checkOracleObjects(objects)
 	return nil
 }

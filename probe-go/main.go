@@ -352,68 +352,7 @@ func (h *harvester) extractCatalog() CatalogDocument {
 	if h.dialect == "sqlserver" {
 		return h.extractMSSQL()
 	}
-	// 스트리밍과 같은 스키마 목록으로 요청 스키마 누락을 신고한다.
-	h.oracleSchemas()
-	objects := h.collectObjects()
-	if len(objects) == 0 {
-		h.markIncomplete(oracleNoObjectsLimitation)
-	}
-	views := h.collectViews()
-	triggers := h.collectTriggers()
-	routines := h.collectRoutines()
-
-	schemaSet := map[string]bool{}
-	for s := range objects {
-		schemaSet[s] = true
-	}
-	for s := range routines {
-		schemaSet[s] = true
-	}
-	schemas := make([]string, 0, len(schemaSet))
-	for s := range schemaSet {
-		schemas = append(schemas, s)
-	}
-	sort.Strings(schemas)
-
-	doc := CatalogDocument{
-		Version: documentVersion, Dialect: h.dialect, Reader: "probe-go",
-		Schemas: []SchemaDoc{},
-		// 빈 배열이 null로 직렬화되면 Kotlin 측 문서와 모양이 갈린다.
-		Limitations: append([]string{}, h.limitations...),
-	}
-	for _, schema := range schemas {
-		sd := SchemaDoc{Name: schema, Objects: []ObjectDoc{}, Routines: []RoutineDoc{}}
-		for _, obj := range objects[schema] {
-			if b, ok := views[schema+"."+obj.Name]; ok {
-				obj.Body = &b
-			}
-			obj.Triggers = triggers[schema+"."+obj.Name]
-			if obj.Triggers == nil {
-				obj.Triggers = []TriggerDoc{}
-			}
-			sd.Objects = append(sd.Objects, obj)
-		}
-		rts := routines[schema]
-		sort.Slice(rts, func(i, j int) bool {
-			if rts[i].Name != rts[j].Name {
-				return rts[i].Name < rts[j].Name
-			}
-			var a, b string
-			if rts[i].Signature != nil {
-				a = *rts[i].Signature
-			}
-			if rts[j].Signature != nil {
-				b = *rts[j].Signature
-			}
-			return a < b
-		})
-		sd.Routines = rts
-		if sd.Routines == nil {
-			sd.Routines = []RoutineDoc{}
-		}
-		doc.Schemas = append(doc.Schemas, sd)
-	}
-	return doc
+	return h.extractOracle()
 }
 
 // collectObjects — ALL_TABLES/ALL_VIEWS/ALL_MVIEWS/ALL_SYNONYMS에서 객체를

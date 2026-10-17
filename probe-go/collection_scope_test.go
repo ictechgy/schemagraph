@@ -199,11 +199,15 @@ func mssqlDiscoveryReply(query string, _ []driver.NamedValue) scriptedReply {
 }
 
 // oracleCatalog는 OWNER가 첫 열인 Oracle 사전 행을 돌려준다. OWNER가 :schema로 바인딩되면
-// 서버처럼 그 소유자의 행만 보낸다. 나머지 사전 조회는 빈 결과다.
+// 서버처럼 그 소유자의 행만 보낸다. 정하지 않은 사전 조회는 빈 결과다.
 type oracleCatalog struct {
 	owners   []string
 	objects  [][]driver.Value // OWNER, 이름, kind
 	routines [][]driver.Value // OWNER, 이름, OBJECT_TYPE, LINE, TEXT
+	// details는 그 밖의 사전 조회를 질의에 든 고유 문자열로 찾아 돌려줄 행이다.
+	details map[string][][]driver.Value
+	// sent는 소유자별로 클라이언트에 보낸 사전 행 수다. nil이면 세지 않는다.
+	sent map[string]int
 }
 
 func (c *oracleCatalog) reply(query string, args []driver.NamedValue) scriptedReply {
@@ -217,21 +221,62 @@ func (c *oracleCatalog) reply(query string, args []driver.NamedValue) scriptedRe
 		}
 		return scriptedRows(owners...)
 	case strings.Contains(query, "'table' FROM ALL_TABLES"):
-		return ownedRows(c.objects, args)
+		return c.owned(c.objects, args)
 	case strings.Contains(query, "JOIN ALL_SOURCE"):
-		return ownedRows(c.routines, args)
+		return c.owned(c.routines, args)
+	}
+	for marker, rows := range c.details {
+		if strings.Contains(query, marker) {
+			return c.owned(rows, args)
+		}
 	}
 	return scriptedReply{}
 }
 
-// ownedRows는 바인딩된 소유자의 행만 남긴다. 바인딩이 없으면 보이는 사전 전체를 보낸다.
-func ownedRows(rows [][]driver.Value, args []driver.NamedValue) scriptedReply {
+// owned는 바인딩된 소유자의 행만 남긴다. 바인딩이 없으면 보이는 사전 전체를 보낸다.
+func (c *oracleCatalog) owned(rows [][]driver.Value, args []driver.NamedValue) scriptedReply {
 	owner, bound := namedArg(args, "schema")
 	kept := [][]driver.Value{}
 	for _, row := range rows {
 		if !bound || row[0] == owner {
 			kept = append(kept, row)
+			if c.sent != nil {
+				c.sent[row[0].(string)]++
+			}
 		}
 	}
 	return scriptedRows(kept...)
+}
+
+// oracleFixtureCatalog는 작은 APP 스키마와 수확 대상이 아닌 SYS 사전 행을 함께 가진 Oracle이다.
+// sysLines는 SYS 패키지 원문 줄 수다. OWNER 바인딩이 없으면 그만큼 버릴 행을 전송한다.
+// 표지 문자열은 질의마다 하나에만 맞는다(PACKAGE_NAME IS NULL은 IS NOT NULL에 들지 않는다).
+func oracleFixtureCatalog(sysLines int) *oracleCatalog {
+	source := [][]driver.Value{{"APP", "PING", "PROCEDURE", int64(1), "PROCEDURE PING(n NUMBER) IS BEGIN NULL; END;"}}
+	for line := 1; line <= sysLines; line++ {
+		source = append(source, []driver.Value{"SYS", "DBMS_FIXTURE", "PACKAGE", int64(line), "-- system package line\n"})
+	}
+	return &oracleCatalog{
+		owners: []string{"APP", "SYS"},
+		objects: [][]driver.Value{
+			{"APP", "ORDERS", "table"}, {"APP", "ORDER_TOTALS", "view"},
+			{"SYS", "DUAL", "table"}, {"SYS", "ALL_FIXTURES", "view"},
+		},
+		routines: source,
+		details: map[string][][]driver.Value{
+			"NULLABLE, COLUMN_ID": {
+				{"APP", "ORDERS", "ID", "NUMBER", "N", int64(1)}, {"APP", "ORDERS", "TOTAL", "NUMBER", "Y", int64(2)},
+				{"APP", "ORDER_TOTALS", "TOTAL", "NUMBER", "Y", int64(1)}, {"SYS", "DUAL", "DUMMY", "VARCHAR2", "Y", int64(1)},
+			},
+			"DATA_DEFAULT FROM ALL_TAB_COLUMNS": {{"APP", "ORDERS", "TOTAL", "0"}, {"SYS", "DUAL", "DUMMY", nil}},
+			"CONSTRAINT_TYPE = 'P'":             {{"APP", "ORDERS", "ORDERS_PK", "ID", int64(1)}},
+			"FROM ALL_INDEXES":                  {{"APP", "ORDERS", "ORDERS_PK", "UNIQUE", "ID", int64(1)}},
+			"VIEW_NAME, TEXT FROM ALL_VIEWS": {
+				{"APP", "ORDER_TOTALS", "SELECT TOTAL FROM ORDERS"}, {"SYS", "ALL_FIXTURES", "SELECT DUMMY FROM DUAL"},
+			},
+			"FROM ALL_TRIGGERS":    {{"APP", "ORDERS", "ORDERS_AUDIT", "BEGIN NULL; END;"}},
+			"PACKAGE_NAME IS NULL": {{"APP", "PING", "NUMBER"}},
+		},
+		sent: map[string]int{},
+	}
 }
