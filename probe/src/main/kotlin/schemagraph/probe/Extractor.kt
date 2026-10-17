@@ -397,16 +397,12 @@ class Extractor(
         val routineParams: Map<Pair<String, String>, String>,
     )
 
-    /** SQL 리터럴 인용 — 스키마 이름은 서버가 준 값이라 위험이 없지만
-     *  작은따옴표는 이스케이프한다. */
-    private fun q(s: String): String = "'" + s.replace("'", "''") + "'"
-
+    /** 스키마 이름은 DB에 스키마를 만들 수 있는 누구나 정하는 값이라 조회문에는 `?`로만 넣는다. */
     private fun collectBodies(schema: String): BodyHarvest {
         val views = mutableMapOf<Pair<String, String>, String>()
         val triggers = mutableMapOf<Pair<String, String>, MutableList<TriggerDoc>>()
         val routines = mutableListOf<Triple<String, String, RoutineDoc>>()
         val params = mutableMapOf<Pair<String, String>, String>()
-        val sq = q(schema)
 
         if (dialect == "db2") {
             val specialized = db2Bodies(conn, schema, limitations)
@@ -433,16 +429,16 @@ class Extractor(
                 // TEXT/TRIGGER_BODY/QUERY는 LONG이라 스트림 주의가 필요하지만
                 // ojdbc는 getString으로 읽어준다.
                 bestEffort("views",
-                    "SELECT OWNER, VIEW_NAME, TEXT FROM ALL_VIEWS WHERE OWNER = $sq") { rs ->
+                    "SELECT OWNER, VIEW_NAME, TEXT FROM ALL_VIEWS WHERE OWNER = ?", schema) { rs ->
                     views[rs.getString(1) to rs.getString(2)] = rs.getString(3) ?: return@bestEffort
                 }
                 bestEffort("materialized views",
-                    "SELECT OWNER, MVIEW_NAME, QUERY FROM ALL_MVIEWS WHERE OWNER = $sq") { rs ->
+                    "SELECT OWNER, MVIEW_NAME, QUERY FROM ALL_MVIEWS WHERE OWNER = ?", schema) { rs ->
                     views[rs.getString(1) to rs.getString(2)] = rs.getString(3) ?: return@bestEffort
                 }
                 bestEffort("triggers",
                     "SELECT OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGER_BODY FROM ALL_TRIGGERS " +
-                        "WHERE OWNER = $sq") { rs ->
+                        "WHERE OWNER = ?", schema) { rs ->
                     val key = rs.getString(1) to rs.getString(2)
                     triggers.getOrPut(key) { mutableListOf() } +=
                         TriggerDoc(rs.getString(3), rs.getString(4))
@@ -458,8 +454,8 @@ class Extractor(
                         "JOIN ALL_SOURCE s ON s.OWNER = o.OWNER " +
                         "  AND s.NAME = o.OBJECT_NAME AND s.TYPE = o.OBJECT_TYPE " +
                         "WHERE o.OBJECT_TYPE IN ('PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY') " +
-                        "  AND o.OWNER = $sq " +
-                        "ORDER BY o.OWNER, o.OBJECT_NAME, s.LINE") { rs ->
+                        "  AND o.OWNER = ? " +
+                        "ORDER BY o.OWNER, o.OBJECT_NAME, s.LINE", schema) { rs ->
                     val key = Triple(rs.getString(1), rs.getString(2), rs.getString(3))
                     oracleBodies.getOrPut(key) { StringBuilder() }.append(rs.getString(5))
                 }
@@ -470,8 +466,8 @@ class Extractor(
                 bestEffort("package members",
                     "SELECT OWNER, OBJECT_NAME, PROCEDURE_NAME, OVERLOAD " +
                         "FROM ALL_PROCEDURES WHERE PROCEDURE_NAME IS NOT NULL " +
-                        "AND OWNER = $sq " +
-                        "ORDER BY OWNER, OBJECT_NAME, SUBPROGRAM_ID") { rs ->
+                        "AND OWNER = ? " +
+                        "ORDER BY OWNER, OBJECT_NAME, SUBPROGRAM_ID", schema) { rs ->
                     pkgMembers.getOrPut(rs.getString(1) to rs.getString(2)) { mutableListOf() } +=
                         (rs.getString(3) to rs.getString(4))
                 }
@@ -482,8 +478,8 @@ class Extractor(
                 bestEffort("package member arguments",
                     "SELECT OWNER, PACKAGE_NAME, OBJECT_NAME, DATA_TYPE, POSITION, OVERLOAD " +
                         "FROM ALL_ARGUMENTS WHERE PACKAGE_NAME IS NOT NULL " +
-                        "AND OWNER = $sq " +
-                        "ORDER BY OWNER, PACKAGE_NAME, OBJECT_NAME, OVERLOAD, SEQUENCE") { rs ->
+                        "AND OWNER = ? " +
+                        "ORDER BY OWNER, PACKAGE_NAME, OBJECT_NAME, OVERLOAD, SEQUENCE", schema) { rs ->
                     val key = Triple(rs.getString(1), rs.getString(2),
                         rs.getString(3) + (rs.getString(6)?.let { "#$it" } ?: ""))
                     if (rs.getInt(5) == 0) memberFunctions += key
@@ -548,8 +544,8 @@ class Extractor(
                 bestEffort("routine parameters",
                     "SELECT OWNER, OBJECT_NAME, DATA_TYPE FROM ALL_ARGUMENTS " +
                         "WHERE POSITION > 0 AND PACKAGE_NAME IS NULL " +
-                        "AND OWNER = $sq " +
-                        "ORDER BY OWNER, OBJECT_NAME, SEQUENCE") { rs ->
+                        "AND OWNER = ? " +
+                        "ORDER BY OWNER, OBJECT_NAME, SEQUENCE", schema) { rs ->
                     params.merge(rs.getString(1) to rs.getString(2),
                         rs.getString(3).lowercase()) { a, b -> "$a, $b" }
                 }
@@ -574,7 +570,7 @@ class Extractor(
                     "SELECT SCHEMA_NAME(o.schema_id), o.name, m.definition " +
                         "FROM sys.views o " +
                         "JOIN sys.sql_modules m ON m.object_id = o.object_id " +
-                        "WHERE SCHEMA_NAME(o.schema_id) = $sq") { rs ->
+                        "WHERE SCHEMA_NAME(o.schema_id) = ?", schema) { rs ->
                     views[rs.getString(1) to rs.getString(2)] =
                         rs.getString(3) ?: return@bestEffort
                 }
@@ -583,7 +579,7 @@ class Extractor(
                         "FROM sys.triggers t " +
                         "JOIN sys.objects p ON p.object_id = t.parent_id " +
                         "JOIN sys.sql_modules m ON m.object_id = t.object_id " +
-                        "WHERE t.parent_class = 1 AND SCHEMA_NAME(p.schema_id) = $sq") { rs ->
+                        "WHERE t.parent_class = 1 AND SCHEMA_NAME(p.schema_id) = ?", schema) { rs ->
                     triggers.getOrPut(rs.getString(1) to rs.getString(2)) { mutableListOf() } +=
                         TriggerDoc(rs.getString(3), rs.getString(4))
                 }
@@ -592,7 +588,7 @@ class Extractor(
                         "FROM sys.objects o " +
                         "JOIN sys.sql_modules m ON m.object_id = o.object_id " +
                         "WHERE o.type IN ('P','FN','IF','TF') " +
-                        "  AND SCHEMA_NAME(o.schema_id) = $sq") { rs ->
+                        "  AND SCHEMA_NAME(o.schema_id) = ?", schema) { rs ->
                     val name = rs.getString(2)
                     routines += Triple(
                         rs.getString(1),
@@ -612,8 +608,8 @@ class Extractor(
                         "FROM sys.parameters p " +
                         "JOIN sys.objects o ON o.object_id = p.object_id " +
                         "WHERE o.type IN ('P','FN','IF','TF') AND p.parameter_id > 0 " +
-                        "  AND SCHEMA_NAME(o.schema_id) = $sq " +
-                        "ORDER BY o.name, p.parameter_id") { rs ->
+                        "  AND SCHEMA_NAME(o.schema_id) = ? " +
+                        "ORDER BY o.name, p.parameter_id", schema) { rs ->
                     // parameter_id=0은 반환값 — MySQL의 ordinal=0과 같은 함정.
                     params.merge(rs.getString(1) to rs.getString(2),
                         rs.getString(3).lowercase()) { a, b -> "$a, $b" }
@@ -623,21 +619,23 @@ class Extractor(
             // PostgreSQL 정보 스키마는 비소유자의 정의를 NULL로 숨긴다.
             // 네이티브 reader와 같은 원본 카탈로그에서 이름·정의를 옮긴다.
             val viewSql = if (dialect == "postgres")
-                "SELECT schemaname, viewname, definition FROM pg_views WHERE schemaname = $sq " +
-                    "UNION ALL SELECT schemaname, matviewname, definition FROM pg_matviews WHERE schemaname = $sq"
-            else "SELECT TABLE_SCHEMA, TABLE_NAME, VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = $sq"
+                "SELECT schemaname, viewname, definition FROM pg_views WHERE schemaname = ? " +
+                    "UNION ALL SELECT schemaname, matviewname, definition FROM pg_matviews WHERE schemaname = ?"
+            else "SELECT TABLE_SCHEMA, TABLE_NAME, VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = ?"
+            // PostgreSQL은 뷰와 물화뷰를 UNION ALL로 함께 읽어 같은 스키마를 두 번 바인드한다.
+            val viewParams = if (dialect == "postgres") arrayOf(schema, schema) else arrayOf(schema)
             bestEffort("views",
-                viewSql) { rs ->
+                viewSql, *viewParams) { rs ->
                 views[rs.getString(1) to rs.getString(2)] = rs.getString(3) ?: return@bestEffort
             }
             val triggerSql = if (dialect == "postgres")
                 "SELECT n.nspname, c.relname, t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t " +
                     "JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace " +
-                    "WHERE NOT t.tgisinternal AND n.nspname = $sq"
+                    "WHERE NOT t.tgisinternal AND n.nspname = ?"
             else "SELECT TRIGGER_SCHEMA, EVENT_OBJECT_TABLE, TRIGGER_NAME, ACTION_STATEMENT " +
-                "FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = $sq"
+                "FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = ?"
             bestEffort("triggers",
-                triggerSql) { rs ->
+                triggerSql, schema) { rs ->
                 val key = rs.getString(1) to rs.getString(2)
                 triggers.getOrPut(key) { mutableListOf() } +=
                     TriggerDoc(rs.getString(3), rs.getString(4))
@@ -653,8 +651,8 @@ class Extractor(
                         "FROM pg_proc p " +
                         "JOIN pg_namespace n ON n.oid = p.pronamespace " +
                         "JOIN pg_language l ON l.oid = p.prolang " +
-                        "WHERE n.nspname = $sq AND p.prokind IN ('f', 'p', 'a', 'w') " +
-                        "ORDER BY p.proname, pg_get_function_identity_arguments(p.oid), p.oid") { rs ->
+                        "WHERE n.nspname = ? AND p.prokind IN ('f', 'p', 'a', 'w') " +
+                        "ORDER BY p.proname, pg_get_function_identity_arguments(p.oid), p.oid", schema) { rs ->
                     val name = rs.getString(3)
                     val kind = when (rs.getString(4)) {
                         "f", "a", "w" -> "function"
@@ -677,7 +675,7 @@ class Extractor(
                 bestEffort("routines",
                     "SELECT ROUTINE_SCHEMA, ROUTINE_NAME, SPECIFIC_NAME, ROUTINE_TYPE, " +
                         "ROUTINE_DEFINITION, EXTERNAL_LANGUAGE FROM INFORMATION_SCHEMA.ROUTINES " +
-                        "WHERE ROUTINE_SCHEMA = $sq") { rs ->
+                        "WHERE ROUTINE_SCHEMA = ?", schema) { rs ->
                     val rtype = rs.getString(4) ?: return@bestEffort
                     routines += Triple(
                         rs.getString(1),
@@ -696,8 +694,8 @@ class Extractor(
                 bestEffort("routine parameters",
                     "SELECT SPECIFIC_SCHEMA, SPECIFIC_NAME, DATA_TYPE, ORDINAL_POSITION " +
                         "FROM INFORMATION_SCHEMA.PARAMETERS WHERE PARAMETER_MODE = 'IN' " +
-                        "AND SPECIFIC_SCHEMA = $sq " +
-                        "ORDER BY ORDINAL_POSITION") { rs ->
+                        "AND SPECIFIC_SCHEMA = ? " +
+                        "ORDER BY ORDINAL_POSITION", schema) { rs ->
                     val key = rs.getString(1) to rs.getString(2)
                     params.merge(key, rs.getString(3).lowercase()) { a, b -> "$a, $b" }
                 }
@@ -945,11 +943,15 @@ class Extractor(
         return UsageHarvest(tables, indexes, functions)
     }
 
-    /** best-effort 쿼리 — 실패를 limitation으로 변환해 숨기지 않는다. */
-    private fun bestEffort(label: String, sql: String, row: (ResultSet) -> Unit) {
+    /** best-effort 쿼리 — 실패를 limitation으로 변환해 숨기지 않는다.
+     *  [params]는 `?` 순서대로 바인드한다. 따옴표 이중화만으로는 백슬래시를 이스케이프로
+     *  읽는 세션(MySQL 기본 sql_mode, PostgreSQL standard_conforming_strings=off)에서
+     *  리터럴 경계가 지켜지지 않아, 값은 SQL 원문에 넣지 않는다. */
+    private fun bestEffort(label: String, sql: String, vararg params: String, row: (ResultSet) -> Unit) {
         runCatching {
-            conn.createStatement().use { st ->
-                st.executeQuery(sql).use { rs -> while (rs.next()) row(rs) }
+            conn.prepareStatement(sql).use { st ->
+                params.forEachIndexed { index, value -> st.setString(index + 1, value) }
+                st.executeQuery().use { rs -> while (rs.next()) row(rs) }
             }
         }.onFailure {
             // 한 줄로 — 줄바꿈이 들어가면 limitation 텍스트가 지저분해진다.
