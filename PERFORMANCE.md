@@ -1,5 +1,50 @@
 # Performance measurements
 
+## PL/pgSQL routine bodies at scale (2026-10-18)
+
+These release-mode measurements compare the 0.7.1 engine (`a2f0dffc7af4…`,
+built from `a6ee7d5`) with the unreleased parser change (`ea6e2019586a…`) on
+the same macOS ARM64 host. The host was shared with other work, and the two
+engines ran one after the other. Each value is the median of three fresh
+processes per mode.
+
+`Scripts/benchmark-analysis.py --routines` generates PostgreSQL catalog
+documents in the form the readers collect: `pg_get_functiondef` text of
+PL/pgSQL functions over half as many ten-column tables. Each function reads one
+table with `SELECT … INTO` and updates another. The verifier checks every
+function's table reads and writes against the generated SQL in both directions
+and requires every body to parse completely. Both engines produce the same
+graph bytes for each size, all modes of one size produce the same bytes, and
+every reused-cache run reports a hit for every function.
+
+| Functions | Engine | No cache s | Empty cache s | Reused cache s | No-cache peak RSS MiB |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1,000 | 0.7.1 | 3.018 | 3.259 | 3.040 | 36.1 |
+| 1,000 | Unreleased | 0.082 | 0.297 | 0.127 | 32.8 |
+| 2,000 | 0.7.1 | 12.158 | 12.402 | 11.603 | 60.9 |
+| 2,000 | Unreleased | 0.153 | 0.640 | 0.215 | 55.3 |
+| 4,000 | 0.7.1 | 49.769 | 52.096 | 48.590 | 342.2 |
+| 4,000 | Unreleased | 0.293 | 1.497 | 0.391 | 97.7 |
+
+From 2,000 to 4,000 functions, 0.7.1 took 4.1–4.2 times as long in every mode.
+It built a cache key for every body even without a cache, and each
+`CREATE FUNCTION` body hashed the whole document. The unreleased engine builds
+keys only when a cache is present and computes document-wide parts once per
+run. The same step takes 1.9 times as long without a cache and 1.8 times with a
+reused cache. Empty-cache runs also capture and write one entry per function
+and took 2.3 times as long.
+
+```sh
+python3 Scripts/benchmark-analysis.py --engine engine/target/release/schemagraph \
+  --routines 1000 2000 4000 --repeat 3 --max-growth 3 \
+  --output engine/target/analysis-routines
+```
+
+`--max-growth` fails the run when the no-cache or reused-cache median grows by
+more than the given factor between consecutive sizes. `results.json` records
+the executable and catalog hashes, verified facts, every sample, and the growth
+ratios.
+
 ## JDBC and large SQL bodies (2026-09-22 follow-up)
 
 These measurements use fixed binaries on the same macOS ARM64 host and three
