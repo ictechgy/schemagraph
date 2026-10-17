@@ -7,6 +7,7 @@
 //! 뷰는 스키마·스코프별로 컬럼을 해석하고, 절차형 몸체는 지원하는 SQL 문장을
 //! 추출한다. 값의 계보와 조건절의 읽기 의존성을 구분하고 미해석은 진단한다.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
@@ -66,9 +67,14 @@ pub fn enrich_with_cache(
                 } else {
                     VertexKind::MaterializedView
                 };
-                if let Some(owner) =
-                    resolve_object(g, &schema.name, &obj.name, kind, &obj.kind, false)
-                {
+                if let Some(owner) = resolve_object(
+                    g,
+                    &schema.name,
+                    &obj.name,
+                    kind,
+                    &obj.kind,
+                    catalog_index.lookup(false),
+                ) {
                     // 캐시 키는 재사용·저장에만 쓰인다. 캐시가 없으면 만들지 않는다.
                     let context = obj
                         .body
@@ -118,7 +124,7 @@ pub fn enrich_with_cache(
                     &trg.name,
                     VertexKind::Trigger,
                     "trigger",
-                    ci,
+                    catalog_index.lookup(ci),
                 ) else {
                     notes.push(format!(
                         "trigger {}.{}.{}: 정점을 못 찾음(이름 충돌?) — 몸체 간선 생략",
@@ -229,7 +235,7 @@ pub fn enrich_with_cache(
                     routine.signature.as_deref(),
                     kind,
                     suffix,
-                    ci,
+                    catalog_index.lookup(ci),
                 ),
                 None => resolve_routine_vertex(
                     g,
@@ -239,7 +245,7 @@ pub fn enrich_with_cache(
                     routine.signature.as_deref(),
                     kind,
                     suffix,
-                    ci,
+                    catalog_index.lookup(ci),
                 ),
             };
             let Some(owner) = owner else {
@@ -494,7 +500,7 @@ pub fn enrich_with_cache(
                 routine.signature.as_deref(),
                 VertexKind::Query,
                 "query",
-                false,
+                catalog_index.lookup(false),
             ) {
                 if let Some(mut record) = g.analysis().get(&id).cloned() {
                     record.source = routine.source.clone();
@@ -3244,6 +3250,141 @@ enum RoutineHit {
     Ambiguous(usize),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 이름 해석이 그래프 정점 전체를 훑은 횟수. 테스트 스레드마다 따로 센다.
+    static VERTEX_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 이름 해석의 정점 전체 순회를 한 번 센다.
+#[cfg(test)]
+fn count_vertex_scan() {
+    VERTEX_SCANS.with(|scans| scans.set(scans.get() + 1));
+}
+
+/// 현재 테스트 스레드의 정점 순회 횟수를 돌려주고 0으로 되돌린다.
+#[cfg(test)]
+fn take_vertex_scans() -> usize {
+    VERTEX_SCANS.with(std::cell::Cell::take)
+}
+
+/// enrich 동안 고정된 정점 집합에서 이름 해석 후보를 찾는 색인.
+///
+/// parser는 정점을 추가하지 않고 간선만 더하므로 처음 조회할 때 만든 색인이
+/// enrich 끝까지 유효하다. 참조마다 전체 정점을 훑던 해석을 키 조회로 바꾸되,
+/// 후보 0개·1개·2개 이상을 None·One·Ambiguous로 가르는 규칙은 그대로 둔다.
+/// 그래서 한 색인은 처음 조회한 그래프 하나에만 써야 한다.
+#[derive(Default)]
+pub(crate) struct VertexIndex {
+    exact: OnceCell<RoutineIndex>,
+    folded: OnceCell<RoutineIndex>,
+    /// ASCII 대문자로 접은 id → 정점. ci 방언의 단일 후보 판정에 쓴다.
+    folded_ids: OnceCell<BTreeMap<String, Vec<VertexId>>>,
+}
+
+impl VertexIndex {
+    /// 정확 일치만 볼지, 대소문자 무시 단일 후보까지 볼지 정한 조회 방식.
+    pub(crate) fn lookup(&self, ci: bool) -> Lookup<'_> {
+        Lookup { index: self, ci }
+    }
+
+    fn routines(&self, g: &Graph, ci: bool) -> &RoutineIndex {
+        if ci {
+            self.folded.get_or_init(|| RoutineIndex::new(g, fold_case))
+        } else {
+            self.exact
+                .get_or_init(|| RoutineIndex::new(g, str::to_owned))
+        }
+    }
+
+    fn folded_ids(&self, g: &Graph) -> &BTreeMap<String, Vec<VertexId>> {
+        self.folded_ids.get_or_init(|| {
+            #[cfg(test)]
+            count_vertex_scan();
+            let mut ids: BTreeMap<String, Vec<VertexId>> = BTreeMap::new();
+            for vertex in g.vertices() {
+                let key = fold_case(vertex.id.as_str());
+                ids.entry(key).or_default().push(vertex.id.clone());
+            }
+            ids
+        })
+    }
+}
+
+/// routine 이름 해석 후보. 이름 키는 만들 때 준 규칙으로 접은 값이다.
+#[derive(Default)]
+struct RoutineIndex {
+    /// (스키마, 표시 이름) → 함수·프로시저·패키지 정점.
+    routines: BTreeMap<(String, String), Vec<VertexId>>,
+    /// (패키지 id, 멤버 이름) → 함수·프로시저 정점. 패키지 id는 접지 않는다.
+    members: BTreeMap<(VertexId, String), Vec<VertexId>>,
+}
+
+impl RoutineIndex {
+    fn new(g: &Graph, fold: fn(&str) -> String) -> Self {
+        #[cfg(test)]
+        count_vertex_scan();
+        let mut index = Self::default();
+        for vertex in g.vertices() {
+            if matches!(
+                vertex.kind,
+                VertexKind::Function | VertexKind::Procedure | VertexKind::Package
+            ) {
+                let key = (fold(&vertex.schema), fold(&vertex.name));
+                index
+                    .routines
+                    .entry(key)
+                    .or_default()
+                    .push(vertex.id.clone());
+            }
+            if matches!(vertex.kind, VertexKind::Function | VertexKind::Procedure) {
+                if let Some(package) = vertex.id.parent() {
+                    let key = (package, fold(&vertex.name));
+                    index
+                        .members
+                        .entry(key)
+                        .or_default()
+                        .push(vertex.id.clone());
+                }
+            }
+        }
+        index
+    }
+}
+
+/// 이름 해석 방식과 그 색인. ci면 정확 일치가 없을 때 대소문자 무시 단일
+/// 후보를 본다.
+#[derive(Clone, Copy)]
+pub(crate) struct Lookup<'a> {
+    index: &'a VertexIndex,
+    ci: bool,
+}
+
+impl Lookup<'_> {
+    /// 이 조회 방식의 비교 규칙으로 이름 키를 만든다.
+    fn key(&self, value: &str) -> String {
+        if self.ci {
+            fold_case(value)
+        } else {
+            value.to_owned()
+        }
+    }
+}
+
+/// ci 비교 `a == b || a.eq_ignore_ascii_case(b)`와 같은 동치류를 만드는 키.
+fn fold_case(value: &str) -> String {
+    value.to_ascii_uppercase()
+}
+
+/// 후보 수로 routine 해석 결과를 정한다 — 둘 이상이면 추측하지 않는다.
+fn routine_hit(candidates: Option<&Vec<VertexId>>) -> RoutineHit {
+    match candidates.map(Vec::as_slice).unwrap_or_default() {
+        [] => RoutineHit::None,
+        [only] => RoutineHit::One(only.clone()),
+        many => RoutineHit::Ambiguous(many.len()),
+    }
+}
+
 /// 멤버 정점 id를 찾는다 — document_to_graph가 이름 충돌을 `name@kind`로
 /// 분리하므로, 평범한 id에 우리 kind가 없으면 접미사 id를 시도한다.
 /// 못 찾으면 None — 유령 id로 간선을 만들지 않는다.
@@ -3254,9 +3395,9 @@ fn resolve_member(
     name: &str,
     kind: VertexKind,
     suffix: &str,
-    ci: bool,
+    lookup: Lookup<'_>,
 ) -> Option<VertexId> {
-    resolve_renamed(g, VertexId::member(schema, obj, name), kind, suffix, ci)
+    resolve_renamed(g, VertexId::member(schema, obj, name), kind, suffix, lookup)
 }
 
 fn resolve_routine_vertex(
@@ -3267,14 +3408,14 @@ fn resolve_routine_vertex(
     signature: Option<&str>,
     kind: VertexKind,
     suffix: &str,
-    ci: bool,
+    lookup: Lookup<'_>,
 ) -> Option<VertexId> {
     resolve_renamed(
         g,
         VertexId::routine(schema, package, name, signature),
         kind,
         suffix,
-        ci,
+        lookup,
     )
 }
 
@@ -3285,9 +3426,9 @@ fn resolve_object(
     name: &str,
     kind: VertexKind,
     suffix: &str,
-    ci: bool,
+    lookup: Lookup<'_>,
 ) -> Option<VertexId> {
-    resolve_renamed(g, VertexId::object(schema, name), kind, suffix, ci)
+    resolve_renamed(g, VertexId::object(schema, name), kind, suffix, lookup)
 }
 
 /// base id가 다른 kind에게 점유됐으면 `base@suffix`를 시도한다 —
@@ -3297,12 +3438,12 @@ fn resolve_renamed(
     base: VertexId,
     kind: VertexKind,
     suffix: &str,
-    ci: bool,
+    lookup: Lookup<'_>,
 ) -> Option<VertexId> {
     let renamed = VertexId::from_raw(&format!("{}@{suffix}", base.as_str()));
     [base, renamed]
         .into_iter()
-        .filter_map(|id| vertex_hit(g, &id, ci))
+        .filter_map(|id| vertex_hit(g, &id, lookup))
         .find(|id| g.vertex(id).map(|v| v.kind == kind).unwrap_or(false))
 }
 
@@ -3310,52 +3451,28 @@ fn resolve_renamed(
 /// 찾는다. Oracle의 미인용 식별자는 대문자로 접혀 몸체의 `orders`와 카탈로그의
 /// `ORDERS`가 같은 대상이지만, 대소문자만 다른 두 객체가 있으면 어느 쪽인지
 /// 추측할 수 없어 None을 돌려 유령 간선을 막는다.
-fn vertex_hit(g: &Graph, id: &VertexId, ci: bool) -> Option<VertexId> {
+fn vertex_hit(g: &Graph, id: &VertexId, lookup: Lookup<'_>) -> Option<VertexId> {
     if g.vertex(id).is_some() {
         return Some(id.clone());
     }
-    if !ci {
+    if !lookup.ci {
         return None;
     }
-    let mut hits = g
-        .vertices()
-        .map(|v| &v.id)
-        .filter(|v| v.as_str().eq_ignore_ascii_case(id.as_str()));
-    let first = hits.next()?;
-    if hits.next().is_none() {
-        Some(first.clone())
-    } else {
-        None
+    match lookup.index.folded_ids(g).get(&fold_case(id.as_str())) {
+        Some(hits) if hits.len() == 1 => Some(hits[0].clone()),
+        _ => None,
     }
 }
 
 /// 스키마 안에서 routine 정점을 이름으로 찾는다. 정확한 id(name 그대로)가
 /// 먼저이고, 없으면 routine kind 정점의 표시 이름과 비교한다 — 호출자는
 /// 시그니처를 모르므로 이름이 유일할 때만 받아들인다(resolve()와 같은 철학).
-fn resolve_routine(g: &Graph, schema: &str, name: &str, ci: bool) -> RoutineHit {
+fn resolve_routine(g: &Graph, schema: &str, name: &str, lookup: Lookup<'_>) -> RoutineHit {
     // 정확한 base id가 있어도 같은 표시 이름의 시그니처 정점이 있으면
     // 호출 인자 수를 모르는 이 경로에서 무인자 overload를 임의로 고르면 안
     // 된다. 모든 routine 후보를 먼저 모아 하나일 때만 선택한다.
-    let name_eq = |a: &str, b: &str| a == b || (ci && a.eq_ignore_ascii_case(b));
-    let hits: Vec<VertexId> = g
-        .vertices()
-        .filter(|v| {
-            name_eq(&v.schema, schema)
-                && name_eq(&v.name, name)
-                && matches!(
-                    v.kind,
-                    schemagraph_core::VertexKind::Function
-                        | schemagraph_core::VertexKind::Procedure
-                        | schemagraph_core::VertexKind::Package
-                )
-        })
-        .map(|v| v.id.clone())
-        .collect();
-    match hits.len() {
-        0 => RoutineHit::None,
-        1 => RoutineHit::One(hits.into_iter().next().unwrap()),
-        n => RoutineHit::Ambiguous(n),
-    }
+    let routines = &lookup.index.routines(g, lookup.ci).routines;
+    routine_hit(routines.get(&(lookup.key(schema), lookup.key(name))))
 }
 
 /// trigger 파싱 결과를 그래프 간선으로 반영한다 — DML + calls + fired-columns.
@@ -3405,7 +3522,14 @@ fn apply_trigger(
         },
         &mut parsed.diagnostics,
     );
-    apply_call_edges(g, schema, trigger_id, &parsed.calls, notes, ci);
+    apply_call_edges(
+        g,
+        schema,
+        trigger_id,
+        &parsed.calls,
+        notes,
+        catalog.lookup(ci),
+    );
     // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다. 컬럼이 id 충돌로
     // `@column`으로 분리됐을 수 있어 kind-aware 해석자를 쓴다.
     let mut made = std::collections::BTreeSet::new();
@@ -3417,7 +3541,7 @@ fn apply_trigger(
             column,
             VertexKind::Column,
             "column",
-            ci,
+            catalog.lookup(ci),
         ) else {
             continue;
         };
@@ -3476,7 +3600,7 @@ fn apply_routine(
         },
         &mut parsed.diagnostics,
     );
-    apply_call_edges(g, schema, owner, &parsed.calls, notes, ci);
+    apply_call_edges(g, schema, owner, &parsed.calls, notes, catalog.lookup(ci));
     parsed.partial
 }
 
@@ -3513,7 +3637,8 @@ fn apply_dml_edges(
                 continue;
             }
             let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-            let Some(target) = vertex_hit(g, &VertexId::object(&target_schema, table), ci) else {
+            let target_id = VertexId::object(&target_schema, table);
+            let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
                 notes.push(format!(
                     "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
                 ));
@@ -3548,7 +3673,8 @@ fn apply_dml_edges(
                     continue;
                 }
             };
-            let Some(target) = vertex_hit(g, &VertexId::object(&target_schema, &table), ci) else {
+            let target_id = VertexId::object(&target_schema, &table);
+            let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
                 notes.push(format!(
                     "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
                 ));
@@ -3575,17 +3701,17 @@ fn apply_call_edges(
     from: &VertexId,
     calls: &[(Option<String>, String)],
     notes: &mut Vec<String>,
-    ci: bool,
+    lookup: Lookup<'_>,
 ) {
     for (ref_schema, name) in calls {
         let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-        let hit = match resolve_routine(g, &target_schema, name, ci) {
+        let hit = match resolve_routine(g, &target_schema, name, lookup) {
             RoutineHit::None => {
                 // `pkg.member()` 꼴 — qualifier가 스키마가 아니라 패키지면
                 // 멤버 정점 schema.pkg.member를 찾는다.
                 ref_schema
                     .as_ref()
-                    .map(|pkg| resolve_pkg_member(g, schema, pkg, name, ci))
+                    .map(|pkg| resolve_pkg_member(g, schema, pkg, name, lookup))
                     .unwrap_or(RoutineHit::None)
             }
             hit => hit,
@@ -3617,29 +3743,22 @@ fn apply_call_edges(
 /// 다 될 수 있어 둘을 시도하고, 시그니처가 붙은 id(`pkg.m(int)`)는
 /// `schema.pkg.` 접두 안의 이름 스캔으로 찾는다. 오버로드가 여럿이면
 /// Ambiguous — resolve_routine과 같이 추측하지 않는다.
-fn resolve_pkg_member(g: &Graph, schema: &str, pkg: &str, name: &str, ci: bool) -> RoutineHit {
+fn resolve_pkg_member(
+    g: &Graph,
+    schema: &str,
+    pkg: &str,
+    name: &str,
+    lookup: Lookup<'_>,
+) -> RoutineHit {
     let base = VertexId::routine(schema, Some(pkg), name, None);
-    if let Some(id) = resolve_renamed(g, base.clone(), VertexKind::Procedure, "procedure", ci)
-        .or_else(|| resolve_renamed(g, base, VertexKind::Function, "function", ci))
+    if let Some(id) = resolve_renamed(g, base.clone(), VertexKind::Procedure, "procedure", lookup)
+        .or_else(|| resolve_renamed(g, base, VertexKind::Function, "function", lookup))
     {
         return RoutineHit::One(id);
     }
     let package_id = VertexId::object(schema, pkg);
-    let name_eq = |a: &str, b: &str| a == b || (ci && a.eq_ignore_ascii_case(b));
-    let hits: Vec<VertexId> = g
-        .vertices()
-        .filter(|v| {
-            name_eq(&v.name, name)
-                && matches!(v.kind, VertexKind::Procedure | VertexKind::Function)
-                && v.id.parent().as_ref() == Some(&package_id)
-        })
-        .map(|v| v.id.clone())
-        .collect();
-    match hits.len() {
-        0 => RoutineHit::None,
-        1 => RoutineHit::One(hits.into_iter().next().unwrap()),
-        n => RoutineHit::Ambiguous(n),
-    }
+    let members = &lookup.index.routines(g, lookup.ci).members;
+    routine_hit(members.get(&(package_id, lookup.key(name))))
 }
 
 #[cfg(test)]
@@ -5669,5 +5788,299 @@ mod tests {
                 && edge.to.as_str() == "main.customers"
         }));
         assert!(notes.is_empty(), "notes: {notes:?}");
+    }
+
+    /// 대문자 카탈로그를 소문자 PL/SQL 몸체가 참조·호출하는 Oracle 문서 —
+    /// 관계마다 ci 해석, 호출마다 routine·패키지 멤버 해석을 탄다.
+    fn oracle_resolution_doc(procedures: usize) -> CatalogDocument {
+        let mut package = routine("PKG", Some("plsql"), "PACKAGE pkg IS END pkg;");
+        package.kind = "package".into();
+        let mut touch = routine(
+            "TOUCH",
+            Some("plsql"),
+            "PROCEDURE touch IS BEGIN NULL; END touch;",
+        );
+        touch.kind = "procedure".into();
+        touch.member_of = Some("PKG".into());
+        let mut routines = vec![package, touch];
+        for index in 0..procedures {
+            let mut procedure = routine(
+                &format!("P{index}"),
+                Some("plsql"),
+                &format!(
+                    "BEGIN UPDATE orders SET id = 1 WHERE customer_id = 0; \
+                     INSERT INTO customers(id) SELECT id FROM orders; p{}(1); pkg.touch(); END;",
+                    (index + 1) % procedures
+                ),
+            );
+            procedure.kind = "procedure".into();
+            routines.push(procedure);
+        }
+        CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
+            version: 1,
+            dialect: "oracle".into(),
+            reader: "test".into(),
+            limitations: vec![],
+            schemas: vec![SchemaDoc {
+                name: "APP".into(),
+                routines,
+                objects: vec![
+                    table("ORDERS", vec![col("ID", 1), col("CUSTOMER_ID", 2)]),
+                    table("CUSTOMERS", vec![col("ID", 1), col("NAME", 2)]),
+                ],
+            }],
+        }
+    }
+
+    fn has_edge(g: &Graph, from: &str, to: &str, kind: EdgeKind) -> bool {
+        g.edges()
+            .iter()
+            .any(|e| e.from.as_str() == from && e.to.as_str() == to && e.kind == kind)
+    }
+
+    #[test]
+    fn 이름_해석은_참조_수와_무관하게_정점을_몇_번만_훑는다() {
+        for procedures in [4, 16] {
+            let doc = oracle_resolution_doc(procedures);
+            take_vertex_scans();
+            let (g, notes) = build(&doc);
+            let scans = take_vertex_scans();
+            // ci id 색인과 ci routine 색인 — 참조·호출 수와 무관한 상수다.
+            assert!(scans <= 3, "{procedures} procedures: {scans} vertex scans");
+            for index in 0..procedures {
+                let from = format!("APP.P{index}");
+                assert!(
+                    has_edge(&g, &from, "APP.ORDERS", EdgeKind::Writes),
+                    "{notes:?}"
+                );
+                assert!(has_edge(&g, &from, "APP.CUSTOMERS", EdgeKind::Writes));
+                assert!(has_edge(&g, &from, "APP.ORDERS", EdgeKind::Reads));
+                let next = format!("APP.P{}", (index + 1) % procedures);
+                assert!(has_edge(&g, &from, &next, EdgeKind::Calls), "{notes:?}");
+                assert!(
+                    has_edge(&g, &from, "APP.PKG.TOUCH", EdgeKind::Calls),
+                    "{notes:?}"
+                );
+            }
+        }
+        // SQL 식 안의 호출은 Binder가 정확한 이름으로 해석한다.
+        let callers: Vec<_> = (0..16)
+            .map(|index| {
+                routine(
+                    &format!("f{index}"),
+                    Some("sql"),
+                    &format!("SELECT f{}(1) + f{}(2)", (index + 1) % 16, (index + 2) % 16),
+                )
+            })
+            .collect();
+        take_vertex_scans();
+        let (g, notes) = build(&doc_with_routine(callers, ""));
+        assert!(take_vertex_scans() <= 1);
+        assert!(
+            has_edge(&g, "public.f0", "public.f1", EdgeKind::Calls),
+            "{notes:?}"
+        );
+        assert!(
+            has_edge(&g, "public.f15", "public.f1", EdgeKind::Calls),
+            "{notes:?}"
+        );
+    }
+
+    /// 색인 이전의 선형 탐색 — 색인 해석이 같은 후보를 고르는지 대조하는 기준이다.
+    fn linear_vertex_hit(g: &Graph, id: &VertexId, ci: bool) -> Option<VertexId> {
+        if g.vertex(id).is_some() {
+            return Some(id.clone());
+        }
+        if !ci {
+            return None;
+        }
+        let mut hits = g
+            .vertices()
+            .map(|v| &v.id)
+            .filter(|v| v.as_str().eq_ignore_ascii_case(id.as_str()));
+        let first = hits.next()?;
+        hits.next().is_none().then(|| first.clone())
+    }
+
+    fn linear_renamed(
+        g: &Graph,
+        base: VertexId,
+        kind: VertexKind,
+        suffix: &str,
+        ci: bool,
+    ) -> Option<VertexId> {
+        let renamed = VertexId::from_raw(&format!("{}@{suffix}", base.as_str()));
+        [base, renamed]
+            .into_iter()
+            .filter_map(|id| linear_vertex_hit(g, &id, ci))
+            .find(|id| g.vertex(id).map(|v| v.kind == kind).unwrap_or(false))
+    }
+
+    fn linear_name_eq(a: &str, b: &str, ci: bool) -> bool {
+        a == b || (ci && a.eq_ignore_ascii_case(b))
+    }
+
+    fn linear_routine(g: &Graph, schema: &str, name: &str, ci: bool) -> Vec<VertexId> {
+        g.vertices()
+            .filter(|v| {
+                linear_name_eq(&v.schema, schema, ci)
+                    && linear_name_eq(&v.name, name, ci)
+                    && matches!(
+                        v.kind,
+                        VertexKind::Function | VertexKind::Procedure | VertexKind::Package
+                    )
+            })
+            .map(|v| v.id.clone())
+            .collect()
+    }
+
+    fn linear_pkg_member(
+        g: &Graph,
+        schema: &str,
+        pkg: &str,
+        name: &str,
+        ci: bool,
+    ) -> Vec<VertexId> {
+        let base = VertexId::routine(schema, Some(pkg), name, None);
+        if let Some(id) = linear_renamed(g, base.clone(), VertexKind::Procedure, "procedure", ci)
+            .or_else(|| linear_renamed(g, base, VertexKind::Function, "function", ci))
+        {
+            return vec![id];
+        }
+        let package_id = VertexId::object(schema, pkg);
+        g.vertices()
+            .filter(|v| {
+                linear_name_eq(&v.name, name, ci)
+                    && matches!(v.kind, VertexKind::Procedure | VertexKind::Function)
+                    && v.id.parent().as_ref() == Some(&package_id)
+            })
+            .map(|v| v.id.clone())
+            .collect()
+    }
+
+    /// RoutineHit을 후보 목록과 같은 모양으로 바꿔 비교한다.
+    fn hit_shape(hit: RoutineHit) -> (usize, Option<VertexId>) {
+        match hit {
+            RoutineHit::None => (0, None),
+            RoutineHit::One(id) => (1, Some(id)),
+            RoutineHit::Ambiguous(count) => (count, None),
+        }
+    }
+
+    fn candidate_shape(candidates: Vec<VertexId>) -> (usize, Option<VertexId>) {
+        match candidates.as_slice() {
+            [only] => (1, Some(only.clone())),
+            many => (many.len(), None),
+        }
+    }
+
+    #[test]
+    fn 색인_해석은_선형_탐색과_같은_후보를_고른다() {
+        let mut routines = Vec::new();
+        for (name, kind, signature, member_of) in [
+            ("F", "function", None, None),
+            ("f", "function", None, None),
+            ("G", "function", Some("integer"), None),
+            ("G", "function", Some("text"), None),
+            ("g", "procedure", None, None),
+            ("PKG", "package", None, None),
+            ("M", "procedure", None, Some("PKG")),
+            ("M", "function", Some("integer"), Some("PKG")),
+            ("N", "function", None, Some("PKG")),
+            ("K", "function", Some("integer"), Some("PKG")),
+            ("K", "function", Some("text"), Some("PKG")),
+            ("pkg", "package", None, None),
+            ("m", "procedure", None, Some("pkg")),
+            ("ORDERS", "function", None, None),
+        ] {
+            let mut doc_routine = routine(name, Some("plsql"), "BEGIN NULL; END");
+            doc_routine.kind = kind.into();
+            doc_routine.signature = signature.map(str::to_owned);
+            doc_routine.member_of = member_of.map(str::to_owned);
+            routines.push(doc_routine);
+        }
+        let mut other = routine("F", Some("plsql"), "BEGIN NULL; END");
+        other.kind = "procedure".into();
+        let doc = CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
+            version: 1,
+            dialect: "oracle".into(),
+            reader: "test".into(),
+            limitations: vec![],
+            schemas: vec![
+                SchemaDoc {
+                    name: "APP".into(),
+                    routines,
+                    objects: vec![
+                        table("ORDERS", vec![col("ID", 1), col("id", 2)]),
+                        table("orders", vec![col("ID", 1)]),
+                        table("Orders", vec![col("ID", 1)]),
+                        table("CUSTOMERS", vec![col("ID", 1)]),
+                    ],
+                },
+                SchemaDoc {
+                    name: "app".into(),
+                    routines: vec![other],
+                    objects: vec![table("customers", vec![col("id", 1)])],
+                },
+            ],
+        };
+        let g = schemagraph_source::graph::document_to_graph(&doc);
+        let index = VertexIndex::default();
+        let mut ids: Vec<VertexId> = g.vertices().map(|v| v.id.clone()).collect();
+        let variants: Vec<VertexId> = ids
+            .iter()
+            .flat_map(|id| {
+                [
+                    VertexId::from_raw(&id.as_str().to_ascii_lowercase()),
+                    VertexId::from_raw(&id.as_str().to_ascii_uppercase()),
+                ]
+            })
+            .collect();
+        ids.extend(variants);
+        ids.push(VertexId::from_raw("APP.MISSING"));
+        let schemas = ["APP", "app", "App", "OTHER"];
+        let names = [
+            "F", "f", "G", "g", "K", "k", "M", "m", "N", "n", "PKG", "pkg", "ORDERS", "orders", "X",
+        ];
+        // 비교가 후보 0개·1개·2개 이상과 ci에서만 찾는 경우를 모두 지나는지도 센다.
+        let mut routine_shapes = BTreeSet::new();
+        let mut member_shapes = BTreeSet::new();
+        let mut folded_only_hits = 0;
+        for ci in [false, true] {
+            let lookup = index.lookup(ci);
+            for id in &ids {
+                let expected = linear_vertex_hit(&g, id, ci);
+                folded_only_hits += usize::from(expected.is_some() && g.vertex(id).is_none());
+                assert_eq!(vertex_hit(&g, id, lookup), expected, "{id} ci={ci}");
+            }
+            for schema in schemas {
+                for name in names {
+                    let expected = candidate_shape(linear_routine(&g, schema, name, ci));
+                    routine_shapes.insert((ci, expected.0.min(2)));
+                    assert_eq!(
+                        hit_shape(resolve_routine(&g, schema, name, lookup)),
+                        expected,
+                        "{schema}.{name} ci={ci}"
+                    );
+                    for pkg in ["PKG", "pkg", "Pkg", "X"] {
+                        let expected =
+                            candidate_shape(linear_pkg_member(&g, schema, pkg, name, ci));
+                        member_shapes.insert((ci, expected.0.min(2)));
+                        assert_eq!(
+                            hit_shape(resolve_pkg_member(&g, schema, pkg, name, lookup)),
+                            expected,
+                            "{schema}.{pkg}.{name} ci={ci}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(routine_shapes.len(), 6, "{routine_shapes:?}");
+        assert_eq!(member_shapes.len(), 6, "{member_shapes:?}");
+        assert!(folded_only_hits > 0);
     }
 }

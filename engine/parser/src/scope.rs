@@ -75,6 +75,9 @@ pub(crate) struct CatalogIndex<'a> {
     database: Option<String>,
     doc: &'a CatalogDocument,
     cache_keys: CacheKeyMemo<'a>,
+    /// enrich가 다루는 그래프 하나의 이름 해석 색인. 정점 집합이 고정이라
+    /// 처음 조회할 때 한 번만 만든다.
+    vertices: super::VertexIndex,
 }
 
 impl<'a> CatalogIndex<'a> {
@@ -113,7 +116,13 @@ impl<'a> CatalogIndex<'a> {
                 .map(|database| database_key(&doc.dialect, database)),
             doc,
             cache_keys: CacheKeyMemo::default(),
+            vertices: super::VertexIndex::default(),
         }
+    }
+
+    /// 이 enrich의 그래프에서 이름을 찾는 방식. ci면 대소문자 무시 단일 후보도 본다.
+    pub(crate) fn lookup(&self, ci: bool) -> super::Lookup<'_> {
+        self.vertices.lookup(ci)
     }
 
     pub(crate) fn local_qualified_relation(
@@ -779,9 +788,9 @@ impl Binder<'_, '_> {
             return;
         }
         let hit = if let Some((pkg, member)) = routine.split_once('.') {
-            super::resolve_pkg_member(self.graph, &schema, pkg, member, false)
+            super::resolve_pkg_member(self.graph, &schema, pkg, member, self.catalog.lookup(false))
         } else if known {
-            super::resolve_routine(self.graph, &schema, &routine, false)
+            super::resolve_routine(self.graph, &schema, &routine, self.catalog.lookup(false))
         } else {
             super::RoutineHit::None
         };
@@ -1609,7 +1618,7 @@ impl Binder<'_, '_> {
             &object.name,
             kind,
             &object.kind,
-            false,
+            self.catalog.lookup(false),
         ) else {
             self.note(
                 "SG_RELATION_UNRESOLVED",
@@ -1637,7 +1646,7 @@ impl Binder<'_, '_> {
                     &column.name,
                     VertexKind::Column,
                     "column",
-                    false,
+                    self.catalog.lookup(false),
                 )
                 .into_iter()
                 .collect::<Sources>();
@@ -3205,7 +3214,7 @@ pub(crate) fn enrich_view(
                 &column.name,
                 VertexKind::Column,
                 "column",
-                false,
+                catalog.lookup(false),
             ) else {
                 continue;
             };
