@@ -69,10 +69,12 @@ pub fn enrich_with_cache(
                 if let Some(owner) =
                     resolve_object(g, &schema.name, &obj.name, kind, &obj.kind, false)
                 {
+                    // 캐시 키는 재사용·저장에만 쓰인다. 캐시가 없으면 만들지 않는다.
                     let context = obj
                         .body
                         .as_deref()
-                        .map(|body| scope::cache_context(doc, g, &owner, body));
+                        .filter(|_| cache.is_some())
+                        .map(|body| catalog_index.cache_context(g, &owner, body));
                     if !cache::reuse(
                         &mut cache,
                         g,
@@ -137,13 +139,15 @@ pub fn enrich_with_cache(
                     );
                     continue;
                 };
-                let context = scope::cache_context(doc, g, &trigger_id, body);
+                let context = cache
+                    .is_some()
+                    .then(|| catalog_index.cache_context(g, &trigger_id, body));
                 if cache::reuse(
                     &mut cache,
                     g,
                     &trigger_id,
                     Some(body),
-                    Some(&context),
+                    context.as_ref(),
                     &mut notes,
                     &mut enriched,
                 ) {
@@ -202,7 +206,7 @@ pub fn enrich_with_cache(
                     g,
                     &trigger_id,
                     Some(body),
-                    Some(&context),
+                    context.as_ref(),
                     &notes[note_start..],
                     enriched - enriched_start,
                 );
@@ -262,13 +266,15 @@ pub fn enrich_with_cache(
                 );
                 continue;
             };
-            let context = scope::cache_context(doc, g, &owner, body);
+            let context = cache
+                .is_some()
+                .then(|| catalog_index.cache_context(g, &owner, body));
             if cache::reuse(
                 &mut cache,
                 g,
                 &owner,
                 Some(body),
-                Some(&context),
+                context.as_ref(),
                 &mut notes,
                 &mut enriched,
             ) {
@@ -301,7 +307,7 @@ pub fn enrich_with_cache(
                     g,
                     &owner,
                     Some(body),
-                    Some(&context),
+                    context.as_ref(),
                     &notes[note_start..],
                     enriched - enriched_start,
                 );
@@ -468,7 +474,7 @@ pub fn enrich_with_cache(
                 g,
                 &owner,
                 Some(body),
-                Some(&context),
+                context.as_ref(),
                 &notes[note_start..],
                 enriched - enriched_start,
             );

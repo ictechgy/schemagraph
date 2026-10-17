@@ -516,6 +516,98 @@ mod tests {
         let changed = crate::scope::cache_context(&doc, &graph, &owner, "SELECT other.fn()");
         assert_ne!(first.fingerprint, changed.fingerprint);
     }
+
+    /// pg_get_functiondef 꼴의 보수 경로 몸체와 AST로 읽히는 신뢰 경로 몸체를
+    /// 섞어 캐시 키 계산이 몸체 수에 따라 어떻게 늘어나는지 보게 한다.
+    fn mixed_body_document(bodies: usize) -> CatalogDocument {
+        let column = serde_json::json!([{"name":"amount","data_type":"INTEGER","nullable":true,"ordinal":1,"pk_position":0}]);
+        let mut objects = vec![
+            serde_json::json!({"name":"orders","kind":"table","columns":column,"constraints":[],"indexes":[],"triggers":[
+                {"name":"touch_orders","body":"CREATE TRIGGER touch_orders AFTER INSERT ON public.orders FOR EACH ROW EXECUTE FUNCTION public.touch_0()"}
+            ]}),
+            serde_json::json!({"name":"audit","kind":"table","columns":column,"constraints":[],"indexes":[],"triggers":[]}),
+        ];
+        let mut routines = Vec::new();
+        for index in 0..bodies {
+            objects.push(serde_json::json!({"name":format!("v_{index}"),"kind":"view","body":"SELECT amount FROM orders","columns":column,"constraints":[],"indexes":[],"triggers":[]}));
+            routines.push(serde_json::json!({"name":format!("touch_{index}"),"kind":"function","language":"plpgsql","body":format!(
+                "CREATE OR REPLACE FUNCTION public.touch_{index}()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$ BEGIN UPDATE audit SET amount = 1; RETURN NEW; END $function$\n"
+            )}));
+            routines.push(serde_json::json!({"name":format!("copy_{index}"),"kind":"procedure","language":"sql","body":"INSERT INTO audit(amount) SELECT amount FROM orders"}));
+        }
+        serde_json::from_value(serde_json::json!({
+            "version":1,"dialect":"postgres","reader":"test","limitations":[],
+            "schemas":[{"name":"public","objects":objects,"routines":routines}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn enrich_without_a_cache_does_not_build_cache_contexts() {
+        let doc = mixed_body_document(2);
+        crate::scope::take_cache_key_counters();
+        let mut plain = schemagraph_source::graph::document_to_graph(&doc);
+        let expected = crate::enrich_from_document(&mut plain, &doc);
+        assert_eq!(crate::scope::take_cache_key_counters().contexts, 0);
+
+        let mut cache = MemoryCache::default();
+        let mut cached = schemagraph_source::graph::document_to_graph(&doc);
+        let result = crate::enrich_with_cache(&mut cached, &doc, Some(&mut cache));
+        // 뷰 2개, trigger 1개, routine 4개가 각각 context를 한 번씩 만든다.
+        assert_eq!(crate::scope::take_cache_key_counters().contexts, 7);
+        assert_eq!(result, expected);
+        assert_eq!(cached.edges(), plain.edges());
+        assert_eq!(cached.analysis(), plain.analysis());
+        assert_eq!(cached.origins(), plain.origins());
+    }
+
+    #[test]
+    fn cache_contexts_walk_the_document_a_bounded_number_of_times() {
+        for bodies in [4, 16] {
+            let doc = mixed_body_document(bodies);
+            let mut cache = MemoryCache::default();
+            crate::scope::take_cache_key_counters();
+            crate::enrich_with_cache(
+                &mut schemagraph_source::graph::document_to_graph(&doc),
+                &doc,
+                Some(&mut cache),
+            );
+            let counters = crate::scope::take_cache_key_counters();
+            assert_eq!(counters.contexts, 3 * bodies + 1);
+            // 문서 지문·후보 색인·routine 모양은 몸체 수와 무관하게 enrich마다
+            // 한 번만 만든다.
+            assert!(
+                counters.document_passes <= 3,
+                "{bodies} bodies: {counters:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conservative_context_keeps_its_fingerprint_and_tracks_unrelated_changes() {
+        use sha2::{Digest, Sha256};
+
+        let mut doc = mixed_body_document(1);
+        let owner = VertexId::routine("public", None, "touch_0", None);
+        let body = doc.schemas[0].routines[0].body.clone().unwrap();
+        let graph = schemagraph_source::graph::document_to_graph(&doc);
+        let context = crate::scope::cache_context(&doc, &graph, &owner, &body);
+        assert!(!context.trusted);
+        // 외부 BodyCache에 저장된 보수 지문을 다시 찾을 수 있게 값 정의를 유지한다.
+        let legacy =
+            Sha256::digest(format!("global\0{:?}\0{:?}", doc, graph.vertex(&owner)).as_bytes());
+        assert_eq!(context.fingerprint, format!("sha256:{legacy:x}"));
+
+        doc.schemas[0].objects.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"unrelated","kind":"table","columns":[],"constraints":[],"indexes":[],"triggers":[]
+            }))
+            .unwrap(),
+        );
+        let graph = schemagraph_source::graph::document_to_graph(&doc);
+        let changed = crate::scope::cache_context(&doc, &graph, &owner, &body);
+        assert_ne!(context.fingerprint, changed.fingerprint);
+    }
 }
 
 pub(crate) fn capture(
