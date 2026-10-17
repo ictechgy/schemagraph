@@ -141,7 +141,8 @@ PostgreSQL·H2·SQLite·SQL Server 드라이버는 번들에 포함됩니다. �
 
 DB 사용자는 `--user`, 비밀번호는 `SG_DB_PASSWORD` 환경 변수로 전달합니다.
 `--schema app,reporting`은 수집 범위를 지정한 스키마로 제한합니다. 기본값은
-시스템 스키마를 제외한 전체입니다.
+시스템 스키마를 제외한 전체입니다. SQLite 파일과 PostgreSQL 세션은 읽기 전용으로
+열며, 없는 SQLite 파일은 빈 DB를 새로 만들지 않고 오류로 처리합니다.
 
 Db2 LUW·Informix 드라이버 설정과 실DB 검증은 [IBM.md](IBM.md)에,
 Maven Central 설치·추가 GitHub Pages 저장소·게시 방법은 [MAVEN.md](MAVEN.md)에

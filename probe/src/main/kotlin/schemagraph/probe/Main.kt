@@ -2,6 +2,9 @@ package schemagraph.probe
 
 import java.io.File
 import java.net.URLClassLoader
+import java.nio.file.Files
+import java.nio.file.InvalidPathException
+import java.nio.file.Path
 import java.sql.Driver
 import java.sql.DriverManager
 import java.util.Properties
@@ -54,11 +57,9 @@ fun main(args: Array<String>) {
     runCatching { registerDrivers(opts.driverJars, opts.driverClass) }
         .onFailure { fatal("드라이버 로딩 실패: ${it.message}") }
 
-    val props = Properties()
-    opts.user?.let { props["user"] = it }
-    (opts.password ?: System.getenv("SG_DB_PASSWORD"))?.let { props["password"] = it }
-
     val dialect = dialectOf(url)
+    if (dialect == "sqlite") sqliteTargetError(url)?.let { fatal(it) }
+    val props = connectionProperties(dialect, opts.user, opts.password ?: System.getenv("SG_DB_PASSWORD"))
     if (opts.format == "ndjson") {
         // 진짜 스트리밍 — 문서를 전부 들지 않고 스키마 단위로 수확→방출한다.
         runCatching {
@@ -85,6 +86,47 @@ fun main(args: Array<String>) {
     val json = mapper.writeValueAsString(documentWire(doc, opts.documentVersion))
     if (opts.output == "-") println(json)
     else File(opts.output).writeText("$json\n")
+}
+
+/**
+ * 방언별 연결 속성 — 프로브는 카탈로그만 읽으므로 드라이버가 지원하는 읽기 전용 모드로
+ * 연다. 연결 뒤 setReadOnly 힌트는 sqlite-jdbc가 거부하고, pgjdbc 기본값
+ * (readOnlyMode=transaction)은 autocommit 세션에 적용하지 않기 때문이다.
+ */
+internal fun connectionProperties(dialect: String, user: String?, password: String?): Properties {
+    val props = Properties()
+    user?.let { props["user"] = it }
+    password?.let { props["password"] = it }
+    when (dialect) {
+        // setReadOnly(true)가 SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY를 보내게 한다.
+        "postgres" -> props["readOnlyMode"] = "always"
+        // sqlite-jdbc SQLiteConfig는 open_mode 값을 sqlite3_open_v2 플래그로 쓰고 OPEN_URI만
+        // 더한다. SQLITE_OPEN_READONLY(1)만 주면 CREATE가 빠져 없는 경로에 빈 DB를 만들지
+        // 않고, 연결을 닫을 때 -wal을 원본 파일에 체크포인트하지 않는다. 연결 속성이 URL의
+        // 같은 키보다 우선한다. sqlite-jdbc는 runtimeOnly라 SQLiteConfig 대신 문자열 키를 쓴다.
+        "sqlite" -> props["open_mode"] = "1"
+    }
+    return props
+}
+
+/**
+ * SQLite 대상이 이미 있는 파일인지 연결 전에 확인해 사용자에게 보일 오류 문구를 돌려준다
+ * (문제없으면 null). 읽기 전용으로 열면 드라이버도 거부하지만, 경로 오타를 원인과 해결
+ * 방향이 담긴 문구로 먼저 알린다. file: URI 파일명은 해석을 SQLite에 맡긴다.
+ */
+internal fun sqliteTargetError(url: String): String? {
+    val target = url.removePrefix("jdbc:sqlite:").substringBefore('?')
+    if (target.startsWith("file:")) return null
+    if (target.isEmpty() || target.startsWith(":")) {
+        return "SQLite probe requires an existing database file; in-memory and resource databases are not supported"
+    }
+    val path = try {
+        Path.of(target)
+    } catch (error: InvalidPathException) {
+        return "SQLite database path is invalid (${error.reason}); check the path"
+    }
+    return if (Files.isRegularFile(path)) null
+    else "SQLite database file not found or not a regular file; check the path"
 }
 
 private fun fatal(message: String): Nothing {

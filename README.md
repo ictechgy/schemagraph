@@ -149,7 +149,9 @@ driver discovery fails. MySQL and Oracle drivers are supplied externally.
 
 Use `--user` for the database user and `SG_DB_PASSWORD` for the password.
 `--schema app,reporting` restricts collection to the named schemas; by
-default, the probe collects non-system schemas.
+default, the probe collects non-system schemas. SQLite files and PostgreSQL
+sessions are opened read-only, and a missing SQLite file is an error instead
+of a new empty database.
 
 Db2 LUW and Informix driver setup and live fixture checks are described in
 [IBM.md](IBM.md). Maven Central installation, the additional GitHub Pages

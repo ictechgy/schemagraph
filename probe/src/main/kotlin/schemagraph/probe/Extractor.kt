@@ -52,11 +52,30 @@ class Extractor(
             limitations += "read-only session hint was unavailable; only catalog queries were issued"
         }
         if (dialect == "postgres") {
+            checkPostgresReadOnly()
             runCatching { conn.createStatement().use { it.execute("SET search_path = pg_catalog") } }
                 .onFailure {
                     sessionComplete = false
                     limitations += "PostgreSQL definition namespace could not be pinned; object resolution may be incomplete"
                 }
+        }
+    }
+
+    /** pgjdbc는 readOnlyMode=always일 때만 autocommit 세션을 읽기 전용으로 만든다. CLI는 그
+     *  속성으로 연결하지만, 연결을 직접 넘긴 호출자나 URL로 모드를 바꾼 경우를 관측해 신고한다. */
+    private fun checkPostgresReadOnly() {
+        runCatching {
+            conn.createStatement().use { st ->
+                st.executeQuery("SHOW transaction_read_only").use { rs -> if (rs.next()) rs.getString(1) else null }
+            }
+        }.onSuccess { state ->
+            if (state != "on") {
+                limitations += "PostgreSQL session is not read-only (transaction_read_only=${state ?: "unknown"}); " +
+                    "connect with readOnlyMode=always; only catalog queries were issued"
+            }
+        }.onFailure {
+            limitations += "PostgreSQL read-only session state could not be verified " +
+                "(${it.javaClass.simpleName}); only catalog queries were issued"
         }
     }
 
@@ -81,7 +100,7 @@ class Extractor(
 
     fun extract(): CatalogDocument {
         // 읽기 전용 힌트 — sqlite-jdbc처럼 연결 후 변경을 거부하는 드라이버는
-        // 건너뛴다(프로브는 어차피 SELECT만 친다).
+        // 건너뛴다(CLI는 연결 속성으로 읽기 전용을 건다, connectionProperties).
         prepareSession()
         val usage = collectUsage()
         val metadataStart = limitations.size
