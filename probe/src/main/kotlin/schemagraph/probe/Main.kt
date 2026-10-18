@@ -3,12 +3,14 @@ package schemagraph.probe
 import java.io.BufferedWriter
 import java.io.File
 import java.io.IOException
+import java.io.PrintStream
 import java.net.URLClassLoader
 import java.nio.file.Files
 import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.sql.Driver
 import java.sql.DriverManager
+import java.sql.SQLException
 import java.util.Properties
 import java.util.ServiceLoader
 import kotlin.system.exitProcess
@@ -48,10 +50,26 @@ private val BUNDLED_DRIVERS = listOf(
 )
 
 fun main(args: Array<String>) {
+    runProbe(args)?.let { exitProcess(it) }
+}
+
+/**
+ * CLI 본체. fatal은 ProbeExit를 던지고 여기서 stderr에 써서 종료 코드 2를 돌려준다. exitProcess
+ * 없이 부를 수 있어야 테스트가 실제 오류 경로의 stderr를 확인한다. 정상 수집은 null이라 main이
+ * 지금처럼 그냥 반환한다(도움말은 0, 인자 오류는 2로 지금처럼 종료한다).
+ */
+internal fun runProbe(args: Array<String>, stderr: PrintStream = System.err): Int? = try {
+    probe(args, stderr)
+} catch (exit: ProbeExit) {
+    stderr.println("error: ${exit.message}")
+    2
+}
+
+private fun probe(args: Array<String>, stderr: PrintStream): Int? {
     val opts = parseArgs(args)
     if (opts.help || opts.url == null) {
-        System.err.println(if (opts.url == null && !opts.help) "error: --url이 필요하다\n$USAGE" else USAGE)
-        exitProcess(if (opts.help) 0 else 2)
+        stderr.println(if (opts.url == null && !opts.help) "error: --url이 필요하다\n$USAGE" else USAGE)
+        return if (opts.help) 0 else 2
     }
     val url = opts.url!!
 
@@ -64,6 +82,8 @@ fun main(args: Array<String>) {
     // 출력 경로는 연결 전에 정한다. SQLite 원본을 가리키면 DB를 열기 전에 끝낸다.
     val target = if (opts.output == "-") null else fileOutput(opts.output, url, dialect)
     val props = connectionProperties(dialect, opts.user, opts.password ?: System.getenv("SG_DB_PASSWORD"))
+    // --password가 환경 변수를 이겨도 두 값 모두 비밀이라 오류에서 함께 가린다.
+    val secrets = listOfNotNull(opts.password, System.getenv("SG_DB_PASSWORD"))
     if (opts.format == "ndjson") {
         // 진짜 스트리밍 — 문서를 전부 들지 않고 스키마 단위로 수확→방출한다. 파일은 트레일러까지
         // 쓴 임시 파일만 교체해, 끊긴 수집이 이전 스냅샷을 자르지 않게 한다.
@@ -73,19 +93,20 @@ fun main(args: Array<String>) {
                 if (target == null) streamDocument(extractor, opts.documentVersion, System.out.bufferedWriter())
                 else writeOutput(target) { writer -> streamDocument(extractor, opts.documentVersion, writer) }
             }
-        }.getOrElse { fatal("추출 실패: ${it.message}") }
-        return
+        }.getOrElse { fatal("추출 실패: ${connectionFailure(it, url, secrets)}") }
+        return null
     }
     if (opts.format != "json") fatal("--format은 json|ndjson 중 하나다: ${opts.format}")
     val doc = runCatching {
         DriverManager.getConnection(url, props).use { conn ->
             Extractor(conn, dialect, opts.schemas, opts.catalogDependencies, opts.sourceId).extract()
         }
-    }.getOrElse { fatal("추출 실패: ${it.message}") }
+    }.getOrElse { fatal("추출 실패: ${connectionFailure(it, url, secrets)}") }
 
     val json = mapper.writeValueAsString(documentWire(doc, opts.documentVersion))
     if (target == null) println(json)
     else writeOutput(target) { writer -> writer.write("$json\n") }
+    return null
 }
 
 /** '-'가 아닌 -o를 연결 전에 해석하고 SQLite 원본 별칭을 거절한다. */
@@ -154,9 +175,47 @@ internal fun sqliteTargetError(url: String): String? {
     else "SQLite database file not found or not a regular file; check the path"
 }
 
-private fun fatal(message: String): Nothing {
-    System.err.println("error: $message")
-    exitProcess(2)
+/** 사용자에게 보일 오류. runProbe가 "error: …"로 쓰고 종료 코드 2로 끝낸다. */
+private class ProbeExit(message: String) : RuntimeException(message)
+
+private fun fatal(message: String): Nothing = throw ProbeExit(message)
+
+private const val REDACTED = "<redacted>"
+
+/** jdbc:와 subprotocol만 안내에 싣는다 — 이 모양이 아니면 원문 일부일 수 있어 싣지 않는다. */
+private val SUBPROTOCOL = Regex("[A-Za-z][A-Za-z0-9+._-]{0,63}")
+
+/** 드라이버가 URL 일부만 되풀이한 모양: //user:pw@, user/pw@(Oracle thin), (…)password=값. */
+private val URL_USERINFO = Regex("//[^/@\\s]+@")
+private val SLASH_CREDENTIALS = Regex("[^\\s/:@;=]+/[^\\s/@]*@")
+private val PASSWORD_VALUE = Regex("(?i)(password\\s*=\\s*)[^;&\\s]*")
+
+/**
+ * 연결·추출 실패를 사용자에게 보일 문구로 바꾼다. DriverManager는 받아 주는 드라이버가 없으면
+ * "No suitable driver found for <URL 전체>"(SQLState 08001)를 던지므로, 번들되지 않은 Oracle·MySQL에서
+ * --driver를 빠뜨리는 흔한 실수가 URL 속 자격 증명을 로그에 남겼다. 이때는 subprotocol과 --driver를
+ * 안내하고, 나머지 메시지는 scrubSecrets로 가린다.
+ */
+internal fun connectionFailure(error: Throwable, url: String, secrets: List<String>): String {
+    if (error is SQLException && error.sqlState == "08001" && error.message.orEmpty().startsWith("No suitable driver")) {
+        val subprotocol = url.removePrefix("jdbc:").substringBefore(':')
+        return if (SUBPROTOCOL.matches(subprotocol)) "no JDBC driver accepts subprotocol '$subprotocol'; pass its driver jar with --driver"
+        else "no JDBC driver accepts this URL; pass its driver jar with --driver"
+    }
+    return scrubSecrets("${error.message}", url, secrets)
+}
+
+/**
+ * 드라이버 메시지에서 자격 증명을 가린다. Go 프로브의 "오류에 비밀번호가 든 원문을 싣지 않는다"는
+ * 계약과 Scripts/verify-probe-versions.py의 scrub을 프로브 안으로 옮긴 것이다 — 스크립트 밖에서 직접
+ * 실행해도 지켜져야 한다. URL·비밀번호 원문을 긴 것부터 지운 뒤, URL 일부만 되풀이한 모양을 가린다.
+ */
+internal fun scrubSecrets(message: String, url: String, secrets: List<String>): String {
+    val literals = (listOf(url, url.removePrefix("jdbc:")) + secrets).filter { it.isNotEmpty() }.sortedByDescending { it.length }
+    val withoutLiterals = literals.fold(message) { text, literal -> text.replace(literal, REDACTED) }
+    val withoutUserinfo = URL_USERINFO.replace(withoutLiterals, "//$REDACTED@")
+    val withoutSlashCredentials = SLASH_CREDENTIALS.replace(withoutUserinfo, "$REDACTED@")
+    return PASSWORD_VALUE.replace(withoutSlashCredentials) { it.groupValues[1] + REDACTED }
 }
 
 private data class Opts(
@@ -202,9 +261,10 @@ private fun parseArgs(args: Array<String>): Opts {
 }
 
 /** jdbc:<subprotocol>:… 에서 방언 이름을 뽑는다. 알 수 없는 방언은 subprotocol
- *  이름 그대로 — 엔진이 GenericDialect로 폴백한다. */
+ *  이름 그대로 — 엔진이 GenericDialect로 폴백한다. 오류에는 자격 증명이 들 수 있는 URL
+ *  원문을 싣지 않는다(Go 프로브용 postgres://user:pw@… 를 그대로 넘기는 실수가 흔하다). */
 private fun dialectOf(url: String): String = when {
-    !url.startsWith("jdbc:") -> fatal("JDBC URL이 아니다: $url")
+    !url.startsWith("jdbc:") -> fatal("not a JDBC URL; expected jdbc:<subprotocol>:…")
     else -> url.removePrefix("jdbc:").substringBefore(':').let {
         when (it) {
             "postgresql" -> "postgres"
