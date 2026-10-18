@@ -103,9 +103,11 @@ private fun probe(args: Array<String>, stderr: PrintStream): Int? {
         }
     }.getOrElse { fatal("추출 실패: ${connectionFailure(it, url, secrets)}") }
 
-    val json = mapper.writeValueAsString(documentWire(doc, opts.documentVersion))
-    if (target == null) println(json)
-    else writeOutput(target) { writer -> writer.write("$json\n") }
+    val wire = documentWire(doc, opts.documentVersion)
+    // 파일은 문자열을 만들지 않고 임시 파일 스트림에 바로 쓴다. stdout은 PrintStream의 인코딩을
+    // 그대로 두려고 지금처럼 println한다(JDK 17에는 그 charset을 얻는 API가 없다).
+    if (target == null) println(mapper.writeValueAsString(wire))
+    else writeOutput(target) { writer -> writeDocumentJson(writer, wire) }
     return null
 }
 
