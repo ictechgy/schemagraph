@@ -332,12 +332,11 @@ impl Graph {
     }
 
     /// 존재하는 간선에만 원문 근거를 연결해 유령 참조를 막는다.
+    ///
+    /// 간선 존재는 간선 색인으로 확인한다 — origin마다 owner의 outgoing을 훑으면 넓은
+    /// 뷰·대형 프로시저처럼 출차수가 큰 owner에서 O(origin × 출차수)가 된다.
     pub fn add_origin(&mut self, key: OriginKey, origin: Origin) {
-        if self
-            .outgoing(&key.0)
-            .iter()
-            .any(|e| e.to == key.1 && e.kind == key.2)
-        {
+        if self.edge_slots.contains_key(&key) {
             self.origins.entry(key).or_default().insert(origin);
         } else {
             self.add_limitation(format!(
@@ -571,13 +570,12 @@ impl Graph {
             let (Some(from), Some(to)) = (ancestors.of(from), ancestors.of(to)) else {
                 continue;
             };
-            if projected
-                .outgoing(&from)
-                .iter()
-                .any(|e| e.to == to && e.kind == *kind)
-            {
+            // 투영에서 사라진 간선(붕괴된 멤버 간선 등)의 origin은 limitation 없이
+            // 건너뛴다 — add_origin에 맡기면 없는 간선마다 limitation이 생긴다.
+            let key = (from, to, *kind);
+            if projected.edge_slots.contains_key(&key) {
                 for origin in origins {
-                    projected.add_origin((from.clone(), to.clone(), *kind), origin.clone());
+                    projected.add_origin(key.clone(), origin.clone());
                 }
             }
         }
@@ -1188,6 +1186,122 @@ mod tests {
         // 투영마다 Contains 부모 색인을 한 번 만들고 조상을 memo하므로 탐색량은 간선 수에
         // 비례한다. 조상마다 incoming을 다시 훑으면 READERS²에 비례한다.
         assert!(scanned <= 4 * edges, "scanned {scanned}, edges {edges}");
+    }
+
+    /// 뷰 s.v가 테이블 s.t{i}의 컬럼 c를 하나씩 읽는다(간선마다 origin 하나).
+    fn wide_view(columns: usize) -> (Graph, VertexId) {
+        let mut g = Graph::new();
+        schema_vertex(&mut g, "s");
+        let view = VertexId::object("s", "v");
+        g.add_vertex(Vertex {
+            id: view.clone(),
+            kind: VertexKind::View,
+            name: "v".into(),
+            schema: "s".into(),
+        });
+        g.add_edge(contains_edge(&VertexId::schema("s"), &view));
+        for index in 0..columns {
+            let name = format!("t{index:03}");
+            let owner = VertexId::object("s", &name);
+            g.add_vertex(table("s", &name));
+            g.add_edge(contains_edge(&VertexId::schema("s"), &owner));
+            let read = column(&mut g, "s", &name, "c");
+            g.add_edge(contains_edge(&owner, &read));
+            g.add_edge(Edge {
+                from: view.clone(),
+                to: read.clone(),
+                kind: EdgeKind::Reads,
+                evidence: vec![],
+            });
+            g.add_origin(
+                (view.clone(), read, EdgeKind::Reads),
+                Origin {
+                    body_hash: "h".into(),
+                    role: "relation".into(),
+                    location: None,
+                },
+            );
+        }
+        (g, view)
+    }
+
+    #[test]
+    fn add_origin은_출차수와_무관하게_간선_색인으로_간선을_확인한다() {
+        const COLUMNS: usize = 300;
+        work::take_scanned();
+        let (mut g, view) = wide_view(COLUMNS);
+        let missing = VertexId::member("s", "t000", "missing");
+        g.add_origin(
+            (view, missing, EdgeKind::Reads),
+            Origin {
+                body_hash: "h".into(),
+                role: "relation".into(),
+                location: None,
+            },
+        );
+        let scanned = work::take_scanned();
+        assert_eq!(g.origins().len(), COLUMNS);
+        assert_eq!(
+            g.limitations(),
+            ["origin edge s.v -> s.t000.missing does not exist; annotation omitted"]
+        );
+        // origin마다 owner의 outgoing을 훑으면 COLUMNS²에 비례한다.
+        assert!(scanned <= COLUMNS, "scanned {scanned}");
+    }
+
+    #[test]
+    fn 투영의_origin은_출차수가_큰_owner에서도_간선_색인으로_옮긴다() {
+        const COLUMNS: usize = 300;
+        let (g, view) = wide_view(COLUMNS);
+        work::take_scanned();
+        let projected = g.project(Level::Object);
+        let scanned = work::take_scanned();
+        assert_eq!(projected.outgoing(&view).len(), COLUMNS);
+        assert_eq!(projected.origins().len(), COLUMNS);
+        assert!(projected.limitations().is_empty());
+        // 투영 간선 확인을 인접 리스트 대신 색인으로 하면 탐색량은 조상 색인을 만드는
+        // 간선 한 바퀴뿐이다.
+        let edges = g.edges().len();
+        assert!(scanned <= 2 * edges, "scanned {scanned}, edges {edges}");
+    }
+
+    #[test]
+    fn 투영에서_사라진_간선의_origin은_limitation_없이_건너뛴다() {
+        let mut g = Graph::new();
+        schema_vertex(&mut g, "s");
+        let (a, b) = (VertexId::object("s", "a"), VertexId::object("s", "b"));
+        for id in [&a, &b] {
+            g.add_vertex(table("s", id.as_str().trim_start_matches("s.")));
+            g.add_edge(contains_edge(&VertexId::schema("s"), id));
+        }
+        let x = column(&mut g, "s", "a", "x");
+        let y = column(&mut g, "s", "a", "y");
+        let z = column(&mut g, "s", "b", "z");
+        for (parent, child) in [(&a, &x), (&a, &y), (&b, &z)] {
+            g.add_edge(contains_edge(parent, child));
+        }
+        let origin = Origin {
+            body_hash: "h".into(),
+            role: "value".into(),
+            location: None,
+        };
+        // 같은 테이블 안 컬럼 사이 간선은 Object 투영에서 붕괴돼 사라진다.
+        for (from, to) in [(&x, &y), (&z, &x)] {
+            g.add_edge(Edge {
+                from: from.clone(),
+                to: to.clone(),
+                kind: EdgeKind::DerivesFrom,
+                evidence: vec![],
+            });
+            g.add_origin(
+                (from.clone(), to.clone(), EdgeKind::DerivesFrom),
+                origin.clone(),
+            );
+        }
+        let projected = g.project(Level::Object);
+        let keys: Vec<_> = projected.origins().keys().cloned().collect();
+        assert_eq!(keys, [(b, a, EdgeKind::DerivesFrom)]);
+        assert!(projected.limitations().is_empty());
     }
 
     #[test]
