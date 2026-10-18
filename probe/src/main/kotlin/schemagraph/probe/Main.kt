@@ -1,6 +1,8 @@
 package schemagraph.probe
 
+import java.io.BufferedWriter
 import java.io.File
+import java.io.IOException
 import java.net.URLClassLoader
 import java.nio.file.Files
 import java.nio.file.InvalidPathException
@@ -59,19 +61,17 @@ fun main(args: Array<String>) {
 
     val dialect = dialectOf(url)
     if (dialect == "sqlite") sqliteTargetError(url)?.let { fatal(it) }
+    // 출력 경로는 연결 전에 정한다. SQLite 원본을 가리키면 DB를 열기 전에 끝낸다.
+    val target = if (opts.output == "-") null else fileOutput(opts.output, url, dialect)
     val props = connectionProperties(dialect, opts.user, opts.password ?: System.getenv("SG_DB_PASSWORD"))
     if (opts.format == "ndjson") {
-        // 진짜 스트리밍 — 문서를 전부 들지 않고 스키마 단위로 수확→방출한다.
+        // 진짜 스트리밍 — 문서를 전부 들지 않고 스키마 단위로 수확→방출한다. 파일은 트레일러까지
+        // 쓴 임시 파일만 교체해, 끊긴 수집이 이전 스냅샷을 자르지 않게 한다.
         runCatching {
             DriverManager.getConnection(url, props).use { conn ->
-                val writer = if (opts.output == "-") System.out.bufferedWriter()
-                    else File(opts.output).bufferedWriter()
-                Extractor(conn, dialect, opts.schemas, opts.catalogDependencies, opts.sourceId).extractStreaming(opts.documentVersion) { line ->
-                    writer.write(line)
-                    writer.newLine()
-                }
-                writer.flush()
-                if (opts.output != "-") writer.close()
+                val extractor = Extractor(conn, dialect, opts.schemas, opts.catalogDependencies, opts.sourceId)
+                if (target == null) streamDocument(extractor, opts.documentVersion, System.out.bufferedWriter())
+                else writeOutput(target) { writer -> streamDocument(extractor, opts.documentVersion, writer) }
             }
         }.getOrElse { fatal("추출 실패: ${it.message}") }
         return
@@ -84,8 +84,31 @@ fun main(args: Array<String>) {
     }.getOrElse { fatal("추출 실패: ${it.message}") }
 
     val json = mapper.writeValueAsString(documentWire(doc, opts.documentVersion))
-    if (opts.output == "-") println(json)
-    else File(opts.output).writeText("$json\n")
+    if (target == null) println(json)
+    else writeOutput(target) { writer -> writer.write("$json\n") }
+}
+
+/** '-'가 아닌 -o를 연결 전에 해석하고 SQLite 원본 별칭을 거절한다. */
+private fun fileOutput(output: String, url: String, dialect: String): OutputTarget {
+    val (target, aliasError) = try {
+        val prepared = prepareOutput(output)
+        prepared to if (dialect == "sqlite") sqliteOutputAliasError(url, prepared) else null
+    } catch (error: IOException) {
+        fatal("invalid output path: $error")
+    } catch (error: InvalidPathException) {
+        fatal("invalid output path: ${error.reason}; check the path")
+    }
+    aliasError?.let { fatal("invalid output path: $it") }
+    return target
+}
+
+/** NDJSON 행을 writer에 쓰고 flush한다. 파일 출력은 writeOutput이 트레일러까지 쓴 뒤에만 교체한다. */
+private fun streamDocument(extractor: Extractor, documentVersion: Int, writer: BufferedWriter) {
+    extractor.extractStreaming(documentVersion) { line ->
+        writer.write(line)
+        writer.newLine()
+    }
+    writer.flush()
 }
 
 /**

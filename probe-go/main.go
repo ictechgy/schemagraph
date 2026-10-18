@@ -17,6 +17,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -255,6 +256,13 @@ func main() {
 	if err != nil {
 		fatal("invalid connection settings", err)
 	}
+	// 출력 경로는 연결 전에 정한다. SQLite 원본을 가리키면 DB를 열기 전에 끝낸다.
+	var target outputTarget
+	if *output != "-" {
+		if target, err = prepareFileOutput(spec, *output); err != nil {
+			fatal("invalid output path", err)
+		}
+	}
 	db, err := sql.Open(spec.driver, spec.dsn)
 	if err != nil {
 		fatal("database driver setup failed", err)
@@ -285,17 +293,16 @@ func main() {
 				fatal("document streaming failed", err)
 			}
 		} else {
-			file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+			// 트레일러까지 쓴 임시 파일만 교체해, 끊긴 수집이 이전 스냅샷을 자르지 않게 한다.
+			file, err := openOutput(target)
 			if err != nil {
 				fatal("document output failed", err)
 			}
-			err = h.streamNDJSON(file, *wireVersion)
-			closeErr := file.Close()
-			if err != nil {
-				fatal("document streaming failed", err)
+			if err := h.streamNDJSON(file, *wireVersion); err != nil {
+				fatal("document streaming failed", errors.Join(err, file.discard()))
 			}
-			if closeErr != nil {
-				fatal("document output failed", closeErr)
+			if err := file.commit(); err != nil {
+				fatal("document output failed", err)
 			}
 		}
 		return
@@ -310,7 +317,7 @@ func main() {
 		if _, err := os.Stdout.Write(encoded); err != nil {
 			fatal("document output failed", err)
 		}
-	} else if err := os.WriteFile(*output, encoded, 0o644); err != nil {
+	} else if err := writeDocument(target, encoded); err != nil {
 		fatal("document write failed", err)
 	}
 }

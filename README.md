@@ -200,6 +200,20 @@ The normalized catalog and graph still reside in memory; Go JSON output also
 retains the full catalog. See [PERFORMANCE.md](PERFORMANCE.md) for measured
 memory reductions, reproducible benchmarks, and the remaining limits.
 
+### Output files
+
+Both probes write an `-o` file to a temporary file in the same directory,
+sync it, and rename it over the destination only after the whole document is
+written; for NDJSON that includes the final `limitations` record. A failed or
+interrupted collection leaves the previous file in place, although a killed
+probe can leave a hidden temporary file such as `.catalog.json.tmp-*` beside
+it. Existing file permissions are kept, new files get the same default
+permissions as before, and a symlink destination updates the file it points
+to. An `-o` path that names the SQLite database being read, or its `-wal` or
+`-shm` file, is rejected before connecting. Use `-o -` for stdout. Devices,
+pipes, other non-regular files, and paths under `/dev` are written in place
+without this protection.
+
 ## Interpreting results
 
 Reports describe the dependencies captured in the graph. Application

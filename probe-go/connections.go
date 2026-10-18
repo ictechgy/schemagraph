@@ -15,6 +15,8 @@ import (
 
 type connectionSpec struct {
 	driver, dialect, dsn, schema string
+	// file은 SQLite가 열 DB 파일 경로다(다른 방언은 빈 값). -o가 원본을 덮지 않게 연결 전에 비교한다.
+	file string
 }
 
 // URL을 직접 받거나 환경 변수에서 한 번만 읽어 접속 입력을 확정한다.
@@ -140,7 +142,48 @@ func sqliteConnection(raw string) (connectionSpec, error) {
 	query := u.Query()
 	query.Set("mode", "ro")
 	u.RawQuery = query.Encode()
-	return connectionSpec{driver: "sqlite", dialect: "sqlite", dsn: u.String()}, nil
+	return connectionSpec{driver: "sqlite", dialect: "sqlite", dsn: u.String(), file: sqliteFilePath(u)}, nil
+}
+
+// sqliteFilePath — SQLite가 URI 파일명에서 얻는 경로다. Path는 net/url이 이미 풀었고(잘못된 %는
+// 위에서 거절됨), 불투명 경로(file:app.db)는 DSN에 그대로 실려 SQLite가 %HH만 푼다.
+func sqliteFilePath(u *url.URL) string {
+	if u.Opaque == "" {
+		return u.Path
+	}
+	return decodeSQLitePercent(u.Opaque)
+}
+
+// decodeSQLitePercent — sqlite3ParseUri처럼 뒤에 16진수 두 자리가 오는 %만 바이트로 바꾸고,
+// 나머지 %는 글자 그대로 둔다(url.PathUnescape는 그런 %를 오류로 본다).
+func decodeSQLitePercent(value string) string {
+	var decoded strings.Builder
+	for index := 0; index < len(value); index++ {
+		if value[index] == '%' && index+2 < len(value) {
+			high, highOK := hexValue(value[index+1])
+			low, lowOK := hexValue(value[index+2])
+			if highOK && lowOK {
+				decoded.WriteByte(high<<4 | low)
+				index += 2
+				continue
+			}
+		}
+		decoded.WriteByte(value[index])
+	}
+	return decoded.String()
+}
+
+// hexValue — 16진수 한 자리의 값. 16진수가 아니면 false다.
+func hexValue(character byte) (byte, bool) {
+	switch {
+	case '0' <= character && character <= '9':
+		return character - '0', true
+	case 'a' <= character && character <= 'f':
+		return character - 'a' + 10, true
+	case 'A' <= character && character <= 'F':
+		return character - 'A' + 10, true
+	}
+	return 0, false
 }
 
 // catalogSession — 수확기가 쓰는 조회 연산이다. 운영 경로는 pinSession이 만든 고정 연결이고,
