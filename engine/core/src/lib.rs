@@ -502,9 +502,10 @@ impl Graph {
     /// 양 끝이 같은 간선(자기 루프)과, 그 레벨보다 위에 조상이 없는 정점
     /// (Member 레벨에서 object 등)은 사라진다. `limitations`는 그대로 계승한다.
     pub fn project(&self, level: Level) -> Graph {
+        let mut ancestors = Ancestors::new(self, level);
         let mut projected = Graph::new();
         for vertex in self.vertices() {
-            if let Some(id) = self.ancestor_at(&vertex.id, level) {
+            if let Some(id) = ancestors.of(&vertex.id) {
                 // 투영된 정점은 조상 자신의 정보를 계승한다 — 멤버가 객체
                 // 레벨로 올라갈 때 kind가 멤버로 남는 일이 없게 한다.
                 let ancestor = &self.vertices[&id];
@@ -519,8 +520,8 @@ impl Graph {
         // 여러 원본 간선이 같은 투영 간선으로 합쳐지므로(Schema 레벨이면 스키마 쌍마다
         // 하나) 근거를 투영 키별로 모아 한 번에 병합한다.
         projected.add_edges(self.edges().into_iter().filter_map(|edge| {
-            let from = self.ancestor_at(&edge.from, level)?;
-            let to = self.ancestor_at(&edge.to, level)?;
+            let from = ancestors.of(&edge.from)?;
+            let to = ancestors.of(&edge.to)?;
             // 투영으로 붕괴된 간선(from≠to였는데 같은 조상에 수렴)은 버린다.
             // 단, 원래부터 자기 루프였던 간선(자기 참조 FK 등)은 진짜 순환이라
             // 유지한다 — 둘을 구분하지 않으면 자기 루프 순환이 사라진다.
@@ -538,7 +539,7 @@ impl Graph {
         // "member 레벨에선 쓰였는데 object에선 미사용"이라는 모순이 나온다.
         // 합쳐질 때 since는 가장 이른 것(보수적으로)을 남긴다.
         for (id, usage) in &self.usage {
-            let Some(ancestor) = self.ancestor_at(id, level) else {
+            let Some(ancestor) = ancestors.of(id) else {
                 continue;
             };
             let entry = projected.usage.entry(ancestor).or_default();
@@ -567,9 +568,7 @@ impl Graph {
             }
         }
         for ((from, to, kind), origins) in &self.origins {
-            let (Some(from), Some(to)) =
-                (self.ancestor_at(from, level), self.ancestor_at(to, level))
-            else {
+            let (Some(from), Some(to)) = (ancestors.of(from), ancestors.of(to)) else {
                 continue;
             };
             if projected
@@ -583,38 +582,6 @@ impl Graph {
             }
         }
         projected
-    }
-
-    /// id의 주어진 레벨 조상. 자기 자신이 그 레벨이면 자신을 돌려준다.
-    /// 조상 사슬에 그 레벨이 없으면 None.
-    fn ancestor_at(&self, id: &VertexId, level: Level) -> Option<VertexId> {
-        let mut current = Some(id.clone());
-        let mut seen = BTreeSet::new();
-        while let Some(cid) = current {
-            if !seen.insert(cid.clone()) {
-                return None;
-            }
-            match self.vertices.get(&cid) {
-                Some(v) if v.kind.level() == level => return Some(cid),
-                Some(_) => {
-                    let parents: BTreeSet<_> = self
-                        .incoming(&cid)
-                        .iter()
-                        .filter(|edge| edge.kind == EdgeKind::Contains)
-                        .map(|edge| edge.from.clone())
-                        .collect();
-                    // 실제 소유 관계가 없을 때만 graph v1의 문자열 부모 규칙을 쓴다.
-                    current = match parents.len() {
-                        0 => cid.parent(),
-                        1 => parents.into_iter().next(),
-                        _ => return None,
-                    };
-                }
-                // 부모 정점이 그래프에 없으면(비정상 입력) 사슬 종료.
-                None => return None,
-            }
-        }
-        None
     }
 
     /// 의존성 간선만으로 계산한 강연결 요소(Tarjan). 크기 1짜리도 돌려주므로
@@ -703,6 +670,77 @@ impl Graph {
     }
 }
 
+/// project 한 번 동안 정점을 주어진 레벨의 조상으로 사상한다.
+///
+/// 조상마다 incoming 전체에서 Contains 부모를 다시 거르면, 많은 query·뷰가 읽는
+/// hot 정점에서 정점·간선·usage·origin 루프가 Σ 진입 차수²를 낸다. 투영 시작에
+/// Contains 부모 색인을 한 번 만들고 정점별 결과를 memo해 같은 답을 재사용한다.
+struct Ancestors<'g> {
+    graph: &'g Graph,
+    level: Level,
+    /// 자식 → Contains 부모. 값이 None이면 부모가 둘 이상이라 소유가 모호하다.
+    parents: BTreeMap<&'g VertexId, Option<&'g VertexId>>,
+    /// 이미 구한 정점별 조상 — 간선 양 끝처럼 같은 정점을 여러 번 묻는다.
+    memo: BTreeMap<VertexId, Option<VertexId>>,
+}
+
+impl<'g> Ancestors<'g> {
+    /// 간선을 한 번 훑어 Contains 부모 색인을 만든다(O(E)).
+    fn new(graph: &'g Graph, level: Level) -> Self {
+        let mut parents: BTreeMap<&VertexId, Option<&VertexId>> = BTreeMap::new();
+        #[cfg(test)]
+        work::scanned(graph.out_edges.values().map(Vec::len).sum());
+        let edges = graph.out_edges.values().flatten();
+        for edge in edges.filter(|edge| edge.kind == EdgeKind::Contains) {
+            parents
+                .entry(&edge.to)
+                .and_modify(|parent| {
+                    if *parent != Some(&edge.from) {
+                        *parent = None;
+                    }
+                })
+                .or_insert(Some(&edge.from));
+        }
+        Self {
+            graph,
+            level,
+            parents,
+            memo: BTreeMap::new(),
+        }
+    }
+
+    /// id의 조상. 자기 자신이 그 레벨이면 자신이고, 사슬에 그 레벨이 없으면 None이다.
+    fn of(&mut self, id: &VertexId) -> Option<VertexId> {
+        if let Some(found) = self.memo.get(id) {
+            return found.clone();
+        }
+        let found = self.walk(id);
+        self.memo.insert(id.clone(), found.clone());
+        found
+    }
+
+    /// Contains 부모를 따라 올라간다. 부모가 둘 이상이거나 순환이면 None이다.
+    fn walk(&self, id: &VertexId) -> Option<VertexId> {
+        let mut current = id.clone();
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(current.clone()) {
+                return None;
+            }
+            // 부모 정점이 그래프에 없으면(비정상 입력) 사슬 종료.
+            if self.graph.vertices.get(&current)?.kind.level() == self.level {
+                return Some(current);
+            }
+            current = match self.parents.get(&current) {
+                // 실제 소유 관계가 없을 때만 graph v1의 문자열 부모 규칙을 쓴다.
+                None => current.parent()?,
+                Some(Some(parent)) => (*parent).clone(),
+                Some(None) => return None,
+            };
+        }
+    }
+}
+
 /// 간선 근거의 정렬 순서 — layer가 먼저, 같은 layer 안에서는 detail 사전순이다.
 fn evidence_order(a: &Evidence, b: &Evidence) -> std::cmp::Ordering {
     (a.layer, &a.detail).cmp(&(b.layer, &b.detail))
@@ -741,6 +779,7 @@ mod work {
 
     thread_local! {
         static MERGED: Cell<usize> = const { Cell::new(0) };
+        static SCANNED: Cell<usize> = const { Cell::new(0) };
     }
 
     /// 병합 한 번에 다시 정렬하거나 복제한 근거 수를 더한다.
@@ -751,6 +790,16 @@ mod work {
     /// 지금까지 센 병합 작업량을 돌려주고 0으로 되돌린다.
     pub(crate) fn take_merged() -> usize {
         MERGED.with(|merged| merged.replace(0))
+    }
+
+    /// 그래프 내부 질의가 훑은 인접 간선 수를 더한다.
+    pub(crate) fn scanned(count: usize) {
+        SCANNED.with(|scanned| scanned.set(scanned.get() + count));
+    }
+
+    /// 지금까지 센 인접 간선 탐색량을 돌려주고 0으로 되돌린다.
+    pub(crate) fn take_scanned() -> usize {
+        SCANNED.with(|scanned| scanned.replace(0))
     }
 }
 
@@ -1001,6 +1050,144 @@ mod tests {
         );
         // 투영 키마다 근거를 모아 한 번 병합하므로 작업량은 근거 수에 비례한다.
         assert!(merged <= 4 * QUERIES, "merged {merged}");
+    }
+
+    /// `schema.object.name` 컬럼 정점을 넣고 그 id를 돌려준다.
+    fn column(graph: &mut Graph, schema: &str, object: &str, name: &str) -> VertexId {
+        let id = VertexId::member(schema, object, name);
+        graph.add_vertex(Vertex {
+            id: id.clone(),
+            kind: VertexKind::Column,
+            name: name.into(),
+            schema: schema.into(),
+        });
+        id
+    }
+
+    /// 스키마 정점 하나를 넣는다.
+    fn schema_vertex(graph: &mut Graph, name: &str) {
+        graph.add_vertex(Vertex {
+            id: VertexId::schema(name),
+            kind: VertexKind::Schema,
+            name: name.into(),
+            schema: name.into(),
+        });
+    }
+
+    #[test]
+    fn 투영은_소유가_모호하거나_끊긴_정점을_버리고_문자열_부모로_올라간다() {
+        let mut g = Graph::new();
+        for (schema, object) in [("s", "t"), ("s", "u"), ("r", "x")] {
+            schema_vertex(&mut g, schema);
+            g.add_vertex(table(schema, object));
+            g.add_edge(contains_edge(
+                &VertexId::schema(schema),
+                &VertexId::object(schema, object),
+            ));
+        }
+        let shared = column(&mut g, "s", "t", "shared");
+        let owned = column(&mut g, "s", "t", "owned");
+        let loop_a = column(&mut g, "s", "t", "loop_a");
+        let loop_b = column(&mut g, "s", "t", "loop_b");
+        // 문자열 부모 s.gone은 정점이 아니다.
+        let orphan = column(&mut g, "s", "gone", "c");
+        // Contains 없이 graph v1의 문자열 부모 s.u로 올라간다.
+        let legacy = column(&mut g, "s", "u", "legacy");
+        let target = column(&mut g, "r", "x", "k");
+        let (t, u, x) = (
+            VertexId::object("s", "t"),
+            VertexId::object("s", "u"),
+            VertexId::object("r", "x"),
+        );
+        for (parent, child) in [
+            (&t, &shared),
+            (&u, &shared),
+            (&t, &owned),
+            (&loop_a, &loop_b),
+            (&loop_b, &loop_a),
+            (&x, &target),
+        ] {
+            g.add_edge(contains_edge(parent, child));
+        }
+        for source in [&shared, &owned, &loop_a, &orphan, &legacy] {
+            g.add_edge(Edge {
+                from: source.clone(),
+                to: target.clone(),
+                kind: EdgeKind::Reads,
+                evidence: vec![Evidence {
+                    layer: EvidenceLayer::BodyParse,
+                    detail: format!("{source} reads"),
+                }],
+            });
+        }
+        let reads = |projected: &Graph| {
+            projected
+                .edges()
+                .into_iter()
+                .filter(|edge| edge.kind == EdgeKind::Reads)
+                .map(|edge| {
+                    let details: Vec<_> = edge.evidence.iter().map(|e| e.detail.clone()).collect();
+                    (edge.from.to_string(), edge.to.to_string(), details)
+                })
+                .collect::<Vec<_>>()
+        };
+        let object = g.project(Level::Object);
+        assert_eq!(
+            reads(&object),
+            [
+                ("s.t".into(), "r.x".into(), vec!["s.t.owned reads".into()]),
+                ("s.u".into(), "r.x".into(), vec!["s.u.legacy reads".into()]),
+            ]
+        );
+        let ids: Vec<_> = object.vertices().map(|v| v.id.to_string()).collect();
+        assert_eq!(ids, ["r.x", "s.t", "s.u"]);
+        assert_eq!(
+            reads(&g.project(Level::Schema)),
+            [(
+                "s".into(),
+                "r".into(),
+                vec!["s.t.owned reads".into(), "s.u.legacy reads".into()]
+            )]
+        );
+    }
+
+    #[test]
+    fn 투영은_hot_정점의_진입_간선을_조상마다_다시_훑지_않는다() {
+        const READERS: usize = 500;
+        let mut g = Graph::new();
+        schema_vertex(&mut g, "s");
+        let users = VertexId::object("s", "users");
+        g.add_vertex(table("s", "users"));
+        g.add_edge(contains_edge(&VertexId::schema("s"), &users));
+        let hot = column(&mut g, "s", "users", "id");
+        g.add_edge(contains_edge(&users, &hot));
+        for index in 0..READERS {
+            let name = format!("q{index:03}");
+            let query = VertexId::object("s", &name);
+            g.add_vertex(Vertex {
+                id: query.clone(),
+                kind: VertexKind::Query,
+                name,
+                schema: "s".into(),
+            });
+            g.add_edge(contains_edge(&VertexId::schema("s"), &query));
+            g.add_edge(Edge {
+                from: query,
+                to: hot.clone(),
+                kind: EdgeKind::Reads,
+                evidence: vec![],
+            });
+        }
+        let edges = g.edges().len();
+        work::take_scanned();
+        let object = g.project(Level::Object);
+        let schema = g.project(Level::Schema);
+        let scanned = work::take_scanned();
+        assert_eq!(object.incoming(&users).len(), READERS);
+        assert!(schema.edges().is_empty());
+        // 투영마다 Contains 부모 색인을 한 번 만들고 조상을 memo하므로 탐색량은 간선 수에
+        // 비례한다. 조상마다 incoming을 다시 훑으면 READERS²에 비례한다.
+        assert!(scanned <= 4 * edges, "scanned {scanned}, edges {edges}");
     }
 
     #[test]
