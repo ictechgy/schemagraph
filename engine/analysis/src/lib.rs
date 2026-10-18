@@ -581,29 +581,55 @@ pub struct RulesReport {
     pub limitations: Vec<String>,
 }
 
+/// rules 작업량을 시간 대신 횟수로 확인하게 하는 테스트 전용 계수다.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RulesWork {
+    /// 그래프 간선 목록을 모아 정렬한 횟수.
+    edge_lists: usize,
+    /// 글롭 패턴을 문자 목록으로 준비한 횟수.
+    patterns: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 테스트는 스레드마다 병렬로 돌므로 계수도 스레드마다 따로 둔다.
+    static RULES_WORK: std::cell::Cell<RulesWork> =
+        const { std::cell::Cell::new(RulesWork { edge_lists: 0, patterns: 0 }) };
+}
+
+/// 현재 테스트 스레드의 rules 계수를 갱신한다.
+#[cfg(test)]
+fn count_rules_work(update: impl FnOnce(&mut RulesWork)) {
+    RULES_WORK.with(|work| {
+        let mut value = work.get();
+        update(&mut value);
+        work.set(value);
+    });
+}
+
+/// 현재 테스트 스레드의 rules 계수를 돌려주고 0으로 되돌린다.
+#[cfg(test)]
+fn take_rules_work() -> RulesWork {
+    RULES_WORK.with(std::cell::Cell::take)
+}
+
 /// 모든 규칙을 그래프의 모든 간선에 대조한다.
+///
+/// 의존 간선 목록과 규칙별 글롭 패턴은 한 번씩만 준비한다. 규칙마다 전체 간선을 다시 모아
+/// 정렬하고 간선마다 패턴 문자를 다시 모으면, 큰 그래프의 CI 게이트가 규칙 수에 비례해
+/// 느려진다. 간선은 규칙마다 같은 (from, to, kind) 순서로 돌므로 위반 순서도 그대로다.
 pub fn rules(graph: &Graph, rule_set: &[Rule]) -> RulesReport {
+    #[cfg(test)]
+    count_rules_work(|work| work.edge_lists += 1);
+    let edges: Vec<&Edge> = graph
+        .edges()
+        .into_iter()
+        .filter(|edge| edge.kind.is_dependency())
+        .collect();
     let mut violations = Vec::new();
     for rule in rule_set {
-        for edge in graph.edges() {
-            if !edge.kind.is_dependency() {
-                continue;
-            }
-            if let Some(kinds) = &rule.kinds {
-                if !kinds.contains(&edge.kind) {
-                    continue;
-                }
-            }
-            if glob_match(&rule.from, edge.from.as_str()) && glob_match(&rule.to, edge.to.as_str())
-            {
-                violations.push(RuleViolation {
-                    rule: rule.name.clone(),
-                    from: edge.from.clone(),
-                    to: edge.to.clone(),
-                    kind: edge.kind,
-                });
-            }
-        }
+        push_rule_violations(rule, &edges, &mut violations);
     }
     violations.sort_by(|a, b| {
         a.rule
@@ -615,6 +641,26 @@ pub fn rules(graph: &Graph, rule_set: &[Rule]) -> RulesReport {
         checked: rule_set.len(),
         violations,
         limitations: graph.limitations().to_vec(),
+    }
+}
+
+/// 규칙 하나를 의존 간선 목록에 대조해 위반을 간선 순서대로 더한다.
+fn push_rule_violations(rule: &Rule, edges: &[&Edge], violations: &mut Vec<RuleViolation>) {
+    let (from, to) = (GlobPattern::new(&rule.from), GlobPattern::new(&rule.to));
+    let selected = edges.iter().filter(|edge| {
+        rule.kinds
+            .as_ref()
+            .is_none_or(|kinds| kinds.contains(&edge.kind))
+    });
+    for edge in selected {
+        if from.matches(edge.from.as_str()) && to.matches(edge.to.as_str()) {
+            violations.push(RuleViolation {
+                rule: rule.name.clone(),
+                from: edge.from.clone(),
+                to: edge.to.clone(),
+                kind: edge.kind,
+            });
+        }
     }
 }
 
@@ -710,31 +756,57 @@ pub fn diff_graph(old: &Graph, new: &Graph) -> GraphDiff {
 /// 정규식 없이 직접 매칭한다 — 정점 id가 `.`을 많이 쓰는데 `*`가 점을
 /// 포함해야 `reporting.*`가 `reporting.orders.id`까지 덮는다.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    // 재귀 DP 대신 두 포인터 백트래킹 — 글롭 표준 알고리즘.
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let (mut star_p, mut star_t) = (usize::MAX, 0usize);
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star_p = pi;
-            star_t = ti;
-            pi += 1;
-        } else if star_p != usize::MAX {
-            pi = star_p + 1;
-            star_t += 1;
-            ti = star_t;
-        } else {
-            return false;
+    GlobPattern::new(pattern).matches(text)
+}
+
+/// 한 번 준비해 여러 문자열에 대조하는 글롭 패턴이다.
+///
+/// 패턴 문자를 매칭마다 다시 모으지 않으려고 둔다. `?`는 바이트가 아니라 유니코드
+/// 스칼라 하나와 맞는다 — 비ASCII 식별자에서도 `glob_match`와 같은 뜻이어야 한다.
+struct GlobPattern(Vec<char>);
+
+impl GlobPattern {
+    /// 패턴 문자를 한 번 모은다.
+    fn new(pattern: &str) -> Self {
+        #[cfg(test)]
+        count_rules_work(|work| work.patterns += 1);
+        Self(pattern.chars().collect())
+    }
+
+    /// 재귀 DP 대신 두 포인터 백트래킹 — 글롭 표준 알고리즘.
+    ///
+    /// 패턴 위치는 문자 단위, 문자열 위치는 문자 경계의 바이트 단위라서 문자열을 문자
+    /// 목록으로 복사하지 않는다.
+    fn matches(&self, text: &str) -> bool {
+        let pattern = self.0.as_slice();
+        let (mut pi, mut ti) = (0usize, 0usize);
+        let (mut star_p, mut star_t) = (usize::MAX, 0usize);
+        while let Some(current) = text[ti..].chars().next() {
+            if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == current) {
+                pi += 1;
+                ti += current.len_utf8();
+            } else if pi < pattern.len() && pattern[pi] == '*' {
+                star_p = pi;
+                star_t = ti;
+                pi += 1;
+            } else if star_p != usize::MAX {
+                pi = star_p + 1;
+                // star_t ≤ ti < text.len()이고 둘 다 문자 경계라 star_t 자리에는 항상 글자가 있다.
+                let skipped = text[star_t..]
+                    .chars()
+                    .next()
+                    .expect("star_t는 ti 이하의 문자 경계다");
+                star_t += skipped.len_utf8();
+                ti = star_t;
+            } else {
+                return false;
+            }
         }
+        while pi < pattern.len() && pattern[pi] == '*' {
+            pi += 1;
+        }
+        pi == pattern.len()
     }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
 }
 
 #[cfg(test)]
@@ -1258,6 +1330,127 @@ mod tests {
         assert!(glob_match("a*b", "axb"));
         assert!(!glob_match("", "x"));
         assert!(glob_match("", ""));
+    }
+
+    #[test]
+    fn glob의_물음표는_유니코드_스칼라_하나와_맞는다() {
+        assert!(glob_match("s.t?", "s.t한"));
+        assert!(glob_match("s.t?", "s.t\u{e9}"));
+        assert!(!glob_match("s.t??", "s.t한"));
+        assert!(glob_match("보고.*", "보고.주문.id"));
+        assert!(glob_match("*?", "한"));
+        assert!(glob_match("a*?b", "a한b"));
+        assert!(!glob_match("a*?b", "ab"));
+        assert!(glob_match("*한*", "가나한다"));
+        assert!(!glob_match("*한?", "가나한"));
+        // 결합 문자는 스칼라 두 개다 — 글자 모양(grapheme)이 아니라 스칼라로 센다.
+        assert!(!glob_match("?", "e\u{301}"));
+        assert!(glob_match("??", "e\u{301}"));
+        // 별 뒤 백트래킹이 다중 바이트 문자 경계에서 다시 시작해도 결과가 같다.
+        assert!(glob_match("*가*나", "가가나나"));
+        assert!(glob_match("a*한한", "a한한한"));
+        assert!(!glob_match("*한한한한", "a한한한"));
+    }
+
+    #[test]
+    fn rules는_간선_목록과_규칙_패턴을_한_번씩만_준비한다() {
+        let id = |number: usize| VertexId::object("s", &format!("t{number:02}"));
+        let mut g = Graph::new();
+        for number in 0..20 {
+            g.add_vertex(table("s", &format!("t{number:02}")));
+        }
+        for number in 1..20 {
+            g.add_edge(reads(&id(number), &id(number - 1)));
+        }
+        let rule_set: Vec<Rule> = (0..4)
+            .map(|number| Rule {
+                name: format!("r{number}"),
+                from: "s.t1*".into(),
+                to: "*".into(),
+                kinds: None,
+            })
+            .collect();
+        take_rules_work();
+        let report = rules(&g, &rule_set);
+        // s.t10..s.t19에서 나가는 간선 10개가 규칙마다 위반이다.
+        assert_eq!(report.violations.len(), 4 * 10);
+        assert_eq!(
+            take_rules_work(),
+            RulesWork {
+                edge_lists: 1,
+                patterns: 2 * 4
+            }
+        );
+    }
+
+    #[test]
+    fn rules_위반은_규칙_이름_끝점_간선_종류_순이고_같은_이름은_규칙_순서를_지킨다() {
+        let mut g = Graph::new();
+        g.add_vertex(table("rpt", "a"));
+        g.add_vertex(table("core", "b"));
+        let (a, b) = (VertexId::object("rpt", "a"), VertexId::object("core", "b"));
+        // 같은 끝점에 종류만 다른 간선 두 개. 넣는 순서를 종류 순서와 반대로 둔다.
+        g.add_edge(Edge {
+            kind: EdgeKind::Writes,
+            ..dep(&a, &b)
+        });
+        g.add_edge(reads(&a, &b));
+        let rule = |name: &str, kinds: Option<BTreeSet<EdgeKind>>| Rule {
+            name: name.into(),
+            from: "rpt.*".into(),
+            to: "core.*".into(),
+            kinds,
+        };
+        let report = rules(
+            &g,
+            &[
+                rule("z", None),
+                rule("dup", Some(BTreeSet::from([EdgeKind::Writes]))),
+                rule("a", None),
+                rule("dup", None),
+            ],
+        );
+        let got: Vec<_> = report
+            .violations
+            .iter()
+            .map(|v| (v.rule.as_str(), v.kind))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a", EdgeKind::Reads),
+                ("a", EdgeKind::Writes),
+                ("dup", EdgeKind::Writes),
+                ("dup", EdgeKind::Reads),
+                ("dup", EdgeKind::Writes),
+                ("z", EdgeKind::Reads),
+                ("z", EdgeKind::Writes),
+            ]
+        );
+    }
+
+    #[test]
+    fn rules는_비ascii_id에도_물음표를_글자_하나로_대조한다() {
+        let mut g = Graph::new();
+        for (schema, name) in [("보고", "주문1"), ("보고", "주문12"), ("핵심", "고객")]
+        {
+            g.add_vertex(table(schema, name));
+        }
+        for name in ["주문1", "주문12"] {
+            g.add_edge(reads(
+                &VertexId::object("보고", name),
+                &VertexId::object("핵심", "고객"),
+            ));
+        }
+        let rule = Rule {
+            name: "r".into(),
+            from: "보고.주문?".into(),
+            to: "핵심.??".into(),
+            kinds: None,
+        };
+        let report = rules(&g, &[rule]);
+        let got: Vec<_> = report.violations.iter().map(|v| v.from.as_str()).collect();
+        assert_eq!(got, ["보고.주문1"]);
     }
 
     #[test]
