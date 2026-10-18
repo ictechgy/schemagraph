@@ -129,36 +129,53 @@ func packageTokenIs(token packageToken, word string) bool {
 	return token.kind == packageTokenWord && strings.EqualFold(token.text, word)
 }
 
-// packageRoutineEnd는 바깥 routine의 END를 찾는다. 중첩 routine 선언을
-// 재귀로 건너뛰어 로컬 멤버의 BEGIN/END가 바깥 깊이에 섞이지 않게 한다.
+// maxPackageRoutineDepth — 동시에 열린 서브프로그램 정의 수(패키지 수준 멤버 포함)의
+// 상한이다. Kotlin MAX_PACKAGE_ROUTINE_DEPTH와 같다. 컴파일되는 PL/SQL은 블록 중첩
+// 255단에서 멈추므로 정상 본문은 닿지 않는다. 컴파일 오류가 난 본문도 ALL_SOURCE에 원문이
+// 남아, 끝없이 중첩된 헤더가 탐색을 키우지 못하게 넘으면 경계를 못 찾은 것으로 처리한다.
+const maxPackageRoutineDepth = 256
+
+// packageRoutineLevel — packageRoutineEnd가 추적하는 열린 routine 하나의 블록 깊이다.
+type packageRoutineLevel struct {
+	blocks   int
+	sawBegin bool
+}
+
+// packageRoutineEnd는 바깥 routine의 END를 찾는다. 중첩 routine 선언은 명시적 스택으로
+// 건너뛰어 로컬 멤버의 BEGIN/END가 바깥 깊이에 섞이지 않게 한다. 재귀하지 않아 조작된
+// 본문이 탐색을 키우지 못하고, maxPackageRoutineDepth를 넘는 중첩은 경계 없음이다.
 func packageRoutineEnd(tokens []packageToken, header int) (int, bool) {
-	blocks := 0
-	sawBegin := false
+	levels := []packageRoutineLevel{{}}
 	for i := header + 2; i < len(tokens); i++ {
+		current := &levels[len(levels)-1]
 		if packageTokenIs(tokens[i], "END") {
-			if blocks == 0 {
+			if current.blocks == 0 {
 				continue
 			}
-			blocks--
-			if sawBegin && blocks == 0 {
-				return i, true
+			current.blocks--
+			if current.sawBegin && current.blocks == 0 {
+				levels = levels[:len(levels)-1]
+				if len(levels) == 0 {
+					return i, true
+				}
 			}
 			continue
 		}
 		if isPackageRoutineHeader(tokens, i) {
-			end, ok := packageRoutineEnd(tokens, i)
-			if !ok {
+			if len(levels) == maxPackageRoutineDepth {
 				return 0, false
 			}
-			i = end
+			levels = append(levels, packageRoutineLevel{})
+			// 바깥 루틴처럼 중첩 헤더도 이름 다음 토큰부터 센다.
+			i++
 			continue
 		}
 		switch {
 		case packageTokenIs(tokens[i], "BEGIN"):
-			blocks++
-			sawBegin = true
+			current.blocks++
+			current.sawBegin = true
 		case packageTokenIs(tokens[i], "IF"), packageTokenIs(tokens[i], "LOOP"), packageTokenIs(tokens[i], "CASE"):
-			blocks++
+			current.blocks++
 		}
 	}
 	return 0, false

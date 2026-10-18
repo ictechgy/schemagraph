@@ -115,3 +115,23 @@ func TestSlicePackageBodyLexicalUncertainBoundaryIsMissing(t *testing.T) {
 		t.Fatalf("uncertain routine should be omitted: %#v", got)
 	}
 }
+
+// 중첩 정의 256단(패키지 멤버 포함)까지는 경계를 찾고, 257단부터는 경계 없음이다.
+// Kotlin PackageBodiesTest와 같은 상한이다. 컴파일되는 PL/SQL은 블록 중첩 255단에서 멈춘다.
+func TestSlicePackageBodyLexicalNestingDepthLimit(t *testing.T) {
+	for _, tc := range []struct {
+		depth  int
+		slices int
+	}{{depth: 256, slices: 1}, {depth: 257, slices: 0}} {
+		got := slicePackageBodyLexical(nestedPackageBody(tc.depth), map[string]bool{"M": true})
+		if len(got) != tc.slices {
+			t.Fatalf("depth %d: got %d slices, want %d", tc.depth, len(got), tc.slices)
+		}
+	}
+}
+
+// nestedPackageBody는 m 안에 m을 depth단 정의하고 안쪽부터 모두 닫은 PACKAGE BODY다.
+func nestedPackageBody(depth int) string {
+	return "PACKAGE BODY p AS\n" + strings.Repeat("PROCEDURE m IS\n", depth) +
+		strings.Repeat("BEGIN NULL; END m;\n", depth) + "END p;"
+}

@@ -74,34 +74,53 @@ private fun isPackageRoutineKeyword(text: String): Boolean =
 private fun packageLexTokenIs(token: PackageToken, word: String): Boolean =
     token.kind == PACKAGE_WORD && token.text.equals(word, ignoreCase = true)
 
-private fun packageRoutineEnd(tokens: List<PackageToken>, header: Int): Int? {
+/**
+ * 동시에 열린 서브프로그램 정의 수(패키지 수준 멤버 포함)의 상한 — Go maxPackageRoutineDepth와 같다.
+ *
+ * 컴파일되는 PL/SQL은 블록 중첩 255단에서 멈추므로 정상 본문은 닿지 않는다. 컴파일 오류가
+ * 난 본문도 ALL_SOURCE에 원문이 남아, 끝없이 중첩된 헤더가 탐색을 키우지 못하게 넘으면
+ * 경계를 못 찾은 것으로 처리한다.
+ */
+private const val MAX_PACKAGE_ROUTINE_DEPTH = 256
+
+/** [packageRoutineEnd]가 추적하는 열린 routine 하나 — 그 안에서 열린 블록 수와 BEGIN을 지났는지. */
+private class PackageRoutineLevel {
     var blocks = 0
     var sawBegin = false
+}
+
+/**
+ * 바깥 routine의 END를 찾는다. 중첩 routine 선언은 명시적 스택으로 건너뛰어 로컬 멤버의
+ * BEGIN/END가 바깥 깊이에 섞이지 않게 한다. 재귀하지 않아 조작된 본문이 호출 스택을
+ * 소진하지 못하고, [MAX_PACKAGE_ROUTINE_DEPTH]를 넘는 중첩은 경계 없음(null)이다.
+ */
+private fun packageRoutineEnd(tokens: List<PackageToken>, header: Int): Int? {
+    val levels = mutableListOf(PackageRoutineLevel())
     var index = header + 2
     while (index < tokens.size) {
-        if (packageLexTokenIs(tokens[index], "END")) {
-            if (blocks == 0) {
-                index++
-                continue
-            }
-            blocks--
-            if (sawBegin && blocks == 0) return index
-            index++
-            continue
-        }
-        if (isPackageRoutineHeader(tokens, index)) {
-            val nestedEnd = packageRoutineEnd(tokens, index) ?: return null
-            index = nestedEnd + 1
-            continue
-        }
+        val current = levels.last()
+        val token = tokens[index]
         when {
-            packageLexTokenIs(tokens[index], "BEGIN") -> {
-                blocks++
-                sawBegin = true
+            packageLexTokenIs(token, "END") -> if (current.blocks > 0) {
+                current.blocks--
+                if (current.sawBegin && current.blocks == 0) {
+                    levels.removeAt(levels.lastIndex)
+                    if (levels.isEmpty()) return index
+                }
             }
-            packageLexTokenIs(tokens[index], "IF") ||
-                packageLexTokenIs(tokens[index], "LOOP") ||
-                packageLexTokenIs(tokens[index], "CASE") -> blocks++
+            isPackageRoutineHeader(tokens, index) -> {
+                if (levels.size == MAX_PACKAGE_ROUTINE_DEPTH) return null
+                levels += PackageRoutineLevel()
+                // 바깥 루틴처럼 중첩 헤더도 이름 다음 토큰부터 센다.
+                index++
+            }
+            packageLexTokenIs(token, "BEGIN") -> {
+                current.blocks++
+                current.sawBegin = true
+            }
+            packageLexTokenIs(token, "IF") ||
+                packageLexTokenIs(token, "LOOP") ||
+                packageLexTokenIs(token, "CASE") -> current.blocks++
         }
         index++
     }

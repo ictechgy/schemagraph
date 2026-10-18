@@ -20,11 +20,13 @@ internal class PreparedCall(val sql: String) {
  *
  * 메타데이터 호출은 [metadataSource](H2 인메모리 DB 등)에 그대로 맡겨 객체 수집 경로를
  * 실제로 돌리고, SQL 실행은 기록만 한 뒤 빈 결과를 돌려준다. [answers]에 있는 SQL은
- * 그 값 한 칸짜리 결과를 돌려준다(세션 상태 조회 흉내).
+ * 그 값 한 칸짜리 결과를 돌려준다(세션 상태 조회 흉내). [tables]는 준비된 조회의 원문에
+ * 키 문자열이 들어 있으면 그 행들을 열 번호로 읽게 돌려준다(Oracle 사전 조회 흉내).
  */
 internal class ScriptedConnection(
     private val metadataSource: Connection,
     private val answers: Map<String, String> = emptyMap(),
+    private val tables: Map<String, List<List<Any?>>> = emptyMap(),
 ) {
     /** createStatement 경로로 실행된 SQL 원문. */
     val executed = mutableListOf<String>()
@@ -70,13 +72,32 @@ internal class ScriptedConnection(
             when (method.name) {
                 "setString" -> { call.bindings[args[0] as Int] = args[1] as String; null }
                 "setFetchSize" -> { call.fetchSize = args[0] as Int; null }
-                "executeQuery" -> rows(answer(sql))
+                "executeQuery" -> tables.entries.firstOrNull { it.key in sql }?.let { table(it.value) }
+                    ?: rows(answer(sql))
                 else -> defaultValue(method.returnType)
             }
         }
     }
 
     private fun answer(sql: String): List<String> = answers[sql]?.let { listOf(it) }.orEmpty()
+
+    /** 열 번호(1부터)로 읽는 여러 열 결과. 열 이름 조회는 이 하네스가 흉내 내지 않는다. */
+    private fun table(values: List<List<Any?>>): ResultSet {
+        var cursor = -1
+        return proxy(ResultSet::class.java) { method, args ->
+            fun cell(): Any? {
+                val column = args[0] as? Int
+                    ?: error("scripted table rows are read by column index, not by label ${args[0]}")
+                return values[cursor][column - 1]
+            }
+            when (method.name) {
+                "next" -> ++cursor < values.size
+                "getString" -> cell()?.toString()
+                "getInt" -> (cell() as Number?)?.toInt() ?: 0
+                else -> defaultValue(method.returnType)
+            }
+        }
+    }
 
     private fun rows(values: List<String>): ResultSet {
         var cursor = -1

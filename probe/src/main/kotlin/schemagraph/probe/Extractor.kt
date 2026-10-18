@@ -533,7 +533,15 @@ class Extractor(
                     val members = if (impl != null) pkgMembers[pkg].orEmpty() else emptyList()
                     val memberDocs = mutableListOf<Triple<String, String, RoutineDoc>>()
                     if (impl != null && members.isNotEmpty()) {
-                        val slices = slicePackageBodyLexical(impl, members.map { it.first }.toSet())
+                        // 분할 실패는 이 패키지 멤버의 limitation으로만 남긴다 — 컴파일 오류가 난
+                        // 본문 하나 때문에 다른 패키지와 문서 전체의 수집을 끝내지 않는다.
+                        val slices = runCatching { slicePackageBodyLexical(impl, members.map { it.first }.toSet()) }
+                            .getOrElse { error ->
+                                val msg = error.message?.replace(Regex("\\s+"), " ")?.let { ": $it" }.orEmpty()
+                                limitations += "$owner.$pname: package body could not be split into members " +
+                                    "(${error.javaClass.simpleName}$msg); member body edges are omitted"
+                                emptyMap()
+                            }
                         val seen = mutableMapOf<String, Int>()
                         for ((mname, overload) in members) {
                             // 같은 이름의 n번째 오버로드는 본문의 n번째 헤더와 짝짓는다.
