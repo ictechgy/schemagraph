@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use schemagraph_core::{EdgeKind, Graph, Level, Usage, Vertex, VertexId, VertexKind};
+use schemagraph_core::{Edge, EdgeKind, Graph, Level, Usage, Vertex, VertexId, VertexKind};
 
 mod retention;
 pub use retention::{RetentionPolicy, Suppression};
@@ -265,6 +265,108 @@ fn is_consumer_kind(kind: VertexKind) -> bool {
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// dead 판정이 훑은 인접 간선 수. 테스트 스레드마다 따로 센다.
+    static DEAD_EDGE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// dead 판정이 인접 간선을 훑은 수를 더한다.
+#[cfg(test)]
+fn count_dead_edge_visits(count: usize) {
+    DEAD_EDGE_VISITS.with(|visits| visits.set(visits.get() + count));
+}
+
+/// 현재 테스트 스레드의 dead 인접 간선 방문 수를 돌려주고 0으로 되돌린다.
+#[cfg(test)]
+fn take_dead_edge_visits() -> usize {
+    DEAD_EDGE_VISITS.with(std::cell::Cell::take)
+}
+
+/// dead 후보를 작업 목록으로 전파하는 상태다.
+///
+/// 변화가 없을 때까지 정점 전체를 다시 도는 고정점은 패스마다의 진전이 id 정렬 순서에
+/// 달려, 소비자 id가 의존 대상 id보다 사전식으로 뒤에 오는 view 사슬에서 패스마다 하나만
+/// 확정해 O(정점 × 사슬 길이)가 된다. 그래서 후보가 될 수 있는 정점마다 아직 후보가 아닌
+/// 서로 다른 의존자 수를 세고, 0이 된 정점만 의존 대상에 전파해 O(정점 + 간선)로 같은 최소
+/// 고정점을 구한다. 비소비자·보존·유령 의존자와 순환 구성원은 후보가 되지 않으므로, 그들이
+/// 의존하는 정점은 반복 고정점에서처럼 살아남는다.
+struct DeadPropagation<'g> {
+    /// 아직 후보가 아닌 정점 → 후보가 아닌 서로 다른 의존자 수. 의존자가 있는 정점만 담는다.
+    remaining: BTreeMap<&'g VertexId, usize>,
+    /// 후보로 확정했지만 아직 의존 대상에 전파하지 않은 정점.
+    queue: VecDeque<&'g VertexId>,
+    /// 확정한 후보와 사유.
+    reasons: BTreeMap<VertexId, DeadReason>,
+}
+
+impl<'g> DeadPropagation<'g> {
+    /// 보존되지 않은 소비자 정점의 의존자 수를 세고, 의존자가 없는 정점은 바로 후보로 둔다.
+    fn seed(graph: &'g Graph, protected: &BTreeMap<VertexId, String>) -> Self {
+        let mut state = Self {
+            remaining: BTreeMap::new(),
+            queue: VecDeque::new(),
+            reasons: BTreeMap::new(),
+        };
+        let consumers = graph
+            .vertices()
+            .filter(|v| is_consumer_kind(v.kind) && !protected.contains_key(&v.id));
+        for vertex in consumers {
+            match dependency_ends(graph.incoming(&vertex.id), |edge| &edge.from).len() {
+                0 => state.confirm(&vertex.id, DeadReason::NoDependents),
+                count => {
+                    state.remaining.insert(&vertex.id, count);
+                }
+            }
+        }
+        state
+    }
+
+    /// 후보를 확정하고 전파 대기열에 넣는다.
+    fn confirm(&mut self, id: &'g VertexId, reason: DeadReason) {
+        self.reasons.insert(id.clone(), reason);
+        self.queue.push_back(id);
+    }
+
+    /// 확정한 후보마다 의존 대상의 남은 의존자 수를 한 번씩 줄여 고정점까지 전파한다.
+    fn run(mut self, graph: &'g Graph) -> BTreeMap<VertexId, DeadReason> {
+        while let Some(id) = self.queue.pop_front() {
+            for target in dependency_ends(graph.outgoing(id), |edge| &edge.to) {
+                self.release(target);
+            }
+        }
+        self.reasons
+    }
+
+    /// 의존자 하나가 후보가 됐음을 반영한다. 남은 의존자가 없으면 그 정점도 후보다.
+    fn release(&mut self, target: &'g VertexId) {
+        let Some(count) = self.remaining.get_mut(target) else {
+            return;
+        };
+        // 후보마다 한 번, 서로 다른 대상마다 한 번만 불리므로 처음 센 수보다 많이 줄지 않는다.
+        *count -= 1;
+        if *count == 0 {
+            self.remaining.remove(target);
+            self.confirm(target, DeadReason::AllDependentsDead);
+        }
+    }
+}
+
+/// 의존 간선(`contains`·`inferred` 제외)의 서로 다른 반대쪽 끝이다. 같은 객체가 여러 종류의
+/// 간선으로 이어져도 하나로 센다 — 의존자 수와 전파 횟수가 같은 기준이어야 한다.
+fn dependency_ends<'g>(
+    edges: &'g [Edge],
+    end: impl Fn(&'g Edge) -> &'g VertexId,
+) -> BTreeSet<&'g VertexId> {
+    #[cfg(test)]
+    count_dead_edge_visits(edges.len());
+    edges
+        .iter()
+        .filter(|edge| edge.kind.is_dependency())
+        .map(end)
+        .collect()
+}
+
 /// DB 내부 도달성 기반 dead 후보 판정 — fixpoint.
 ///
 /// 애플리케이션 쿼리는 그래프에 없으므로 "후보"는 "DB 내부 참조 없음"의
@@ -280,46 +382,13 @@ pub fn dead_with_policy(
     policy: &RetentionPolicy,
 ) -> DeadReport {
     let protected = retention::retained(graph, policy);
-    let mut dead_set: BTreeSet<VertexId> = BTreeSet::new();
-    let mut reasons: BTreeMap<VertexId, DeadReason> = BTreeMap::new();
-    loop {
-        let mut changed = false;
-        for v in graph.vertices() {
-            if !is_consumer_kind(v.kind)
-                || dead_set.contains(&v.id)
-                || protected.contains_key(&v.id)
-            {
-                continue;
-            }
-            let dependents: Vec<&VertexId> = graph
-                .incoming(&v.id)
-                .iter()
-                .filter(|e| e.kind.is_dependency())
-                .map(|e| &e.from)
-                .collect();
-            let reason = if dependents.is_empty() {
-                Some(DeadReason::NoDependents)
-            } else if dependents.iter().all(|d| dead_set.contains(*d)) {
-                Some(DeadReason::AllDependentsDead)
-            } else {
-                None
-            };
-            if let Some(r) = reason {
-                dead_set.insert(v.id.clone());
-                reasons.insert(v.id.clone(), r);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let mut candidates: Vec<DeadCandidate> = dead_set
+    let reasons = DeadPropagation::seed(graph, &protected).run(graph);
+    let mut candidates: Vec<DeadCandidate> = reasons
         .iter()
-        .filter_map(|id| {
+        .filter_map(|(id, reason)| {
             graph.vertex(id).map(|v| DeadCandidate {
                 vertex: v.clone(),
-                reason: reasons[id],
+                reason: *reason,
                 usage: graph.usage(id).cloned(),
                 suppression: retention::suppression(id, policy),
             })
@@ -1057,6 +1126,122 @@ mod tests {
         ));
         let report = dead(&g, 256);
         assert!(report.candidates.is_empty());
+    }
+
+    /// 길이 `length`인 view 사슬 — 위치 i의 view가 i-1을 읽고 위치 0이 테이블을 읽는다.
+    ///
+    /// `ascending_consumers`면 소비자 id가 의존 대상 id보다 사전식으로 뒤에 온다. id 순으로
+    /// 정점 전체를 다시 도는 고정점은 이 순서에서 패스마다 하나만 확정한다.
+    fn view_chain(length: usize, ascending_consumers: bool) -> Graph {
+        let name = |position: usize| {
+            let rank = if ascending_consumers {
+                position
+            } else {
+                length - 1 - position
+            };
+            format!("v_{rank:06}")
+        };
+        let mut g = Graph::new();
+        g.add_vertex(table("s", "base"));
+        for position in 0..length {
+            let current = name(position);
+            g.add_vertex(view("s", &current));
+            let target = match position {
+                0 => "base".to_owned(),
+                _ => name(position - 1),
+            };
+            g.add_edge(reads(
+                &VertexId::object("s", &current),
+                &VertexId::object("s", &target),
+            ));
+        }
+        g
+    }
+
+    #[test]
+    fn dead_연쇄는_이름_순서와_무관하게_간선을_상수_번만_본다() {
+        for ascending in [true, false] {
+            let g = view_chain(200, ascending);
+            take_dead_edge_visits();
+            let report = dead(&g, 1024);
+            let visits = take_dead_edge_visits();
+            assert_eq!(report.total_candidates, 200, "{ascending}");
+            // 정점 201개·간선 200개 — 패스를 반복하면 사슬 길이의 제곱이 된다.
+            assert!(visits <= 2 * (201 + 200), "{ascending}: {visits}");
+        }
+    }
+
+    #[test]
+    fn dead_만_길이_view_사슬은_두_이름_순서에서_같은_후보와_사유를_낸다() {
+        for ascending in [true, false] {
+            let report = dead(&view_chain(10_000, ascending), 10_000);
+            assert_eq!(report.total_candidates, 10_000, "{ascending}");
+            assert!(!report.truncated);
+            let seeds: Vec<_> = report
+                .candidates
+                .iter()
+                .filter(|c| c.reason == DeadReason::NoDependents)
+                .map(|c| c.vertex.id.as_str())
+                .collect();
+            // 의존자가 없는 것은 사슬 맨 위 소비자 하나뿐이고 나머지는 연쇄로 죽는다.
+            let top = if ascending {
+                "s.v_009999"
+            } else {
+                "s.v_000000"
+            };
+            assert_eq!(seeds, [top]);
+            assert!(report
+                .candidates
+                .windows(2)
+                .all(|pair| pair[0].vertex.id < pair[1].vertex.id));
+        }
+    }
+
+    #[test]
+    fn dead는_순환_자기참조_유령_의존자를_살리고_같은_의존자는_한_번만_센다() {
+        let mut g = Graph::new();
+        let names = [
+            "c1", "c2", "by_cycle", "selfie", "by_self", "by_ghost", "top", "mid", "hinted",
+        ];
+        for name in names {
+            g.add_vertex(view("s", name));
+        }
+        g.add_vertex(table("s", "t"));
+        let id = |name: &str| VertexId::object("s", name);
+        // c1 ↔ c2 순환과 순환 구성원만 읽는 view.
+        g.add_edge(reads(&id("c1"), &id("c2")));
+        g.add_edge(reads(&id("c2"), &id("c1")));
+        g.add_edge(reads(&id("c1"), &id("by_cycle")));
+        // 자기 자신을 읽는 view와 그것만 읽는 view.
+        g.add_edge(reads(&id("selfie"), &id("selfie")));
+        g.add_edge(reads(&id("selfie"), &id("by_self")));
+        // 정점 없이 간선에만 있는 의존자도 살아 있는 의존자로 본다.
+        g.add_edge(reads(&id("ghost"), &id("by_ghost")));
+        // 같은 의존자가 종류가 다른 간선 두 개로 읽는다.
+        g.add_edge(reads(&id("top"), &id("mid")));
+        g.add_edge(Edge {
+            kind: EdgeKind::DependsOn,
+            ..dep(&id("top"), &id("mid"))
+        });
+        // 추정 간선은 의존자가 아니다.
+        g.add_edge(Edge {
+            kind: EdgeKind::Inferred,
+            ..dep(&id("t"), &id("hinted"))
+        });
+        let report = dead(&g, 256);
+        let got: Vec<_> = report
+            .candidates
+            .iter()
+            .map(|c| (c.vertex.id.as_str(), c.reason))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("s.hinted", DeadReason::NoDependents),
+                ("s.mid", DeadReason::AllDependentsDead),
+                ("s.top", DeadReason::NoDependents),
+            ]
+        );
     }
 
     #[test]
