@@ -90,7 +90,7 @@ internal fun sqliteOutputAliasError(url: String, target: OutputTarget): String? 
  * file: URI는 SQLite가 해석한다. 메모리·리소스 DB는 파일이 없어 null이다.
  */
 internal fun sqliteDatabasePath(url: String): Path? {
-    val target = url.removePrefix("jdbc:sqlite:")
+    val target = sqliteAddress(url)
     val name = if (target.startsWith("file:")) sqliteUriPath(target.removePrefix("file:")) else target.substringBefore('?')
     if (name.isNullOrEmpty() || name.startsWith(":")) return null
     return Path.of(name)

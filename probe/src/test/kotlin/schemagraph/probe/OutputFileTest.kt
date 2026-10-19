@@ -1,6 +1,8 @@
 package schemagraph.probe
 
+import java.io.ByteArrayOutputStream
 import java.io.FileOutputStream
+import java.io.PrintStream
 import java.nio.file.AccessDeniedException
 import java.nio.file.Files
 import java.nio.file.LinkOption
@@ -96,6 +98,27 @@ class OutputFileTest {
         assertNull(sqliteDatabasePath("jdbc:sqlite::memory:"))
         assertNull(sqliteDatabasePath("jdbc:sqlite:file:shared?mode=memory&cache=shared"))
         assertContentEquals(original, Files.readAllBytes(database))
+    }
+
+    // sqlite-jdbc는 URL 접두를 소문자로 바꿔 비교하므로 jdbc:SQLite:도 같은 파일을 연다. 방언 판정이
+    // 대소문자를 구분하면 원본 -o 거절을 건너뛰어 JSON 문서가 DB를 덮었다. 그래서 실제 CLI 경로
+    // (runProbe)로 종료 코드와 원본 바이트를 본다.
+    @Test
+    fun outputNamingTheSqliteSourceIsRejectedForAnySubprotocolCase() = withTemporaryDirectory { directory ->
+        val database = directory.resolve("app.db")
+        createSqlite(database)
+        val original = Files.readAllBytes(database)
+        for (subprotocol in listOf("SQLite", "SQLITE")) {
+            val stderr = ByteArrayOutputStream()
+            val code = PrintStream(stderr, true, Charsets.UTF_8).use {
+                runProbe(arrayOf("--url", "jdbc:$subprotocol:$database", "-o", "$database"), it)
+            }
+            assertEquals(2, code, "jdbc:$subprotocol: stderr=$stderr")
+            assertTrue(SQLITE_SOURCE_ALIAS_ERROR in stderr.toString(Charsets.UTF_8), "jdbc:$subprotocol: stderr=$stderr")
+            assertContentEquals(original, Files.readAllBytes(database), "jdbc:$subprotocol: the database was rewritten")
+            assertTrue(Files.isSameFile(sqliteMainFile("jdbc:$subprotocol:$database"), sqliteDatabasePath("jdbc:$subprotocol:$database")!!))
+        }
+        assertEquals(listOf("app.db"), entries(directory))
     }
 
     // NDJSON은 연결 직후 -o를 잘라 열어, 트레일러 전에 끊긴 수집이 이전 스냅샷을 잃게 했다(writer도

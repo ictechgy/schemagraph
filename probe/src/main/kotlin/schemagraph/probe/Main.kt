@@ -163,7 +163,7 @@ internal fun connectionProperties(dialect: String, user: String?, password: Stri
  * 방향이 담긴 문구로 먼저 알린다. file: URI 파일명은 해석을 SQLite에 맡긴다.
  */
 internal fun sqliteTargetError(url: String): String? {
-    val target = url.removePrefix("jdbc:sqlite:").substringBefore('?')
+    val target = sqliteAddress(url).substringBefore('?')
     if (target.startsWith("file:")) return null
     if (target.isEmpty() || target.startsWith(":")) {
         return "SQLite probe requires an existing database file; in-memory and resource databases are not supported"
@@ -176,6 +176,17 @@ internal fun sqliteTargetError(url: String): String? {
     return if (Files.isRegularFile(path)) null
     else "SQLite database file not found or not a regular file; check the path"
 }
+
+/** sqlite-jdbc가 받는 URL 접두. 드라이버는 URL을 소문자로 바꿔 이 접두와 비교한 뒤 그 길이만큼 떼어 낸다. */
+private const val SQLITE_URL_PREFIX = "jdbc:sqlite:"
+
+/**
+ * sqlite-jdbc가 열 주소(접두 뒤 원문)를 돌려준다. 드라이버처럼 접두를 대소문자 없이 비교한다.
+ * 대소문자를 구분해 떼면 jdbc:SQLite:는 URL 전체가 경로로 남아, 없는 파일 검사와 -o 원본 비교가
+ * 드라이버가 실제로 여는 파일이 아닌 엉뚱한 경로를 본다.
+ */
+internal fun sqliteAddress(url: String): String =
+    if (url.startsWith(SQLITE_URL_PREFIX, ignoreCase = true)) url.substring(SQLITE_URL_PREFIX.length) else url
 
 /** 사용자에게 보일 오류. runProbe가 "error: …"로 쓰고 종료 코드 2로 끝낸다. */
 private class ProbeExit(message: String) : RuntimeException(message)
@@ -262,20 +273,29 @@ private fun parseArgs(args: Array<String>): Opts {
     return o
 }
 
-/** jdbc:<subprotocol>:… 에서 방언 이름을 뽑는다. 알 수 없는 방언은 subprotocol
- *  이름 그대로 — 엔진이 GenericDialect로 폴백한다. 오류에는 자격 증명이 들 수 있는 URL
+/** jdbc:<subprotocol>:… 에서 방언 이름을 뽑는다. 프로브와 엔진이 방언별로 다루는 subprotocol은
+ *  대소문자를 무시하고 [KNOWN_DIALECTS]의 소문자 이름으로 낸다. sqlite-jdbc처럼 접두를 소문자로
+ *  바꿔 비교하는 드라이버는 jdbc:SQLite:도 받는데, 방언이 "SQLite"로 남으면 그 방언에 묶인
+ *  읽기 전용 연결·원본 보호가 모두 빠지고 엔진도 GenericDialect로 읽는다. 알 수 없는 방언은
+ *  subprotocol 이름 그대로 — 엔진이 GenericDialect로 폴백한다. 오류에는 자격 증명이 들 수 있는 URL
  *  원문을 싣지 않는다(Go 프로브용 postgres://user:pw@… 를 그대로 넘기는 실수가 흔하다). */
-private fun dialectOf(url: String): String = when {
+internal fun dialectOf(url: String): String = when {
     !url.startsWith("jdbc:") -> fatal("not a JDBC URL; expected jdbc:<subprotocol>:…")
-    else -> url.removePrefix("jdbc:").substringBefore(':').let {
-        when (it) {
-            "postgresql" -> "postgres"
-            "informix-sqli", "informix" -> "informix"
-            "db2" -> "db2"
-            else -> it
-        }
-    }
+    else -> url.removePrefix("jdbc:").substringBefore(':').let { KNOWN_DIALECTS[it.lowercase()] ?: it }
 }
+
+/** 소문자 subprotocol → 방언 이름. 프로브나 엔진(parser dialect_for·scope)이 이름으로 분기하는 방언이다. */
+private val KNOWN_DIALECTS = mapOf(
+    "postgresql" to "postgres",
+    "informix-sqli" to "informix",
+    "informix" to "informix",
+    "db2" to "db2",
+    "sqlite" to "sqlite",
+    "oracle" to "oracle",
+    "sqlserver" to "sqlserver",
+    "mysql" to "mysql",
+    "mariadb" to "mariadb",
+)
 
 /**
  * --driver로 넘긴 jar을 등록한다. DriverManager는 시스템 클래스로더의
