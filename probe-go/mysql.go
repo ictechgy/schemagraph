@@ -114,6 +114,7 @@ func (h *harvester) mysqlObjects(schema string) []ObjectDoc {
 		return nil
 	})
 
+	positions := objectPositions(objects)
 	h.mysqlRows("views", `
 		SELECT CAST(table_name AS CHAR), CAST(view_definition AS CHAR)
 		FROM information_schema.views WHERE table_schema = ?`, []any{schema}, func(rows *sql.Rows) error {
@@ -122,14 +123,39 @@ func (h *harvester) mysqlObjects(schema string) []ObjectDoc {
 		if err := rows.Scan(&name, &body); err != nil {
 			return err
 		}
-		for i := range objects {
-			if objects[i].Name == name {
-				objects[i].Body = ns(body)
-			}
+		for _, i := range positions[name] {
+			objects[i].Body = ns(body)
 		}
 		return nil
 	})
 	return objects
+}
+
+// objectPositions는 이름마다 objects 안의 위치를 모은다. 뷰 본문·사용 통계 행을 이름으로 귀속할
+// 때 행마다 objects 전체를 훑으면 스키마마다 O(행 수 × 객체 수)가 된다. 같은 이름이 여러 번 있으면
+// 예전 선형 탐색처럼 그 모두에 귀속하도록 위치를 전부 담는다.
+func objectPositions(objects []ObjectDoc) map[string][]int {
+	positions := make(map[string][]int, len(objects))
+	for i := range objects {
+		positions[objects[i].Name] = append(positions[objects[i].Name], i)
+	}
+	return positions
+}
+
+// indexPosition은 objects[object].Indexes[index]를 가리킨다.
+type indexPosition struct{ object, index int }
+
+// indexPositions는 "테이블\x00인덱스" 키마다 인덱스 위치를 모은다. MySQL 식별자에는 NUL이 없어
+// 두 이름의 경계가 섞이지 않는다(postgresObjectUsage의 인덱스 키와 같은 규칙).
+func indexPositions(objects []ObjectDoc) map[string][]indexPosition {
+	positions := map[string][]indexPosition{}
+	for i := range objects {
+		for j := range objects[i].Indexes {
+			key := objects[i].Name + "\x00" + objects[i].Indexes[j].Name
+			positions[key] = append(positions[key], indexPosition{object: i, index: j})
+		}
+	}
+	return positions
 }
 
 func (h *harvester) mysqlColumns(schema, table string) []ColumnDoc {
@@ -397,6 +423,7 @@ func (h *harvester) mysqlObjectUsage(schema string, objects []ObjectDoc) {
 	if err != nil {
 		h.limitations = append(h.limitations, fmt.Sprintf("%s: sys.schema_table_statistics unavailable; no usage evidence — %s", schema, oneLine(err.Error())))
 	} else {
+		positions := objectPositions(objects)
 		for tableRows.Next() {
 			var table string
 			var reads, writes int64
@@ -404,10 +431,8 @@ func (h *harvester) mysqlObjectUsage(schema string, objects []ObjectDoc) {
 				h.limitations = append(h.limitations, fmt.Sprintf("%s: sys.schema_table_statistics row read failed — %s", schema, oneLine(err.Error())))
 				break
 			}
-			for i := range objects {
-				if objects[i].Name == table {
-					objects[i].Usage = &UsageDoc{Since: ns(since), Reads: maxInt64(reads), Writes: maxInt64(writes)}
-				}
+			for _, i := range positions[table] {
+				objects[i].Usage = &UsageDoc{Since: ns(since), Reads: maxInt64(reads), Writes: maxInt64(writes)}
 			}
 		}
 		if err := tableRows.Err(); err != nil {
@@ -422,21 +447,15 @@ func (h *harvester) mysqlObjectUsage(schema string, objects []ObjectDoc) {
 		return
 	}
 	defer rows.Close()
+	indexes := indexPositions(objects)
 	for rows.Next() {
 		var table, index string
 		if err := rows.Scan(&table, &index); err != nil {
 			h.limitations = append(h.limitations, fmt.Sprintf("%s: sys.schema_unused_indexes row read failed — %s", schema, oneLine(err.Error())))
 			return
 		}
-		for i := range objects {
-			if objects[i].Name != table {
-				continue
-			}
-			for j := range objects[i].Indexes {
-				if objects[i].Indexes[j].Name == index {
-					objects[i].Indexes[j].Usage = &UsageDoc{Since: ns(since), Reads: 0, Writes: 0}
-				}
-			}
+		for _, position := range indexes[table+"\x00"+index] {
+			objects[position.object].Indexes[position.index].Usage = &UsageDoc{Since: ns(since), Reads: 0, Writes: 0}
 		}
 	}
 	if err := rows.Err(); err != nil {

@@ -510,6 +510,7 @@ func (h *harvester) postgresRoutineUsage(schema string, routines []RoutineDoc) {
 		return
 	}
 	defer rows.Close()
+	positions := routinePositions(routines)
 	ambiguous := 0
 	for rows.Next() {
 		var name string
@@ -519,12 +520,7 @@ func (h *harvester) postgresRoutineUsage(schema string, routines []RoutineDoc) {
 			h.limitations = append(h.limitations, fmt.Sprintf("pg_stat_user_functions row read failed — %s", oneLine(err.Error())))
 			return
 		}
-		hits := []int{}
-		for i := range routines {
-			if routines[i].Name == name {
-				hits = append(hits, i)
-			}
-		}
+		hits := positions[name]
 		if len(hits) == 1 {
 			routines[hits[0]].Usage = &UsageDoc{Since: ns(since), Reads: maxInt64(calls), TotalMs: nullFloat(total), SelfMs: nullFloat(self)}
 		} else if len(hits) > 1 {
@@ -537,6 +533,17 @@ func (h *harvester) postgresRoutineUsage(schema string, routines []RoutineDoc) {
 	if ambiguous > 0 {
 		h.limitations = append(h.limitations, fmt.Sprintf("%s: usage unavailable for %d overloaded routines because funcname is ambiguous", schema, ambiguous))
 	}
+}
+
+// routinePositions는 이름마다 routines 안의 위치를 모은다. pg_stat_user_functions의 funcname에는
+// 시그니처가 없어서, 위치가 하나면 귀속하고 오버로드로 여럿이면 모호하다고 센다. 통계 행마다
+// routines 전체를 훑으면 스키마마다 O(행 수 × routine 수)가 된다.
+func routinePositions(routines []RoutineDoc) map[string][]int {
+	positions := make(map[string][]int, len(routines))
+	for i := range routines {
+		positions[routines[i].Name] = append(positions[routines[i].Name], i)
+	}
+	return positions
 }
 
 // pgRows는 보조 조회 실패를 빈 결과로 위장하지 않고 limitation에 남긴다.
