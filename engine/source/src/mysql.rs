@@ -5,13 +5,22 @@
 //! pg 카탈로그를 따로 팔 이유가 없다. "스키마"는 곧 데이터베이스이고,
 //! URL에 데이터베이스가 있으면 그것만, 없으면 시스템 스키마를 뺀 전부를 읽는다.
 
-use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions};
+use sqlx::mysql::{
+    MySqlConnectOptions, MySqlConnection, MySqlPool, MySqlPoolOptions, MySqlQueryResult,
+};
 use sqlx::Row;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::document::*;
 use crate::SourceError;
+
+/// 읽기 전용 세션을 고정하지 못했을 때의 한계. Go 프로브와 같은 문구라 수집기와
+/// 무관하게 같은 사실로 읽힌다.
+const READ_ONLY_UNAVAILABLE: &str =
+    "read-only session mode was unavailable; only catalog queries were issued";
 
 /// `mysql://…` URL로 접속해 카탈로그를 읽는다.
 pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
@@ -21,18 +30,17 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
     // URL에 데이터베이스가 있으면 그것만 — 없으면 사용자 스키마 전부.
     let scope_db = options.get_database().map(|d| d.to_owned());
 
+    // after_connect는 연결마다 돈다 — 어느 연결이든 고정에 실패하면 문서 전체의 한계다.
+    let read_only_unavailable = Arc::new(AtomicBool::new(false));
+    let unavailable = Arc::clone(&read_only_unavailable);
     let pool = MySqlPoolOptions::new()
-        .after_connect(|conn, _| {
+        .after_connect(move |conn, _| {
+            let unavailable = Arc::clone(&unavailable);
             Box::pin(async move {
-                // 읽기 전용 세션 고정 — MySQL 8은 transaction_read_only,
-                // MariaDB는 tx_read_only라 둘 다 시도한다. 둘 다 실패해도
-                // 스캔은 계속하되 세션이 쓰기 가능이라는 사실은 기록해 둔다.
-                let mysql8 =
-                    sqlx::Executor::execute(&mut *conn, "SET SESSION transaction_read_only = 1")
-                        .await;
-                if mysql8.is_err() {
-                    let _ =
-                        sqlx::Executor::execute(&mut *conn, "SET SESSION tx_read_only = 1").await;
+                // 둘 다 실패해도 스캔은 계속하되(reader는 카탈로그 SELECT만 보낸다)
+                // 세션이 쓰기 가능이라는 사실은 limitation으로 남긴다.
+                if read_only_limitation(&pin_read_only_session(conn).await).is_some() {
+                    unavailable.store(true, Ordering::Relaxed);
                 }
                 Ok(())
             })
@@ -57,6 +65,11 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
             .push(read_schema(&pool, &schema, &mut doc.limitations, &mut catalog_complete).await?);
     }
     doc.schemas.sort_by(|a, b| a.name.cmp(&b.name));
+    // 수집한 카탈로그 자체는 온전하므로 catalog_complete는 그대로 둔다(Go 프로브와 같다).
+    // Go처럼 접속 단계의 사실이라 맨 앞에 둔다.
+    if read_only_unavailable.load(Ordering::Relaxed) {
+        doc.limitations.insert(0, READ_ONLY_UNAVAILABLE.to_owned());
+    }
     doc.context = Some(CollectionContext {
         source_id: String::new(),
         database: scope_db.clone(),
@@ -64,6 +77,32 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         catalog_complete,
     });
     Ok(doc)
+}
+
+/// 읽기 전용 세션을 고정한다. MySQL 8은 transaction_read_only, MariaDB는
+/// tx_read_only라 차례로 시도하고 처음 성공한 데서 멈춘다. 시도 결과를 모두 돌려준다.
+async fn pin_read_only_session(
+    conn: &mut MySqlConnection,
+) -> Vec<Result<MySqlQueryResult, sqlx::Error>> {
+    let mut attempts = Vec::new();
+    for statement in [
+        "SET SESSION transaction_read_only = 1",
+        "SET SESSION tx_read_only = 1",
+    ] {
+        let attempt = sqlx::Executor::execute(&mut *conn, statement).await;
+        let pinned = attempt.is_ok();
+        attempts.push(attempt);
+        if pinned {
+            break;
+        }
+    }
+    attempts
+}
+
+/// 연결 하나의 읽기 전용 SET 결과를 한계 문구로 바꾼다. 하나라도 성공하면 세션은
+/// 고정됐다. 모두 거절되면(또는 시도가 없으면) 쓰기 가능 세션이라는 사실을 알린다.
+fn read_only_limitation<T, E>(attempts: &[Result<T, E>]) -> Option<&'static str> {
+    (!attempts.iter().any(Result::is_ok)).then_some(READ_ONLY_UNAVAILABLE)
 }
 
 /// 읽을 스키마 목록 — URL의 데이터베이스가 있으면 그 하나, 없으면
@@ -573,5 +612,24 @@ fn sort_all(objects: &mut [ObjectDoc], routines: &mut [RoutineDoc]) {
         obj.constraints.sort_by(|a, b| a.name.cmp(&b.name));
         obj.indexes.sort_by(|a, b| a.name.cmp(&b.name));
         obj.triggers.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 두 SET 중 하나라도 성공하면 세션은 고정됐고, 모두 거절되면 Go 프로브와 같은 한계를 남긴다.
+    #[test]
+    fn read_only_limitation_reports_only_when_every_attempt_failed() {
+        let pinned: [&[Result<(), &str>]; 2] = [&[Ok(())], &[Err("unknown variable"), Ok(())]];
+        for attempts in pinned {
+            assert_eq!(read_only_limitation(attempts), None, "{attempts:?}");
+        }
+        let rejected: &[Result<(), &str>] = &[Err("unknown variable"), Err("access denied")];
+        assert_eq!(
+            read_only_limitation(rejected),
+            Some("read-only session mode was unavailable; only catalog queries were issued")
+        );
     }
 }
