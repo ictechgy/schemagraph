@@ -182,6 +182,103 @@
         "count": 100000,
         "text": "PROCEDURE m IS\n"
       }
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE a(x NUMBER) IS\n  BEGIN\n    IF x > 0 THEN\n      INSERT INTO a_log VALUES (x);\n    ELSIF x < 0 THEN\n      INSERT INTO a_negative VALUES (x);\n    ELSE\n      NULL;\n    END IF;\n  END a;\n  PROCEDURE b IS\n  BEGIN\n    DELETE FROM b_tab;\n  END b;\nEND p;",
+      "expected": [
+        {
+          "body": "PROCEDURE a(x NUMBER) IS\n  BEGIN\n    IF x > 0 THEN\n      INSERT INTO a_log VALUES (x);\n    ELSIF x < 0 THEN\n      INSERT INTO a_negative VALUES (x);\n    ELSE\n      NULL;\n    END IF;\n  END a;"
+        },
+        {
+          "body": "PROCEDURE b IS\n  BEGIN\n    DELETE FROM b_tab;\n  END b;"
+        }
+      ],
+      "members": [
+        {
+          "name": "A",
+          "signature": "number"
+        },
+        {
+          "name": "B"
+        }
+      ],
+      "name": "IF statement before the next member",
+      "reason": "END IF closes the IF block; counting its IF as a new block made the member swallow b and the package END."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE sweep(n NUMBER) IS\n    i NUMBER := 0;\n  BEGIN\n    FOR r IN (SELECT id FROM sweep_queue) LOOP\n      DELETE FROM sweep_items WHERE id = r.id;\n    END LOOP;\n    WHILE i < n LOOP\n      i := i + 1;\n    end loop;\n    <<outer>>\n    LOOP\n      EXIT outer WHEN i > n;\n      i := i + 1;\n    END LOOP outer;\n  END sweep;\n  FUNCTION total RETURN NUMBER IS\n    t NUMBER;\n  BEGIN\n    SELECT SUM(amount) INTO t FROM ledger;\n    RETURN t;\n  END total;\nEND p;",
+      "expected": [
+        {
+          "body": "PROCEDURE sweep(n NUMBER) IS\n    i NUMBER := 0;\n  BEGIN\n    FOR r IN (SELECT id FROM sweep_queue) LOOP\n      DELETE FROM sweep_items WHERE id = r.id;\n    END LOOP;\n    WHILE i < n LOOP\n      i := i + 1;\n    end loop;\n    <<outer>>\n    LOOP\n      EXIT outer WHEN i > n;\n      i := i + 1;\n    END LOOP outer;\n  END sweep;"
+        },
+        {
+          "body": "FUNCTION total RETURN NUMBER IS\n    t NUMBER;\n  BEGIN\n    SELECT SUM(amount) INTO t FROM ledger;\n    RETURN t;\n  END total;"
+        }
+      ],
+      "members": [
+        {
+          "name": "SWEEP",
+          "signature": "number"
+        },
+        {
+          "function": true,
+          "name": "TOTAL"
+        }
+      ],
+      "name": "FOR, WHILE and labeled loops before the next member",
+      "reason": "END LOOP, a lowercase end loop and END LOOP <label> close their loops without opening new blocks."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  FUNCTION grade(score NUMBER) RETURN VARCHAR2 IS\n    label VARCHAR2(10) := CASE WHEN score IS NULL THEN 'none' END;\n  BEGIN\n    CASE\n      WHEN score >= 90 THEN label := 'A';\n      WHEN score >= 80 THEN label := 'B';\n      ELSE label := 'C';\n    END CASE;\n    SELECT CASE WHEN COUNT(*) > 0 THEN label ELSE 'none' END INTO label FROM grades WHERE grade = label;\n    RETURN CASE label WHEN 'A' THEN 'top' ELSE label END;\n  END grade;\n  PROCEDURE repeat_log(n NUMBER) IS\n  BEGIN\n    FOR i IN 1 .. CASE WHEN n > 0 THEN n ELSE 1 END LOOP\n      INSERT INTO repeat_log_tab VALUES (i);\n    END LOOP;\n    UPDATE repeat_done SET flag = 1;\n  END repeat_log;\n  PROCEDURE after_case IS\n  BEGIN\n    DELETE FROM after_case_tab;\n  END after_case;\nEND p;",
+      "expected": [
+        {
+          "body": "FUNCTION grade(score NUMBER) RETURN VARCHAR2 IS\n    label VARCHAR2(10) := CASE WHEN score IS NULL THEN 'none' END;\n  BEGIN\n    CASE\n      WHEN score >= 90 THEN label := 'A';\n      WHEN score >= 80 THEN label := 'B';\n      ELSE label := 'C';\n    END CASE;\n    SELECT CASE WHEN COUNT(*) > 0 THEN label ELSE 'none' END INTO label FROM grades WHERE grade = label;\n    RETURN CASE label WHEN 'A' THEN 'top' ELSE label END;\n  END grade;"
+        },
+        {
+          "body": "PROCEDURE repeat_log(n NUMBER) IS\n  BEGIN\n    FOR i IN 1 .. CASE WHEN n > 0 THEN n ELSE 1 END LOOP\n      INSERT INTO repeat_log_tab VALUES (i);\n    END LOOP;\n    UPDATE repeat_done SET flag = 1;\n  END repeat_log;"
+        },
+        {
+          "body": "PROCEDURE after_case IS\n  BEGIN\n    DELETE FROM after_case_tab;\n  END after_case;"
+        }
+      ],
+      "members": [
+        {
+          "function": true,
+          "name": "GRADE",
+          "signature": "number"
+        },
+        {
+          "name": "REPEAT_LOG",
+          "signature": "number"
+        },
+        {
+          "name": "AFTER_CASE"
+        }
+      ],
+      "name": "CASE statements and CASE expressions",
+      "reason": "END CASE closes a CASE statement and a CASE expression closes with END alone; the LOOP right after a CASE expression in a FOR range opens the loop."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE outer_proc(n NUMBER) IS\n    PROCEDURE helper(m NUMBER) IS\n    BEGIN\n      IF m > 0 THEN\n        INSERT INTO helper_log VALUES (m);\n      END IF;\n    END helper;\n  BEGIN\n    FOR i IN 1 .. n LOOP\n      helper(i);\n    END LOOP;\n  END outer_proc;\n  PROCEDURE after_proc IS\n  BEGIN\n    DELETE FROM after_tab;\n  END after_proc;\nBEGIN\n  IF SYSDATE IS NOT NULL THEN\n    INSERT INTO package_init_log VALUES (1);\n  END IF;\nEND p;",
+      "expected": [
+        {
+          "body": "PROCEDURE outer_proc(n NUMBER) IS\n    PROCEDURE helper(m NUMBER) IS\n    BEGIN\n      IF m > 0 THEN\n        INSERT INTO helper_log VALUES (m);\n      END IF;\n    END helper;\n  BEGIN\n    FOR i IN 1 .. n LOOP\n      helper(i);\n    END LOOP;\n  END outer_proc;"
+        },
+        {
+          "body": "PROCEDURE after_proc IS\n  BEGIN\n    DELETE FROM after_tab;\n  END after_proc;"
+        }
+      ],
+      "members": [
+        {
+          "name": "OUTER_PROC",
+          "signature": "number"
+        },
+        {
+          "name": "AFTER_PROC"
+        }
+      ],
+      "name": "local routine with control statements and an initialization block",
+      "reason": "Control statements inside a local routine and in the initialization block must not move the member boundaries."
     }
   ],
   "description": "Oracle PACKAGE BODY member attribution cases shared by probe-go/package_slices_test.go and probe PackageBodiesTest. Each expected entry is the exact trimmed member body or a substring of the limitation reason; repeat.text is appended repeat.count times to body."

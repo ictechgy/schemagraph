@@ -246,11 +246,21 @@ private val PARAMETER_MODES = listOf("IN", "OUT", "NOCOPY")
  */
 private const val MAX_PACKAGE_ROUTINE_DEPTH = 256
 
-/** [packageRoutineEnd]가 추적하는 열린 routine 하나 — 그 안에서 열린 블록 수와 BEGIN을 지났는지. */
+/** [packageRoutineEnd]가 추적하는 열린 routine 하나 — 그 안에서 열린 블록 머리(연 순서)와 BEGIN을 지났는지. */
 private class PackageRoutineLevel {
-    var blocks = 0
+    val blocks = ArrayList<String>()
     var sawBegin = false
 }
+
+/**
+ * END로 닫히는 블록 머리 — Go packageBlockKeywords와 같다. IF·LOOP·CASE 문은 END 뒤에 같은 단어를
+ * 한 번 더 쓴다(END IF·END LOOP·END CASE). CASE 식은 END만 쓴다.
+ */
+private val PACKAGE_BLOCK_KEYWORDS = listOf("BEGIN", "IF", "LOOP", "CASE")
+
+/** 토큰이 블록 머리면 그 키워드, 아니면 null. */
+private fun packageBlockKeyword(token: PackageToken): String? =
+    PACKAGE_BLOCK_KEYWORDS.firstOrNull { packageLexTokenIs(token, it) }
 
 /**
  * 정의의 IS/AS([declaration]) 뒤부터 바깥 routine의 END를 찾는다. 중첩 routine 정의는 명시적
@@ -265,11 +275,16 @@ private fun packageRoutineEnd(tokens: List<PackageToken>, declaration: Int): Int
         val current = levels.last()
         val token = tokens[index]
         when {
-            packageLexTokenIs(token, "END") -> if (current.blocks > 0) {
-                current.blocks--
-                if (current.sawBegin && current.blocks == 0) {
+            packageLexTokenIs(token, "END") -> if (current.blocks.isNotEmpty()) {
+                val end = index
+                val closed = current.blocks.removeAt(current.blocks.lastIndex)
+                // END IF·END LOOP·END CASE의 꼬리 단어는 방금 닫은 블록의 표지다. 새 블록으로 세면 그런
+                // 문이 있는 멤버는 제 END에서 깊이가 0이 되지 않아 뒤 멤버와 패키지 END까지 삼킨다.
+                // 꼬리가 닫은 블록과 다르면 새 블록 머리다(FOR i IN 1 .. CASE … END LOOP의 LOOP).
+                if (closed != "BEGIN" && index + 1 < tokens.size && packageLexTokenIs(tokens[index + 1], closed)) index++
+                if (current.sawBegin && current.blocks.isEmpty()) {
                     levels.removeAt(levels.lastIndex)
-                    if (levels.isEmpty()) return index
+                    if (levels.isEmpty()) return end
                 }
             }
             isPackageRoutineHeader(tokens, index) -> {
@@ -281,13 +296,10 @@ private fun packageRoutineEnd(tokens: List<PackageToken>, declaration: Int): Int
                 // 전방 선언은 ';'까지, 정의는 IS/AS까지 건너뛰고 그 다음 토큰부터 센다.
                 index = nested.index
             }
-            packageLexTokenIs(token, "BEGIN") -> {
-                current.blocks++
-                current.sawBegin = true
+            else -> packageBlockKeyword(token)?.let { keyword ->
+                current.blocks += keyword
+                current.sawBegin = current.sawBegin || keyword == "BEGIN"
             }
-            packageLexTokenIs(token, "IF") ||
-                packageLexTokenIs(token, "LOOP") ||
-                packageLexTokenIs(token, "CASE") -> current.blocks++
         }
         index++
     }

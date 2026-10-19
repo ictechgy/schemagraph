@@ -316,10 +316,25 @@ func packageParameterType(parameter []packageToken) string {
 // 남아, 끝없이 중첩된 헤더가 탐색을 키우지 못하게 넘으면 경계를 못 찾은 것으로 처리한다.
 const maxPackageRoutineDepth = 256
 
-// packageRoutineLevel — packageRoutineEnd가 추적하는 열린 routine 하나의 블록 깊이다.
+// packageRoutineLevel — packageRoutineEnd가 추적하는 열린 routine 하나다. blocks는 그 안에서 열린
+// 블록 머리(BEGIN·IF·LOOP·CASE)를 연 순서대로 담는다.
 type packageRoutineLevel struct {
-	blocks   int
+	blocks   []string
 	sawBegin bool
+}
+
+// packageBlockKeywords — END로 닫히는 블록 머리다. IF·LOOP·CASE 문은 END 뒤에 같은 단어를 한 번 더
+// 쓴다(END IF·END LOOP·END CASE). CASE 식은 END만 쓴다.
+var packageBlockKeywords = []string{"BEGIN", "IF", "LOOP", "CASE"}
+
+// packageBlockKeyword — 토큰이 블록 머리면 그 키워드를 돌려준다.
+func packageBlockKeyword(token packageToken) (string, bool) {
+	for _, keyword := range packageBlockKeywords {
+		if packageTokenIs(token, keyword) {
+			return keyword, true
+		}
+	}
+	return "", false
 }
 
 // packageRoutineEnd는 정의의 IS/AS(declaration) 뒤부터 바깥 routine의 END를 찾는다. 중첩
@@ -331,14 +346,22 @@ func packageRoutineEnd(tokens []packageToken, declaration int) (int, bool) {
 	for i := declaration + 1; i < len(tokens); i++ {
 		current := &levels[len(levels)-1]
 		if packageTokenIs(tokens[i], "END") {
-			if current.blocks == 0 {
+			if len(current.blocks) == 0 {
 				continue
 			}
-			current.blocks--
-			if current.sawBegin && current.blocks == 0 {
+			end := i
+			closed := current.blocks[len(current.blocks)-1]
+			current.blocks = current.blocks[:len(current.blocks)-1]
+			// END IF·END LOOP·END CASE의 꼬리 단어는 방금 닫은 블록의 표지다. 새 블록으로 세면 그런
+			// 문이 있는 멤버는 제 END에서 깊이가 0이 되지 않아 뒤 멤버와 패키지 END까지 삼킨다.
+			// 꼬리가 닫은 블록과 다르면 새 블록 머리다(FOR i IN 1 .. CASE … END LOOP의 LOOP).
+			if closed != "BEGIN" && i+1 < len(tokens) && packageTokenIs(tokens[i+1], closed) {
+				i++
+			}
+			if current.sawBegin && len(current.blocks) == 0 {
 				levels = levels[:len(levels)-1]
 				if len(levels) == 0 {
-					return i, true
+					return end, true
 				}
 			}
 			continue
@@ -358,12 +381,9 @@ func packageRoutineEnd(tokens []packageToken, declaration int) (int, bool) {
 			i = nested
 			continue
 		}
-		switch {
-		case packageTokenIs(tokens[i], "BEGIN"):
-			current.blocks++
-			current.sawBegin = true
-		case packageTokenIs(tokens[i], "IF"), packageTokenIs(tokens[i], "LOOP"), packageTokenIs(tokens[i], "CASE"):
-			current.blocks++
+		if keyword, ok := packageBlockKeyword(tokens[i]); ok {
+			current.blocks = append(current.blocks, keyword)
+			current.sawBegin = current.sawBegin || keyword == "BEGIN"
 		}
 	}
 	return 0, false
