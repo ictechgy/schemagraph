@@ -127,7 +127,7 @@ class Extractor(
             schemas = schemas,
             limitations = limitations.distinct().sorted(),
             context = collectionContext(limitations.size == metadataStart),
-            dependencies = dependencies.distinct().sortedBy { lineMapper.writeValueAsString(it) },
+            dependencies = distinctSortedDependencies(dependencies),
         )
     }
 
@@ -161,7 +161,7 @@ class Extractor(
                 for (rt in sd.routines) rec("routine", "schema" to sd.name, "data" to rt)
             }
             if (catalogDependencies) {
-                for (dependency in collectCatalogDependencies(conn, dialect, schema, limitations).distinct().sortedBy { lineMapper.writeValueAsString(it) }) rec("dependency", "data" to dependency)
+                for (dependency in distinctSortedDependencies(collectCatalogDependencies(conn, dialect, schema, limitations))) rec("dependency", "data" to dependency)
             }
         }
         if (!sawObjects) {
