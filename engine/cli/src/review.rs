@@ -6,6 +6,7 @@ use schemagraph_core::{EdgeKind, Graph, VertexId, VertexKind};
 use schemagraph_source::{self as source, diff::DocumentDiff};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -115,6 +116,7 @@ impl Changes<'_> {
                 );
             }
         }
+        let added = Structures::new(new);
         for item in diff.objects.added.iter().chain(&diff.routines.added) {
             self.add_detailed(
                 &item.id,
@@ -123,9 +125,10 @@ impl Changes<'_> {
                 "object-added",
                 None,
                 Some(item.kind.clone()),
-                Some(structure_detail(new, self.after, &item.id)),
+                Some(added.detail(self.after, &item.id)),
             );
         }
+        let removed = Structures::new(old);
         for item in diff.objects.removed.iter().chain(&diff.routines.removed) {
             self.add_detailed(
                 &item.id,
@@ -134,7 +137,7 @@ impl Changes<'_> {
                 "object-removed",
                 Some(item.kind.clone()),
                 None,
-                Some(structure_detail(old, self.before, &item.id)),
+                Some(removed.detail(self.before, &item.id)),
             );
         }
         for object in &diff.objects.changed {
@@ -400,35 +403,48 @@ fn body_hash(graph: &Graph, id: &str, kind: Option<&str>) -> Option<String> {
         .and_then(|analysis| analysis.body_hash.clone())
 }
 
-/// 실제 object/routine 구조를 fingerprint에 넣되 usage와 시각적 관측값은 제외한다.
-fn structure_detail(document: &source::CatalogDocument, graph: &Graph, id: &str) -> Value {
-    for schema in &document.schemas {
-        for object in &schema.objects {
-            if VertexId::object(&schema.name, &object.name).as_str() == id {
-                return json!({
-                    "id": id,
-                    "kind": object.kind,
-                    "bodyHash": body_hash(graph, id, None),
-                    "columns": &object.columns,
-                    "constraints": &object.constraints,
-                    "indexes": object.indexes.iter().map(index_detail).collect::<Vec<_>>(),
-                    "triggers": object.triggers.iter().map(trigger_detail).collect::<Vec<_>>(),
-                });
-            }
+/// 문서의 object·routine을 review가 쓰는 정점 id로 찾는 색인.
+///
+/// 추가·삭제 항목마다 문서 전체를 훑으면 변경 수 × 객체 수가 된다. 빈 기준선과의 첫 비교나
+/// 스키마 추가처럼 객체가 한꺼번에 바뀌는 review가 이차 시간이 된다. 처음 찾을 때 문서를 한 번만
+/// 훑어 id → 항목 맵을 만들고, 그 뒤로는 조회만 한다.
+struct Structures<'a> {
+    document: &'a source::CatalogDocument,
+    entries: OnceCell<BTreeMap<String, Structure<'a>>>,
+}
+
+/// id가 가리키는 문서 항목.
+#[derive(Clone, Copy)]
+enum Structure<'a> {
+    Object(&'a source::document::ObjectDoc),
+    Routine(&'a source::document::RoutineDoc),
+}
+
+impl<'a> Structures<'a> {
+    /// 아직 훑지 않은 색인. 추가·삭제 항목이 없으면 문서를 훑지 않는다.
+    fn new(document: &'a source::CatalogDocument) -> Self {
+        Self {
+            document,
+            entries: OnceCell::new(),
         }
-        for routine in &schema.routines {
-            let base = VertexId::routine(
-                &schema.name,
-                routine.member_of.as_deref(),
-                &routine.name,
-                routine.signature.as_deref(),
-            );
-            let candidate = base.as_str();
-            let renamed = format!("{candidate}@{}", routine.kind);
-            if id != candidate && id != renamed {
-                continue;
-            }
-            return json!({
+    }
+
+    /// 실제 object/routine 구조를 fingerprint에 넣되 usage와 시각적 관측값은 제외한다.
+    fn detail(&self, graph: &Graph, id: &str) -> Value {
+        let entries = self
+            .entries
+            .get_or_init(|| structure_entries(self.document));
+        match entries.get(id) {
+            Some(Structure::Object(object)) => json!({
+                "id": id,
+                "kind": object.kind,
+                "bodyHash": body_hash(graph, id, None),
+                "columns": &object.columns,
+                "constraints": &object.constraints,
+                "indexes": object.indexes.iter().map(index_detail).collect::<Vec<_>>(),
+                "triggers": object.triggers.iter().map(trigger_detail).collect::<Vec<_>>(),
+            }),
+            Some(Structure::Routine(routine)) => json!({
                 "id": id,
                 "kind": routine.kind,
                 "language": routine.language,
@@ -436,10 +452,46 @@ fn structure_detail(document: &source::CatalogDocument, graph: &Graph, id: &str)
                 "memberOf": routine.member_of,
                 "source": routine.source,
                 "bodyHash": body_hash(graph, id, Some(&routine.kind)),
-            });
+            }),
+            None => json!({"id": id}),
         }
     }
-    json!({"id": id})
+}
+
+/// 문서의 객체 id와 routine의 기본·`name@kind` id를 항목에 잇는다.
+///
+/// 스키마 순서대로 객체를 먼저, 그 스키마의 routine을 다음에 넣고 같은 id는 먼저 넣은 항목을
+/// 지킨다. 그래서 문서를 앞에서부터 훑어 처음 일치한 항목을 고르던 때와 같은 항목이 나온다.
+fn structure_entries(document: &source::CatalogDocument) -> BTreeMap<String, Structure<'_>> {
+    let mut entries = BTreeMap::new();
+    for schema in &document.schemas {
+        for object in &schema.objects {
+            #[cfg(test)]
+            work::visited(1);
+            let id = VertexId::object(&schema.name, &object.name);
+            entries
+                .entry(id.as_str().to_owned())
+                .or_insert(Structure::Object(object));
+        }
+        for routine in &schema.routines {
+            #[cfg(test)]
+            work::visited(1);
+            let base = VertexId::routine(
+                &schema.name,
+                routine.member_of.as_deref(),
+                &routine.name,
+                routine.signature.as_deref(),
+            );
+            let renamed = format!("{}@{}", base.as_str(), routine.kind);
+            entries
+                .entry(base.as_str().to_owned())
+                .or_insert(Structure::Routine(routine));
+            entries
+                .entry(renamed)
+                .or_insert(Structure::Routine(routine));
+        }
+    }
+    entries
 }
 
 fn indexes_detail(indexes: &source::diff::CollectionDelta<source::document::IndexDoc>) -> Value {
@@ -706,9 +758,188 @@ fn report_has_safety_gap(report: &schemagraph_analysis::review::ReviewReport) ->
         || !report.complete
 }
 
+/// 테스트가 구조 상세 작업량을 시간 대신 횟수로 확인하게 한다.
+///
+/// 이차 시간 회귀는 작은 입력에서 시간으로 잡히지 않고, 큰 입력의 시간 단언은 공유
+/// 기계에서 불안정하다. 테스트마다 스레드가 따로라 thread_local이면 서로 섞이지 않는다.
+#[cfg(test)]
+mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static VISITED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// 구조 상세를 찾으며 들여다본 문서 항목(object·routine) 수를 더한다.
+    pub(super) fn visited(count: usize) {
+        VISITED.with(|visited| visited.set(visited.get() + count));
+    }
+
+    /// 지금까지 센 문서 항목 방문 수를 돌려주고 0으로 되돌린다.
+    pub(super) fn take_visited() -> usize {
+        VISITED.with(Cell::take)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 테이블 `tables`개와 signature 있는 함수 `functions`개를 담은 스키마 하나.
+    fn bulk_document(tables: usize, functions: usize) -> source::CatalogDocument {
+        let objects: Vec<_> = (0..tables)
+            .map(|t| json!({"name":format!("t{t}"),"kind":"table","columns":[{"name":"id","data_type":"integer","nullable":false,"ordinal":1,"pk_position":1}],"constraints":[],"indexes":[],"triggers":[]}))
+            .collect();
+        let routines: Vec<_> = (0..functions)
+            .map(|f| json!({"name":format!("f{f}"),"kind":"function","signature":"integer","language":"sql","body":"SELECT 1"}))
+            .collect();
+        serde_json::from_value(json!({
+            "version":1,"reader":"test","dialect":"postgres","limitations":[],
+            "schemas":[{"name":"app","objects":objects,"routines":routines}]
+        }))
+        .unwrap()
+    }
+
+    /// 색인 도입 전의 구조 상세 — 항목마다 문서를 앞에서부터 훑는다.
+    fn linear_structure_detail(
+        document: &source::CatalogDocument,
+        graph: &Graph,
+        id: &str,
+    ) -> Value {
+        for schema in &document.schemas {
+            for object in &schema.objects {
+                if VertexId::object(&schema.name, &object.name).as_str() == id {
+                    return json!({
+                        "id": id,
+                        "kind": object.kind,
+                        "bodyHash": body_hash(graph, id, None),
+                        "columns": &object.columns,
+                        "constraints": &object.constraints,
+                        "indexes": object.indexes.iter().map(index_detail).collect::<Vec<_>>(),
+                        "triggers": object.triggers.iter().map(trigger_detail).collect::<Vec<_>>(),
+                    });
+                }
+            }
+            for routine in &schema.routines {
+                let base = VertexId::routine(
+                    &schema.name,
+                    routine.member_of.as_deref(),
+                    &routine.name,
+                    routine.signature.as_deref(),
+                );
+                let candidate = base.as_str();
+                let renamed = format!("{candidate}@{}", routine.kind);
+                if id != candidate && id != renamed {
+                    continue;
+                }
+                return json!({
+                    "id": id,
+                    "kind": routine.kind,
+                    "language": routine.language,
+                    "signature": routine.signature,
+                    "memberOf": routine.member_of,
+                    "source": routine.source,
+                    "bodyHash": body_hash(graph, id, Some(&routine.kind)),
+                });
+            }
+        }
+        json!({"id": id})
+    }
+
+    #[test]
+    fn indexed_structure_details_match_the_first_linear_match() {
+        // 같은 id의 객체와 routine, `@kind` 분리 id, overload, 패키지 멤버, 알 수 없는 kind,
+        // 같은 이름의 스키마 두 개, escape가 필요한 이름을 한 문서에 섞는다.
+        let document: source::CatalogDocument = serde_json::from_value(json!({
+            "version": 1, "reader": "test", "dialect": "oracle", "limitations": [],
+            "schemas": [
+                {"name": "s", "objects": [
+                    {"name": "f", "kind": "table", "columns": [{"name":"id","data_type":"integer","nullable":false,"ordinal":1,"pk_position":1}], "constraints": [], "indexes": [{"name":"f_idx","unique":true,"columns":["id"]}], "triggers": [{"name":"f_trg","body":"BEGIN NULL; END;"}]},
+                    {"name": "v", "kind": "view", "columns": [], "constraints": [], "indexes": [], "triggers": [], "body": "SELECT 1"},
+                    {"name": "a.b", "kind": "table", "columns": [], "constraints": [], "indexes": [], "triggers": []}
+                ], "routines": [
+                    {"name": "f", "kind": "function", "language": "sql", "body": "SELECT 1"},
+                    {"name": "f", "kind": "function", "signature": "integer", "language": "sql", "body": "SELECT 2"},
+                    {"name": "f", "kind": "procedure", "language": "plsql", "body": "BEGIN NULL; END;"},
+                    {"name": "pkg", "kind": "package", "language": "plsql"},
+                    {"name": "m", "kind": "procedure", "member_of": "pkg", "language": "plsql", "body": "BEGIN NULL; END;"},
+                    {"name": "agg", "kind": "aggregate", "language": "sql"},
+                    {"name": "dup", "kind": "function", "language": "sql", "body": "SELECT 3"},
+                    {"name": "dup", "kind": "function", "language": "plpgsql", "body": "SELECT 4"}
+                ]},
+                {"name": "s", "objects": [
+                    {"name": "late", "kind": "table", "columns": [], "constraints": [], "indexes": [], "triggers": []},
+                    {"name": "dup", "kind": "table", "columns": [], "constraints": [], "indexes": [], "triggers": []}
+                ], "routines": [
+                    {"name": "f", "kind": "function", "language": "plpgsql", "body": "SELECT 5"}
+                ]},
+                {"name": "o", "objects": [
+                    {"name": "f", "kind": "table", "columns": [], "constraints": [], "indexes": [], "triggers": []}
+                ], "routines": []}
+            ]
+        }))
+        .unwrap();
+        let graph = super::super::analyze_document(&document, false);
+        let structures = Structures::new(&document);
+        let mut ids: Vec<String> = structure_entries(&document).into_keys().collect();
+        ids.extend(
+            [
+                "s.nope",
+                "",
+                "s.f@table",
+                "s.t@function",
+                "o.f@function",
+                "s.dup@table",
+            ]
+            .map(str::to_owned),
+        );
+        for id in &ids {
+            assert_eq!(
+                structures.detail(&graph, id),
+                linear_structure_detail(&document, &graph, id),
+                "{id}"
+            );
+        }
+        // 객체가 같은 id의 routine보다, 앞 스키마의 항목이 뒤 스키마의 항목보다 먼저다.
+        assert_eq!(structures.detail(&graph, "s.f")["kind"], "table");
+        assert_eq!(structures.detail(&graph, "s.f@function")["language"], "sql");
+        assert_eq!(structures.detail(&graph, "s.dup")["language"], "sql");
+        assert_eq!(
+            structures.detail(&graph, "s.agg@aggregate")["kind"],
+            "aggregate"
+        );
+    }
+
+    #[test]
+    fn bulk_added_and_removed_structure_details_visit_each_document_entry_once() {
+        let (empty, full) = (bulk_document(0, 0), bulk_document(200, 50));
+        for (old, new) in [(&empty, &full), (&full, &empty)] {
+            let before = super::super::analyze_document(old, false);
+            let after = super::super::analyze_document(new, false);
+            let mut changes = Changes {
+                before: &before,
+                after: &after,
+                items: vec![],
+                details: BTreeMap::new(),
+                notes: vec![],
+            };
+            work::take_visited();
+            changes
+                .collect(&source::diff::diff_documents(old, new), old, new)
+                .unwrap();
+            let visited = work::take_visited();
+            assert_eq!(changes.items.len(), 250, "{:?}", changes.notes);
+            assert!(changes
+                .items
+                .iter()
+                .all(|change| changes.details[change]["kind"].is_string()));
+            // 항목마다 문서를 처음부터 훑으면 변경 수 × 객체 수가 된다.
+            assert!(
+                visited <= 250,
+                "visited {visited} document entries for 250 changes"
+            );
+        }
+    }
     #[test]
     fn catalog_dependency_changes_preserve_overloaded_source_identity() {
         let old:source::CatalogDocument=serde_json::from_value(serde_json::json!({"version":1,"reader":"test","dialect":"postgres","limitations":[],"schemas":[{"name":"app","objects":[{"name":"t","kind":"table","columns":[],"constraints":[],"indexes":[],"triggers":[]}],"routines":[{"name":"f","kind":"function","signature":"integer","language":"sql","body":"SELECT 1"}]}]})).unwrap();
