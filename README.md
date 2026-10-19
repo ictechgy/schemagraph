@@ -98,6 +98,17 @@ also take defaults from libpq variables such as `PGSSLMODE` and
 without forward secrecy, fails the handshake even in the default mode; scan
 it with `sslmode=disable` or `ssl-mode=DISABLED`.
 
+When a catalog is read over an unencrypted connection to a host other than a
+Unix socket or a loopback address (`127.0.0.0/8`, `::1`, or `localhost`), the
+catalog document and graph record a `connection-not-encrypted:` limitation.
+For such a host, `sslmode=disable`, `sslmode=allow`, and `ssl-mode=DISABLED`
+always record it. In the default mode the reader asks the server whether the
+session uses TLS (`pg_stat_ssl`, `Ssl_cipher`); if the server cannot answer,
+the limitation says that encryption could not be confirmed. Behind a
+connection pooler or proxy, that answer describes the pooler's connection to
+the server, so use a verify mode when the connection must be encrypted. The
+limitation does not change `catalog_complete`.
+
 The JDBC baseline collects schemas, tables, columns, keys, indexes, and
 routine metadata exposed by the driver. Body and usage collection depend on
 the database dialect, permissions, and available catalogs. Collection gaps

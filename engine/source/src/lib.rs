@@ -16,6 +16,7 @@ pub mod ndjson;
 pub mod postgres;
 pub mod sql_files;
 pub mod sqlite;
+mod transport;
 
 pub use document::CatalogDocument;
 
