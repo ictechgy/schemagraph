@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // outputTarget — 연결 전에 정한 출력 방식이다. 이때는 아무것도 쓰지 않는다.
@@ -32,13 +33,32 @@ type outputTarget struct {
 // DB를 비운 뒤 빈 DB를 catalog_complete=true인 빈 카탈로그로 냈다.
 var sqliteSourceAliasError = errors.New("output must differ from the SQLite database and its -wal/-shm files; choose another -o path")
 
-// prepareFileOutput — '-'가 아닌 -o를 연결 전에 해석하고 SQLite 원본 별칭을 거절한다.
+// prepareFileOutput — '-'가 아닌 -o를 연결 전에 해석하고 SQLite 원본 별칭을 거절한 뒤, 교체에 쓸
+// 임시 파일을 만들 수 있는지 확인한다.
 func prepareFileOutput(spec connectionSpec, output string) (outputTarget, error) {
 	target, err := prepareOutput(output)
 	if err != nil {
 		return outputTarget{}, err
 	}
-	return target, checkOutputSource(spec, target)
+	if err := checkOutputSource(spec, target); err != nil {
+		return outputTarget{}, err
+	}
+	return target, checkStaging(target)
+}
+
+// checkStaging — 교체할 출력이면 연결 전에 같은 디렉터리에 임시 파일을 만들었다 지운다. 디렉터리
+// 쓰기 권한이나 읽기 전용 파일 시스템 때문에 임시 파일을 만들 수 없으면 수집을 다 마친 뒤가 아니라
+// 연결 전에 알린다. 제자리 쓰기 대상은 임시 파일을 쓰지 않는다.
+func checkStaging(target outputTarget) error {
+	if target.inPlace {
+		return nil
+	}
+	file, err := createStagingFile(target.path)
+	if err != nil {
+		return fmt.Errorf("cannot create a temporary file next to the output (%w); "+
+			"the output directory must be writable because the document is renamed into place", err)
+	}
+	return errors.Join(file.Close(), os.Remove(file.Name()))
 }
 
 // prepareOutput — 출력 경로의 쓰기 방식을 정한다. 기존 파일이 쓰기 불가면 제자리 쓰기가
@@ -210,9 +230,29 @@ func openOutput(target outputTarget) (*stagedOutput, error) {
 	return output, nil
 }
 
+// stagingNameLimit — 임시 파일 이름에 싣는 대상 이름의 최대 바이트 수다. 임시 이름은 대상 이름에
+// "."와 ".tmp-<임의 문자 13자 이하>"를 더하므로, 대상 이름을 통째로 쓰면 이름 길이 상한(NAME_MAX,
+// 보통 255바이트) 근처의 -o가 수집을 다 마친 뒤 임시 파일을 만들지 못한다. 상한 안이면 대상 이름이
+// 아무리 길어도 임시 이름은 119바이트를 넘지 않는다. Kotlin STAGING_NAME_LIMIT과 같다.
+const stagingNameLimit = 100
+
+// stagingPrefix — 대상 옆 숨은 임시 파일의 경로 접두다. 대상 이름은 앞 stagingNameLimit바이트까지
+// UTF-8 글자 경계에서 자른다. 어느 출력의 임시 파일인지 알아볼 수 있을 만큼만 남긴다.
+func stagingPrefix(target string) string {
+	name := filepath.Base(target)
+	if len(name) > stagingNameLimit {
+		cut := stagingNameLimit
+		for cut > 0 && !utf8.RuneStart(name[cut]) {
+			cut--
+		}
+		name = name[:cut]
+	}
+	return filepath.Join(filepath.Dir(target), "."+name+".tmp-")
+}
+
 // createStagingFile — 대상 옆에 숨은 임시 파일을 만든다. 같은 디렉터리라 rename이 원자적이다.
 func createStagingFile(target string) (*os.File, error) {
-	prefix := filepath.Join(filepath.Dir(target), "."+filepath.Base(target)+".tmp-")
+	prefix := stagingPrefix(target)
 	for range 100 {
 		file, err := os.OpenFile(prefix+strconv.FormatUint(rand.Uint64(), 36), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 		if !errors.Is(err, fs.ErrExist) {

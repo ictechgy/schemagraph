@@ -175,13 +175,67 @@ internal fun writeOutput(target: OutputTarget, write: (BufferedWriter) -> Unit) 
 }
 
 /**
+ * 교체할 출력이면 연결 전에 같은 디렉터리에 임시 파일을 만들었다 지운다. 디렉터리 쓰기 권한이나
+ * 읽기 전용 파일 시스템 때문에 임시 파일을 만들 수 없으면 수집을 다 마친 뒤가 아니라 연결 전에
+ * 알린다. 제자리 쓰기 대상은 임시 파일을 쓰지 않는다. Go checkStaging과 같다.
+ */
+internal fun checkStaging(target: OutputTarget) {
+    if (target.inPlace) return
+    val (temporary, channel) = try {
+        createStagingFile(target.path)
+    } catch (error: IOException) {
+        throw IOException(
+            "cannot create a temporary file next to the output ($error); " +
+                "the output directory must be writable because the document is renamed into place",
+            error,
+        )
+    }
+    try {
+        channel.close()
+    } finally {
+        Files.deleteIfExists(temporary)
+    }
+}
+
+/**
+ * 임시 파일 이름에 싣는 대상 이름의 최대 UTF-8 바이트 수. 임시 이름은 대상 이름에 "."와
+ * ".tmp-<UUID 36자>"를 더하므로, 대상 이름을 통째로 쓰면 이름 길이 상한(NAME_MAX, 보통 255바이트)
+ * 근처의 -o가 수집을 다 마친 뒤 임시 파일을 만들지 못한다. 상한 안이면 대상 이름이 아무리 길어도
+ * 임시 이름은 142바이트를 넘지 않는다. Go stagingNameLimit과 같다.
+ */
+private const val STAGING_NAME_LIMIT = 100
+
+/** 대상 옆 숨은 임시 파일 이름의 접두. 대상 이름은 UTF-8 [STAGING_NAME_LIMIT]바이트 안에서 글자 경계로 자른다. */
+internal fun stagingPrefix(target: Path): String {
+    val name = target.fileName.toString()
+    var bytes = 0
+    var end = 0
+    while (end < name.length) {
+        val codePoint = name.codePointAt(end)
+        bytes += utf8Width(codePoint)
+        if (bytes > STAGING_NAME_LIMIT) break
+        end += Character.charCount(codePoint)
+    }
+    return ".${name.substring(0, end)}.tmp-"
+}
+
+/** 코드 포인트 하나의 UTF-8 바이트 수. */
+private fun utf8Width(codePoint: Int): Int = when {
+    codePoint < 0x80 -> 1
+    codePoint < 0x800 -> 2
+    codePoint < 0x10000 -> 3
+    else -> 4
+}
+
+/**
  * 대상 옆에 숨은 임시 파일을 만든다. 같은 디렉터리라 rename이 원자적이다. 권한을 지정하지 않아
  * 지금의 FileOutputStream처럼 0666&~umask로 만든다(Files.createTempFile은 0600이다).
  */
 private fun createStagingFile(target: Path): Pair<Path, FileChannel> {
+    val prefix = stagingPrefix(target)
     var collision: FileAlreadyExistsException? = null
     repeat(100) {
-        val candidate = target.resolveSibling(".${target.fileName}.tmp-${UUID.randomUUID()}")
+        val candidate = target.resolveSibling("$prefix${UUID.randomUUID()}")
         try {
             return candidate to FileChannel.open(candidate, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
         } catch (error: FileAlreadyExistsException) {
@@ -189,5 +243,5 @@ private fun createStagingFile(target: Path): Pair<Path, FileChannel> {
             collision = error
         }
     }
-    throw IOException("cannot create a temporary file next to $target; remove stale .${target.fileName}.tmp-* files", collision)
+    throw IOException("cannot create a temporary file next to $target; remove stale $prefix* files", collision)
 }

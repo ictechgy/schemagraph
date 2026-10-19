@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -301,6 +303,72 @@ func TestNonRegularOutputsAreWrittenInPlace(t *testing.T) {
 		t.Fatal("writing a document over a directory succeeded")
 	}
 	assertEntries(t, directory)
+}
+
+// 임시 파일 이름이 대상 이름을 통째로 담으면, 이름 길이 상한(255바이트) 근처의 -o는 수집을 다 마친 뒤
+// 임시 파일을 만들지 못해 실패했다. 제자리에 쓰던 때는 성공하던 출력이다. 상한 안의 이름은 연결 전
+// 검사와 교체를 모두 통과하고 임시 파일을 남기지 않아야 한다. Kotlin OutputFileTest와 같은 길이다.
+func TestOutputNamesNearTheNameLimitAreReplaced(t *testing.T) {
+	for _, length := range []int{213, 214, 236, 237, 255} {
+		directory := t.TempDir()
+		name := strings.Repeat("c", length-len(".json")) + ".json"
+		path := filepath.Join(directory, name)
+		target, err := prepareFileOutput(connectionSpec{}, path)
+		if err != nil {
+			t.Fatalf("%d-byte name was rejected before collection: %v", length, err)
+		}
+		if err := writeDocument(target, []byte("next\n")); err != nil {
+			t.Fatalf("%d-byte name failed after collection: %v", length, err)
+		}
+		if got := string(readOutput(t, path)); got != "next\n" {
+			t.Fatalf("%d-byte name contents = %q", length, got)
+		}
+		assertEntries(t, directory, name)
+	}
+}
+
+// 임시 파일 접두는 대상 이름의 앞 100바이트까지를 UTF-8 글자 경계에서 자른다. 글자 중간을 자르면
+// 잘못된 UTF-8 이름이 된다. 짧은 이름은 그대로 쓴다.
+func TestStagingPrefixKeepsWholeCharactersWithinTheLimit(t *testing.T) {
+	name := strings.Repeat("가", 85) // 255바이트
+	kept := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(stagingPrefix(filepath.Join("out", name))), "."), ".tmp-")
+	if !utf8.ValidString(kept) || len(kept) != 99 || !strings.HasPrefix(name, kept) {
+		t.Fatalf("staging prefix kept %q (%d bytes)", kept, len(kept))
+	}
+	if got := stagingPrefix(filepath.Join("out", "catalog.json")); got != filepath.Join("out", ".catalog.json.tmp-") {
+		t.Fatalf("short name prefix = %q", got)
+	}
+}
+
+// rename 교체는 디렉터리에 임시 파일을 만들어야 한다. 그럴 수 없으면 수집을 다 마친 뒤가 아니라 연결
+// 전(prepareFileOutput)에 실패해야 하고, 기존 파일과 디렉터리를 그대로 둬야 한다.
+func TestUnwritableOutputDirectoryFailsBeforeCollection(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can create files in read-only directories")
+	}
+	directory := t.TempDir()
+	existing := filepath.Join(directory, "existing.json")
+	if err := os.WriteFile(existing, []byte("previous\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	// t.TempDir의 삭제보다 먼저 돌아 권한을 되돌린다(Cleanup은 등록 역순이다).
+	t.Cleanup(func() {
+		if err := os.Chmod(directory, 0o755); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, path := range []string{filepath.Join(directory, "fresh.json"), existing} {
+		if _, err := prepareFileOutput(connectionSpec{}, path); !errors.Is(err, fs.ErrPermission) {
+			t.Fatalf("-o %s in a read-only directory was accepted before collection: %v", filepath.Base(path), err)
+		}
+	}
+	if got := string(readOutput(t, existing)); got != "previous\n" {
+		t.Fatalf("contents = %q", got)
+	}
+	assertEntries(t, directory, "existing.json")
 }
 
 // 제자리 쓰기는 읽기 전용 파일에서 실패했다. rename은 파일 권한 없이도 바꿀 수 있으므로 같은

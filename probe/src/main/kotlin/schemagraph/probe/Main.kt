@@ -111,7 +111,7 @@ private fun probe(args: Array<String>, stderr: PrintStream): Int? {
     return null
 }
 
-/** '-'가 아닌 -o를 연결 전에 해석하고 SQLite 원본 별칭을 거절한다. */
+/** '-'가 아닌 -o를 연결 전에 해석하고 SQLite 원본 별칭을 거절한 뒤, 교체에 쓸 임시 파일을 만들 수 있는지 본다. */
 private fun fileOutput(output: String, url: String, dialect: String): OutputTarget {
     val (target, aliasError) = try {
         val prepared = prepareOutput(output)
@@ -122,6 +122,11 @@ private fun fileOutput(output: String, url: String, dialect: String): OutputTarg
         fatal("invalid output path: ${error.reason}; check the path")
     }
     aliasError?.let { fatal("invalid output path: $it") }
+    try {
+        checkStaging(target)
+    } catch (error: IOException) {
+        fatal("invalid output path: ${error.message}")
+    }
     return target
 }
 

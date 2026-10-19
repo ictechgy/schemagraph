@@ -189,6 +189,65 @@ class OutputFileTest {
         assertEquals(emptyList(), entries(directory))
     }
 
+    /** runProbe를 exitProcess 없이 돌려 종료 코드와 stderr를 돌려준다. */
+    private fun probe(vararg args: String): Pair<Int?, String> {
+        val buffer = ByteArrayOutputStream()
+        val code = PrintStream(buffer, true, Charsets.UTF_8).use { runProbe(arrayOf(*args), it) }
+        return code to buffer.toString(Charsets.UTF_8)
+    }
+
+    // 임시 파일 이름이 대상 이름을 통째로 담으면, 이름 길이 상한(255바이트) 근처의 -o는 수집을 다 마친
+    // 뒤 임시 파일을 만들지 못했다. JSON은 잡히지 않은 FileSystemException(exit 1), NDJSON은 추출
+    // 실패(exit 2)였다. 제자리에 쓰던 때는 성공하던 출력이다. probe-go
+    // TestOutputNamesNearTheNameLimitAreReplaced와 같은 길이다.
+    @Test
+    fun outputNamesNearTheNameLimitAreWritten() = withTemporaryDirectory { directory ->
+        val database = directory.resolve("app.db")
+        createSqlite(database)
+        for (length in listOf(213, 214, 236, 237, 255)) {
+            for (format in listOf("json", "ndjson")) {
+                val name = "c".repeat(length - ".$format".length) + ".$format"
+                val output = directory.resolve(name)
+                val (code, stderr) = probe("--url", "jdbc:sqlite:$database", "--format", format, "-o", "$output")
+                assertNull(code, "$length-byte $format name: $stderr")
+                assertTrue(output.readText().contains("\"accounts\""), "$length-byte $format name: ${output.readText()}")
+                Files.delete(output)
+                assertEquals(listOf("app.db"), entries(directory))
+            }
+        }
+    }
+
+    // 임시 파일 접두는 대상 이름의 앞 100바이트까지를 UTF-8 글자 경계에서 자른다. 짧은 이름은 그대로 쓴다.
+    @Test
+    fun stagingPrefixKeepsWholeCharactersWithinTheLimit() {
+        val name = "가".repeat(85) // UTF-8 255바이트
+        val kept = stagingPrefix(Path.of("out", name)).removePrefix(".").removeSuffix(".tmp-")
+        assertEquals("가".repeat(33), kept)
+        assertEquals(".catalog.json.tmp-", stagingPrefix(Path.of("out", "catalog.json")))
+    }
+
+    // rename 교체는 디렉터리에 임시 파일을 만들어야 한다. 그럴 수 없으면 수집을 다 마친 뒤가 아니라 연결
+    // 전에 실패해야 한다. 받아 주는 드라이버가 없는 URL을 써서, 연결까지 갔다면 드라이버 오류가 났을
+    // 것임을 이용해 순서를 본다. 기존 파일과 디렉터리는 그대로다.
+    @Test
+    fun unwritableOutputDirectoryIsRejectedBeforeConnecting() = withTemporaryDirectory { directory ->
+        if (System.getProperty("user.name") == "root") return@withTemporaryDirectory
+        val existing = directory.resolve("existing.json")
+        existing.writeText("previous\n")
+        Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("r-xr-xr-x"))
+        try {
+            for (output in listOf(directory.resolve("fresh.json"), existing)) {
+                val (code, stderr) = probe("--url", "jdbc:sgnone:catalog", "-o", "$output")
+                assertEquals(2, code, stderr)
+                assertTrue("invalid output path" in stderr && "must be writable" in stderr, stderr)
+            }
+            assertEquals("previous\n", existing.readText())
+            assertEquals(listOf("existing.json"), entries(directory))
+        } finally {
+            Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("rwx------"))
+        }
+    }
+
     // 제자리 쓰기는 읽기 전용 파일에서 실패했다. rename은 파일 권한 없이도 바꿀 수 있으므로 같은
     // 검사를 먼저 해서 보호된 스냅샷을 바꾸지 않는다.
     @Test
