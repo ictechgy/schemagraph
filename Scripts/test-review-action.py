@@ -10,7 +10,22 @@ import tempfile
 import time
 import unittest
 
-RUNNER = Path(__file__).with_name('run-review-action.py')
+RUNNER = Path(__file__).resolve().with_name('run-review-action.py')
+# 기본 소스 빌드가 cargo·rustup을 실행해야 하는 신뢰 위치(action checkout의 engine)다.
+ACTION_ENGINE = RUNNER.parents[1] / 'engine'
+# PATH 맨 앞에 두는 가짜 Rust 도구다. 실행 위치와 인자를 기록하고 빌드 산출물만 흉내 내므로
+# 실제 툴체인 설치나 네트워크 없이 기본 소스 빌드 경로를 검사할 수 있다.
+TOOL_STUB = '''#!{python}
+import json, os, pathlib, shutil, sys
+tool, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
+with open(os.environ['SG_TEST_TOOLS'], 'a') as out: out.write(json.dumps({{'tool': tool, 'cwd': os.getcwd(), 'args': args}})+'\\n')
+if tool == 'cargo' and args[:1] == ['--version']: print(os.environ['SG_TEST_CARGO_VERSION'])
+elif tool == 'cargo':
+    args = args[1:] if args[0].startswith('+') else args
+    target = pathlib.Path(args[args.index('--target-dir')+1])/'release'/'schemagraph'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(os.environ['SG_TEST_ENGINE'], target)
+'''
 
 
 class ReviewActionTests(unittest.TestCase):
@@ -53,11 +68,60 @@ raise SystemExit(int(os.environ.get('SG_TEST_EXIT', '0')))
             self.env.pop(key, None)
 
     def run_action(self, **values):
+        # composite 단계는 working-directory 없이 GITHUB_WORKSPACE를 cwd로 실행된다.
         return subprocess.run([sys.executable, str(RUNNER)], env={**self.env, **values},
-                              capture_output=True, text=True, timeout=20)
+                              cwd=self.workspace, capture_output=True, text=True, timeout=20)
 
     def outputs(self):
         return dict(line.split('=', 1) for line in (self.root/'outputs').read_text().splitlines())
+
+    def use_source_build(self, cargo_version='cargo 1.96.0 (fake)'):
+        """engine-path 없는 기본 경로를 타게 하고, 리뷰 대상 저장소가 심을 수 있는 설정을 둔다."""
+        tools = self.root/'toolchain'
+        tools.mkdir()
+        for name in ('cargo', 'rustup'):
+            (tools/name).write_text(TOOL_STUB.format(python=sys.executable))
+            (tools/name).chmod(0o755)
+        # 실제 cargo·rustup은 cwd에서 위로 올라가며 이 파일들을 찾아 wrapper나 대체 툴체인을 실행한다.
+        (self.workspace/'.cargo').mkdir()
+        (self.workspace/'.cargo/config.toml').write_text('[build]\nrustc-wrapper = "./wrapper.sh"\n')
+        (self.workspace/'rust-toolchain.toml').write_text('[toolchain]\npath = "/workspace/toolchain"\n')
+        del self.env['SG_REVIEW_ENGINE']
+        self.env.update(PATH=str(tools)+os.pathsep+self.env.get('PATH', ''), SG_TEST_TOOLS=str(self.root/'tools'),
+                        SG_TEST_ENGINE=str(self.engine), SG_TEST_CARGO_VERSION=cargo_version)
+
+    def tool_calls(self):
+        return [json.loads(line) for line in (self.root/'tools').read_text().splitlines()]
+
+    def assert_tools_ran_in_action_source(self, expected):
+        """빌드·툴체인 명령이 워크스페이스 설정을 탐색하지 않는 action 소스에서 실행됐는지 본다."""
+        calls = self.tool_calls()
+        self.assertEqual([call['tool'] for call in calls], expected)
+        for call in calls:
+            cwd = Path(call['cwd']).resolve()
+            self.assertFalse(cwd.is_relative_to(self.workspace), call)
+            self.assertEqual(cwd, ACTION_ENGINE, call)
+
+    def test_source_build_does_not_run_in_the_workspace(self):
+        self.use_source_build()
+        result = self.run_action()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_tools_ran_in_action_source(['cargo', 'cargo'])
+
+    def test_toolchain_install_does_not_run_in_the_workspace(self):
+        self.use_source_build(cargo_version='cargo 1.95.0 (fake)')
+        result = self.run_action()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_tools_ran_in_action_source(['cargo', 'rustup', 'cargo'])
+        self.assertEqual(self.tool_calls()[-1]['args'][:2], ['+1.96.0', 'build'])
+
+    def test_workspace_output_directory_is_not_the_build_cwd(self):
+        self.use_source_build()
+        result = self.run_action(SG_REVIEW_OUTPUT='reports/review')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_tools_ran_in_action_source(['cargo', 'cargo'])
+        build = self.tool_calls()[-1]['args']
+        self.assertTrue(Path(build[build.index('--target-dir')+1]).is_relative_to(self.workspace/'reports/review'))
 
     def test_reports_and_strict_decision_are_preserved_with_literal_paths(self):
         result = self.run_action(SG_TEST_EXIT='1')

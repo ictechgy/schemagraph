@@ -69,6 +69,7 @@ func (h *harvester) streamSQLite(stream *ndjsonStreamWriter) error {
 }
 
 // sqliteSchemas — database_list의 attached 순서를 정렬해 결과를 결정적으로 만든다.
+// 요청한 이름이 attached 목록에 없으면(--schema 오타 포함) 미완전으로 신고한다.
 func (h *harvester) sqliteSchemas() []string {
 	set := map[string]bool{}
 	h.bestEffort("sqlite schemas", "PRAGMA database_list", func(rows *sql.Rows) error {
@@ -87,6 +88,7 @@ func (h *harvester) sqliteSchemas() []string {
 		out = append(out, name)
 	}
 	sort.Strings(out)
+	h.checkRequestedSchemas(out)
 	return out
 }
 

@@ -300,7 +300,7 @@ def role_psql(psql, role, database):
 def restricted_case(engine, url, psql, work, env, version, complete):
     """권한 없는 관계가 있는 역할의 facts가 보인 것만 선언하고 coverage 공백을 싣는지 본다."""
     admin = role_psql(psql, 'postgres', 'postgres')
-    ACCURACY.run(admin+['-qc', 'CREATE ROLE collector LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT'], env=env)
+    ACCURACY.create_login_role(admin, 'collector', 'NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT', env)
     ACCURACY.run(psql+['-qc', 'GRANT REFERENCES ON public.users TO collector'], env=env)
     catalog = work/'restricted.catalog.json'
     # 스키마를 한정하지 않는다 — USAGE가 없는 audit 스키마의 관계가 새지 않는지도 본다.

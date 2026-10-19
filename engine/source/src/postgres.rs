@@ -142,6 +142,11 @@ async fn read_schema(
     let metadata_start = limitations.len();
     let mut objects = read_objects(pool, schema).await?;
     for obj in &mut objects {
+        // 시퀀스는 컬럼(information_schema·MV 분기 모두 제외)·제약·인덱스·트리거 카탈로그에
+        // 행이 없다 — 항상 빈 결과를 받으려고 객체마다 네 번 왕복하지 않는다.
+        if obj.kind == "sequence" {
+            continue;
+        }
         obj.columns = read_columns(pool, schema, &obj.name).await?;
         obj.constraints = read_constraints(pool, schema, &obj.name).await?;
         apply_primary_key_positions(obj);
@@ -530,13 +535,23 @@ fn apply_primary_key_positions(object: &mut ObjectDoc) {
 
 /// PK·FK·UNIQUE·CHECK 제약. 컬럼 대응은 pg_constraint의 conkey/confkey를
 /// ordinality로 풀어 member 레벨까지 정확히 만든다.
+///
+/// 번역은 같은 질의의 ARRAY 하위 질의가 한다. 제약마다 attnum 번역 질의를 따로 보내면
+/// 왕복이 PK·UNIQUE마다 한 번, FK마다 두 번 는다(Go 프로브도 한 질의로 읽는다).
+/// ARRAY(하위 질의)는 행이 없으면 NULL이 아니라 빈 배열이다.
 async fn read_constraints(
     pool: &PgPool,
     schema: &str,
     table: &str,
 ) -> Result<Vec<ConstraintDoc>, SourceError> {
     let rows = sqlx::query(
-        "SELECT con.conname, con.contype::text AS contype, con.conkey, con.confkey, \
+        "SELECT con.conname, con.contype::text AS contype, \
+                ARRAY(SELECT a.attname::text FROM unnest(con.conkey) WITH ORDINALITY u(attnum, ord) \
+                      JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = u.attnum \
+                      ORDER BY u.ord) AS cols, \
+                ARRAY(SELECT a.attname::text FROM unnest(con.confkey) WITH ORDINALITY u(attnum, ord) \
+                      JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = u.attnum \
+                      ORDER BY u.ord) AS fcols, \
                 frel.relname AS ftable, fn.nspname AS fschema \
          FROM pg_constraint con \
          JOIN pg_class rel ON rel.oid = con.conrelid \
@@ -554,20 +569,14 @@ async fn read_constraints(
     let mut constraints = Vec::new();
     for r in &rows {
         let contype = r.get::<String, _>("contype");
-        let conkey = r.get::<Option<Vec<i16>>, _>("conkey").unwrap_or_default();
-        // attnum 배열을 컬럼명으로 번역한다.
-        let columns = attnames(pool, schema, table, &conkey).await?;
+        let columns = r.get::<Vec<String>, _>("cols");
         let referenced = if contype == "f" {
-            let ftable = r.get::<String, _>("ftable");
-            let fschema = r.get::<Option<String>, _>("fschema");
-            let fkey = r.get::<Option<Vec<i16>>, _>("confkey").unwrap_or_default();
             Some(ReferencedDoc {
-                // 대상 컬럼은 대상 스키마에서 번역해야 한다 — 같은 이름의
+                // 대상 컬럼은 대상 관계(confrelid)에서 번역해야 한다 — 같은 이름의
                 // 테이블이 다른 스키마에 있으면 엉뚱한 컬럼을 가리킨다.
-                columns: attnames(pool, fschema.as_deref().unwrap_or(schema), &ftable, &fkey)
-                    .await?,
-                schema: fschema,
-                table: ftable,
+                columns: r.get::<Vec<String>, _>("fcols"),
+                schema: r.get::<Option<String>, _>("fschema"),
+                table: r.get::<String, _>("ftable"),
             })
         } else {
             None
@@ -585,32 +594,6 @@ async fn read_constraints(
         });
     }
     Ok(constraints)
-}
-
-/// attnum 배열을 컬럼명으로 번역한다 — 한 쿼리로 묶는다.
-async fn attnames(
-    pool: &PgPool,
-    schema: &str,
-    table: &str,
-    attnums: &[i16],
-) -> Result<Vec<String>, SourceError> {
-    if attnums.is_empty() {
-        return Ok(vec![]);
-    }
-    let rows = sqlx::query(
-        "SELECT a.attname, u.ord FROM pg_attribute a \
-         JOIN pg_class rel ON rel.oid = a.attrelid \
-         JOIN pg_namespace n ON n.oid = rel.relnamespace \
-         JOIN unnest($3::int2[]) WITH ORDINALITY u(attnum, ord) ON u.attnum = a.attnum \
-         WHERE n.nspname = $1 AND rel.relname = $2 ORDER BY u.ord",
-    )
-    .bind(schema)
-    .bind(table)
-    .bind(attnums)
-    .fetch_all(pool)
-    .await
-    .map_err(SourceError::Query)?;
-    Ok(rows.iter().map(|r| r.get::<String, _>("attname")).collect())
 }
 
 async fn read_indexes(

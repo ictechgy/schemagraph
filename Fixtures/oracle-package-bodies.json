@@ -1,0 +1,285 @@
+{
+  "cases": [
+    {
+      "body": "PACKAGE BODY order_ops AS\n    /* 인용·주석 안에 실제 멤버와 같은 헤더가 있어도 경계로 취급하지 않는다.\n    PROCEDURE touch(cid IN NUMBER) IS BEGIN UPDATE standalone SET note = 'x'; END;\n    FUNCTION count_all RETURN NUMBER IS BEGIN SELECT id FROM standalone; END;\n    */\n    PROCEDURE touch(cid IN NUMBER) IS\n    BEGIN\n        UPDATE customers SET name = name WHERE id = cid;\n    END touch;\n    FUNCTION count_all RETURN NUMBER IS\n        n NUMBER;\n    BEGIN\n        SELECT COUNT(*) INTO n FROM orders;\n        RETURN n;\n    END count_all;\n    -- 멤버가 패키지 한정 호출(order_ops.count_all)을 하면 멤버 정점으로 해석돼야 한다.\n    PROCEDURE refresh IS\n        n NUMBER;\n    BEGIN\n        n := order_ops.count_all();\n        DECLARE\n            inert_sql VARCHAR2(300) := q'[\n                FUNCTION count_all RETURN NUMBER IS\n                BEGIN\n                    SELECT id FROM standalone;\n                END;]';\n        BEGIN\n            NULL;\n        END;\n        UPDATE tickets SET note = 'refreshed' WHERE id = n;\n    END refresh;\nEND order_ops;",
+      "expected": [
+        {
+          "body": "PROCEDURE touch(cid IN NUMBER) IS\n    BEGIN\n        UPDATE customers SET name = name WHERE id = cid;\n    END touch;"
+        },
+        {
+          "body": "FUNCTION count_all RETURN NUMBER IS\n        n NUMBER;\n    BEGIN\n        SELECT COUNT(*) INTO n FROM orders;\n        RETURN n;\n    END count_all;"
+        },
+        {
+          "body": "PROCEDURE refresh IS\n        n NUMBER;\n    BEGIN\n        n := order_ops.count_all();\n        DECLARE\n            inert_sql VARCHAR2(300) := q'[\n                FUNCTION count_all RETURN NUMBER IS\n                BEGIN\n                    SELECT id FROM standalone;\n                END;]';\n        BEGIN\n            NULL;\n        END;\n        UPDATE tickets SET note = 'refreshed' WHERE id = n;\n    END refresh;"
+        }
+      ],
+      "members": [
+        {
+          "name": "TOUCH",
+          "signature": "number"
+        },
+        {
+          "function": true,
+          "name": "COUNT_ALL"
+        },
+        {
+          "name": "REFRESH"
+        }
+      ],
+      "name": "Oracle fixture order_ops package",
+      "reason": "The body from Fixtures/oracle/basic.sql keeps the member bodies the container fixture checks."
+    },
+    {
+      "body": "PACKAGE BODY util AS\n  PROCEDURE log(msg VARCHAR2, lvl NUMBER) IS\n  BEGIN\n    INSERT INTO debug_log VALUES (msg, lvl);\n  END log;\n  PROCEDURE log(msg VARCHAR2) IS\n  BEGIN\n    INSERT INTO audit_log VALUES (msg);\n  END log;\nEND util;",
+      "expected": [
+        {
+          "limitation": "boundary ambiguous (2 headers vs 1 catalog members)"
+        }
+      ],
+      "members": [
+        {
+          "name": "LOG",
+          "signature": "varchar2"
+        }
+      ],
+      "name": "private overload defined before the public member",
+      "reason": "The body has two LOG headers for one catalog member; the private overload must not take the public member's body."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE work(a VARCHAR2) IS\n  BEGIN\n    INSERT INTO text_log VALUES (a);\n  END work;\n  PROCEDURE work(a NUMBER) IS\n  BEGIN\n    INSERT INTO number_log VALUES (a);\n  END work;\nEND p;",
+      "expected": [
+        {
+          "limitation": "boundary ambiguous (overload headers do not match catalog signatures)"
+        },
+        {
+          "limitation": "boundary ambiguous (overload headers do not match catalog signatures)"
+        }
+      ],
+      "members": [
+        {
+          "name": "WORK",
+          "signature": "number"
+        },
+        {
+          "name": "WORK",
+          "signature": "varchar2"
+        }
+      ],
+      "name": "public overloads defined in reverse specification order",
+      "reason": "Header order differs from SUBPROGRAM_ID order, so positional pairing would swap the bodies."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE work(a IN NUMBER, b IN OUT NOCOPY VARCHAR2) IS\n  BEGIN\n    INSERT INTO number_log VALUES (a);\n  END work;\n  PROCEDURE work(a VARCHAR2 DEFAULT 'none') IS\n  BEGIN\n    INSERT INTO text_log VALUES (a);\n  END work;\n  FUNCTION work(a DATE := SYSDATE) RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END work;\nEND p;",
+      "expected": [
+        {
+          "body": "PROCEDURE work(a IN NUMBER, b IN OUT NOCOPY VARCHAR2) IS\n  BEGIN\n    INSERT INTO number_log VALUES (a);\n  END work;"
+        },
+        {
+          "body": "PROCEDURE work(a VARCHAR2 DEFAULT 'none') IS\n  BEGIN\n    INSERT INTO text_log VALUES (a);\n  END work;"
+        },
+        {
+          "body": "FUNCTION work(a DATE := SYSDATE) RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END work;"
+        }
+      ],
+      "members": [
+        {
+          "name": "WORK",
+          "signature": "number, varchar2"
+        },
+        {
+          "name": "WORK",
+          "signature": "varchar2"
+        },
+        {
+          "function": true,
+          "name": "WORK",
+          "signature": "date"
+        }
+      ],
+      "name": "public overloads defined in specification order",
+      "reason": "Parameter modes, NOCOPY and defaults are not part of the compared type list."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE work(b NUMBER) IS\n  BEGIN\n    INSERT INTO b_log VALUES (b);\n  END work;\n  PROCEDURE work(a NUMBER) IS\n  BEGIN\n    INSERT INTO a_log VALUES (a);\n  END work;\nEND p;",
+      "expected": [
+        {
+          "limitation": "boundary ambiguous (overloads share a catalog signature)"
+        },
+        {
+          "limitation": "boundary ambiguous (overloads share a catalog signature)"
+        }
+      ],
+      "members": [
+        {
+          "name": "WORK",
+          "signature": "number"
+        },
+        {
+          "name": "WORK",
+          "signature": "number"
+        }
+      ],
+      "name": "overloads that differ only in parameter names",
+      "reason": "Equal type lists cannot confirm the definition order, so the specification-order members must not take each other's bodies."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE b;\n  PROCEDURE a IS\n  BEGIN\n    b;\n    INSERT INTO a_log VALUES (1);\n  END a;\n  PROCEDURE b IS\n  BEGIN\n    INSERT INTO b_tab VALUES (2);\n  END b;\nBEGIN\n  INSERT INTO init_log VALUES (3);\nEND p;",
+      "expected": [
+        {
+          "body": "PROCEDURE a IS\n  BEGIN\n    b;\n    INSERT INTO a_log VALUES (1);\n  END a;"
+        },
+        {
+          "body": "PROCEDURE b IS\n  BEGIN\n    INSERT INTO b_tab VALUES (2);\n  END b;"
+        }
+      ],
+      "members": [
+        {
+          "name": "A"
+        },
+        {
+          "name": "B"
+        }
+      ],
+      "name": "public forward declaration with an initialization block",
+      "reason": "PROCEDURE b; has no body, so it must not absorb a, b and the initialization block."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE a IS\n    PROCEDURE helper;\n    PROCEDURE helper IS\n    BEGIN\n      INSERT INTO helper_log VALUES (0);\n    END helper;\n  BEGIN\n    helper;\n  END a;\n  PROCEDURE b IS\n  BEGIN\n    INSERT INTO b_tab VALUES (2);\n  END b;\nBEGIN\n  INSERT INTO init_log VALUES (3);\nEND p;",
+      "expected": [
+        {
+          "body": "PROCEDURE a IS\n    PROCEDURE helper;\n    PROCEDURE helper IS\n    BEGIN\n      INSERT INTO helper_log VALUES (0);\n    END helper;\n  BEGIN\n    helper;\n  END a;"
+        },
+        {
+          "body": "PROCEDURE b IS\n  BEGIN\n    INSERT INTO b_tab VALUES (2);\n  END b;"
+        }
+      ],
+      "members": [
+        {
+          "name": "A"
+        },
+        {
+          "name": "B"
+        }
+      ],
+      "name": "local forward declaration inside a member",
+      "reason": "A local forward declaration must not close the enclosing member at the package END."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n",
+      "expected": [
+        {
+          "limitation": "패키지 본문에서 멤버 경계를 못 찾음"
+        }
+      ],
+      "members": [
+        {
+          "name": "M"
+        }
+      ],
+      "name": "100000 unterminated nested headers",
+      "reason": "Nesting beyond the depth limit has no certain boundary and must not exhaust the stack.",
+      "repeat": {
+        "count": 100000,
+        "text": "PROCEDURE m IS\n"
+      }
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE a(x NUMBER) IS\n  BEGIN\n    IF x > 0 THEN\n      INSERT INTO a_log VALUES (x);\n    ELSIF x < 0 THEN\n      INSERT INTO a_negative VALUES (x);\n    ELSE\n      NULL;\n    END IF;\n  END a;\n  PROCEDURE b IS\n  BEGIN\n    DELETE FROM b_tab;\n  END b;\nEND p;",
+      "expected": [
+        {
+          "body": "PROCEDURE a(x NUMBER) IS\n  BEGIN\n    IF x > 0 THEN\n      INSERT INTO a_log VALUES (x);\n    ELSIF x < 0 THEN\n      INSERT INTO a_negative VALUES (x);\n    ELSE\n      NULL;\n    END IF;\n  END a;"
+        },
+        {
+          "body": "PROCEDURE b IS\n  BEGIN\n    DELETE FROM b_tab;\n  END b;"
+        }
+      ],
+      "members": [
+        {
+          "name": "A",
+          "signature": "number"
+        },
+        {
+          "name": "B"
+        }
+      ],
+      "name": "IF statement before the next member",
+      "reason": "END IF closes the IF block; counting its IF as a new block made the member swallow b and the package END."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE sweep(n NUMBER) IS\n    i NUMBER := 0;\n  BEGIN\n    FOR r IN (SELECT id FROM sweep_queue) LOOP\n      DELETE FROM sweep_items WHERE id = r.id;\n    END LOOP;\n    WHILE i < n LOOP\n      i := i + 1;\n    end loop;\n    <<outer>>\n    LOOP\n      EXIT outer WHEN i > n;\n      i := i + 1;\n    END LOOP outer;\n  END sweep;\n  FUNCTION total RETURN NUMBER IS\n    t NUMBER;\n  BEGIN\n    SELECT SUM(amount) INTO t FROM ledger;\n    RETURN t;\n  END total;\nEND p;",
+      "expected": [
+        {
+          "body": "PROCEDURE sweep(n NUMBER) IS\n    i NUMBER := 0;\n  BEGIN\n    FOR r IN (SELECT id FROM sweep_queue) LOOP\n      DELETE FROM sweep_items WHERE id = r.id;\n    END LOOP;\n    WHILE i < n LOOP\n      i := i + 1;\n    end loop;\n    <<outer>>\n    LOOP\n      EXIT outer WHEN i > n;\n      i := i + 1;\n    END LOOP outer;\n  END sweep;"
+        },
+        {
+          "body": "FUNCTION total RETURN NUMBER IS\n    t NUMBER;\n  BEGIN\n    SELECT SUM(amount) INTO t FROM ledger;\n    RETURN t;\n  END total;"
+        }
+      ],
+      "members": [
+        {
+          "name": "SWEEP",
+          "signature": "number"
+        },
+        {
+          "function": true,
+          "name": "TOTAL"
+        }
+      ],
+      "name": "FOR, WHILE and labeled loops before the next member",
+      "reason": "END LOOP, a lowercase end loop and END LOOP <label> close their loops without opening new blocks."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  FUNCTION grade(score NUMBER) RETURN VARCHAR2 IS\n    label VARCHAR2(10) := CASE WHEN score IS NULL THEN 'none' END;\n  BEGIN\n    CASE\n      WHEN score >= 90 THEN label := 'A';\n      WHEN score >= 80 THEN label := 'B';\n      ELSE label := 'C';\n    END CASE;\n    SELECT CASE WHEN COUNT(*) > 0 THEN label ELSE 'none' END INTO label FROM grades WHERE grade = label;\n    RETURN CASE label WHEN 'A' THEN 'top' ELSE label END;\n  END grade;\n  PROCEDURE repeat_log(n NUMBER) IS\n  BEGIN\n    FOR i IN 1 .. CASE WHEN n > 0 THEN n ELSE 1 END LOOP\n      INSERT INTO repeat_log_tab VALUES (i);\n    END LOOP;\n    UPDATE repeat_done SET flag = 1;\n  END repeat_log;\n  PROCEDURE after_case IS\n  BEGIN\n    DELETE FROM after_case_tab;\n  END after_case;\nEND p;",
+      "expected": [
+        {
+          "body": "FUNCTION grade(score NUMBER) RETURN VARCHAR2 IS\n    label VARCHAR2(10) := CASE WHEN score IS NULL THEN 'none' END;\n  BEGIN\n    CASE\n      WHEN score >= 90 THEN label := 'A';\n      WHEN score >= 80 THEN label := 'B';\n      ELSE label := 'C';\n    END CASE;\n    SELECT CASE WHEN COUNT(*) > 0 THEN label ELSE 'none' END INTO label FROM grades WHERE grade = label;\n    RETURN CASE label WHEN 'A' THEN 'top' ELSE label END;\n  END grade;"
+        },
+        {
+          "body": "PROCEDURE repeat_log(n NUMBER) IS\n  BEGIN\n    FOR i IN 1 .. CASE WHEN n > 0 THEN n ELSE 1 END LOOP\n      INSERT INTO repeat_log_tab VALUES (i);\n    END LOOP;\n    UPDATE repeat_done SET flag = 1;\n  END repeat_log;"
+        },
+        {
+          "body": "PROCEDURE after_case IS\n  BEGIN\n    DELETE FROM after_case_tab;\n  END after_case;"
+        }
+      ],
+      "members": [
+        {
+          "function": true,
+          "name": "GRADE",
+          "signature": "number"
+        },
+        {
+          "name": "REPEAT_LOG",
+          "signature": "number"
+        },
+        {
+          "name": "AFTER_CASE"
+        }
+      ],
+      "name": "CASE statements and CASE expressions",
+      "reason": "END CASE closes a CASE statement and a CASE expression closes with END alone; the LOOP right after a CASE expression in a FOR range opens the loop."
+    },
+    {
+      "body": "PACKAGE BODY p AS\n  PROCEDURE outer_proc(n NUMBER) IS\n    PROCEDURE helper(m NUMBER) IS\n    BEGIN\n      IF m > 0 THEN\n        INSERT INTO helper_log VALUES (m);\n      END IF;\n    END helper;\n  BEGIN\n    FOR i IN 1 .. n LOOP\n      helper(i);\n    END LOOP;\n  END outer_proc;\n  PROCEDURE after_proc IS\n  BEGIN\n    DELETE FROM after_tab;\n  END after_proc;\nBEGIN\n  IF SYSDATE IS NOT NULL THEN\n    INSERT INTO package_init_log VALUES (1);\n  END IF;\nEND p;",
+      "expected": [
+        {
+          "body": "PROCEDURE outer_proc(n NUMBER) IS\n    PROCEDURE helper(m NUMBER) IS\n    BEGIN\n      IF m > 0 THEN\n        INSERT INTO helper_log VALUES (m);\n      END IF;\n    END helper;\n  BEGIN\n    FOR i IN 1 .. n LOOP\n      helper(i);\n    END LOOP;\n  END outer_proc;"
+        },
+        {
+          "body": "PROCEDURE after_proc IS\n  BEGIN\n    DELETE FROM after_tab;\n  END after_proc;"
+        }
+      ],
+      "members": [
+        {
+          "name": "OUTER_PROC",
+          "signature": "number"
+        },
+        {
+          "name": "AFTER_PROC"
+        }
+      ],
+      "name": "local routine with control statements and an initialization block",
+      "reason": "Control statements inside a local routine and in the initialization block must not move the member boundaries."
+    }
+  ],
+  "description": "Oracle PACKAGE BODY member attribution cases shared by probe-go/package_slices_test.go and probe PackageBodiesTest. Each expected entry is the exact trimmed member body or a substring of the limitation reason; repeat.text is appended repeat.count times to body."
+}

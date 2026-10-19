@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use schemagraph_core::{EdgeKind, Graph, Level, Usage, Vertex, VertexId, VertexKind};
+use schemagraph_core::{Edge, EdgeKind, Graph, Level, Usage, Vertex, VertexId, VertexKind};
 
 mod retention;
 pub use retention::{RetentionPolicy, Suppression};
@@ -265,6 +265,108 @@ fn is_consumer_kind(kind: VertexKind) -> bool {
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// dead 판정이 훑은 인접 간선 수. 테스트 스레드마다 따로 센다.
+    static DEAD_EDGE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// dead 판정이 인접 간선을 훑은 수를 더한다.
+#[cfg(test)]
+fn count_dead_edge_visits(count: usize) {
+    DEAD_EDGE_VISITS.with(|visits| visits.set(visits.get() + count));
+}
+
+/// 현재 테스트 스레드의 dead 인접 간선 방문 수를 돌려주고 0으로 되돌린다.
+#[cfg(test)]
+fn take_dead_edge_visits() -> usize {
+    DEAD_EDGE_VISITS.with(std::cell::Cell::take)
+}
+
+/// dead 후보를 작업 목록으로 전파하는 상태다.
+///
+/// 변화가 없을 때까지 정점 전체를 다시 도는 고정점은 패스마다의 진전이 id 정렬 순서에
+/// 달려, 소비자 id가 의존 대상 id보다 사전식으로 뒤에 오는 view 사슬에서 패스마다 하나만
+/// 확정해 O(정점 × 사슬 길이)가 된다. 그래서 후보가 될 수 있는 정점마다 아직 후보가 아닌
+/// 서로 다른 의존자 수를 세고, 0이 된 정점만 의존 대상에 전파해 O(정점 + 간선)로 같은 최소
+/// 고정점을 구한다. 비소비자·보존·유령 의존자와 순환 구성원은 후보가 되지 않으므로, 그들이
+/// 의존하는 정점은 반복 고정점에서처럼 살아남는다.
+struct DeadPropagation<'g> {
+    /// 아직 후보가 아닌 정점 → 후보가 아닌 서로 다른 의존자 수. 의존자가 있는 정점만 담는다.
+    remaining: BTreeMap<&'g VertexId, usize>,
+    /// 후보로 확정했지만 아직 의존 대상에 전파하지 않은 정점.
+    queue: VecDeque<&'g VertexId>,
+    /// 확정한 후보와 사유.
+    reasons: BTreeMap<VertexId, DeadReason>,
+}
+
+impl<'g> DeadPropagation<'g> {
+    /// 보존되지 않은 소비자 정점의 의존자 수를 세고, 의존자가 없는 정점은 바로 후보로 둔다.
+    fn seed(graph: &'g Graph, protected: &BTreeMap<VertexId, String>) -> Self {
+        let mut state = Self {
+            remaining: BTreeMap::new(),
+            queue: VecDeque::new(),
+            reasons: BTreeMap::new(),
+        };
+        let consumers = graph
+            .vertices()
+            .filter(|v| is_consumer_kind(v.kind) && !protected.contains_key(&v.id));
+        for vertex in consumers {
+            match dependency_ends(graph.incoming(&vertex.id), |edge| &edge.from).len() {
+                0 => state.confirm(&vertex.id, DeadReason::NoDependents),
+                count => {
+                    state.remaining.insert(&vertex.id, count);
+                }
+            }
+        }
+        state
+    }
+
+    /// 후보를 확정하고 전파 대기열에 넣는다.
+    fn confirm(&mut self, id: &'g VertexId, reason: DeadReason) {
+        self.reasons.insert(id.clone(), reason);
+        self.queue.push_back(id);
+    }
+
+    /// 확정한 후보마다 의존 대상의 남은 의존자 수를 한 번씩 줄여 고정점까지 전파한다.
+    fn run(mut self, graph: &'g Graph) -> BTreeMap<VertexId, DeadReason> {
+        while let Some(id) = self.queue.pop_front() {
+            for target in dependency_ends(graph.outgoing(id), |edge| &edge.to) {
+                self.release(target);
+            }
+        }
+        self.reasons
+    }
+
+    /// 의존자 하나가 후보가 됐음을 반영한다. 남은 의존자가 없으면 그 정점도 후보다.
+    fn release(&mut self, target: &'g VertexId) {
+        let Some(count) = self.remaining.get_mut(target) else {
+            return;
+        };
+        // 후보마다 한 번, 서로 다른 대상마다 한 번만 불리므로 처음 센 수보다 많이 줄지 않는다.
+        *count -= 1;
+        if *count == 0 {
+            self.remaining.remove(target);
+            self.confirm(target, DeadReason::AllDependentsDead);
+        }
+    }
+}
+
+/// 의존 간선(`contains`·`inferred` 제외)의 서로 다른 반대쪽 끝이다. 같은 객체가 여러 종류의
+/// 간선으로 이어져도 하나로 센다 — 의존자 수와 전파 횟수가 같은 기준이어야 한다.
+fn dependency_ends<'g>(
+    edges: &'g [Edge],
+    end: impl Fn(&'g Edge) -> &'g VertexId,
+) -> BTreeSet<&'g VertexId> {
+    #[cfg(test)]
+    count_dead_edge_visits(edges.len());
+    edges
+        .iter()
+        .filter(|edge| edge.kind.is_dependency())
+        .map(end)
+        .collect()
+}
+
 /// DB 내부 도달성 기반 dead 후보 판정 — fixpoint.
 ///
 /// 애플리케이션 쿼리는 그래프에 없으므로 "후보"는 "DB 내부 참조 없음"의
@@ -280,46 +382,13 @@ pub fn dead_with_policy(
     policy: &RetentionPolicy,
 ) -> DeadReport {
     let protected = retention::retained(graph, policy);
-    let mut dead_set: BTreeSet<VertexId> = BTreeSet::new();
-    let mut reasons: BTreeMap<VertexId, DeadReason> = BTreeMap::new();
-    loop {
-        let mut changed = false;
-        for v in graph.vertices() {
-            if !is_consumer_kind(v.kind)
-                || dead_set.contains(&v.id)
-                || protected.contains_key(&v.id)
-            {
-                continue;
-            }
-            let dependents: Vec<&VertexId> = graph
-                .incoming(&v.id)
-                .iter()
-                .filter(|e| e.kind.is_dependency())
-                .map(|e| &e.from)
-                .collect();
-            let reason = if dependents.is_empty() {
-                Some(DeadReason::NoDependents)
-            } else if dependents.iter().all(|d| dead_set.contains(*d)) {
-                Some(DeadReason::AllDependentsDead)
-            } else {
-                None
-            };
-            if let Some(r) = reason {
-                dead_set.insert(v.id.clone());
-                reasons.insert(v.id.clone(), r);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let mut candidates: Vec<DeadCandidate> = dead_set
+    let reasons = DeadPropagation::seed(graph, &protected).run(graph);
+    let mut candidates: Vec<DeadCandidate> = reasons
         .iter()
-        .filter_map(|id| {
+        .filter_map(|(id, reason)| {
             graph.vertex(id).map(|v| DeadCandidate {
                 vertex: v.clone(),
-                reason: reasons[id],
+                reason: *reason,
                 usage: graph.usage(id).cloned(),
                 suppression: retention::suppression(id, policy),
             })
@@ -512,29 +581,55 @@ pub struct RulesReport {
     pub limitations: Vec<String>,
 }
 
+/// rules 작업량을 시간 대신 횟수로 확인하게 하는 테스트 전용 계수다.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RulesWork {
+    /// 그래프 간선 목록을 모아 정렬한 횟수.
+    edge_lists: usize,
+    /// 글롭 패턴을 문자 목록으로 준비한 횟수.
+    patterns: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 테스트는 스레드마다 병렬로 돌므로 계수도 스레드마다 따로 둔다.
+    static RULES_WORK: std::cell::Cell<RulesWork> =
+        const { std::cell::Cell::new(RulesWork { edge_lists: 0, patterns: 0 }) };
+}
+
+/// 현재 테스트 스레드의 rules 계수를 갱신한다.
+#[cfg(test)]
+fn count_rules_work(update: impl FnOnce(&mut RulesWork)) {
+    RULES_WORK.with(|work| {
+        let mut value = work.get();
+        update(&mut value);
+        work.set(value);
+    });
+}
+
+/// 현재 테스트 스레드의 rules 계수를 돌려주고 0으로 되돌린다.
+#[cfg(test)]
+fn take_rules_work() -> RulesWork {
+    RULES_WORK.with(std::cell::Cell::take)
+}
+
 /// 모든 규칙을 그래프의 모든 간선에 대조한다.
+///
+/// 의존 간선 목록과 규칙별 글롭 패턴은 한 번씩만 준비한다. 규칙마다 전체 간선을 다시 모아
+/// 정렬하고 간선마다 패턴 문자를 다시 모으면, 큰 그래프의 CI 게이트가 규칙 수에 비례해
+/// 느려진다. 간선은 규칙마다 같은 (from, to, kind) 순서로 돌므로 위반 순서도 그대로다.
 pub fn rules(graph: &Graph, rule_set: &[Rule]) -> RulesReport {
+    #[cfg(test)]
+    count_rules_work(|work| work.edge_lists += 1);
+    let edges: Vec<&Edge> = graph
+        .edges()
+        .into_iter()
+        .filter(|edge| edge.kind.is_dependency())
+        .collect();
     let mut violations = Vec::new();
     for rule in rule_set {
-        for edge in graph.edges() {
-            if !edge.kind.is_dependency() {
-                continue;
-            }
-            if let Some(kinds) = &rule.kinds {
-                if !kinds.contains(&edge.kind) {
-                    continue;
-                }
-            }
-            if glob_match(&rule.from, edge.from.as_str()) && glob_match(&rule.to, edge.to.as_str())
-            {
-                violations.push(RuleViolation {
-                    rule: rule.name.clone(),
-                    from: edge.from.clone(),
-                    to: edge.to.clone(),
-                    kind: edge.kind,
-                });
-            }
-        }
+        push_rule_violations(rule, &edges, &mut violations);
     }
     violations.sort_by(|a, b| {
         a.rule
@@ -546,6 +641,26 @@ pub fn rules(graph: &Graph, rule_set: &[Rule]) -> RulesReport {
         checked: rule_set.len(),
         violations,
         limitations: graph.limitations().to_vec(),
+    }
+}
+
+/// 규칙 하나를 의존 간선 목록에 대조해 위반을 간선 순서대로 더한다.
+fn push_rule_violations(rule: &Rule, edges: &[&Edge], violations: &mut Vec<RuleViolation>) {
+    let (from, to) = (GlobPattern::new(&rule.from), GlobPattern::new(&rule.to));
+    let selected = edges.iter().filter(|edge| {
+        rule.kinds
+            .as_ref()
+            .is_none_or(|kinds| kinds.contains(&edge.kind))
+    });
+    for edge in selected {
+        if from.matches(edge.from.as_str()) && to.matches(edge.to.as_str()) {
+            violations.push(RuleViolation {
+                rule: rule.name.clone(),
+                from: edge.from.clone(),
+                to: edge.to.clone(),
+                kind: edge.kind,
+            });
+        }
     }
 }
 
@@ -641,31 +756,57 @@ pub fn diff_graph(old: &Graph, new: &Graph) -> GraphDiff {
 /// 정규식 없이 직접 매칭한다 — 정점 id가 `.`을 많이 쓰는데 `*`가 점을
 /// 포함해야 `reporting.*`가 `reporting.orders.id`까지 덮는다.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    // 재귀 DP 대신 두 포인터 백트래킹 — 글롭 표준 알고리즘.
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let (mut star_p, mut star_t) = (usize::MAX, 0usize);
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star_p = pi;
-            star_t = ti;
-            pi += 1;
-        } else if star_p != usize::MAX {
-            pi = star_p + 1;
-            star_t += 1;
-            ti = star_t;
-        } else {
-            return false;
+    GlobPattern::new(pattern).matches(text)
+}
+
+/// 한 번 준비해 여러 문자열에 대조하는 글롭 패턴이다.
+///
+/// 패턴 문자를 매칭마다 다시 모으지 않으려고 둔다. `?`는 바이트가 아니라 유니코드
+/// 스칼라 하나와 맞는다 — 비ASCII 식별자에서도 `glob_match`와 같은 뜻이어야 한다.
+struct GlobPattern(Vec<char>);
+
+impl GlobPattern {
+    /// 패턴 문자를 한 번 모은다.
+    fn new(pattern: &str) -> Self {
+        #[cfg(test)]
+        count_rules_work(|work| work.patterns += 1);
+        Self(pattern.chars().collect())
+    }
+
+    /// 재귀 DP 대신 두 포인터 백트래킹 — 글롭 표준 알고리즘.
+    ///
+    /// 패턴 위치는 문자 단위, 문자열 위치는 문자 경계의 바이트 단위라서 문자열을 문자
+    /// 목록으로 복사하지 않는다.
+    fn matches(&self, text: &str) -> bool {
+        let pattern = self.0.as_slice();
+        let (mut pi, mut ti) = (0usize, 0usize);
+        let (mut star_p, mut star_t) = (usize::MAX, 0usize);
+        while let Some(current) = text[ti..].chars().next() {
+            if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == current) {
+                pi += 1;
+                ti += current.len_utf8();
+            } else if pi < pattern.len() && pattern[pi] == '*' {
+                star_p = pi;
+                star_t = ti;
+                pi += 1;
+            } else if star_p != usize::MAX {
+                pi = star_p + 1;
+                // star_t ≤ ti < text.len()이고 둘 다 문자 경계라 star_t 자리에는 항상 글자가 있다.
+                let skipped = text[star_t..]
+                    .chars()
+                    .next()
+                    .expect("star_t는 ti 이하의 문자 경계다");
+                star_t += skipped.len_utf8();
+                ti = star_t;
+            } else {
+                return false;
+            }
         }
+        while pi < pattern.len() && pattern[pi] == '*' {
+            pi += 1;
+        }
+        pi == pattern.len()
     }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
 }
 
 #[cfg(test)]
@@ -1059,6 +1200,122 @@ mod tests {
         assert!(report.candidates.is_empty());
     }
 
+    /// 길이 `length`인 view 사슬 — 위치 i의 view가 i-1을 읽고 위치 0이 테이블을 읽는다.
+    ///
+    /// `ascending_consumers`면 소비자 id가 의존 대상 id보다 사전식으로 뒤에 온다. id 순으로
+    /// 정점 전체를 다시 도는 고정점은 이 순서에서 패스마다 하나만 확정한다.
+    fn view_chain(length: usize, ascending_consumers: bool) -> Graph {
+        let name = |position: usize| {
+            let rank = if ascending_consumers {
+                position
+            } else {
+                length - 1 - position
+            };
+            format!("v_{rank:06}")
+        };
+        let mut g = Graph::new();
+        g.add_vertex(table("s", "base"));
+        for position in 0..length {
+            let current = name(position);
+            g.add_vertex(view("s", &current));
+            let target = match position {
+                0 => "base".to_owned(),
+                _ => name(position - 1),
+            };
+            g.add_edge(reads(
+                &VertexId::object("s", &current),
+                &VertexId::object("s", &target),
+            ));
+        }
+        g
+    }
+
+    #[test]
+    fn dead_연쇄는_이름_순서와_무관하게_간선을_상수_번만_본다() {
+        for ascending in [true, false] {
+            let g = view_chain(200, ascending);
+            take_dead_edge_visits();
+            let report = dead(&g, 1024);
+            let visits = take_dead_edge_visits();
+            assert_eq!(report.total_candidates, 200, "{ascending}");
+            // 정점 201개·간선 200개 — 패스를 반복하면 사슬 길이의 제곱이 된다.
+            assert!(visits <= 2 * (201 + 200), "{ascending}: {visits}");
+        }
+    }
+
+    #[test]
+    fn dead_만_길이_view_사슬은_두_이름_순서에서_같은_후보와_사유를_낸다() {
+        for ascending in [true, false] {
+            let report = dead(&view_chain(10_000, ascending), 10_000);
+            assert_eq!(report.total_candidates, 10_000, "{ascending}");
+            assert!(!report.truncated);
+            let seeds: Vec<_> = report
+                .candidates
+                .iter()
+                .filter(|c| c.reason == DeadReason::NoDependents)
+                .map(|c| c.vertex.id.as_str())
+                .collect();
+            // 의존자가 없는 것은 사슬 맨 위 소비자 하나뿐이고 나머지는 연쇄로 죽는다.
+            let top = if ascending {
+                "s.v_009999"
+            } else {
+                "s.v_000000"
+            };
+            assert_eq!(seeds, [top]);
+            assert!(report
+                .candidates
+                .windows(2)
+                .all(|pair| pair[0].vertex.id < pair[1].vertex.id));
+        }
+    }
+
+    #[test]
+    fn dead는_순환_자기참조_유령_의존자를_살리고_같은_의존자는_한_번만_센다() {
+        let mut g = Graph::new();
+        let names = [
+            "c1", "c2", "by_cycle", "selfie", "by_self", "by_ghost", "top", "mid", "hinted",
+        ];
+        for name in names {
+            g.add_vertex(view("s", name));
+        }
+        g.add_vertex(table("s", "t"));
+        let id = |name: &str| VertexId::object("s", name);
+        // c1 ↔ c2 순환과 순환 구성원만 읽는 view.
+        g.add_edge(reads(&id("c1"), &id("c2")));
+        g.add_edge(reads(&id("c2"), &id("c1")));
+        g.add_edge(reads(&id("c1"), &id("by_cycle")));
+        // 자기 자신을 읽는 view와 그것만 읽는 view.
+        g.add_edge(reads(&id("selfie"), &id("selfie")));
+        g.add_edge(reads(&id("selfie"), &id("by_self")));
+        // 정점 없이 간선에만 있는 의존자도 살아 있는 의존자로 본다.
+        g.add_edge(reads(&id("ghost"), &id("by_ghost")));
+        // 같은 의존자가 종류가 다른 간선 두 개로 읽는다.
+        g.add_edge(reads(&id("top"), &id("mid")));
+        g.add_edge(Edge {
+            kind: EdgeKind::DependsOn,
+            ..dep(&id("top"), &id("mid"))
+        });
+        // 추정 간선은 의존자가 아니다.
+        g.add_edge(Edge {
+            kind: EdgeKind::Inferred,
+            ..dep(&id("t"), &id("hinted"))
+        });
+        let report = dead(&g, 256);
+        let got: Vec<_> = report
+            .candidates
+            .iter()
+            .map(|c| (c.vertex.id.as_str(), c.reason))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("s.hinted", DeadReason::NoDependents),
+                ("s.mid", DeadReason::AllDependentsDead),
+                ("s.top", DeadReason::NoDependents),
+            ]
+        );
+    }
+
     #[test]
     fn glob은_별이_점까지_덮고_물음표는_한글자다() {
         assert!(glob_match("reporting.*", "reporting.orders"));
@@ -1073,6 +1330,127 @@ mod tests {
         assert!(glob_match("a*b", "axb"));
         assert!(!glob_match("", "x"));
         assert!(glob_match("", ""));
+    }
+
+    #[test]
+    fn glob의_물음표는_유니코드_스칼라_하나와_맞는다() {
+        assert!(glob_match("s.t?", "s.t한"));
+        assert!(glob_match("s.t?", "s.t\u{e9}"));
+        assert!(!glob_match("s.t??", "s.t한"));
+        assert!(glob_match("보고.*", "보고.주문.id"));
+        assert!(glob_match("*?", "한"));
+        assert!(glob_match("a*?b", "a한b"));
+        assert!(!glob_match("a*?b", "ab"));
+        assert!(glob_match("*한*", "가나한다"));
+        assert!(!glob_match("*한?", "가나한"));
+        // 결합 문자는 스칼라 두 개다 — 글자 모양(grapheme)이 아니라 스칼라로 센다.
+        assert!(!glob_match("?", "e\u{301}"));
+        assert!(glob_match("??", "e\u{301}"));
+        // 별 뒤 백트래킹이 다중 바이트 문자 경계에서 다시 시작해도 결과가 같다.
+        assert!(glob_match("*가*나", "가가나나"));
+        assert!(glob_match("a*한한", "a한한한"));
+        assert!(!glob_match("*한한한한", "a한한한"));
+    }
+
+    #[test]
+    fn rules는_간선_목록과_규칙_패턴을_한_번씩만_준비한다() {
+        let id = |number: usize| VertexId::object("s", &format!("t{number:02}"));
+        let mut g = Graph::new();
+        for number in 0..20 {
+            g.add_vertex(table("s", &format!("t{number:02}")));
+        }
+        for number in 1..20 {
+            g.add_edge(reads(&id(number), &id(number - 1)));
+        }
+        let rule_set: Vec<Rule> = (0..4)
+            .map(|number| Rule {
+                name: format!("r{number}"),
+                from: "s.t1*".into(),
+                to: "*".into(),
+                kinds: None,
+            })
+            .collect();
+        take_rules_work();
+        let report = rules(&g, &rule_set);
+        // s.t10..s.t19에서 나가는 간선 10개가 규칙마다 위반이다.
+        assert_eq!(report.violations.len(), 4 * 10);
+        assert_eq!(
+            take_rules_work(),
+            RulesWork {
+                edge_lists: 1,
+                patterns: 2 * 4
+            }
+        );
+    }
+
+    #[test]
+    fn rules_위반은_규칙_이름_끝점_간선_종류_순이고_같은_이름은_규칙_순서를_지킨다() {
+        let mut g = Graph::new();
+        g.add_vertex(table("rpt", "a"));
+        g.add_vertex(table("core", "b"));
+        let (a, b) = (VertexId::object("rpt", "a"), VertexId::object("core", "b"));
+        // 같은 끝점에 종류만 다른 간선 두 개. 넣는 순서를 종류 순서와 반대로 둔다.
+        g.add_edge(Edge {
+            kind: EdgeKind::Writes,
+            ..dep(&a, &b)
+        });
+        g.add_edge(reads(&a, &b));
+        let rule = |name: &str, kinds: Option<BTreeSet<EdgeKind>>| Rule {
+            name: name.into(),
+            from: "rpt.*".into(),
+            to: "core.*".into(),
+            kinds,
+        };
+        let report = rules(
+            &g,
+            &[
+                rule("z", None),
+                rule("dup", Some(BTreeSet::from([EdgeKind::Writes]))),
+                rule("a", None),
+                rule("dup", None),
+            ],
+        );
+        let got: Vec<_> = report
+            .violations
+            .iter()
+            .map(|v| (v.rule.as_str(), v.kind))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a", EdgeKind::Reads),
+                ("a", EdgeKind::Writes),
+                ("dup", EdgeKind::Writes),
+                ("dup", EdgeKind::Reads),
+                ("dup", EdgeKind::Writes),
+                ("z", EdgeKind::Reads),
+                ("z", EdgeKind::Writes),
+            ]
+        );
+    }
+
+    #[test]
+    fn rules는_비ascii_id에도_물음표를_글자_하나로_대조한다() {
+        let mut g = Graph::new();
+        for (schema, name) in [("보고", "주문1"), ("보고", "주문12"), ("핵심", "고객")]
+        {
+            g.add_vertex(table(schema, name));
+        }
+        for name in ["주문1", "주문12"] {
+            g.add_edge(reads(
+                &VertexId::object("보고", name),
+                &VertexId::object("핵심", "고객"),
+            ));
+        }
+        let rule = Rule {
+            name: "r".into(),
+            from: "보고.주문?".into(),
+            to: "핵심.??".into(),
+            kinds: None,
+        };
+        let report = rules(&g, &[rule]);
+        let got: Vec<_> = report.violations.iter().map(|v| v.from.as_str()).collect();
+        assert_eq!(got, ["보고.주문1"]);
     }
 
     #[test]

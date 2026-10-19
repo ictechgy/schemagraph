@@ -21,6 +21,8 @@ import (
 // extractMSSQL — 스키마 목록은 객체와 routine의 합집합(Extractor.kt와 같은
 // 규칙: routine만 있는 스키마도 있다).
 func (h *harvester) extractMSSQL() CatalogDocument {
+	// 스트리밍과 같은 스키마 목록으로 요청 스키마 누락을 신고한다.
+	h.mssqlSchemaNames()
 	objects := h.mssqlObjects()
 	columns := h.mssqlColumns()
 	pkPos, pkCons := h.mssqlPrimaryKeys()
@@ -121,6 +123,7 @@ func (h *harvester) mssqlSchemaNames() []string {
 		}
 		return nil
 	})
+	h.checkRequestedSchemas(names)
 	return names
 }
 

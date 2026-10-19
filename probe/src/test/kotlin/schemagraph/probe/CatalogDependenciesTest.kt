@@ -1,5 +1,6 @@
 package schemagraph.probe
 
+import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -7,6 +8,57 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class CatalogDependenciesTest {
+    /** pg_depend 조회 결과처럼 보이는 의존성. 이름을 작은 집합에서 뽑아 직렬화 앞부분이 자주 겹치게
+     *  하고, null 선택 필드와 완전히 같은 값(중복)도 섞는다. Go 프로브 테스트의 생성기와 같은 모양이다. */
+    private fun randomDependencies(count: Int, seed: Int): List<CatalogDependency> {
+        val random = Random(seed)
+        fun pick(vararg values: String) = values[random.nextInt(values.size)]
+        fun optional(vararg values: String) = if (random.nextInt(3) == 0) null else pick(*values)
+        val dependencies = mutableListOf<CatalogDependency>()
+        while (dependencies.size < count) {
+            if (dependencies.isNotEmpty() && random.nextInt(8) == 0) {
+                dependencies += dependencies[random.nextInt(dependencies.size)]
+                continue
+            }
+            dependencies += CatalogDependency(
+                source = CatalogObjectRef(
+                    schema = pick("app", "billing"),
+                    name = pick("orders_v", "orders_mv", "report"),
+                    kind = optional("view", "function"),
+                    signature = optional("", "integer"),
+                ),
+                target = CatalogObjectRef(
+                    schema = pick("app", "billing"),
+                    name = pick("orders", "items", "total"),
+                    kind = optional("table", "function"),
+                    member = optional("id", "amount", "status"),
+                    signature = optional("integer, text"),
+                    database = optional("main"),
+                ),
+                catalog = "pg_depend",
+                dependencyType = pick("n", "a"),
+            )
+        }
+        return dependencies
+    }
+
+    /** 문서·NDJSON의 의존성 순서는 중복을 뺀 뒤 한 줄 직렬화 문자열 순서다. sortedBy는 비교마다
+     *  selector를 두 번 불러, 섞인 입력에서는 직렬화가 약 2·D·log2 D번 일어났다. 같은 순서를 내면서
+     *  서로 다른 의존성마다 직렬화를 한 번만 하는지 호출 수로 확인한다. */
+    @Test
+    fun dependencyOrderSerializesEachDistinctDependencyOnce() {
+        val dependencies = randomDependencies(1024, 20261019)
+        val expected = dependencies.distinct().sortedBy { lineMapper.writeValueAsString(it) }
+        var serializations = 0
+        val sorted = distinctSortedDependencies(dependencies) {
+            serializations++
+            lineMapper.writeValueAsString(it)
+        }
+        assertEquals(expected, sorted)
+        assertEquals(expected, distinctSortedDependencies(dependencies))
+        assertEquals(expected.size, serializations, "sort keys must be serialized once per distinct dependency")
+    }
+
     private fun document(): CatalogDocument {
         return CatalogDocument(
             version = 1,

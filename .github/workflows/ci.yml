@@ -81,6 +81,7 @@ jobs:
           python3 Scripts/test-mysql-ready.py
           python3 Scripts/test-fixture-ports.py
           python3 Scripts/test-postgres-fixture-diagnostics.py
+          python3 Scripts/test-postgres-fixture-auth.py
 
       - name: Verify accuracy and scale measurement invariants
         run: |
