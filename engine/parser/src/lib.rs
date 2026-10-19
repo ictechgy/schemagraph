@@ -6465,7 +6465,7 @@ mod tests {
         let doc = doc_with_view(&vec!["SELECT id FROM orders"; terms].join(" UNION ALL "));
         let (g, notes) = build(&doc);
         let expected = format!(
-            "statement 1 has {} chained set operators, over the {} analysis limit",
+            "statement 1 has {} set operators, over the {} analysis limit",
             terms - 1,
             parse_limits::MAX_SET_OPERATORS
         );
@@ -6489,7 +6489,7 @@ mod tests {
         let doc = doc_with_routine(vec![routine("wide_filter", Some("sql"), &body)], "");
         let (_g, notes) = build(&doc);
         let expected = format!(
-            "statement 1 has {} chained infix operators, over the {} analysis limit",
+            "statement 1 has an operator chain of {} infix operators, over the {} analysis limit",
             terms * 2 - 1,
             parse_limits::MAX_INFIX_OPERATORS
         );
@@ -6499,6 +6499,50 @@ mod tests {
                 .any(|note| note.contains("wide_filter") && note.contains(&expected)),
             "notes: {notes:?}"
         );
+    }
+
+    #[test]
+    fn 갈래가_상한보다_많아도_사슬이_없는_case_뷰는_분석한다() {
+        // 갈래마다 연산자가 하나라 문장 전체로 합하면 상한을 넘지만, 갈래는 sqlparser가
+        // Vec으로 모으는 형제 원소라 트리가 깊어지지 않는다.
+        let arms: String = (0..=parse_limits::MAX_INFIX_OPERATORS)
+            .map(|arm| format!(" WHEN id = {arm} THEN 'v{arm}'"))
+            .collect();
+        let mut doc = doc_with_view(&format!("SELECT CASE{arms} END AS a FROM orders"));
+        doc.schemas[0].objects[2].columns = vec![col("a", 1)];
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        let view = VertexId::object("main", "order_totals");
+        assert_eq!(
+            g.analysis()[&view].state,
+            schemagraph_core::AnalysisState::Complete
+        );
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from == view
+            && e.to.as_str() == "main.orders"));
+    }
+
+    #[test]
+    fn 세미콜론_없이_이어진_tsql_문장은_합이_상한을_넘어도_분석한다() {
+        // 문장마다 연산자가 백여 개라 몸체 전체로 합하면 상한을 넘지만, sqlparser는 IF 블록
+        // 안의 문장을 형제 목록으로 모으므로 사슬은 문장 하나 길이다. 사슬을 더 길게 하면
+        // 디버그 빌드의 기본 테스트 스레드(2MiB)가 사슬 재귀로 넘친다.
+        let increments = " + 1".repeat(100);
+        let statements = parse_limits::MAX_INFIX_OPERATORS / 100 + 1;
+        let block =
+            format!("UPDATE orders SET customer_id = customer_id{increments} WHERE id = 1 ")
+                .repeat(statements);
+        let body = format!("CREATE PROCEDURE touch AS BEGIN IF 1 = 1 BEGIN {block}END; END");
+        let mut doc = doc_with_routine(vec![routine("touch", Some("sql"), &body)], "");
+        doc.dialect = "sqlserver".into();
+        let (g, notes) = build(&doc);
+        assert!(
+            !notes.iter().any(|note| note.contains("analysis limit")),
+            "notes: {notes:?}"
+        );
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.touch"
+            && e.to.as_str() == "public.orders"));
     }
 
     #[test]

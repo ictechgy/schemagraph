@@ -60,6 +60,35 @@ fn analysis<'a>(graph: &'a Value, source: &str) -> &'a Value {
 }
 
 #[test]
+fn scan_analyzes_flat_value_lists_whatever_their_operator_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    catalog(root);
+    fs::create_dir(root.join("sql")).unwrap();
+    // `::` 캐스트가 행마다 둘이라 문장 전체로는 100,002개지만, 행과 값은 형제 원소라
+    // 깊은 사슬이 없다.
+    let rows: Vec<String> = (0..50_001)
+        .map(|row| format!("({row}::integer, 'v{row}'::text)"))
+        .collect();
+    fs::write(
+        root.join("sql/values.sql"),
+        format!("INSERT INTO t (id, a) VALUES {};\n", rows.join(", ")),
+    )
+    .unwrap();
+
+    let graph = scan(root);
+
+    let record = analysis(&graph, "values.sql");
+    assert_eq!(record["state"], "complete", "{record}");
+    assert!(
+        graph["edges"].as_array().unwrap().iter().any(|edge| {
+            edge["from"] == record["id"] && edge["kind"] == "writes" && edge["to"] == "public.t"
+        }),
+        "{graph}"
+    );
+}
+
+#[test]
 fn scan_survives_long_operator_chains_and_counts_skipped_bodies() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -105,10 +134,11 @@ fn scan_survives_long_operator_chains_and_counts_skipped_bodies() {
     assert_eq!(analysis(&graph, "huge.sql")["state"], "partial");
     let limitations = graph["limitations"].as_array().unwrap();
     assert!(
-        limitations.iter().any(|limitation| limitation
-            .as_str()
-            .unwrap()
-            .contains("100001 chained infix operators, over the 100000 analysis limit")),
+        limitations
+            .iter()
+            .any(|limitation| limitation.as_str().unwrap().contains(
+                "an operator chain of 100001 infix operators, over the 100000 analysis limit"
+            )),
         "{limitations:?}"
     );
 }
