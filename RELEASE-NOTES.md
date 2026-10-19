@@ -1,3 +1,44 @@
+# Unreleased
+
+These changes are not yet in a published release.
+
+## Security
+
+- The native PostgreSQL and MySQL/MariaDB readers are now built with TLS
+  (rustls with the ring provider, TLS 1.2 and 1.3) and trust the Mozilla root
+  certificates built into the binary. Before, the default mode connected
+  without encryption, and `require` and the verify modes failed with "SQLx was
+  built without TLS support".
+- The default stays `sslmode=prefer` / `ssl-mode=PREFERRED`, as in libpq: the
+  reader encrypts when the server offers TLS but does not verify the server
+  certificate, so an active network attacker can still force plaintext or
+  impersonate the server. To require a verified connection, add
+  `sslmode=verify-full` or `ssl-mode=VERIFY_IDENTITY`; for a private CA, also
+  add `sslrootcert` or `ssl-ca`, which is added to the built-in roots.
+- `require`, `verify-ca`, and `verify-full` (`REQUIRED`, `VERIFY_CA`,
+  `VERIFY_IDENTITY`) now work. When the server refuses TLS or the certificate
+  check fails, the scan exits with code 2 instead of falling back to an
+  unencrypted connection. With the current libraries (sqlx 0.8.6, rustls
+  0.23), `verify-ca` and `VERIFY_CA` also require the certificate to name the
+  host. `sslmode=allow` does not attempt TLS.
+- A catalog read over an unencrypted connection to a host that is not a Unix
+  socket or a loopback address (`127.0.0.0/8`, `::1`, `localhost`) records a
+  `connection-not-encrypted:` limitation in the catalog document and the graph.
+  `sslmode=disable`, `sslmode=allow`, and `ssl-mode=DISABLED` always record it
+  for such a host. In the default mode the reader asks the server whether the
+  session uses TLS (`pg_stat_ssl`, `Ssl_cipher`); if the server cannot answer,
+  the limitation says that encryption could not be confirmed. Loopback and
+  Unix-socket scans, including the fixtures, produce the same output as before,
+  and `catalog_complete` is unchanged.
+- Once a server accepts TLS, a failed handshake ends the scan even in the
+  default mode; the reader does not retry without TLS. Scan a server that only
+  supports TLS 1.1 or older, or only cipher suites without forward secrecy,
+  with an explicit `sslmode=disable` or `ssl-mode=DISABLED`.
+- New dependencies, pinned by `engine/Cargo.lock`: rustls 0.23.43,
+  rustls-webpki 0.103.14, rustls-pki-types 1.15.1, ring 0.17.14, untrusted
+  0.9.0, and webpki-roots 0.26.11 and 1.0.10. The root certificate data in
+  webpki-roots is licensed under CDLA-Permissive-2.0.
+
 # schemagraph 0.7.1
 
 This patch protects local inputs and saved snapshots during file exports.
