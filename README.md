@@ -90,10 +90,12 @@ connection, add `sslmode=verify-full` or `ssl-mode=VERIFY_IDENTITY`. For a
 private CA, such as a managed database provider's CA, also add
 `sslrootcert=/path/ca.pem` or `ssl-ca=/path/ca.pem`; that CA is added to the
 built-in roots. `require` / `REQUIRED` encrypts without verifying the
-certificate, and `verify-ca` / `VERIFY_CA` skips the host name check. These
-modes fail the scan with exit code 2 instead of falling back to an
-unencrypted connection. `sslmode=allow` does not attempt TLS. PostgreSQL URLs
-also take defaults from libpq variables such as `PGSSLMODE` and
+certificate. `verify-ca` / `VERIFY_CA` are meant to skip the host name check,
+but with the current TLS libraries (sqlx 0.8.6 with rustls 0.23) they also
+require the certificate to name the host, like the full verify modes. The
+`require` and verify modes fail the scan with exit code 2 instead of falling
+back to an unencrypted connection. `sslmode=allow` does not attempt TLS.
+PostgreSQL URLs also take defaults from libpq variables such as `PGSSLMODE` and
 `PGSSLROOTCERT`. A server limited to TLS 1.1 or older, or to cipher suites
 without forward secrecy, fails the handshake even in the default mode; scan
 it with `sslmode=disable` or `ssl-mode=DISABLED`.
