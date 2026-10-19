@@ -191,6 +191,11 @@ func (h *harvester) oracleSchemas() []string {
 	return names
 }
 
+// oracleSchema — 소유자 하나를 수확한다. 소유자 목록(oracleSchemas, ALL_OBJECTS)에는 전역 임시
+// 테이블이나 객체 테이블처럼 collectObjects(ALL_TABLES WHERE TEMPORARY = 'N')가 받지 않는
+// 'TABLE'만 가진 소유자도 오른다. 그래서 객체도 routine도 없는 스키마는 권한 공백의 증거가 아니라
+// 존재하지만 빈 스키마다. 다른 방언과 JDBC 프로브처럼 limitation 없이 완전한 수집으로 남기고,
+// 권한 공백 신호는 수집 전체에 테이블·뷰가 없을 때(checkOracleObjects)만 낸다.
 func (h *harvester) oracleSchema(schema string) SchemaDoc {
 	objects := h.collectObjects()[schema]
 	views := h.collectViews()
@@ -206,17 +211,13 @@ func (h *harvester) oracleSchema(schema string) SchemaDoc {
 		}
 	}
 	routines := h.collectRoutines()[schema]
-	// 목록에는 있었는데 객체도 routine도 받지 못했다. routine만 있는 스키마는 정상이다.
-	if len(objects) == 0 && len(routines) == 0 {
-		h.markIncomplete(oracleNoObjectsLimitation)
-	}
 	sd := SchemaDoc{Name: schema, Objects: objects, Routines: routines}
 	normalizeSchema(&sd)
 	return sd
 }
 
 // oracleScopedSchema — 질의의 OWNER를 이 스키마로 바인딩해 수확하고 원래 범위로 되돌린다.
-// JSON과 NDJSON이 이 함수로 수확해 같은 질의와 같은 0객체 규칙을 쓴다.
+// JSON과 NDJSON이 이 함수로 수확해 같은 질의와 같은 완전성 규칙을 쓴다.
 func (h *harvester) oracleScopedSchema(schema string) SchemaDoc {
 	original, originalActive := h.schemaFilter, h.activeSchema
 	defer func() { h.schemaFilter, h.activeSchema = original, originalActive }()

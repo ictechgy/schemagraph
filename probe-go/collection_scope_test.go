@@ -176,6 +176,39 @@ func TestOracleEmptyCatalogIsIncompleteButRoutineOnlySchemaIsNot(t *testing.T) {
 	}
 }
 
+// 소유자 목록(ALL_OBJECTS)에는 전역 임시 테이블이나 객체 테이블만 가진 소유자도 'TABLE'로 오르지만,
+// collectObjects(ALL_TABLES WHERE TEMPORARY = 'N')는 그 행을 받지 않는다. 가짜 서버는 STAGE를 소유자
+// 목록에만 두어 이 상황을 만든다. 그런 스키마는 존재하지만 빈 스키마라, 다른 스키마에 테이블이 있으면
+// limitation 없이 완전해야 한다. 스키마별 0객체를 권한 공백으로 보면 기본 수집 전체가 미완전이 되고
+// review --require-complete가 매번 exit 2로 끝난다. 요청한 스키마가 그것뿐이면 수집 전체에 테이블·뷰가
+// 없으므로 지금처럼 미완전이다.
+func TestOracleOwnerWithoutCollectableObjectsKeepsTheCatalogComplete(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		filter   map[string]bool
+		complete bool
+		want     []string
+	}{
+		{name: "all schemas", filter: map[string]bool{}, complete: true},
+		{name: "requested with a populated schema", filter: map[string]bool{"APP": true, "STAGE": true}, complete: true},
+		{name: "requested alone", filter: map[string]bool{"STAGE": true}, want: []string{emptyOracleCatalog}},
+	} {
+		catalog := &oracleCatalog{owners: []string{"APP", "STAGE"}, objects: [][]driver.Value{{"APP", "ORDERS", "table"}}}
+		db, _ := newScriptedDB(catalog.reply)
+		verdicts := collectBothFormats(t, func() *harvester {
+			return &harvester{db: db, dialect: "oracle", schemaFilter: test.filter}
+		})
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for format, verdict := range verdicts {
+			if verdict.complete != test.complete || !slices.Equal(verdict.limitations, test.want) {
+				t.Errorf("%s %s: complete=%v limitations=%q", test.name, format, verdict.complete, verdict.limitations)
+			}
+		}
+	}
+}
+
 // mysqlDiscoveryReply는 기본 DB가 app이고 schemata에 app만 보이는 MySQL이다. 나머지 조회는 빈 결과다.
 func mysqlDiscoveryReply(query string, _ []driver.NamedValue) scriptedReply {
 	switch {

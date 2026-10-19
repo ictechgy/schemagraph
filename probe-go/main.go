@@ -121,7 +121,8 @@ type RoutineDoc struct {
 func boolValue(value bool) *bool { return &value }
 
 // oracleNoObjectsLimitation — Oracle 카탈로그가 테이블·뷰를 주지 않았다는 limitation 원문.
-// 권한 공백의 신호라 남길 때는 항상 markIncomplete로 미완전 표시와 함께 남긴다.
+// 권한 공백의 신호라 남길 때는 항상 markIncomplete로 미완전 표시와 함께 남긴다. 수집 전체가
+// 비었을 때(checkOracleObjects)만 쓴다. 스키마 하나가 빈 것은 정상일 수 있다(oracleSchema).
 const oracleNoObjectsLimitation = "카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라"
 
 // Oracle 카탈로그가 노출하는 시스템 스키마 — probe/Extractor.kt의 목록과 동일.
