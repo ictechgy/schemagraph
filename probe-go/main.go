@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 
 	_ "github.com/microsoft/go-mssqldb"
@@ -732,8 +731,8 @@ func (h *harvester) collectTriggers() map[string][]TriggerDoc {
 
 // collectRoutines — ALL_OBJECTS가 kind를, ALL_SOURCE가 LINE순 몸체를 준다.
 // PACKAGE는 스펙과 BODY를 따로 보관해 멤버 몸체를 멤버 헤더로 나눠 귀속한다 —
-// Kotlin Extractor의 slicePackageBody와 같은 규칙이다(경계를 못 찾은 멤버는
-// body 없이 limitation으로 센다).
+// Kotlin Extractor와 같은 attributePackageMembers 규칙이다(경계를 못 찾거나 짝이
+// 모호한 멤버는 body 없이 limitation으로 센다).
 func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 	type key struct{ schema, name, typ string }
 	bodies := map[key]*strings.Builder{}
@@ -890,32 +889,29 @@ func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 		impl, hasImpl := implBodies[p]
 		var memberDocs []RoutineDoc
 		if hasImpl && len(pkgMembers[p]) > 0 {
-			names := map[string]bool{}
-			for _, m := range pkgMembers[p] {
-				names[m.name] = true
-			}
-			slices := slicePackageBodyLexical(impl, names)
-			seen := map[string]int{}
-			for _, m := range pkgMembers[p] {
-				// 같은 이름의 n번째 오버로드는 본문의 n번째 헤더와 짝짓는다.
-				nth := seen[m.name]
-				seen[m.name]++
-				ov := ""
+			keys := make([]string, len(pkgMembers[p]))
+			catalog := make([]packageMember, len(pkgMembers[p]))
+			for i, m := range pkgMembers[p] {
+				keys[i] = p + "." + m.name
 				if m.overload != "" {
-					ov = "#" + m.overload
+					keys[i] += "#" + m.overload
 				}
-				mk := p + "." + m.name + ov
+				catalog[i] = packageMember{name: m.name, function: memberFunctions[keys[i]], signature: memberParams[keys[i]]}
+			}
+			// 정의 수·오버로드 형이 카탈로그와 맞지 않는 멤버는 추측하지 않고 limitation으로 남긴다.
+			attributed := attributePackageMembers(impl, catalog)
+			for i, m := range pkgMembers[p] {
+				mk := keys[i]
 				kind := "procedure"
 				if memberFunctions[mk] {
 					kind = "function"
 				}
-				slice, ok := slices[m.name+"#"+strconv.Itoa(nth)]
 				var body *string
-				if ok {
+				if attributed[i].found {
+					slice := attributed[i].body
 					body = &slice
 				} else {
-					h.limitations = append(h.limitations,
-						mk+": 패키지 본문에서 멤버 경계를 못 찾음 — 해당 멤버의 몸체 간선 없음")
+					h.limitations = append(h.limitations, mk+": "+attributed[i].reason)
 				}
 				var sig *string
 				if s := memberParams[mk]; s != "" {

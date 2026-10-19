@@ -533,35 +533,35 @@ class Extractor(
                     val members = if (impl != null) pkgMembers[pkg].orEmpty() else emptyList()
                     val memberDocs = mutableListOf<Triple<String, String, RoutineDoc>>()
                     if (impl != null && members.isNotEmpty()) {
+                        val keys = members.map { (mname, overload) ->
+                            Triple(owner, pname, mname + (overload?.let { "#$it" } ?: ""))
+                        }
+                        val catalog = members.zip(keys) { (mname, _), key ->
+                            PackageMember(mname, key in memberFunctions, memberParams[key].orEmpty())
+                        }
                         // 분할 실패는 이 패키지 멤버의 limitation으로만 남긴다 — 컴파일 오류가 난
                         // 본문 하나 때문에 다른 패키지와 문서 전체의 수집을 끝내지 않는다.
-                        val slices = runCatching { slicePackageBodyLexical(impl, members.map { it.first }.toSet()) }
+                        // 정의 수·오버로드 형이 카탈로그와 맞지 않는 멤버도 추측하지 않고 limitation이다.
+                        val slices = runCatching { attributePackageMembers(impl, catalog) }
                             .getOrElse { error ->
                                 val msg = error.message?.replace(Regex("\\s+"), " ")?.let { ": $it" }.orEmpty()
                                 limitations += "$owner.$pname: package body could not be split into members " +
                                     "(${error.javaClass.simpleName}$msg); member body edges are omitted"
-                                emptyMap()
+                                catalog.map { PackageMemberSlice(null, PACKAGE_BOUNDARY_NOT_FOUND) }
                             }
-                        val seen = mutableMapOf<String, Int>()
-                        for ((mname, overload) in members) {
-                            // 같은 이름의 n번째 오버로드는 본문의 n번째 헤더와 짝짓는다.
-                            val nth = seen.merge(mname, 1) { a, b -> a + b }!! - 1
-                            val ov = overload?.let { "#$it" } ?: ""
+                        for ((index, member) in catalog.withIndex()) {
+                            val key = keys[index]
                             // specific 키는 `pkg.m#ov` — 같은 이름의 독립 routine이나
                             // 오버로드된 형제 멤버와 병합 키가 충돌하지 않게 한다.
-                            memberDocs += Triple(owner, "$pname.$mname$ov", RoutineDoc(
-                                name = mname,
-                                kind = if (Triple(owner, pname, "$mname$ov") in memberFunctions)
-                                    "function" else "procedure",
+                            memberDocs += Triple(owner, "$pname.${key.third}", RoutineDoc(
+                                name = member.name,
+                                kind = if (member.function) "function" else "procedure",
                                 language = "plsql",
-                                body = slices["$mname#$nth"],
-                                signature = memberParams[Triple(owner, pname, "$mname$ov")],
+                                body = slices[index].body,
+                                signature = memberParams[key],
                                 memberOf = pname,
                             ))
-                            if (slices["$mname#$nth"] == null) {
-                                limitations += "$owner.$pname.$mname: 패키지 본문에서 멤버 경계를 " +
-                                    "못 찾음 — 해당 멤버의 몸체 간선 없음"
-                            }
+                            slices[index].reason?.let { limitations += "$owner.$pname.${member.name}: $it" }
                         }
                     }
                     // 멤버를 냈으면 패키지 몸체는 스펙이 대표다 — 실행 문장은
