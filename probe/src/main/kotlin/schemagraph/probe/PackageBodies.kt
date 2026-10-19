@@ -141,10 +141,16 @@ internal fun slicePackageBodyLexical(impl: String, members: Set<String>): Map<St
     return out
 }
 
-private fun packageRoutineTerminator(tokens: List<PackageToken>, endToken: Int): Int? =
-    tokens.drop(endToken + 1)
-        .firstOrNull { it.kind == PACKAGE_SYMBOL && it.text == ";" }
-        ?.end
+/**
+ * [endToken] 뒤 첫 ';'의 끝 위치 — 멤버의 종료 세미콜론이다. 멤버마다 불리므로 남은 토큰을
+ * 복사하지 않고 제자리에서 훑는다(복사하면 패키지 하나가 멤버 수 × 토큰 수만큼 할당한다).
+ */
+private fun packageRoutineTerminator(tokens: List<PackageToken>, endToken: Int): Int? {
+    for (index in endToken + 1 until tokens.size) {
+        if (packageSymbolIs(tokens[index], ";")) return tokens[index].end
+    }
+    return null
+}
 
 private fun packageCanonicalName(got: String, names: List<String>): String? =
     names.firstOrNull { it == got }

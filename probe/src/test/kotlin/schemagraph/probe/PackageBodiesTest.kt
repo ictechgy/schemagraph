@@ -1,5 +1,6 @@
 package schemagraph.probe
 
+import java.lang.management.ManagementFactory
 import java.nio.file.Path
 import java.sql.DriverManager
 import kotlin.test.Test
@@ -7,6 +8,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
 
 /** probe-go/package_slices_test.go와 같은 사례 — 두 프로브는 같은 본문을 같은 멤버 조각으로 나눠야 한다. */
 class PackageBodiesTest {
@@ -221,7 +223,44 @@ class PackageBodiesTest {
         }
     }
 
+    /**
+     * 멤버마다 남은 토큰 목록을 복사하면 분할 할당량이 멤버 수의 제곱으로 는다. 멤버를 네 배로 늘렸을 때
+     * 할당량이 여덟 배를 넘지 않는지(선형이면 약 네 배, 제곱이면 약 열여섯 배) 본다. 시간이 아니라 이
+     * 스레드가 할당한 바이트를 재므로 기계 부하에 흔들리지 않는다.
+     */
+    @Test
+    fun slicingAllocationGrowsLinearlyWithMemberCount() {
+        val threads = ManagementFactory.getThreadMXBean() as? com.sun.management.ThreadMXBean
+        assumeTrue(threads?.isThreadAllocatedMemorySupported == true, "thread allocation measurement is unavailable")
+        fun allocatedBytes(members: Int): Long {
+            val impl = manyMembersPackageBody(members)
+            val names = (0 until members).map { "M$it" }.toSet()
+            // 클래스 적재와 JIT 첫 컴파일의 할당이 측정에 섞이지 않게 먼저 돌린다.
+            repeat(2) { slicePackageBodyLexical(impl, names) }
+            val before = threads!!.currentThreadAllocatedBytes
+            val slices = slicePackageBodyLexical(impl, names)
+            val allocated = threads.currentThreadAllocatedBytes - before
+            assertEquals(members, slices.size, "every member must still be sliced")
+            return allocated
+        }
+        val small = allocatedBytes(150)
+        val large = allocatedBytes(600)
+        assertTrue(large < small * 8,
+            "allocation grew ${"%.1f".format(large.toDouble() / small)}x for 4x members ($small -> $large bytes)")
+    }
+
     /** m 안에 m을 depth단 정의하고 안쪽부터 모두 닫은 PACKAGE BODY. */
     private fun nestedPackageBody(depth: Int): String =
         "PACKAGE BODY p AS\n" + "PROCEDURE m IS\n".repeat(depth) + "BEGIN NULL; END m;\n".repeat(depth) + "END p;"
+
+    /** 줄 20개짜리 공개 멤버 m0..m(members-1)을 차례로 정의한 PACKAGE BODY. */
+    private fun manyMembersPackageBody(members: Int): String = buildString {
+        append("PACKAGE BODY p AS\n")
+        for (member in 0 until members) {
+            append("  PROCEDURE m$member(p_id IN NUMBER) IS\n    v_count NUMBER := 0;\n  BEGIN\n")
+            repeat(16) { line -> append("    UPDATE orders SET note = 'n' WHERE id = p_id + $line;\n") }
+            append("  END m$member;\n")
+        }
+        append("END p;\n")
+    }
 }
