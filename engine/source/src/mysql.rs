@@ -5,22 +5,27 @@
 //! pg 카탈로그를 따로 팔 이유가 없다. "스키마"는 곧 데이터베이스이고,
 //! URL에 데이터베이스가 있으면 그것만, 없으면 시스템 스키마를 뺀 전부를 읽는다.
 
-use sqlx::mysql::{
-    MySqlConnectOptions, MySqlConnection, MySqlPool, MySqlPoolOptions, MySqlQueryResult,
-};
+use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlPool, MySqlPoolOptions};
 use sqlx::Row;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::document::*;
 use crate::SourceError;
 
-/// 읽기 전용 세션을 고정하지 못했을 때의 한계. Go 프로브와 같은 문구라 수집기와
-/// 무관하게 같은 사실로 읽힌다.
+/// 읽기 전용 세션을 고정하지 못했을 때의 한계. Go 프로브와 같은 문구로 시작해 수집기와
+/// 무관하게 같은 사실로 읽힌다. 네이티브 reader는 그 뒤 괄호 안에 원인을 덧붙인다.
 const READ_ONLY_UNAVAILABLE: &str =
     "read-only session mode was unavailable; only catalog queries were issued";
+
+/// 읽기 전용 세션을 고정하는 문장. MySQL 8은 transaction_read_only, MariaDB는
+/// tx_read_only라 이 순서로 시도한다.
+const READ_ONLY_STATEMENTS: [&str; 2] = [
+    "SET SESSION transaction_read_only = 1",
+    "SET SESSION tx_read_only = 1",
+];
 
 /// `mysql://…` URL로 접속해 카탈로그를 읽는다.
 pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
@@ -31,16 +36,17 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
     let scope_db = options.get_database().map(|d| d.to_owned());
 
     // after_connect는 연결마다 돈다 — 어느 연결이든 고정에 실패하면 문서 전체의 한계다.
-    let read_only_unavailable = Arc::new(AtomicBool::new(false));
-    let unavailable = Arc::clone(&read_only_unavailable);
+    // 원인은 처음 실패한 연결의 것을 남긴다.
+    let read_only_cause = Arc::new(OnceLock::<String>::new());
+    let first_cause = Arc::clone(&read_only_cause);
     let pool = MySqlPoolOptions::new()
         .after_connect(move |conn, _| {
-            let unavailable = Arc::clone(&unavailable);
+            let first_cause = Arc::clone(&first_cause);
             Box::pin(async move {
                 // 둘 다 실패해도 스캔은 계속하되(reader는 카탈로그 SELECT만 보낸다)
-                // 세션이 쓰기 가능이라는 사실은 limitation으로 남긴다.
-                if read_only_limitation(&pin_read_only_session(conn).await).is_some() {
-                    unavailable.store(true, Ordering::Relaxed);
+                // 세션이 쓰기 가능이라는 사실과 그 원인은 limitation으로 남긴다.
+                if let Some(cause) = pin_read_only_session(conn).await {
+                    first_cause.get_or_init(|| cause);
                 }
                 Ok(())
             })
@@ -65,44 +71,57 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
             .push(read_schema(&pool, &schema, &mut doc.limitations, &mut catalog_complete).await?);
     }
     doc.schemas.sort_by(|a, b| a.name.cmp(&b.name));
-    // 수집한 카탈로그 자체는 온전하므로 catalog_complete는 그대로 둔다(Go 프로브와 같다).
-    // Go처럼 접속 단계의 사실이라 맨 앞에 둔다.
-    if read_only_unavailable.load(Ordering::Relaxed) {
-        doc.limitations.insert(0, READ_ONLY_UNAVAILABLE.to_owned());
-    }
     doc.context = Some(CollectionContext {
         source_id: String::new(),
         database: scope_db.clone(),
         schema_filter: scope_db.map(|name| vec![name]),
         catalog_complete,
     });
+    record_read_only_failure(&mut doc, read_only_cause.get().map(String::as_str));
     Ok(doc)
 }
 
-/// 읽기 전용 세션을 고정한다. MySQL 8은 transaction_read_only, MariaDB는
-/// tx_read_only라 차례로 시도하고 처음 성공한 데서 멈춘다. 시도 결과를 모두 돌려준다.
-async fn pin_read_only_session(
-    conn: &mut MySqlConnection,
-) -> Vec<Result<MySqlQueryResult, sqlx::Error>> {
+/// 읽기 전용 세션을 고정한다. 처음 성공한 문장에서 멈추고, 모두 거절되면 원인을 돌려준다.
+async fn pin_read_only_session(conn: &mut MySqlConnection) -> Option<String> {
     let mut attempts = Vec::new();
-    for statement in [
-        "SET SESSION transaction_read_only = 1",
-        "SET SESSION tx_read_only = 1",
-    ] {
+    for statement in READ_ONLY_STATEMENTS {
         let attempt = sqlx::Executor::execute(&mut *conn, statement).await;
         let pinned = attempt.is_ok();
-        attempts.push(attempt);
+        attempts.push((statement, attempt));
         if pinned {
             break;
         }
     }
-    attempts
+    read_only_failure(&attempts)
 }
 
-/// 연결 하나의 읽기 전용 SET 결과를 한계 문구로 바꾼다. 하나라도 성공하면 세션은
-/// 고정됐다. 모두 거절되면(또는 시도가 없으면) 쓰기 가능 세션이라는 사실을 알린다.
-fn read_only_limitation<T, E>(attempts: &[Result<T, E>]) -> Option<&'static str> {
-    (!attempts.iter().any(Result::is_ok)).then_some(READ_ONLY_UNAVAILABLE)
+/// 연결 하나의 SET 시도 결과에서 고정 실패 원인을 만든다. 하나라도 성공했으면 세션은
+/// 고정됐다(None). 모두 거절되면 문장마다 오류를 남긴다. 변수 미지원·권한 거부·연결
+/// 오류는 해결 방향이 달라 사용자가 구분할 수 있어야 하기 때문이다.
+fn read_only_failure<T, E: Display>(attempts: &[(&str, Result<T, E>)]) -> Option<String> {
+    if attempts.iter().any(|(_, attempt)| attempt.is_ok()) {
+        return None;
+    }
+    let causes: Vec<String> = attempts
+        .iter()
+        .filter_map(|(statement, attempt)| {
+            attempt
+                .as_ref()
+                .err()
+                .map(|error| format!("{statement}: {error}"))
+        })
+        .collect();
+    Some(causes.join("; "))
+}
+
+/// 읽기 전용 세션 고정 실패를 문서에 남긴다. Go 프로브처럼 접속 단계의 사실이라
+/// limitations 맨 앞에 둔다. 수집한 카탈로그 자체는 온전하므로 catalog_complete는
+/// 건드리지 않는다(Go 프로브와 같다). 실패가 없으면 문서를 바꾸지 않는다.
+fn record_read_only_failure(doc: &mut CatalogDocument, cause: Option<&str>) {
+    if let Some(cause) = cause {
+        doc.limitations
+            .insert(0, format!("{READ_ONLY_UNAVAILABLE} ({cause})"));
+    }
 }
 
 /// 읽을 스키마 목록 — URL의 데이터베이스가 있으면 그 하나, 없으면
@@ -619,17 +638,69 @@ fn sort_all(objects: &mut [ObjectDoc], routines: &mut [RoutineDoc]) {
 mod tests {
     use super::*;
 
-    /// 두 SET 중 하나라도 성공하면 세션은 고정됐고, 모두 거절되면 Go 프로브와 같은 한계를 남긴다.
+    /// 한 문장이라도 성공하면 세션은 고정됐다. 모두 거절되면 문장마다 오류를 시도 순서대로
+    /// 남긴다 — 어느 변수가 왜 거절됐는지가 해결 방향을 정한다.
     #[test]
-    fn read_only_limitation_reports_only_when_every_attempt_failed() {
-        let pinned: [&[Result<(), &str>]; 2] = [&[Ok(())], &[Err("unknown variable"), Ok(())]];
+    fn read_only_failure_keeps_each_rejection_until_a_statement_pins_the_session() {
+        let pinned: [&[(&str, Result<(), &str>)]; 2] = [
+            &[("SET a", Ok(()))],
+            &[("SET a", Err("unknown variable")), ("SET b", Ok(()))],
+        ];
         for attempts in pinned {
-            assert_eq!(read_only_limitation(attempts), None, "{attempts:?}");
+            assert_eq!(read_only_failure(attempts), None, "{attempts:?}");
         }
-        let rejected: &[Result<(), &str>] = &[Err("unknown variable"), Err("access denied")];
+        let rejected: &[(&str, Result<(), &str>)] = &[
+            ("SET a", Err("unknown variable")),
+            ("SET b", Err("access denied")),
+        ];
         assert_eq!(
-            read_only_limitation(rejected),
-            Some("read-only session mode was unavailable; only catalog queries were issued")
+            read_only_failure(rejected).as_deref(),
+            Some("SET a: unknown variable; SET b: access denied")
         );
+    }
+
+    /// 수집을 마친 문서. 다른 한계와 완전성 표시가 있어야 기록이 그것을 건드리는지 보인다.
+    fn collected_document(catalog_complete: bool) -> CatalogDocument {
+        CatalogDocument {
+            version: DOCUMENT_VERSION,
+            dialect: "mysql".into(),
+            reader: "native-sqlx".into(),
+            schemas: vec![SchemaDoc {
+                name: "app".into(),
+                objects: vec![],
+                routines: vec![],
+            }],
+            limitations: vec!["performance_schema=OFF".into()],
+            context: Some(CollectionContext {
+                source_id: String::new(),
+                database: Some("app".into()),
+                schema_filter: Some(vec!["app".into()]),
+                catalog_complete,
+            }),
+            dependencies: vec![],
+        }
+    }
+
+    /// 고정 실패는 Go 프로브와 같은 문구로 시작하는 한계로 맨 앞에 서고, 원인은 괄호에 실린다.
+    /// 다른 한계·스키마·catalog_complete는 그대로다. 실패가 없으면 문서가 바뀌지 않는다.
+    #[test]
+    fn read_only_failure_is_the_first_limitation_and_keeps_catalog_completeness() {
+        for catalog_complete in [true, false] {
+            let collected = collected_document(catalog_complete);
+            let mut doc = collected.clone();
+            record_read_only_failure(&mut doc, None);
+            assert_eq!(doc, collected);
+            record_read_only_failure(&mut doc, Some("SET SESSION tx_read_only = 1: denied"));
+            assert_eq!(
+                doc.limitations,
+                [
+                    "read-only session mode was unavailable; only catalog queries were issued \
+                     (SET SESSION tx_read_only = 1: denied)",
+                    "performance_schema=OFF",
+                ]
+            );
+            assert_eq!(doc.context, collected.context);
+            assert_eq!(doc.schemas, collected.schemas);
+        }
     }
 }
