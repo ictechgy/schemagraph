@@ -34,6 +34,28 @@ const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_DEPTH: usize = 32;
 const MAX_FORMAT_ARGS: usize = 64;
 
+/// 몸체 하나가 동시에 값을 추적하는 텍스트 변수 수. 실제 프로시저의 상수 텍스트
+/// 변수는 많아야 수십 개라 넉넉하다.
+pub(crate) const MAX_TRACKED_VARIABLES: usize = 4_096;
+
+/// 몸체 하나가 동시에 추적하는 변수 이름·값의 총 바이트(값 하나 상한의 64배).
+///
+/// 값 하나는 MAX_TEXT_BYTES로 묶여도 `b := a`처럼 참조 대입이 값을 통째로 복사하므로,
+/// 총량을 묶지 않으면 대입 수 × 64KiB만큼 메모리를 잡는다.
+pub(crate) const MAX_TRACKED_TEXT_BYTES: usize = 64 * MAX_TEXT_BYTES;
+
+/// 추적 상한을 넘었으면 실제로 센 값과 상한을 담은 사유를 돌려준다.
+pub(crate) fn tracking_overflow(variables: usize, bytes: usize) -> Option<String> {
+    if variables > MAX_TRACKED_VARIABLES {
+        return Some(format!(
+            "{variables} tracked procedural text variables exceed the {MAX_TRACKED_VARIABLES}-variable limit"
+        ));
+    }
+    (bytes > MAX_TRACKED_TEXT_BYTES).then(|| {
+        format!("tracked procedural text variables need {bytes} bytes, over the {MAX_TRACKED_TEXT_BYTES}-byte limit")
+    })
+}
+
 /// 방언 이름을 상수 식 평가 방언으로 바꾼다.
 pub(crate) fn dialect(name: &str) -> TextDialect {
     match name {

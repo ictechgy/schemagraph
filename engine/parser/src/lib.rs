@@ -1334,6 +1334,10 @@ struct ExtractionState {
     declared_symbols: BTreeSet<String>,
     /// 지금 몸체를 꺼내 내려간 중첩 DO 블록 수.
     do_depth: usize,
+    /// 추적 중인 변수 이름과 값의 바이트 합.
+    tracked_bytes: usize,
+    /// 추적 상한을 처음 넘은 사유. 몸체 진단에 그대로 싣는다.
+    tracking_overflow: Option<String>,
 }
 
 impl ExtractionState {
@@ -1348,12 +1352,14 @@ impl ExtractionState {
             outer_block_seen: false,
             declared_symbols: BTreeSet::new(),
             do_depth: 0,
+            tracked_bytes: 0,
+            tracking_overflow: None,
         }
     }
 
     fn invalidate(&mut self) {
         self.evaluation_enabled = false;
-        self.variables.clear();
+        self.invalidate_all_variables();
     }
 
     fn observe_begin(&mut self) {
@@ -1368,41 +1374,70 @@ impl ExtractionState {
         self.invalidate();
     }
 
+    /// 대입 하나를 지금 변수 환경으로 평가해 값을 싣거나, 불명확하면 지운다.
     fn assign(&mut self, name: &str, expression: &str) {
-        let variables = self.variables.clone();
-        self.assign_from(name, expression, &variables);
-    }
-
-    fn assign_from(&mut self, name: &str, expression: &str, variables: &BTreeMap<String, String>) {
         let key = normalize_variable_name(name);
         if key.is_empty() {
             return;
         }
-        if self.evaluation_enabled {
-            if let Some(capacity) = self.capacities.get(&key).copied() {
-                if let Some(value) = constant_sql::evaluate_with_format(
-                    expression,
-                    self.dialect,
-                    variables,
-                    !self.format_shadowed,
-                ) {
-                    let unicode_safe = self.dialect != constant_sql::TextDialect::MsSql
-                        || self.unicode_capable.contains(&key)
-                        || value.is_ascii();
-                    if unicode_safe && constant_sql::fits_capacity(&value, capacity) {
-                        self.variables.insert(key, value);
-                        return;
-                    }
-                }
-            }
+        let value = self.assigned_value(&key, expression);
+        self.set_variable(key, value);
+    }
+
+    /// 대입식의 확정 텍스트 값. 추적하지 않는 타입·용량 초과·평가 실패는 None이다.
+    ///
+    /// 변수 환경은 빌려서 평가한다 — 대입마다 환경 전체(값당 최대 64KiB)를 복제하면
+    /// 대입 수의 제곱만큼 복사하게 된다.
+    fn assigned_value(&self, key: &str, expression: &str) -> Option<String> {
+        if !self.evaluation_enabled {
+            return None;
         }
-        self.variables.remove(&key);
+        let capacity = self.capacities.get(key).copied()?;
+        let value = constant_sql::evaluate_with_format(
+            expression,
+            self.dialect,
+            &self.variables,
+            !self.format_shadowed,
+        )?;
+        let unicode_safe = self.dialect != constant_sql::TextDialect::MsSql
+            || self.unicode_capable.contains(key)
+            || value.is_ascii();
+        (unicode_safe && constant_sql::fits_capacity(&value, capacity)).then_some(value)
+    }
+
+    /// 확정 값을 싣는다. 값이 없거나 평가가 꺼졌으면 지우고, 추적 상한을 넘으면
+    /// 평가를 끄고 사유를 남긴다 — 참조 대입(`b := a`)은 값을 통째로 복사하므로 변수
+    /// 수와 총량을 묶지 않으면 작은 몸체 하나가 GB 단위 메모리를 잡는다.
+    fn set_variable(&mut self, key: String, value: Option<String>) {
+        let previous = self
+            .variables
+            .get(&key)
+            .map_or(0, |old| key.len() + old.len());
+        let Some(value) = value.filter(|_| self.evaluation_enabled) else {
+            self.remove_variable(&key);
+            return;
+        };
+        let bytes = self.tracked_bytes - previous + key.len() + value.len();
+        let count = self.variables.len() + usize::from(previous == 0);
+        if let Some(reason) = constant_sql::tracking_overflow(count, bytes) {
+            self.tracking_overflow.get_or_insert(reason);
+            self.invalidate();
+            return;
+        }
+        self.tracked_bytes = bytes;
+        self.variables.insert(key, value);
+    }
+
+    fn remove_variable(&mut self, key: &str) {
+        if let Some(old) = self.variables.remove(key) {
+            self.tracked_bytes -= key.len() + old.len();
+        }
     }
 
     fn declare(&mut self, name: &str, type_text: &str, expression: Option<&str>) {
         let key = normalize_variable_name(name);
         self.declared_symbols.insert(key.clone());
-        self.variables.remove(&key);
+        self.remove_variable(&key);
         self.capacities.remove(&key);
         self.unicode_capable.remove(&key);
         let Some(capacity) = constant_sql::declared_text_capacity(type_text) else {
@@ -1419,10 +1454,11 @@ impl ExtractionState {
 
     fn invalidate_all_variables(&mut self) {
         self.variables.clear();
+        self.tracked_bytes = 0;
     }
 
     fn invalidate_variable(&mut self, name: &str) {
-        self.variables.remove(&normalize_variable_name(name));
+        self.remove_variable(&normalize_variable_name(name));
     }
 
     fn evaluate(&self, expression: &str) -> Option<String> {
@@ -1486,6 +1522,15 @@ fn parse_procedural_body(
         temp_state_safe: true,
         locations_trusted: false,
     };
+    if let Some(reason) = state.tracking_overflow.take() {
+        // 상한 뒤의 변수 값은 버렸으므로 동적 SQL을 상수로 접지 못했을 수 있다.
+        parsed.partial = true;
+        parsed.diagnostics.push(schemagraph_core::Diagnostic {
+            code: "SG_VARIABLE_STATE_LIMIT".into(),
+            message: format!("{reason}; later dynamic SQL is not folded from variable values"),
+            location: None,
+        });
+    }
     for stmt in &stmts {
         match parse_limits::parse_sql(dialect, stmt) {
             Ok(list) => {
@@ -2487,19 +2532,21 @@ fn record_select_assignments(stmt: &str, head: &str, state: &mut ExtractionState
         .iter()
         .map(|(name, _)| normalize_variable_name(name))
         .collect();
-    let original = state.variables.clone();
-    for (name, expression) in assignments {
-        let key = normalize_variable_name(&name);
-        if constant_sql::references_variables(&expression, state.dialect, &targets) {
-            state.invalidate_variable(&name);
-        } else {
-            state.assign_from(&name, &expression, &original);
-            // 타입·용량 제약으로 값이 불명확해졌으면 이전 대입값을 되살리지
-            // 않고 불명확 상태를 유지한다.
-            if !state.variables.contains_key(&key) {
-                state.invalidate_variable(&name);
-            }
-        }
+    // 오른쪽 식을 모두 대입 전 환경으로 먼저 평가한 뒤 적용한다 — 동시 대입이라 앞선
+    // 대입 결과를 보지 않는다. 같은 문장의 대상을 참조하는 식이나 타입·용량 제약으로
+    // 불명확해진 값은 이전 값을 되살리지 않고 지운다.
+    let values: Vec<(String, Option<String>)> = assignments
+        .iter()
+        .map(|(name, expression)| {
+            let key = normalize_variable_name(name);
+            let value = (!constant_sql::references_variables(expression, state.dialect, &targets))
+                .then(|| state.assigned_value(&key, expression))
+                .flatten();
+            (key, value)
+        })
+        .collect();
+    for (key, value) in values.into_iter().filter(|(key, _)| !key.is_empty()) {
+        state.set_variable(key, value);
     }
 }
 
@@ -6398,6 +6445,61 @@ mod tests {
                 .any(|note| note.contains("public.deep_do") && note.contains("1건 미추출")),
             "notes: {notes:?}"
         );
+    }
+
+    #[test]
+    fn 참조_대입이_추적_총량을_넘으면_변수_평가를_끄고_진단을_남긴다() {
+        // `bN text := a`마다 64KiB 값이 하나씩 복사된다. 총량 상한을 넘은 뒤에는 앞서
+        // 알던 `target` 값으로도 동적 SQL을 접지 않는다.
+        let big = "x".repeat(65_000);
+        let copies: String = (0..100)
+            .map(|copy| format!(" b{copy} text := a;"))
+            .collect();
+        let body = format!(
+            "DECLARE target text := 'customers'; a text := '{big}';{copies} \
+             BEGIN EXECUTE 'SELECT 1 FROM ' || target; END"
+        );
+        let doc = doc_with_routine(vec![routine("copy_values", Some("plpgsql"), &body)], "");
+        let (g, notes) = build(&doc);
+        let record = &g.analysis()[&VertexId::object("public", "copy_values")];
+        assert_eq!(record.state, schemagraph_core::AnalysisState::Partial);
+        let limit = record
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "SG_VARIABLE_STATE_LIMIT")
+            .expect("variable tracking limit diagnostic");
+        assert!(
+            limit.message.contains(&format!(
+                "over the {}-byte limit",
+                constant_sql::MAX_TRACKED_TEXT_BYTES
+            )),
+            "{limit:?}"
+        );
+        assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.copy_values"
+            && e.to.as_str() == "public.customers"));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("copy_values") && note.contains("1건 미추출")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn 추적_상한_안의_변수는_동적_sql을_그대로_접는다() {
+        let big = "x".repeat(65_000);
+        let copies: String = (0..8).map(|copy| format!(" b{copy} text := a;")).collect();
+        let body = format!(
+            "DECLARE target text := 'customers'; a text := '{big}';{copies} \
+             BEGIN EXECUTE 'SELECT 1 FROM ' || target; END"
+        );
+        let doc = doc_with_routine(vec![routine("copy_values", Some("plpgsql"), &body)], "");
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.copy_values"
+            && e.to.as_str() == "public.customers"));
     }
 
     #[test]
