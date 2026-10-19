@@ -1353,8 +1353,11 @@ struct ExtractionState {
     do_depth: usize,
     /// 추적 중인 변수 이름과 값의 바이트 합.
     tracked_bytes: usize,
-    /// 추적 상한을 처음 넘은 사유. 몸체 진단에 그대로 싣는다.
+    /// 추적 상한을 처음 넘은 사유. 그 뒤 동적 SQL을 실제로 접지 못했을 때만 진단에 싣는다.
     tracking_overflow: Option<String>,
+    /// 추적 상한이 평가를 끈 뒤, 분기 같은 다른 이유로 꺼지기 전에 변수 값이 필요한 동적
+    /// SQL을 접지 못했는가.
+    overflow_blocked_folding: bool,
 }
 
 impl ExtractionState {
@@ -1371,6 +1374,7 @@ impl ExtractionState {
             do_depth: 0,
             tracked_bytes: 0,
             tracking_overflow: None,
+            overflow_blocked_folding: false,
         }
     }
 
@@ -1381,14 +1385,34 @@ impl ExtractionState {
 
     fn observe_begin(&mut self) {
         if self.outer_block_seen {
-            self.invalidate();
+            self.invalidate_control_flow();
         } else {
             self.outer_block_seen = true;
         }
     }
 
+    /// 분기·루프·중첩 블록 뒤로는 추적 상한과 무관하게 평가가 꺼진다. 그 전까지 상한 때문에
+    /// 접지 못한 동적 SQL이 없었다면 상한은 결과를 바꾸지 않으므로 사유를 버린다.
     fn invalidate_control_flow(&mut self) {
+        if !self.overflow_blocked_folding {
+            self.tracking_overflow = None;
+        }
         self.invalidate();
+    }
+
+    /// 동적 SQL 식을 접지 못했다. 추적 상한이 평가를 끈 뒤라면 그 탓일 수 있으므로 상한
+    /// 사유를 몸체 진단으로 남기게 표시한다.
+    fn record_unfolded_dynamic_sql(&mut self) {
+        if self.tracking_overflow.is_some() {
+            self.overflow_blocked_folding = true;
+        }
+    }
+
+    /// 몸체 진단에 실을 추적 상한 사유. 상한 뒤 동적 SQL을 실제로 접지 못했을 때만 돌려준다
+    /// — 그런 동적 SQL이 없으면 변수 값을 버린 것이 결과를 바꾸지 않았다.
+    fn take_tracking_limit(&mut self) -> Option<String> {
+        let blocked = self.overflow_blocked_folding;
+        self.tracking_overflow.take().filter(|_| blocked)
     }
 
     /// 대입 하나를 지금 변수 환경으로 평가해 값을 싣거나, 불명확하면 지운다.
@@ -1539,12 +1563,14 @@ fn parse_procedural_body(
         temp_state_safe: true,
         locations_trusted: false,
     };
-    if let Some(reason) = state.tracking_overflow.take() {
-        // 상한 뒤의 변수 값은 버렸으므로 동적 SQL을 상수로 접지 못했을 수 있다.
+    if let Some(reason) = state.take_tracking_limit() {
+        // 상한 뒤의 변수 값은 버렸으므로 그 뒤 동적 SQL을 상수로 접지 못했다.
         parsed.partial = true;
         parsed.diagnostics.push(schemagraph_core::Diagnostic {
             code: "SG_VARIABLE_STATE_LIMIT".into(),
-            message: format!("{reason}; later dynamic SQL is not folded from variable values"),
+            message: format!(
+                "{reason}; dynamic SQL after the limit was not folded from variable values"
+            ),
             location: None,
         });
     }
@@ -2381,7 +2407,7 @@ fn push_dynamic_sql(
     allow_bindings: bool,
     stmts: &mut Vec<String>,
     unextracted: &mut usize,
-    state: &ExtractionState,
+    state: &mut ExtractionState,
 ) {
     let tail = skip_ws_comments(tail);
     let Some((expression, remaining)) = split_dynamic_expression(tail) else {
@@ -2389,6 +2415,7 @@ fn push_dynamic_sql(
         return;
     };
     let Some(sql) = state.evaluate(expression) else {
+        state.record_unfolded_dynamic_sql();
         *unextracted += 1;
         return;
     };
@@ -6679,6 +6706,63 @@ mod tests {
         assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
             && e.from.as_str() == "public.copy_values"
             && e.to.as_str() == "public.customers"));
+    }
+
+    /// 추적 변수 상한을 하나 넘기는 선언 목록.
+    fn declarations_over_the_variable_limit() -> String {
+        (0..=constant_sql::MAX_TRACKED_VARIABLES)
+            .map(|index| format!(" v{index} text := 'x';"))
+            .collect()
+    }
+
+    #[test]
+    fn 추적_상한을_넘어도_뒤에_동적_sql이_없으면_몸체는_complete다() {
+        // 상한은 변수 값을 버릴 뿐이다. 그 값으로 접을 동적 SQL이 없으면 결과가 그대로라
+        // 한계로 싣지 않는다.
+        let body = format!(
+            "DECLARE{} BEGIN UPDATE customers SET name = 'y' WHERE id = 1; END",
+            declarations_over_the_variable_limit()
+        );
+        let doc = doc_with_routine(vec![routine("many_variables", Some("plpgsql"), &body)], "");
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        let record = &g.analysis()[&VertexId::object("public", "many_variables")];
+        assert_eq!(
+            record.state,
+            schemagraph_core::AnalysisState::Complete,
+            "{record:?}"
+        );
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.many_variables"
+            && e.to.as_str() == "public.customers"));
+    }
+
+    #[test]
+    fn 추적_상한_뒤_분기가_평가를_끈_동적_sql에는_상한_진단을_붙이지_않는다() {
+        // 분기 뒤로는 상한과 무관하게 평가가 꺼진다. 그 뒤 동적 SQL의 미추출은 상한 탓이 아니다.
+        let body = format!(
+            "DECLARE target text := 'customers';{} BEGIN \
+             IF 1 = 1 THEN UPDATE customers SET name = 'y' WHERE id = 1; END IF; \
+             EXECUTE 'SELECT 1 FROM ' || target; END",
+            declarations_over_the_variable_limit()
+        );
+        let doc = doc_with_routine(vec![routine("branch_first", Some("plpgsql"), &body)], "");
+        let (g, notes) = build(&doc);
+        let record = &g.analysis()[&VertexId::object("public", "branch_first")];
+        assert_eq!(record.state, schemagraph_core::AnalysisState::Partial);
+        assert!(
+            !record
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "SG_VARIABLE_STATE_LIMIT"),
+            "{record:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("branch_first") && note.contains("1건 미추출")),
+            "notes: {notes:?}"
+        );
     }
 
     /// 이 수정 전의 한 번씩 찾던 인용 경계 — 스캐너가 결과를 바꾸지 않았는지 대조한다.
