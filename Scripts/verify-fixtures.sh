@@ -306,9 +306,12 @@ if [ -n "${SG_MYSQL_URL:-}" ]; then
     fi
 elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     my_container="sg-verify-mysql-$$"
+    # 태그는 업스트림에서 옮겨 가므로 정확도 하네스와 같은 mysql:8.4 다이제스트로
+    # 고정한다(Fixtures/accuracy/mysql-environments.json, arm64/amd64 index).
     docker run -d --name "$my_container" \
         -e MYSQL_ALLOW_EMPTY_PASSWORD=1 -e MYSQL_DATABASE=sgfix \
-        -p 127.0.0.1::3306 mysql:8.4 >/dev/null
+        -p 127.0.0.1::3306 \
+        mysql@sha256:85b9bf2e29cf836ecb8c2a15a935d4ba0c606631dff1dd79531a11983c638f2a >/dev/null
     my_own=1
     trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
     my_port=$(fixture_port "$my_container" 3306)
@@ -404,9 +407,11 @@ maria_port=""
 
 maria_up() {  # $*=추가 mysqld 옵션
     docker rm -f "$maria_container" >/dev/null 2>&1 || true
+    # 정확도 하네스와 같은 mariadb:11.4 다이제스트다(mysql-environments.json).
     docker run -d --name "$maria_container" \
         -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1 -e MARIADB_DATABASE=sgfix \
-        -p 127.0.0.1::3306 mariadb:11.4 "$@" >/dev/null
+        -p 127.0.0.1::3306 \
+        mariadb@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b "$@" >/dev/null
     maria_port=$(fixture_port "$maria_container" 3306)
     maria_url="mysql://root@127.0.0.1:$maria_port/sgfix"
     python3 Scripts/wait-mysql-ready.py "$maria_container" mariadb
@@ -720,9 +725,12 @@ EOF
         mssql_jdbc="$SG_MSSQL_URL"
     elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
         mssql_container="sg-verify-mssql-$$"
+        # azure-sql-edge:latest의 manifest list 다이제스트(2026-10-19 조회)로 고정한다.
+        # amd64는 2.0.0, arm64는 1.0.7과 같은 이미지라 두 아키텍처 모두 지금과 같다.
         docker run -d --name "$mssql_container" \
             -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD="$ms_pass" \
-            -p 127.0.0.1::1433 mcr.microsoft.com/azure-sql-edge:latest >/dev/null
+            -p 127.0.0.1::1433 \
+            mcr.microsoft.com/azure-sql-edge@sha256:902628a8be89e35dfb7895ca31d602974c7bafde4d583a0d0873844feb1c42cf >/dev/null
         trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; [ -n "${maria_own:-}" ] && docker rm -f "${maria_container:-}" >/dev/null 2>&1; docker rm -f "${mssql_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
 
         ms_port=$(fixture_port "$mssql_container" 1433)
@@ -855,10 +863,13 @@ EOF
         oracle_jdbc="$SG_ORACLE_URL"
     elif command -v docker >/dev/null && docker info >/dev/null 2>&1; then
         oracle_container="sg-verify-oracle-$$"
+        # 정확도 하네스와 같은 gvenzl/oracle-free:23.26.3-slim 다이제스트다
+        # (sqlserver-oracle-environments.json, arm64/amd64 index; 2026-10-19 slim과 같음).
         docker run -d --name "$oracle_container" \
             -e ORACLE_PASSWORD="$oracle_pass" \
             -e APP_USER="$oracle_user" -e APP_USER_PASSWORD="$oracle_pass" \
-            -p 127.0.0.1::1521 gvenzl/oracle-free:slim >/dev/null
+            -p 127.0.0.1::1521 \
+            gvenzl/oracle-free@sha256:6d61d267a3b978c24c5ac1790e62e927416a0aec446bd86e4b3a1527562757bd >/dev/null
         trap '[ -n "${pg_own:-}" ] && "${PGBIN:-true}/pg_ctl" -D "${pg_data:-}" -m fast stop >/dev/null 2>&1; [ -n "${my_own:-}" ] && docker rm -f "${my_container:-}" >/dev/null 2>&1; [ -n "${maria_own:-}" ] && docker rm -f "${maria_container:-}" >/dev/null 2>&1; [ -n "${mssql_container:-}" ] && docker rm -f "${mssql_container:-}" >/dev/null 2>&1; docker rm -f "${oracle_container:-}" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
 
         or_port=$(fixture_port "$oracle_container" 1521)
