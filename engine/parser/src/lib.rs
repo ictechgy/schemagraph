@@ -1332,6 +1332,8 @@ struct ExtractionState {
     evaluation_enabled: bool,
     outer_block_seen: bool,
     declared_symbols: BTreeSet<String>,
+    /// 지금 몸체를 꺼내 내려간 중첩 DO 블록 수.
+    do_depth: usize,
 }
 
 impl ExtractionState {
@@ -1345,6 +1347,7 @@ impl ExtractionState {
             evaluation_enabled: true,
             outer_block_seen: false,
             declared_symbols: BTreeSet::new(),
+            do_depth: 0,
         }
     }
 
@@ -2301,7 +2304,14 @@ fn strip_tail_condition(rest: &str, kwlen: usize, stmts: &mut Vec<String>) {
     }
 }
 
+/// 몸체를 꺼내 따라 내려갈 중첩 DO 블록의 최대 깊이.
+///
+/// 실제 몸체의 DO 중첩은 한두 단계다. 상한이 없으면 태그를 바꿔 가며 중첩한 몸체
+/// 하나로 추출 재귀가 스택을 넘고, 단계마다 남은 몸체를 복사해 메모리가 GB 단위가 됐다.
+const MAX_DO_NESTING: usize = 32;
+
 /// `DO $$..$$`·`DO '..'` 중첩 익명 블록 — 몸체를 꺼내 재귀 추출한다.
+/// 깊이 상한을 넘거나 몸체를 꺼내지 못한 블록은 미추출로 센다.
 fn strip_do<'a>(
     rest: &'a str,
     kwlen: usize,
@@ -2309,23 +2319,31 @@ fn strip_do<'a>(
     unextracted: &mut usize,
     state: &mut ExtractionState,
 ) -> &'a str {
-    let tail = rest[kwlen..].trim_start();
-    let inner = if tail.starts_with('$') {
-        undollar_quote(tail).map(|c| c.into_owned())
+    let inner = (state.do_depth < MAX_DO_NESTING)
+        .then(|| do_block_body(&rest[kwlen..]))
+        .flatten();
+    let Some(body) = inner else {
+        *unextracted += 1;
+        return "";
+    };
+    state.do_depth += 1;
+    let (mut nested, nested_unextracted) = extract_procedural_statements(&body, state, false);
+    state.do_depth -= 1;
+    stmts.append(&mut nested);
+    *unextracted += nested_unextracted;
+    ""
+}
+
+/// DO 뒤 인용 몸체. dollar-quote는 원문을 빌려 단계마다 남은 몸체를 복사하지 않는다.
+fn do_block_body(tail: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let tail = tail.trim_start();
+    if tail.starts_with('$') {
+        undollar_quote(tail)
     } else if tail.starts_with('\'') {
-        unquote_sql_string(tail).map(|c| c.into_owned())
+        unquote_sql_string(tail)
     } else {
         None
-    };
-    match inner {
-        Some(b) => {
-            let (mut s, u) = extract_procedural_statements(&b, state, false);
-            stmts.append(&mut s);
-            *unextracted += u;
-        }
-        None => *unextracted += 1,
     }
-    ""
 }
 
 /// `PROCEDURE p(a int)`·`FUNCTION f RETURN t IS`·`PACKAGE BODY x IS` 같은
@@ -6325,6 +6343,61 @@ mod tests {
             .collect();
         sources.sort();
         assert_eq!(sources, ["main.orders.customer_id", "main.orders.id"]);
+    }
+
+    /// `DO $t0$ DO $t1$ … <inner> … $t1$; $t0$;`처럼 태그를 바꿔 가며 `levels`단 중첩한다.
+    fn nested_do(levels: usize, inner: &str) -> String {
+        (0..levels).rev().fold(inner.to_owned(), |body, level| {
+            format!("DO $t{level}$ {body} $t{level}$;")
+        })
+    }
+
+    #[test]
+    fn 한두_단계_do_블록의_안쪽_문장은_그대로_추출한다() {
+        let doc = doc_with_routine(
+            vec![
+                routine(
+                    "touch_nested",
+                    Some("plpgsql"),
+                    &nested_do(2, "UPDATE customers SET name = 'x' WHERE id = 1;"),
+                ),
+                routine(
+                    "read_quoted",
+                    Some("plpgsql"),
+                    "DO 'BEGIN PERFORM 1 FROM orders; END';",
+                ),
+            ],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.touch_nested"
+            && e.to.as_str() == "public.customers"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.read_quoted"
+            && e.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn 중첩_do_블록은_깊이_상한까지만_내려가고_나머지는_미추출로_센다() {
+        // 상한이 없으면 15,000단 몸체 하나로 추출 재귀가 스택을 넘는다.
+        let body = nested_do(15_000, "UPDATE customers SET name = 'x' WHERE id = 1;");
+        let doc = doc_with_routine(vec![routine("deep_do", Some("plpgsql"), &body)], "");
+        let (g, notes) = build(&doc);
+        // 상한 너머의 안쪽 UPDATE는 추측하지 않고 미추출 한 건으로 남긴다.
+        assert!(
+            !g.edges()
+                .iter()
+                .any(|e| e.kind == EdgeKind::Writes && e.from.as_str() == "public.deep_do"),
+            "nested DO beyond the limit must not be extracted"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("public.deep_do") && note.contains("1건 미추출")),
+            "notes: {notes:?}"
+        );
     }
 
     #[test]
