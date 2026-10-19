@@ -203,16 +203,31 @@ fn secret_value_span(after_equals: &str) -> (usize, usize) {
     (start, start + length)
 }
 
-/// 값 안 `index` 위치의 글자 `c`에서 값이 끝나는지 본다. 구분자이고, 바로 앞이 백슬래시가
-/// 아니며, 뒤에 다음 속성이 오거나 구분자만 남아야 한다([`ends_value_at`]).
+/// 값 안 `index` 위치의 글자 `c`에서 값이 끝나는지 본다. 구분자이고, 백슬래시로
+/// 이스케이프되지 않았으며([`is_escaped`]), 뒤에 다음 속성이 오거나 구분자만 남아야
+/// 한다([`ends_value_at`]).
 ///
-/// libpq에서 백슬래시 뒤의 구분자는 값의 글자다(`password=a\ b=c`의 값은 `a b=c`). 이를
+/// libpq에서 이스케이프된 구분자는 값의 글자다(`password=a\ b=c`의 값은 `a b=c`). 이를
 /// 경계로 보면 이스케이프 뒤의 값 조각이 오류 메시지에 남는다. ODBC처럼 백슬래시가
 /// 이스케이프가 아닌 형식에서는 다음 속성까지 더 가릴 뿐이라 안전하다.
 fn is_value_boundary(value: &str, index: usize, c: char) -> bool {
     is_option_separator(c)
-        && !value[..index].ends_with('\\')
+        && !is_escaped(&value[..index])
         && ends_value_at(&value[index + c.len_utf8()..])
+}
+
+/// `before` 바로 뒤 글자가 백슬래시로 이스케이프되는지 본다.
+///
+/// libpq는 백슬래시마다 다음 글자를 이스케이프하므로 `\\`는 리터럴 백슬래시 하나다. 그래서
+/// 끝에 이어진 백슬래시가 홀수 개일 때만 마지막 하나가 뒤 글자를 이스케이프한다. 짝수 개
+/// 뒤의 구분자까지 이스케이프로 보면 그 뒤의 비밀이 아닌 속성까지 가려진다.
+fn is_escaped(before: &str) -> bool {
+    let backslashes = before
+        .bytes()
+        .rev()
+        .take_while(|&byte| byte == b'\\')
+        .count();
+    backslashes % 2 == 1
 }
 
 /// 접속 문자열 속성 사이에 오는 구분자(`;`·`&`·공백)인지 본다.

@@ -188,6 +188,15 @@ fn secret_options_are_redacted_from_connection_strings() {
             "host=db password=FAKE\\ PW=21 dbname=app",
             "host=db password=*** dbname=app",
         ),
+        // 백슬래시 두 개는 리터럴 백슬래시 하나라 바로 뒤 구분자는 진짜 경계다. 이어진
+        // 백슬래시가 홀수 개일 때만 마지막 하나가 구분자를 이스케이프한다.
+        (
+            "host=db password=FAKEPW22\\\\ dbname=app",
+            "host=db password=*** dbname=app",
+        ),
+        ("password=FAKE\\\\\\ PW=23", "password=***"),
+        // 백슬래시가 이스케이프가 아닌 ODBC의 `\;`는 다음 속성까지 더 가린다(덜 가리지 않는다).
+        ("Server=db;Pwd=FAKEPW24\\;Database=app", "Server=db;Pwd=***"),
     ] {
         assert_eq!(redact_connection_secrets(text), expected, "{text}");
     }
