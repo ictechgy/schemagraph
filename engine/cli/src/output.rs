@@ -16,8 +16,13 @@ pub(crate) fn validate_paths(inputs: &[&Path], outputs: &[&Path]) -> Result<()> 
     let inputs = inputs
         .iter()
         .map(|path| {
-            fs::canonicalize(path)
-                .with_context(|| format!("cannot resolve input {}", path.display()))
+            fs::canonicalize(path).with_context(|| {
+                // 스킴 없는 접속 문자열과 슬래시가 빠진 URL 오타도 SQLite 경로로 여기까지 온다
+                // — 비밀번호를 싣지 않는다.
+                let shown =
+                    schemagraph_source::redact_connection_secrets(&path.display().to_string());
+                format!("cannot resolve input {shown}")
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     let outputs = outputs

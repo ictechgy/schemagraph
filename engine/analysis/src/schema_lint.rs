@@ -5,7 +5,8 @@
 //! 진단만 보고한다.
 
 use schemagraph_core::{
-    Diagnostic, ForeignKeyMetadata, Graph, SchemaMetadata, SourceLocation, VertexId, VertexKind,
+    Diagnostic, ForeignKeyMetadata, Graph, IndexMetadata, SchemaMetadata, SourceLocation, VertexId,
+    VertexKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -70,17 +71,96 @@ pub struct LintReport {
     pub complete: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// FK 판정이 훑은 컬럼·인덱스 메타데이터 항목 수. 테스트 스레드마다 따로 센다.
+    static METADATA_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// FK 판정이 메타데이터 항목을 훑은 수를 더한다.
+#[cfg(test)]
+fn count_metadata_visits(count: usize) {
+    METADATA_VISITS.with(|visits| visits.set(visits.get() + count));
+}
+
+/// 현재 테스트 스레드의 메타데이터 항목 방문 수를 돌려주고 0으로 되돌린다.
+#[cfg(test)]
+fn take_metadata_visits() -> usize {
+    METADATA_VISITS.with(std::cell::Cell::take)
+}
+
+/// FK 판정에 쓰는 테이블별 카탈로그 사실이다. lint 한 번에 메타데이터를 한 번만 훑어 만든다.
+///
+/// FK마다 전체 컬럼·인덱스 메타데이터를 다시 훑으면 비용이 FK 수 × 컬럼 수가 되어
+/// 테이블 1만 개 카탈로그에서 lint가 수십 초 걸린다(`unused`가 FK를 테이블별로 묶는
+/// 것과 같은 이유다). 테이블별 목록은 원래 BTreeMap 순회 순서를 지켜 전수 탐색과
+/// 같은 판정을 낸다.
+struct TableFacts<'a> {
+    /// 테이블 → 그 테이블의 인덱스 메타데이터(인덱스 id 순).
+    indexes: BTreeMap<&'a VertexId, Vec<&'a IndexMetadata>>,
+    /// 테이블 → PK 컬럼의 (pk_position, 컬럼 id), (위치, id) 순. PK 컬럼이 없는 테이블은 키가 없다.
+    primary_keys: BTreeMap<VertexId, Vec<(u32, &'a VertexId)>>,
+}
+
+impl<'a> TableFacts<'a> {
+    /// 컬럼·인덱스 메타데이터를 각각 한 번씩 훑어 색인을 만든다.
+    fn new(metadata: &'a SchemaMetadata) -> Self {
+        Self {
+            indexes: indexes_by_table(metadata),
+            primary_keys: primary_keys_by_table(metadata),
+        }
+    }
+}
+
+/// 인덱스를 소속 테이블별로 묶는다. 인덱스 id 순서를 그대로 유지한다.
+fn indexes_by_table(metadata: &SchemaMetadata) -> BTreeMap<&VertexId, Vec<&IndexMetadata>> {
+    let mut by_table = BTreeMap::<&VertexId, Vec<&IndexMetadata>>::new();
+    for index in metadata.indexes.values() {
+        #[cfg(test)]
+        count_metadata_visits(1);
+        by_table.entry(&index.table).or_default().push(index);
+    }
+    by_table
+}
+
+/// PK 컬럼을 테이블별로 묶는다. `parent()`는 호출마다 새 id를 할당하므로 PK 컬럼에만
+/// 한 번씩 부른다. PK 여부와 `parent()`를 한 튜플 패턴으로 맞추면 두 값을 먼저 모두
+/// 평가해 PK가 아닌 컬럼까지 할당하므로, PK가 아닌 컬럼은 먼저 건너뛴다.
+fn primary_keys_by_table(metadata: &SchemaMetadata) -> BTreeMap<VertexId, Vec<(u32, &VertexId)>> {
+    let mut by_table = BTreeMap::<VertexId, Vec<(u32, &VertexId)>>::new();
+    for (id, column) in &metadata.columns {
+        #[cfg(test)]
+        count_metadata_visits(1);
+        if column.pk_position == 0 {
+            continue;
+        }
+        if let Some(table) = id.parent() {
+            by_table
+                .entry(table)
+                .or_default()
+                .push((column.pk_position, id));
+        }
+    }
+    // 컬럼 id 순으로 넣었으니 위치로 안정 정렬하면 (위치, id) 순이 된다.
+    for primary in by_table.values_mut() {
+        primary.sort_by_key(|(position, _)| *position);
+    }
+    by_table
+}
+
 /// 외래 키 컬럼의 ordered key prefix와 일치하는 완전·비부분 인덱스를 찾는다.
+///
+/// 같은 테이블의 인덱스만 본다. 일치하는 인덱스가 없을 때 그 테이블에 불완전한
+/// 인덱스가 하나라도 있으면 두 번째 값이 참이다.
 fn has_unfiltered_prefix(
-    metadata: &schemagraph_core::SchemaMetadata,
+    facts: &TableFacts,
     table: &VertexId,
     columns: &[VertexId],
 ) -> (bool, bool) {
     let mut incomplete = false;
-    let found = metadata.indexes.values().any(|index| {
-        if &index.table != table {
-            return false;
-        }
+    let found = facts.indexes.get(table).into_iter().flatten().any(|index| {
+        #[cfg(test)]
+        count_metadata_visits(1);
         if !index.complete {
             incomplete = true;
             return false;
@@ -92,24 +172,16 @@ fn has_unfiltered_prefix(
 
 /// 테이블 PK 컬럼 순서가 완전하게 관찰됐고 FK가 그 prefix인지 확인한다.
 fn has_primary_key_prefix(
-    metadata: &schemagraph_core::SchemaMetadata,
+    facts: &TableFacts,
     table: &VertexId,
     columns: &[VertexId],
 ) -> (bool, bool) {
-    let mut primary: Vec<_> = metadata
-        .columns
-        .iter()
-        .filter(|(id, column)| id.parent().as_ref() == Some(table) && column.pk_position > 0)
-        .map(|(id, column)| (column.pk_position, id.clone()))
-        .collect();
-    let has_table_columns = metadata
-        .columns
-        .keys()
-        .any(|id| id.parent().as_ref() == Some(table));
-    if !has_table_columns || primary.is_empty() {
+    // 컬럼 메타데이터가 없는 테이블에는 PK 컬럼도 없으므로 이 한 번의 조회로 둘 다 걸러진다.
+    let Some(primary) = facts.primary_keys.get(table) else {
         return (false, true);
-    }
-    primary.sort_by_key(|(position, _)| *position);
+    };
+    #[cfg(test)]
+    count_metadata_visits(primary.len());
     let positions_complete = primary
         .iter()
         .enumerate()
@@ -117,14 +189,19 @@ fn has_primary_key_prefix(
     if !positions_complete {
         return (false, true);
     }
-    let primary_columns: Vec<_> = primary.into_iter().map(|(_, id)| id).collect();
-    (primary_columns.starts_with(columns), false)
+    let is_prefix = primary.len() >= columns.len()
+        && primary
+            .iter()
+            .zip(columns)
+            .all(|((_, id), column)| *id == column);
+    (is_prefix, false)
 }
 
 /// 외래 키의 인덱스 prefix 사실을 보고한다.
 fn foreign_key_findings(
     graph: &Graph,
-    metadata: &schemagraph_core::SchemaMetadata,
+    metadata: &SchemaMetadata,
+    facts: &TableFacts,
     findings: &mut Vec<LintFinding>,
     complete: &mut bool,
 ) {
@@ -162,9 +239,9 @@ fn foreign_key_findings(
             continue;
         }
         let (found, incomplete_index) =
-            has_unfiltered_prefix(metadata, &foreign_key.table, &foreign_key.columns);
+            has_unfiltered_prefix(facts, &foreign_key.table, &foreign_key.columns);
         let (primary_found, incomplete_primary) =
-            has_primary_key_prefix(metadata, &foreign_key.table, &foreign_key.columns);
+            has_primary_key_prefix(facts, &foreign_key.table, &foreign_key.columns);
         if found || primary_found {
             continue;
         }
@@ -196,12 +273,16 @@ fn foreign_key_findings(
 /// `fk-index-prefix`가 이미 알리므로 여기서 중복 보고하지 않는다. 판정하지 못한
 /// 쌍은 미확인이지만, 타입 대조는 FK·인덱스 목록의 관찰 여부와 별개라서 보고서
 /// 완전성은 낮추지 않는다.
-fn foreign_key_type_findings(metadata: &SchemaMetadata, findings: &mut Vec<LintFinding>) {
+fn foreign_key_type_findings(
+    metadata: &SchemaMetadata,
+    facts: &TableFacts,
+    findings: &mut Vec<LintFinding>,
+) {
     for (subject, foreign_key) in &metadata.foreign_keys {
         if !foreign_key.complete {
             continue;
         }
-        let targets = referenced_columns(metadata, foreign_key);
+        let targets = referenced_columns(facts, foreign_key);
         if targets.len() != foreign_key.columns.len() {
             findings.push(type_finding(
                 subject,
@@ -223,24 +304,20 @@ fn foreign_key_type_findings(metadata: &SchemaMetadata, findings: &mut Vec<LintF
 
 /// FK가 가리키는 컬럼이다. 대상 컬럼을 생략한 참조(`REFERENCES t`)는 SQL 규칙대로
 /// 대상 테이블의 PK 키 순서를 쓴다.
-fn referenced_columns(
-    metadata: &SchemaMetadata,
-    foreign_key: &ForeignKeyMetadata,
-) -> Vec<VertexId> {
+fn referenced_columns(facts: &TableFacts, foreign_key: &ForeignKeyMetadata) -> Vec<VertexId> {
     if !foreign_key.target_columns.is_empty() {
         return foreign_key.target_columns.clone();
     }
     let Some(target_table) = &foreign_key.target_table else {
         return Vec::new();
     };
-    let mut primary: Vec<_> = metadata
-        .columns
-        .iter()
-        .filter(|(id, column)| id.parent().as_ref() == Some(target_table) && column.pk_position > 0)
-        .map(|(id, column)| (column.pk_position, id.clone()))
-        .collect();
-    primary.sort();
-    primary.into_iter().map(|(_, id)| id).collect()
+    let primary = facts
+        .primary_keys
+        .get(target_table)
+        .map_or(&[][..], Vec::as_slice);
+    #[cfg(test)]
+    count_metadata_visits(primary.len());
+    primary.iter().map(|(_, id)| (*id).clone()).collect()
 }
 
 /// fk-type-mismatch finding을 만든다.
@@ -482,8 +559,9 @@ pub fn lint(graph: &Graph, max_results: usize) -> LintReport {
     let mut limitations = graph.limitations().to_vec();
     match graph.schema_metadata() {
         Some(metadata) => {
-            foreign_key_findings(graph, metadata, &mut findings, &mut complete);
-            foreign_key_type_findings(metadata, &mut findings);
+            let facts = TableFacts::new(metadata);
+            foreign_key_findings(graph, metadata, &facts, &mut findings, &mut complete);
+            foreign_key_type_findings(metadata, &facts, &mut findings);
             missing_primary_key_findings(graph, metadata, &mut findings);
             duplicate_index_findings(graph, metadata, &mut findings);
         }
@@ -1022,5 +1100,249 @@ mod tests {
         assert!(duplicates[0].message.contains("app.child.i1"));
         assert_eq!(duplicates[0].status, LintStatus::Unverified);
         assert!(report.complete, "{report:?}");
+    }
+
+    /// 여러 테이블을 담은 완전한 카탈로그를 만든다. 컬럼은 (이름, pk_position)이다.
+    ///
+    /// 테이블 이름을 서로의 접두사로 골라(`orders`·`orders_archive`) 문자열 접두 범위로
+    /// 묶는 색인이 다른 테이블의 사실을 섞으면 드러나게 한다.
+    fn tables_fixture(tables: &[(&str, &[(&str, u32)])]) -> (Graph, SchemaMetadata) {
+        let mut graph = Graph::new();
+        let mut metadata = SchemaMetadata {
+            catalog_complete: true,
+            ..SchemaMetadata::default()
+        };
+        let vertex = |raw: String, kind, name: &str| Vertex {
+            id: id(&raw),
+            kind,
+            name: name.into(),
+            schema: "app".into(),
+        };
+        for (table, columns) in tables {
+            graph.add_vertex(vertex(format!("app.{table}"), VertexKind::Table, table));
+            for (column, pk_position) in *columns {
+                let raw = format!("app.{table}.{column}");
+                graph.add_vertex(vertex(raw.clone(), VertexKind::Column, column));
+                metadata.columns.insert(
+                    id(&raw),
+                    ColumnMetadata {
+                        data_type: "integer".into(),
+                        nullable: *pk_position == 0,
+                        ordinal: 1,
+                        pk_position: *pk_position,
+                    },
+                );
+            }
+        }
+        (graph, metadata)
+    }
+
+    /// 테이블에 인덱스 메타데이터와 정점을 더한다.
+    fn add_index(
+        graph: &mut Graph,
+        metadata: &mut SchemaMetadata,
+        (table, name): (&str, &str),
+        columns: &[&str],
+        complete: bool,
+    ) {
+        let raw = format!("app.{table}.{name}");
+        graph.add_vertex(Vertex {
+            id: id(&raw),
+            kind: VertexKind::Index,
+            name: name.into(),
+            schema: "app".into(),
+        });
+        metadata.indexes.insert(
+            id(&raw),
+            IndexMetadata {
+                table: id(&format!("app.{table}")),
+                columns: columns
+                    .iter()
+                    .map(|column| id(&format!("app.{table}.{column}")))
+                    .collect(),
+                unique: false,
+                has_predicate: false,
+                complete,
+            },
+        );
+    }
+
+    /// 완전한 FK 메타데이터와 제약 정점을 더한다. 대상 컬럼을 비우면 대상 PK를 쓴다.
+    fn add_foreign_key(
+        graph: &mut Graph,
+        metadata: &mut SchemaMetadata,
+        (table, name): (&str, &str),
+        columns: &[&str],
+        (target, target_columns): (&str, &[&str]),
+    ) {
+        let raw = format!("app.{table}.{name}");
+        graph.add_vertex(Vertex {
+            id: id(&raw),
+            kind: VertexKind::Constraint,
+            name: name.into(),
+            schema: "app".into(),
+        });
+        let members = |owner: &str, names: &[&str]| -> Vec<VertexId> {
+            names
+                .iter()
+                .map(|column| id(&format!("app.{owner}.{column}")))
+                .collect()
+        };
+        metadata.foreign_keys.insert(
+            id(&raw),
+            ForeignKeyMetadata {
+                table: id(&format!("app.{table}")),
+                columns: members(table, columns),
+                target_table: Some(id(&format!("app.{target}"))),
+                target_columns: members(target, target_columns),
+                complete: true,
+            },
+        );
+    }
+
+    /// 다른 테이블의 PK·완전 인덱스는 FK를 덮지 못하고, 다른 테이블의 불완전 인덱스는
+    /// 확정 판정을 미확인으로 낮추지 못한다.
+    #[test]
+    fn other_tables_keys_and_incomplete_indexes_do_not_leak_into_fk_coverage() {
+        let (mut graph, mut metadata) = tables_fixture(&[
+            ("customers", &[("id", 1)]),
+            ("orders", &[("id", 1), ("customer_id", 0)]),
+            ("orders_archive", &[("customer_id", 1), ("id", 0)]),
+        ]);
+        add_index(
+            &mut graph,
+            &mut metadata,
+            ("orders_archive", "archive_customer"),
+            &["customer_id"],
+            true,
+        );
+        add_index(
+            &mut graph,
+            &mut metadata,
+            ("orders_archive", "archive_partial"),
+            &["id"],
+            false,
+        );
+        add_index(
+            &mut graph,
+            &mut metadata,
+            ("customers", "c"),
+            &["id"],
+            false,
+        );
+        add_foreign_key(
+            &mut graph,
+            &mut metadata,
+            ("orders", "orders_fk"),
+            &["customer_id"],
+            ("customers", &["id"]),
+        );
+        // orders_archive의 FK는 자기 PK prefix로 덮인다 — 같은 테이블의 불완전 인덱스와 무관하다.
+        add_foreign_key(
+            &mut graph,
+            &mut metadata,
+            ("orders_archive", "archive_fk"),
+            &["customer_id"],
+            ("customers", &["id"]),
+        );
+        graph.set_schema_metadata(metadata);
+        let report = lint(&graph, 50);
+        let prefix = prefix_findings(&report);
+        assert_eq!(
+            prefix
+                .iter()
+                .map(|f| (f.subject.as_str(), f.status))
+                .collect::<Vec<_>>(),
+            [("app.orders.orders_fk", LintStatus::Confirmed)],
+            "{report:?}"
+        );
+        assert!(report.complete, "{report:?}");
+    }
+
+    /// PK 위치가 1..n으로 이어지지 않으면 prefix를 판정하지 않는다. 다른 테이블의 PK
+    /// 위치가 구멍을 메우는 것처럼 보이면 안 된다.
+    #[test]
+    fn primary_key_position_gap_stays_unverified_across_tables() {
+        let (mut graph, mut metadata) = tables_fixture(&[
+            ("lines", &[("a", 1), ("b", 3)]),
+            ("lines2", &[("c", 2)]),
+            ("target", &[("id", 1)]),
+        ]);
+        add_foreign_key(
+            &mut graph,
+            &mut metadata,
+            ("lines", "lines_fk"),
+            &["a"],
+            ("target", &["id"]),
+        );
+        graph.set_schema_metadata(metadata);
+        let report = lint(&graph, 50);
+        let prefix = prefix_findings(&report);
+        assert_eq!(prefix.len(), 1, "{report:?}");
+        assert_eq!(prefix[0].status, LintStatus::Unverified);
+        assert!(!report.complete, "{report:?}");
+    }
+
+    /// 대상 컬럼을 생략한 FK는 대상 테이블의 PK만 쓴다 — 이름이 비슷한 다른 테이블의
+    /// PK(다른 타입)를 대조하면 거짓 타입 불일치가 난다.
+    #[test]
+    fn omitted_target_columns_use_only_the_referenced_tables_primary_key() {
+        let (mut graph, mut metadata) = tables_fixture(&[
+            ("parent", &[("id", 1)]),
+            ("parent_archive", &[("id", 1)]),
+            ("child", &[("parent_id", 0)]),
+        ]);
+        metadata
+            .columns
+            .get_mut(&id("app.parent_archive.id"))
+            .unwrap()
+            .data_type = "bigint".into();
+        add_foreign_key(
+            &mut graph,
+            &mut metadata,
+            ("child", "child_fk"),
+            &["parent_id"],
+            ("parent", &[]),
+        );
+        graph.set_schema_metadata(metadata);
+        let report = lint(&graph, 50);
+        assert!(
+            rule_findings(&report, "fk-type-mismatch").is_empty(),
+            "{report:?}"
+        );
+    }
+
+    /// FK 판정은 메타데이터 항목마다 상수 번만 본다. FK마다 전체 컬럼·인덱스를 다시
+    /// 훑으면 테이블 1만 개에서 수십 초가 걸리는데, 시간 대신 방문 수로 고정한다.
+    #[test]
+    fn fk_coverage_examines_each_metadata_entry_a_bounded_number_of_times() {
+        let names: Vec<String> = (0..60).map(|number| format!("t{number:03}")).collect();
+        let columns: &[(&str, u32)] = &[("c0", 1), ("c1", 0), ("c2", 0), ("c3", 0)];
+        let tables: Vec<(&str, &[(&str, u32)])> =
+            names.iter().map(|name| (name.as_str(), columns)).collect();
+        let (mut graph, mut metadata) = tables_fixture(&tables);
+        for (number, name) in names.iter().enumerate() {
+            add_index(&mut graph, &mut metadata, (name, "idx"), &["c1"], true);
+            if number > 0 {
+                let target = names[number - 1].as_str();
+                add_foreign_key(
+                    &mut graph,
+                    &mut metadata,
+                    (name, "fk"),
+                    &["c1"],
+                    (target, &[]),
+                );
+            }
+        }
+        let entries = metadata.columns.len() + metadata.indexes.len();
+        graph.set_schema_metadata(metadata);
+        take_metadata_visits();
+        let report = lint(&graph, 500);
+        let visits = take_metadata_visits();
+        assert!(prefix_findings(&report).is_empty(), "{report:?}");
+        assert!(
+            visits <= 2 * entries,
+            "visited {visits} metadata entries for {entries} entries"
+        );
     }
 }
