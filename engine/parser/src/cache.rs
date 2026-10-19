@@ -74,17 +74,6 @@ pub trait BodyCache {
     fn record_restore_failure(&mut self) {}
 }
 
-fn owns(graph: &Graph, owner: &VertexId, id: &VertexId) -> bool {
-    id == owner
-        || (graph
-            .vertex(id)
-            .is_some_and(|v| v.kind == VertexKind::Column)
-            && graph
-                .outgoing(owner)
-                .iter()
-                .any(|e| e.kind == EdgeKind::Contains && &e.to == id))
-}
-
 pub(crate) fn reuse(
     cache: &mut Option<&mut dyn BodyCache>,
     graph: &mut Graph,
@@ -157,30 +146,7 @@ pub(crate) fn restore(
     if cached.owner != *owner
         || cached.analysis.body_hash.as_deref() != Some(hash.as_str())
         || cached.enriched > 1
-        || cached.edges.iter().any(|e| {
-            !owns(graph, owner, &e.from) && !dml_effect_owned(graph, &cached, owner, e)
-                || graph.vertex(&e.from).is_none()
-                || (!owns(graph, owner, &e.from)
-                    && graph
-                        .vertex(&e.from)
-                        .is_none_or(|vertex| vertex.kind != VertexKind::Column))
-                || graph.vertex(&e.to).is_none()
-                || !e.kind.is_dependency()
-                || e.evidence.is_empty()
-                || e.evidence
-                    .iter()
-                    .any(|v| v.layer != EvidenceLayer::BodyParse)
-                || !cached.origins.iter().any(|(key, origin)| {
-                    (&key.0, &key.1, key.2) == (&e.from, &e.to, e.kind) && origin.body_hash == hash
-                })
-        })
-        || cached.origins.iter().any(|(key, origin)| {
-            origin.body_hash != hash
-                || !cached
-                    .edges
-                    .iter()
-                    .any(|e| (&e.from, &e.to, e.kind) == (&key.0, &key.1, key.2))
-        })
+        || !CachedKeys::new(graph, owner, &hash, &cached).accept(graph, &cached)
     {
         return false;
     }
@@ -196,35 +162,130 @@ pub(crate) fn restore(
     true
 }
 
-fn dml_effect_owned(graph: &Graph, cached: &BodyResult, owner: &VertexId, edge: &Edge) -> bool {
-    if edge.kind != EdgeKind::DerivesFrom {
-        return false;
+/// 빌린 (from, to, kind) 간선 키.
+type KeyRef<'a> = (&'a VertexId, &'a VertexId, EdgeKind);
+
+/// hit를 복원하기 전에 확인하는 캐시 결과의 키 집합.
+///
+/// 간선마다 origin 목록을, origin마다 간선 목록을 훑으면 넓은 뷰·대형 프로시저의
+/// hit가 다시 파싱하는 것보다 느려진다. 집합을 한 번 만들고 같은 거부 조건을
+/// 조회로 확인한다.
+struct CachedKeys<'a> {
+    owner: &'a VertexId,
+    hash: &'a str,
+    /// owner가 Contains로 담은 정점. 그중 컬럼은 owner 소유 간선의 출발점이다.
+    contained: BTreeSet<&'a VertexId>,
+    /// 캐시 간선의 키.
+    edges: BTreeSet<KeyRef<'a>>,
+    /// 이 몸체 해시를 가진 캐시 origin의 키.
+    hashed_origins: BTreeSet<KeyRef<'a>>,
+    /// owner의 DML 분석이 남긴(`dml-owner:{owner}:`) 캐시 origin의 키.
+    owned_origins: BTreeSet<KeyRef<'a>>,
+}
+
+impl<'a> CachedKeys<'a> {
+    fn new(graph: &'a Graph, owner: &'a VertexId, hash: &'a str, cached: &'a BodyResult) -> Self {
+        let mut keys = Self {
+            owner,
+            hash,
+            contained: BTreeSet::new(),
+            edges: BTreeSet::new(),
+            hashed_origins: BTreeSet::new(),
+            owned_origins: BTreeSet::new(),
+        };
+        for edge in graph.outgoing(owner) {
+            #[cfg(test)]
+            count_restore_visit();
+            if edge.kind == EdgeKind::Contains {
+                keys.contained.insert(&edge.to);
+            }
+        }
+        for edge in &cached.edges {
+            #[cfg(test)]
+            count_restore_visit();
+            keys.edges.insert((&edge.from, &edge.to, edge.kind));
+        }
+        keys.add_origins(cached);
+        keys
     }
-    if ![&edge.from, &edge.to].into_iter().all(|id| {
-        graph
-            .vertex(id)
-            .is_some_and(|vertex| vertex.kind == VertexKind::Column)
-    }) {
-        return false;
+
+    /// origin 키를 몸체 해시가 맞는 것과 owner DML이 남긴 것으로 나눠 담는다.
+    fn add_origins(&mut self, cached: &'a BodyResult) {
+        let prefix = format!("dml-owner:{}:", self.owner.as_str());
+        for (key, origin) in &cached.origins {
+            #[cfg(test)]
+            count_restore_visit();
+            if origin.body_hash == self.hash {
+                self.hashed_origins.insert((&key.0, &key.1, key.2));
+            }
+            if origin.role.starts_with(&prefix) {
+                self.owned_origins.insert((&key.0, &key.1, key.2));
+            }
+        }
     }
-    let matching_write = cached.edges.iter().any(|candidate| {
-        candidate.from == *owner && candidate.to == edge.from && candidate.kind == EdgeKind::Writes
-    });
-    let prefix = format!("dml-owner:{}:", owner.as_str());
-    let owned_write_origin = cached.origins.iter().any(|(key, origin)| {
-        key.0 == *owner
-            && key.1 == edge.from
-            && key.2 == EdgeKind::Writes
-            && origin.role.starts_with(&prefix)
-    });
-    if !matching_write || !owned_write_origin {
-        return false;
+
+    /// 캐시 간선과 origin을 모두 현재 그래프에 안전하게 복원할 수 있는지 본다.
+    fn accept(&self, graph: &Graph, cached: &'a BodyResult) -> bool {
+        cached
+            .edges
+            .iter()
+            .all(|edge| self.accept_edge(graph, edge))
+            && cached.origins.iter().all(|(key, origin)| {
+                #[cfg(test)]
+                count_restore_visit();
+                origin.body_hash == self.hash && self.edges.contains(&(&key.0, &key.1, key.2))
+            })
     }
-    cached
-        .origins
-        .iter()
-        .filter(|(key, _)| key.0 == edge.from && key.1 == edge.to && key.2 == edge.kind)
-        .any(|(_, origin)| origin.role.starts_with(&prefix))
+
+    /// owner가 소유했거나 owner 쓰기에 딸린 DML 계보이고, 양 끝이 그래프에 있으며,
+    /// 몸체 근거만 있고 이 몸체 해시의 origin이 있는 의존 간선만 받는다.
+    fn accept_edge(&self, graph: &Graph, edge: &'a Edge) -> bool {
+        #[cfg(test)]
+        count_restore_visit();
+        let owned = self.owns(graph, &edge.from);
+        (owned || self.dml_effect_owned(graph, edge))
+            && graph
+                .vertex(&edge.from)
+                .is_some_and(|vertex| owned || vertex.kind == VertexKind::Column)
+            && graph.vertex(&edge.to).is_some()
+            && edge.kind.is_dependency()
+            && !edge.evidence.is_empty()
+            && edge
+                .evidence
+                .iter()
+                .all(|evidence| evidence.layer == EvidenceLayer::BodyParse)
+            && self
+                .hashed_origins
+                .contains(&(&edge.from, &edge.to, edge.kind))
+    }
+
+    /// owner 자신이거나 owner가 Contains로 담은 컬럼이다.
+    fn owns(&self, graph: &Graph, id: &VertexId) -> bool {
+        id == self.owner
+            || (graph
+                .vertex(id)
+                .is_some_and(|vertex| vertex.kind == VertexKind::Column)
+                && self.contained.contains(id))
+    }
+
+    /// 컬럼 사이 DerivesFrom이고, owner가 그 대상 컬럼에 쓰는 캐시 간선과 owner DML
+    /// origin이 있으며, 계보 자체에도 owner DML origin이 있다.
+    fn dml_effect_owned(&self, graph: &Graph, edge: &'a Edge) -> bool {
+        let column = |id: &VertexId| {
+            graph
+                .vertex(id)
+                .is_some_and(|vertex| vertex.kind == VertexKind::Column)
+        };
+        let write = (self.owner, &edge.from, EdgeKind::Writes);
+        edge.kind == EdgeKind::DerivesFrom
+            && column(&edge.from)
+            && column(&edge.to)
+            && self.edges.contains(&write)
+            && self.owned_origins.contains(&write)
+            && self
+                .owned_origins
+                .contains(&(&edge.from, &edge.to, edge.kind))
+    }
 }
 
 #[cfg(test)]
@@ -233,12 +294,26 @@ thread_local! {
     /// 입력에서 시간으로 드러나지 않으므로 작업량을 횟수로 센다. 테스트는 스레드마다
     /// 병렬로 돌므로 계수도 스레드마다 따로 둔다.
     static CAPTURED_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// restore가 hit를 검증하며 들여다본 캐시 간선·origin과 owner 인접 간선 수.
+    static RESTORE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// 현재 테스트 스레드의 capture 계수를 돌려주고 0으로 되돌린다.
 #[cfg(test)]
 fn take_captured_keys() -> usize {
     CAPTURED_KEYS.with(|count| count.replace(0))
+}
+
+/// restore가 항목 하나를 들여다봤음을 센다.
+#[cfg(test)]
+fn count_restore_visit() {
+    RESTORE_VISITS.with(|count| count.set(count.get() + 1));
+}
+
+/// 현재 테스트 스레드의 restore 계수를 돌려주고 0으로 되돌린다.
+#[cfg(test)]
+fn take_restore_visits() -> usize {
+    RESTORE_VISITS.with(|count| count.replace(0))
 }
 
 #[cfg(test)]
@@ -788,6 +863,195 @@ mod tests {
                 assert_eq!(saved.analysis, legacy.analysis, "{owner}");
             }
         }
+    }
+
+    /// 컬럼 `columns`개를 모두 투영하는 넓은 뷰 하나와 그 원본 테이블.
+    fn wide_view_document(columns: usize) -> CatalogDocument {
+        let column = |index: usize| serde_json::json!({"name":format!("c{index}"),"data_type":"INTEGER","nullable":true,"ordinal":index + 1,"pk_position":0});
+        let shape: Vec<_> = (0..columns).map(column).collect();
+        let projection: Vec<_> = (0..columns).map(|index| format!("c{index}")).collect();
+        serde_json::from_value(serde_json::json!({
+            "version":1,"dialect":"postgres","reader":"test","limitations":[],
+            "schemas":[{"name":"public","routines":[],"objects":[
+                {"name":"t","kind":"table","columns":shape,"constraints":[],"indexes":[],"triggers":[]},
+                {"name":"v","kind":"view","body":format!("SELECT {} FROM t", projection.join(", ")),"columns":shape,"constraints":[],"indexes":[],"triggers":[]}
+            ]}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_checks_each_cached_item_a_bounded_number_of_times() {
+        for doc in [wide_view_document(64), dml_routine_document(4)] {
+            let mut cache = MemoryCache::default();
+            let mut cold = schemagraph_source::graph::document_to_graph(&doc);
+            let expected = crate::enrich_with_cache(&mut cold, &doc, Some(&mut cache));
+            let items: usize = cache
+                .0
+                .values()
+                .map(|result| result.edges.len() + result.origins.len())
+                .sum();
+            take_restore_visits();
+            let mut warm = schemagraph_source::graph::document_to_graph(&doc);
+            let result = crate::enrich_with_cache(&mut warm, &doc, Some(&mut cache));
+            let visits = take_restore_visits();
+            // 모든 몸체가 hit로 복원돼야 이 계수가 restore의 작업량이다.
+            assert_eq!((cache.1, cache.2), (cache.0.len(), 0));
+            assert_eq!(result, expected);
+            assert_eq!(warm.edges(), cold.edges());
+            assert_eq!(warm.origins(), cold.origins());
+            // 간선마다 origin 목록을, origin마다 간선 목록을 훑으면 넓은 몸체에서 항목
+            // 수의 제곱이 된다. 집합을 한 번 만들어 조회하면 항목마다 몇 번만 본다.
+            assert!(
+                visits <= 3 * items,
+                "{visits} visits for {items} cached items"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_accepts_exactly_what_the_pairwise_checks_accepted() {
+        for doc in [dml_routine_document(2), fixture(), wide_view_document(3)] {
+            let mut cache = MemoryCache::default();
+            crate::enrich_with_cache(
+                &mut schemagraph_source::graph::document_to_graph(&doc),
+                &doc,
+                Some(&mut cache),
+            );
+            let graph = schemagraph_source::graph::document_to_graph(&doc);
+            for (owner, saved) in &cache.0 {
+                let hash = saved.analysis.body_hash.clone().unwrap();
+                let verdicts: Vec<bool> = mutations(saved)
+                    .iter()
+                    .map(|cached| {
+                        let accepted =
+                            CachedKeys::new(&graph, owner, &hash, cached).accept(&graph, cached);
+                        let legacy = legacy_accepts(&graph, owner, &hash, cached);
+                        assert_eq!(accepted, legacy, "{owner}: {cached:?}");
+                        accepted
+                    })
+                    .collect();
+                // 원래 결과는 받고 망가뜨린 변형 일부는 거부해야 비교가 의미 있다.
+                assert!(verdicts[0], "{owner}");
+                assert!(verdicts.iter().any(|accepted| !accepted), "{owner}");
+            }
+        }
+    }
+
+    /// 저장된 결과와, 간선·origin을 하나씩 망가뜨린 변형들.
+    fn mutations(saved: &BodyResult) -> Vec<BodyResult> {
+        let mut variants = vec![saved.clone()];
+        let edge_changes: [fn(&mut Edge); 6] = [
+            |edge| edge.to = VertexId::from_raw("missing"),
+            |edge| std::mem::swap(&mut edge.from, &mut edge.to),
+            |edge| edge.kind = EdgeKind::Contains,
+            |edge| edge.kind = EdgeKind::DerivesFrom,
+            |edge| edge.evidence.clear(),
+            |edge| edge.evidence[0].layer = EvidenceLayer::Catalog,
+        ];
+        for index in 0..saved.edges.len() {
+            for change in edge_changes {
+                let mut variant = saved.clone();
+                change(&mut variant.edges[index]);
+                variants.push(variant);
+            }
+            let mut variant = saved.clone();
+            variant.edges.remove(index);
+            variants.push(variant);
+        }
+        let origin_changes: [fn(&mut (OriginKey, Origin)); 3] = [
+            |(_, origin)| origin.body_hash = "sha256:other".into(),
+            |(_, origin)| origin.role = "relation".into(),
+            |(key, _)| key.2 = EdgeKind::Reads,
+        ];
+        for index in 0..saved.origins.len() {
+            for change in origin_changes {
+                let mut variant = saved.clone();
+                change(&mut variant.origins[index]);
+                variants.push(variant);
+            }
+            let mut variant = saved.clone();
+            variant.origins.remove(index);
+            variants.push(variant);
+        }
+        variants
+    }
+
+    /// 간선마다 origin 목록을, origin마다 간선 목록을 훑던 restore의 거부 조건.
+    /// 집합 조회로 바꾼 조건이 같은 결과를 받아들이는지 비교하려고 남긴다.
+    fn legacy_accepts(graph: &Graph, owner: &VertexId, hash: &str, cached: &BodyResult) -> bool {
+        let owns = |id: &VertexId| {
+            id == owner
+                || (graph
+                    .vertex(id)
+                    .is_some_and(|v| v.kind == VertexKind::Column)
+                    && graph
+                        .outgoing(owner)
+                        .iter()
+                        .any(|e| e.kind == EdgeKind::Contains && &e.to == id))
+        };
+        let rejected = cached.edges.iter().any(|e| {
+            !owns(&e.from) && !legacy_dml_effect_owned(graph, cached, owner, e)
+                || graph.vertex(&e.from).is_none()
+                || (!owns(&e.from)
+                    && graph
+                        .vertex(&e.from)
+                        .is_none_or(|vertex| vertex.kind != VertexKind::Column))
+                || graph.vertex(&e.to).is_none()
+                || !e.kind.is_dependency()
+                || e.evidence.is_empty()
+                || e.evidence
+                    .iter()
+                    .any(|v| v.layer != EvidenceLayer::BodyParse)
+                || !cached.origins.iter().any(|(key, origin)| {
+                    (&key.0, &key.1, key.2) == (&e.from, &e.to, e.kind) && origin.body_hash == hash
+                })
+        }) || cached.origins.iter().any(|(key, origin)| {
+            origin.body_hash != hash
+                || !cached
+                    .edges
+                    .iter()
+                    .any(|e| (&e.from, &e.to, e.kind) == (&key.0, &key.1, key.2))
+        });
+        !rejected
+    }
+
+    fn legacy_dml_effect_owned(
+        graph: &Graph,
+        cached: &BodyResult,
+        owner: &VertexId,
+        edge: &Edge,
+    ) -> bool {
+        if edge.kind != EdgeKind::DerivesFrom {
+            return false;
+        }
+        if ![&edge.from, &edge.to].into_iter().all(|id| {
+            graph
+                .vertex(id)
+                .is_some_and(|vertex| vertex.kind == VertexKind::Column)
+        }) {
+            return false;
+        }
+        let matching_write = cached.edges.iter().any(|candidate| {
+            candidate.from == *owner
+                && candidate.to == edge.from
+                && candidate.kind == EdgeKind::Writes
+        });
+        let prefix = format!("dml-owner:{}:", owner.as_str());
+        let owned_write_origin = cached.origins.iter().any(|(key, origin)| {
+            key.0 == *owner
+                && key.1 == edge.from
+                && key.2 == EdgeKind::Writes
+                && origin.role.starts_with(&prefix)
+        });
+        if !matching_write || !owned_write_origin {
+            return false;
+        }
+        cached
+            .origins
+            .iter()
+            .filter(|(key, _)| key.0 == edge.from && key.1 == edge.to && key.2 == edge.kind)
+            .any(|(_, origin)| origin.role.starts_with(&prefix))
     }
 
     /// 몸체마다 그래프의 모든 origin을 훑던 capture. 결과가 같은지 비교하려고 남긴다.

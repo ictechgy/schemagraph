@@ -3,6 +3,7 @@
 //! 캐시는 parser 효과만 저장한다. 카탈로그·usage는 매 실행마다 새로 만들고,
 //! SQL 원문은 namespace 계산과 entry 저장 어디에도 복사하지 않는다.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -439,6 +440,11 @@ impl BodyResultDoc {
             .into_iter()
             .map(OriginDoc::into_origin)
             .collect::<Result<_, _>>()?;
+        // origin마다 간선 목록을 훑으면 넓은 몸체의 hit가 다시 파싱하는 것보다 느려진다.
+        let edge_keys: BTreeSet<_> = edges
+            .iter()
+            .map(|edge| (&edge.from, &edge.to, edge.kind))
+            .collect();
         for (key, origin) in &origins {
             if key.0.as_str().is_empty() || key.1.as_str().is_empty() {
                 return Err("origin endpoint is empty".into());
@@ -446,10 +452,7 @@ impl BodyResultDoc {
             if origin.body_hash != body_hash {
                 return Err("origin body hash does not match cache body".into());
             }
-            if !edges
-                .iter()
-                .any(|edge| edge.from == key.0 && edge.to == key.1 && edge.kind == key.2)
-            {
+            if !edge_keys.contains(&(&key.0, &key.1, key.2)) {
                 return Err("origin has no matching cached edge".into());
             }
         }
@@ -1142,6 +1145,29 @@ mod tests {
             .load(&owner, body)
             .unwrap();
         assert_eq!(loaded.notes, parser_result.notes);
+    }
+
+    #[test]
+    fn cached_origin_without_its_edge_is_a_warning_and_miss() {
+        let directory = tempdir().unwrap();
+        let doc = document("postgres", "orders");
+        let owner = VertexId::object("public", "view");
+        let body = "SELECT id FROM orders";
+        let mut parser_result = result(&owner, body, "public.orders");
+        // origin마다 같은 키의 캐시 간선이 있어야 복원한 근거가 유령 간선을 가리키지 않는다.
+        let (key, _) = &mut parser_result.origins[0];
+        key.2 = EdgeKind::Writes;
+        cache(directory.path(), &doc, "exe-a").store(&owner, body, &parser_result);
+        let mut reader = cache(directory.path(), &doc, "exe-a");
+        assert!(reader.load(&owner, body).is_none());
+        assert_eq!(
+            (
+                reader.stats().hits,
+                reader.stats().misses,
+                reader.stats().warnings
+            ),
+            (0, 1, 1)
+        );
     }
 
     #[test]
