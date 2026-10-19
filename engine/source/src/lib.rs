@@ -186,7 +186,7 @@ fn is_secret_option(before_equals: &str) -> bool {
 ///
 /// 따옴표·중괄호로 감싼 값은 형식마다 이스케이프 규칙이 달라(libpq `\'`, ODBC `}}`)
 /// 문자열 끝까지 가린다. 덜 가리는 것보다 더 가리는 편이 안전하기 때문이다. 그 밖의
-/// 값은 구분자 뒤에 다음 속성이 오거나 문자열이 끝나는 곳에서 끝난다([`ends_value_at`]).
+/// 값은 구분자 뒤에 다음 속성이 오거나 문자열이 끝나는 곳에서 끝난다([`is_value_boundary`]).
 /// libpq 값은 `;`·`&`를 담을 수 있고 백슬래시로 공백을 이스케이프하므로, 구분자 하나만으로
 /// 끝을 정하면 값의 뒷부분이 오류 메시지에 남는다. 그런 경계가 없으면 끝까지 가린다.
 fn secret_value_span(after_equals: &str) -> (usize, usize) {
@@ -197,12 +197,22 @@ fn secret_value_span(after_equals: &str) -> (usize, usize) {
     } else {
         value
             .char_indices()
-            .find(|&(index, c)| {
-                is_option_separator(c) && ends_value_at(&value[index + c.len_utf8()..])
-            })
+            .find(|&(index, c)| is_value_boundary(value, index, c))
             .map_or(value.len(), |(index, _)| index)
     };
     (start, start + length)
+}
+
+/// 값 안 `index` 위치의 글자 `c`에서 값이 끝나는지 본다. 구분자이고, 바로 앞이 백슬래시가
+/// 아니며, 뒤에 다음 속성이 오거나 구분자만 남아야 한다([`ends_value_at`]).
+///
+/// libpq에서 백슬래시 뒤의 구분자는 값의 글자다(`password=a\ b=c`의 값은 `a b=c`). 이를
+/// 경계로 보면 이스케이프 뒤의 값 조각이 오류 메시지에 남는다. ODBC처럼 백슬래시가
+/// 이스케이프가 아닌 형식에서는 다음 속성까지 더 가릴 뿐이라 안전하다.
+fn is_value_boundary(value: &str, index: usize, c: char) -> bool {
+    is_option_separator(c)
+        && !value[..index].ends_with('\\')
+        && ends_value_at(&value[index + c.len_utf8()..])
 }
 
 /// 접속 문자열 속성 사이에 오는 구분자(`;`·`&`·공백)인지 본다.

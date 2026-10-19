@@ -181,6 +181,13 @@ fn secret_options_are_redacted_from_connection_strings() {
             "Server=db;Pwd=FAKE PW&19;Database=app",
             "Server=db;Pwd=***;Database=app",
         ),
+        // 백슬래시로 이스케이프한 구분자는 값의 글자다(libpq). 그 뒤가 `이름=`처럼 보여도
+        // 값의 경계가 아니므로, 이스케이프 뒤의 값 조각을 남기지 않는다.
+        ("password=FAKE\\ PW=20", "password=***"),
+        (
+            "host=db password=FAKE\\ PW=21 dbname=app",
+            "host=db password=*** dbname=app",
+        ),
     ] {
         assert_eq!(redact_connection_secrets(text), expected, "{text}");
     }
