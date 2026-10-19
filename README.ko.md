@@ -74,6 +74,21 @@ fixture에는 외래 키 체인, 뷰, 트리거, 의존성 순환이 포함되�
 (`mysqlx://`)은 지원하지 않습니다. JDBC URL은 프로브에 전달하고, CLI는
 프로브의 출력을 `scan --document`로 읽습니다.
 
+네이티브 PostgreSQL·MySQL/MariaDB reader는 TLS 1.2·1.3(rustls)을 쓰고, 바이너리에
+내장된 Mozilla 루트 인증서를 신뢰합니다. TLS 인자가 없는 URL은 libpq처럼
+`sslmode=prefer`(PostgreSQL)·`ssl-mode=PREFERRED`(MySQL/MariaDB)로 접속합니다. 서버가
+TLS를 제공하면 암호화하지만 서버 인증서는 검증하지 않으며, 네트워크의 능동 공격자는
+암호화하지 않은 연결로 끌어내릴 수 있습니다. 검증된 연결을 요구하려면
+`sslmode=verify-full` 또는 `ssl-mode=VERIFY_IDENTITY`를 붙입니다. 관리형 DB 제공자의
+CA처럼 사설 CA를 쓰면 `sslrootcert=/path/ca.pem` 또는 `ssl-ca=/path/ca.pem`도 붙입니다.
+이 CA는 내장 루트에 더해집니다. `require`·`REQUIRED`는 인증서를 검증하지 않고
+암호화만 하며, `verify-ca`·`VERIFY_CA`는 호스트 이름을 확인하지 않습니다. 이 모드들은
+암호화하지 않은 연결로 내려가지 않고 종료 코드 2로 scan을 끝냅니다.
+`sslmode=allow`는 TLS를 시도하지 않습니다. PostgreSQL URL은 `PGSSLMODE`,
+`PGSSLROOTCERT` 같은 libpq 환경 변수도 기본값으로 씁니다. TLS 1.1 이하나 전방
+비밀성이 없는 암호 모음만 지원하는 서버는 기본 모드에서도 핸드셰이크가 실패하므로
+`sslmode=disable` 또는 `ssl-mode=DISABLED`로 scan합니다.
+
 JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·컬럼·키·인덱스·루틴
 메타데이터입니다. 본문과 사용 통계의 수집 범위는 DB 방언, 권한, 사용 가능한
 카탈로그에 따라 달라집니다. 수집하지 못한 정보는 `limitations`에 보고합니다.

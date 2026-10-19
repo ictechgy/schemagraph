@@ -80,6 +80,24 @@ and `mysql://…`. MariaDB uses `mysql://`; MySQL X Protocol (`mysqlx://`) is
 unsupported. JDBC URLs go to the probe, whose output the CLI reads with
 `scan --document`.
 
+The native PostgreSQL and MySQL/MariaDB readers use TLS 1.2 or 1.3 (rustls)
+and trust the Mozilla root certificates built into the binary. A URL without
+TLS parameters uses `sslmode=prefer` (PostgreSQL) or `ssl-mode=PREFERRED`
+(MySQL/MariaDB), as libpq does: the reader encrypts when the server offers
+TLS, but it does not verify the server certificate, and an active network
+attacker can force an unencrypted connection. To require a verified
+connection, add `sslmode=verify-full` or `ssl-mode=VERIFY_IDENTITY`. For a
+private CA, such as a managed database provider's CA, also add
+`sslrootcert=/path/ca.pem` or `ssl-ca=/path/ca.pem`; that CA is added to the
+built-in roots. `require` / `REQUIRED` encrypts without verifying the
+certificate, and `verify-ca` / `VERIFY_CA` skips the host name check. These
+modes fail the scan with exit code 2 instead of falling back to an
+unencrypted connection. `sslmode=allow` does not attempt TLS. PostgreSQL URLs
+also take defaults from libpq variables such as `PGSSLMODE` and
+`PGSSLROOTCERT`. A server limited to TLS 1.1 or older, or to cipher suites
+without forward secrecy, fails the handshake even in the default mode; scan
+it with `sslmode=disable` or `ssl-mode=DISABLED`.
+
 The JDBC baseline collects schemas, tables, columns, keys, indexes, and
 routine metadata exposed by the driver. Body and usage collection depend on
 the database dialect, permissions, and available catalogs. Collection gaps
