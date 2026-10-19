@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import sqlite3
 import subprocess
@@ -388,6 +389,14 @@ def _pg_run(command: list[str], *, env: dict[str, str], timeout: float = 120) ->
     return subprocess.run(command, capture_output=True, text=True, env=env, timeout=timeout)
 
 
+def _private_file(path: Path, text: str) -> Path:
+    """비밀번호를 담는 파일을 처음부터 0600으로 만든다(만든 뒤 chmod하면 잠깐 열린다)."""
+
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+        stream.write(text)
+    return path
+
+
 def validate_postgres(
     corpus: dict[str, Any],
     selected: set[str] | None = None,
@@ -413,16 +422,19 @@ def validate_postgres(
         report["failed"] = 1
         return report
     cases = [case for case in corpus["cases"] if not selected or case["name"] in selected]
-    with tempfile.TemporaryDirectory(prefix="schemagraph-dml-postgres-") as directory:
+    # trust인 Unix socket은 공용 /tmp가 아니라 /tmp 아래 짧은 0700 디렉터리에 둔다
+    # (작업 디렉터리 전체 경로는 macOS socket 경로 한도 103 bytes를 넘을 수 있다).
+    with tempfile.TemporaryDirectory(prefix="schemagraph-dml-postgres-") as directory, \
+            tempfile.TemporaryDirectory(prefix="sg-pg-", dir="/tmp") as socket_dir:
         work = Path(directory)
         data = work / "data"
-        socket_dir = Path("/tmp")
         env = {key: value for key, value in os.environ.items() if not key.startswith("PG")}
-        password_file = work / "empty-pgpass"
-        password_file.write_text("")
-        password_file.chmod(0o600)
-        env["PGPASSFILE"] = str(password_file)
-        init = _pg_run([str(tools["initdb"]), "-D", str(data), "-U", "postgres", "-A", "trust", "--no-locale", "--encoding=UTF8"], env=env)
+        # 같은 호스트의 다른 계정이 loopback TCP로 슈퍼유저에 접속하지 못하게 host 인증은 실행마다
+        # 만든 비밀번호(scram)로만 받는다. 비밀번호는 0600 파일로만 initdb와 psql(PGPASSFILE)에 준다.
+        password = secrets.token_hex(16)
+        initial = _private_file(work / "initdb-password", password + "\n")
+        init = _pg_run([str(tools["initdb"]), "-D", str(data), "-U", "postgres", "--auth-local=trust",
+                        "--auth-host=scram-sha-256", f"--pwfile={initial}", "--no-locale", "--encoding=UTF8"], env=env)
         if init.returncode:
             report["status"] = "failed"
             report["error"] = f"initdb failed: {init.stderr[-2000:]}"
@@ -431,6 +443,7 @@ def validate_postgres(
         with socket.socket() as candidate:
             candidate.bind(("127.0.0.1", 0))
             port = candidate.getsockname()[1]
+        env["PGPASSFILE"] = str(_private_file(work / "pgpass", f"*:{port}:*:*:{password}\n"))
         log = work / "postgres.log"
         started = _pg_run([str(tools["pg_ctl"]), "-D", str(data), "-l", str(log), "-o", f"-p {port} -k {socket_dir} -h 127.0.0.1", "-w", "start"], env=env)
         if started.returncode:

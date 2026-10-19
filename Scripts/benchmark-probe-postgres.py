@@ -9,6 +9,7 @@ import getpass
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import socket
 import subprocess
@@ -36,11 +37,11 @@ def checked(command: list[str], *, cwd: Path | None = None, stdin=None, stderr=N
         raise RuntimeError(f"command failed with exit code {result.returncode}: {Path(command[0]).name}")
 
 
-def measure(command: list[str], error_path: Path) -> dict[str, int | float]:
+def measure(command: list[str], error_path: Path, env: dict[str, str] | None = None) -> dict[str, int | float]:
     """wait4로 자식 하나의 wall time과 peak RSS를 측정한다."""
     start = time.perf_counter()
     with error_path.open("wb") as errors:
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors)
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors, env=env)
         _, status, usage = os.wait4(process.pid, 0)
         process.returncode = os.waitstatus_to_exitcode(status)
     if process.returncode:
@@ -173,22 +174,41 @@ def first_difference(left: object, right: object, path: str = "graph") -> str:
     return "" if left == right else f"{path}: values differ"
 
 
-def start_postgres(pg_bin: Path, root: Path, report: Path) -> tuple[Path, int, str]:
-    data = Path(tempfile.mkdtemp(prefix="sg-roadmap-pg-"))
+def private_file(path: Path, text: str) -> Path:
+    """비밀번호를 담는 파일을 처음부터 0600으로 만든다(만든 뒤 chmod하면 잠깐 열린다)."""
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+        stream.write(text)
+    return path
+
+
+def start_postgres(pg_bin: Path, root: Path, report: Path) -> tuple[Path, int, str, dict[str, str]]:
+    """측정용 임시 cluster를 띄우고 (cluster 디렉터리, 포트, 사용자, probe 접속 환경)을 돌려준다.
+
+    같은 호스트의 다른 계정이 loopback TCP로 슈퍼유저에 접속하지 못하게 host 인증은 실행마다
+    만든 비밀번호(scram)로만 받는다. 0700 cluster 디렉터리에 data, trust인 Unix socket, 0600
+    비밀번호 파일을 함께 두고, probe는 env의 PGPASSFILE에서 비밀번호를 읽는다.
+    """
+    cluster = Path(tempfile.mkdtemp(prefix="sg-roadmap-pg-"))
     port = reserve_port()
     user = getpass.getuser()
+    password = secrets.token_hex(16)
+    # 셸의 PGPASSWORD는 PGPASSFILE보다 먼저 쓰여 새 비밀번호를 가리므로 뺀다.
+    env = {key: value for key, value in os.environ.items() if key != "PGPASSWORD"}
     try:
-        checked([str(pg_bin / "initdb"), "-D", str(data), "-A", "trust", "--no-instructions"])
+        initial = private_file(cluster / "initdb-password", password + "\n")
+        env["PGPASSFILE"] = str(private_file(cluster / "pgpass", f"*:{port}:*:*:{password}\n"))
+        checked([str(pg_bin / "initdb"), "-D", str(cluster / "data"), "--auth-local=trust",
+                 "--auth-host=scram-sha-256", f"--pwfile={initial}", "--no-instructions"])
         log = report / "postgres.log"
         checked(
             [
                 str(pg_bin / "pg_ctl"),
                 "-D",
-                str(data),
+                str(cluster / "data"),
                 "-l",
                 str(log),
                 "-o",
-                f"-p {port} -k {data}",
+                f"-p {port} -k {cluster}",
                 "-w",
                 "start",
             ]
@@ -197,7 +217,7 @@ def start_postgres(pg_bin: Path, root: Path, report: Path) -> tuple[Path, int, s
             [
                 str(pg_bin / "psql"),
                 "-h",
-                str(data),
+                str(cluster),
                 "-p",
                 str(port),
                 "-U",
@@ -210,20 +230,20 @@ def start_postgres(pg_bin: Path, root: Path, report: Path) -> tuple[Path, int, s
                 "CREATE DATABASE sgbench",
             ]
         )
-        return data, port, user
+        return cluster, port, user, env
     except Exception:
-        stop_postgres(pg_bin, data)
+        stop_postgres(pg_bin, cluster)
         raise
 
 
-def stop_postgres(pg_bin: Path, data: Path) -> None:
+def stop_postgres(pg_bin: Path, cluster: Path) -> None:
     subprocess.run(
-        [str(pg_bin / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop"],
+        [str(pg_bin / "pg_ctl"), "-D", str(cluster / "data"), "-m", "fast", "-w", "stop"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
     )
-    shutil.rmtree(data, ignore_errors=True)
+    shutil.rmtree(cluster, ignore_errors=True)
 
 
 def run_benchmark(args: argparse.Namespace) -> dict:
@@ -248,16 +268,16 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         )
 
     pg_bin = args.pg_bin.resolve()
-    data = None
+    cluster = None
     results = []
     reference_graph = None
     try:
-        data, port, user = start_postgres(pg_bin, Path.cwd(), report)
+        cluster, port, user, env = start_postgres(pg_bin, Path.cwd(), report)
         fixture = report / "fixture.sql"
         expected_shape = write_fixture(fixture, args.schemas, args.tables_per_schema, args.columns)
         checked(
             [
-                str(pg_bin / "psql"), "-h", str(data), "-p", str(port), "-U", user,
+                str(pg_bin / "psql"), "-h", str(cluster), "-p", str(port), "-U", user,
                 "-d", "sgbench", "-v", "ON_ERROR_STOP=1", "-f", str(fixture),
             ],
             stderr=(report / "fixture.stderr").open("wb"),
@@ -272,6 +292,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
                 metric = measure(
                     [str(probe), "--url", url, "--format", "ndjson", "--document-version", "2", "-o", str(document)],
                     Path(f"{prefix}.probe.stderr"),
+                    env,
                 )
                 engine_metric = measure(
                     [str(engine), "scan", "--document", str(document), "-o", str(graph_path)],
@@ -319,8 +340,8 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "results": results,
         }
     finally:
-        if data is not None:
-            stop_postgres(pg_bin, data)
+        if cluster is not None:
+            stop_postgres(pg_bin, cluster)
 
 
 def main() -> int:

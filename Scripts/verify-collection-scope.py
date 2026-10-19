@@ -28,7 +28,7 @@ def check(engine, bindir, go_probe=None, jdbc_jar=None, java=None):
             admin = list(owner)
             admin[admin.index('-U')+1] = 'postgres'
             admin[admin.index('-d')+1] = 'postgres'
-            ACCURACY.run(admin+['-qc', 'CREATE ROLE collector LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT'], env=environment)
+            ACCURACY.create_login_role(admin, 'collector', 'NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT', environment)
             ACCURACY.run(owner+['-qc', '''
                 CREATE SCHEMA locked;
                 CREATE TABLE locked.parent (id integer PRIMARY KEY, value text NOT NULL);

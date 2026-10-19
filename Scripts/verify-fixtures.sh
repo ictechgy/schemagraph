@@ -210,7 +210,18 @@ fi
 if [ -z "$pg_url" ] && [ -n "$PGBIN" ] && [ -x "$PGBIN/initdb" ]; then
     pg_data="$tmp/pgdata"
     pg_port=$((55400 + RANDOM % 90))
-    "$PGBIN/initdb" -D "$pg_data" -U postgres --no-instructions >/dev/null 2>&1
+    # 같은 호스트의 다른 계정이 loopback TCP로 슈퍼유저에 접속하지 못하게 host 인증은 실행마다
+    # 만든 비밀번호(scram)로만 받는다. trust인 Unix socket은 0700인 $tmp 안에 있다. 비밀번호는
+    # 0600 파일로만 넘기므로 psql·엔진(sqlx)·Go(pgx)·JDBC(pgjdbc)가 PGPASSFILE에서 읽고
+    # URL과 argv에는 싣지 않는다. 셸의 PGPASSWORD는 PGPASSFILE보다 먼저 쓰이므로 지운다.
+    pg_password="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    (umask 077
+     printf '%s\n' "$pg_password" > "$tmp/pg-password"
+     printf '*:%s:*:*:%s\n' "$pg_port" "$pg_password" > "$tmp/pgpass")
+    export PGPASSFILE="$tmp/pgpass"
+    unset PGPASSWORD
+    "$PGBIN/initdb" -D "$pg_data" -U postgres --auth-local=trust --auth-host=scram-sha-256 \
+        --pwfile="$tmp/pg-password" --no-instructions >/dev/null 2>&1
     "$PGBIN/pg_ctl" -D "$pg_data" -l "$tmp/pg.log" -o "-p $pg_port -k $tmp" \
         -w start >/dev/null
     pg_own=1

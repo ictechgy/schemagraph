@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -57,37 +59,73 @@ def cases(name, suite):
     return result
 
 
+def private_file(path, text):
+    """비밀번호를 담는 파일을 처음부터 0600으로 만든다(만든 뒤 chmod하면 잠깐 열린다)."""
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as stream:
+        stream.write(text)
+    return path
+
+
+def create_login_role(admin, name, attributes, env):
+    """임시 cluster의 LOGIN 역할에 PGPASSFILE과 같은 비밀번호를 준다.
+
+    loopback TCP는 scram 인증이라 비밀번호 없는 역할은 접속하지 못한다. 같은 호스트의 다른
+    계정이 프로세스 목록에서 읽지 못하도록 비밀번호는 argv 대신 PGPASSFILE 옆(0700 작업
+    디렉터리)의 0600 SQL 파일로 넘기고 실행 뒤 지운다.
+    """
+    passfile = Path(env['PGPASSFILE'])
+    password = passfile.read_text().strip().rsplit(':', 1)[1]
+    script = private_file(passfile.with_name(f'role-{name}.sql'),
+                          f"CREATE ROLE {name} LOGIN {attributes} PASSWORD '{password}';\n")
+    try:
+        run(admin+['-qf', script], env=env)
+    finally:
+        script.unlink()
+
+
 @contextmanager
 def postgres(work, bindir):
-    """사용자 서비스 설정을 사용하지 않는 루프백 전용 임시 cluster다."""
+    """사용자 서비스 설정을 사용하지 않는 루프백 전용 임시 cluster다.
+
+    같은 호스트의 다른 계정이 슈퍼유저로 접속하지 못하게 TCP는 실행마다 만든 비밀번호
+    (scram)로만 받고, trust로 둔 Unix socket은 공용 /tmp 대신 0700 디렉터리에 둔다. 비밀번호는
+    0600 PGPASSFILE로만 전달하므로 psql·sqlx·pgx·pgjdbc 모두 URL과 argv에 비밀번호 없이
+    접속한다. 소비자가 만드는 LOGIN 역할은 create_login_role로 같은 비밀번호를 받는다.
+    """
     env = {key: value for key, value in os.environ.items() if not key.startswith('PG')}
-    passwords = work/'empty-passwords'
-    passwords.write_text('')
-    passwords.chmod(0o600)
-    env['PGPASSFILE'] = str(passwords)
     for tool in ('initdb', 'pg_ctl', 'psql'):
         if not (bindir/tool).is_file():
             raise RuntimeError(f'PostgreSQL tools are required: {bindir/tool}')
+    password = secrets.token_hex(16)
+    initial = private_file(work/'initdb-password', password+'\n')
     data = work/'postgres-data'
-    run([bindir/'initdb', '-D', data, '-U', 'postgres', '-A', 'trust', '--no-locale', '--encoding=UTF8'], env=env)
+    run([bindir/'initdb', '-D', data, '-U', 'postgres', '--auth-local=trust', '--auth-host=scram-sha-256',
+         f'--pwfile={initial}', '--no-locale', '--encoding=UTF8'], env=env)
     with socket.socket() as candidate:
         candidate.bind(('127.0.0.1', 0))
         port = candidate.getsockname()[1]
+    env['PGPASSFILE'] = str(private_file(work/'pgpass', f'*:{port}:*:*:{password}\n'))
+    # 작업 디렉터리 전체 경로는 macOS Unix socket 경로 한도(103 bytes)를 넘을 수 있어
+    # /tmp 아래의 짧은 비공개(0700) 디렉터리를 쓴다.
+    sockets = Path(tempfile.mkdtemp(prefix='sg-pg-', dir='/tmp'))
     log = work/'postgres.log'
     # 서버 프로세스가 Python PIPE를 붙잡지 않도록 pg_ctl 출력도 파일로 보낸다.
     admin = [bindir/'psql', '-X', '-h', '127.0.0.1', '-p', str(port), '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1']
     try:
         with (work/'pg-control.log').open('w') as output:
-            started = subprocess.run([str(bindir/'pg_ctl'), '-D', str(data), '-l', str(log), '-o', f'-p {port} -k /tmp -h 127.0.0.1', '-w', 'start'], stdout=output, stderr=output, env=env, timeout=60)
+            started = subprocess.run([str(bindir/'pg_ctl'), '-D', str(data), '-l', str(log), '-o', f'-p {port} -k {sockets} -h 127.0.0.1', '-w', 'start'], stdout=output, stderr=output, env=env, timeout=60)
         if started.returncode:
             raise RuntimeError('temporary PostgreSQL failed to start: '+log.read_text()[-2000:])
-        run(admin+['-qc','CREATE ROLE corpus LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE'],env=env)
+        create_login_role(admin, 'corpus', 'NOSUPERUSER NOCREATEDB NOCREATEROLE', env)
         run(admin+['-qc','CREATE DATABASE corpus OWNER corpus'],env=env)
         psql = [bindir/'psql', '-X', '-h', '127.0.0.1', '-p', str(port), '-U', 'corpus', '-d', 'corpus', '-v', 'ON_ERROR_STOP=1']
         yield f'postgres://corpus@127.0.0.1:{port}/corpus', psql, env
     finally:
-        if (data/'postmaster.pid').exists():
-            run([bindir/'pg_ctl', '-D', data, '-m', 'fast', '-w', 'stop'], env=env)
+        try:
+            if (data/'postmaster.pid').exists():
+                run([bindir/'pg_ctl', '-D', data, '-m', 'fast', '-w', 'stop'], env=env)
+        finally:
+            shutil.rmtree(sockets)
 
 
 def scan(engine, url, directory, label, baseline, authored, env=None):
