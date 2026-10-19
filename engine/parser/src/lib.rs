@@ -734,6 +734,8 @@ struct ParsedTrigger {
     /// AST로 확인한 DML 문장. 컬럼 효과는 카탈로그 정점이 있는 적용 단계에서
     /// 해석한다 — 파싱 단계에서 임시·미수집 정점을 만들지 않는다.
     dml_statements: Vec<Statement>,
+    /// 문장 해시 → dml_statements 위치. 같은 문장인지 해시가 같은 후보와만 비교한다.
+    dml_buckets: BTreeMap<u64, Vec<usize>>,
     /// 직선 구간에서 만든 임시 relation 이름. graph 정점으로 만들지 않고
     /// source column으로 접어야 하므로 객체 수준 missing note에서도 제외한다.
     local_relations: BTreeSet<(Option<String>, String)>,
@@ -761,6 +763,36 @@ impl ParsedTrigger {
             && self.qualified_writes.is_empty()
             && self.dml_statements.is_empty())
     }
+
+    /// 컬럼 효과를 해석할 DML 문장을 처음 나온 순서대로 한 번씩만 보관한다.
+    ///
+    /// 위치만 다른 같은 문장은 효과와 근거가 같아 하나로 합친다. sqlparser의 비교와
+    /// 해시는 둘 다 위치(span)를 보지 않으므로 해시가 다르면 다른 문장이다. 앞서 모은
+    /// 문장 전체와 깊게 비교하면 문장 수의 제곱이 되므로, 해시가 같은 후보와만 비교한다.
+    /// 문장은 복제하지 않고 옮긴다 — 깊은 집합 연산 사슬의 복제는 사슬 길이만큼 스택을 쓴다.
+    fn retain_dml_statement(&mut self, statement: Statement) {
+        let bucket = self
+            .dml_buckets
+            .entry(statement_hash(&statement))
+            .or_default();
+        let duplicate = bucket.iter().any(|&index| {
+            #[cfg(test)]
+            work::compared_statement();
+            self.dml_statements[index] == statement
+        });
+        if !duplicate {
+            bucket.push(self.dml_statements.len());
+            self.dml_statements.push(statement);
+        }
+    }
+}
+
+/// 한 실행 안에서만 쓰는 문장 해시. 후보를 고르는 데만 쓰고 출력 순서에는 쓰지 않는다.
+fn statement_hash(statement: &Statement) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    statement.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// `CREATE TRIGGER ... BEGIN <문장들> END`를 파싱한다. sqlparser는
@@ -788,6 +820,7 @@ fn parse_trigger_body(
         qualified_reads: Vec::new(),
         qualified_writes: Vec::new(),
         dml_statements: Vec::new(),
+        dml_buckets: BTreeMap::new(),
         local_relations: BTreeSet::new(),
         diagnostics: Vec::new(),
         scalar_symbols: BTreeSet::new(),
@@ -806,7 +839,7 @@ fn parse_trigger_body(
                     "procedural variables or dynamic SQL require statement extraction".to_owned(),
                 );
             }
-            for stmt in &stmts {
+            for stmt in stmts {
                 collect_trigger_stmt(stmt, &mut parsed, sqlserver_trigger);
             }
             invalidate_temp_state_if_unsafe(&mut parsed, body, 0);
@@ -886,6 +919,7 @@ fn empty_parsed_trigger() -> ParsedTrigger {
         qualified_reads: Vec::new(),
         qualified_writes: Vec::new(),
         dml_statements: Vec::new(),
+        dml_buckets: BTreeMap::new(),
         local_relations: BTreeSet::new(),
         diagnostics: Vec::new(),
         scalar_symbols: BTreeSet::new(),
@@ -1436,6 +1470,7 @@ fn parse_procedural_body(
         qualified_reads: Vec::new(),
         qualified_writes: Vec::new(),
         dml_statements: Vec::new(),
+        dml_buckets: BTreeMap::new(),
         local_relations: BTreeSet::new(),
         diagnostics: Vec::new(),
         scalar_symbols: state.declared_symbols.clone(),
@@ -1446,7 +1481,7 @@ fn parse_procedural_body(
     for stmt in &stmts {
         match sqlparser::parser::Parser::parse_sql(dialect, stmt) {
             Ok(list) => {
-                for s in &list {
+                for s in list {
                     collect_trigger_stmt(s, &mut parsed, false);
                 }
             }
@@ -2776,8 +2811,24 @@ fn is_query_text(s: &str) -> bool {
         || s.trim_start().starts_with('(')
 }
 
-/// 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
-fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_trigger: bool) {
+/// 소유한 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
+///
+/// 컬럼 DML은 복제하지 않고 옮겨 보관하고, 절차형 블록(IF/WHILE/CASE)은 안쪽 문장을
+/// 꺼내 같은 규칙으로 모은다. 컬럼 DML에는 안쪽 문장이 없으므로 처음 나온 순서가
+/// 참조로 훑던 때와 같다.
+fn collect_trigger_stmt(stmt: Statement, parsed: &mut ParsedTrigger, sqlserver_trigger: bool) {
+    collect_trigger_facts(&stmt, parsed, sqlserver_trigger);
+    if is_column_dml_statement(&stmt) {
+        parsed.retain_dml_statement(stmt);
+        return;
+    }
+    for nested in into_nested_statements(stmt) {
+        collect_trigger_stmt(nested, parsed, sqlserver_trigger);
+    }
+}
+
+/// 문장 하나의 관계·식·호출 참조를 모은다. 안쪽 문장은 호출자가 따로 넘긴다.
+fn collect_trigger_facts(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_trigger: bool) {
     if let Statement::CreateTable(create) = stmt {
         let local = create.temporary
             || create
@@ -2820,9 +2871,6 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_
                 .into(),
             location: None,
         });
-    }
-    if is_column_dml_statement(stmt) && !parsed.dml_statements.contains(stmt) {
-        parsed.dml_statements.push(stmt.clone());
     }
     // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
     // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
@@ -2923,12 +2971,31 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_
             parsed.calls.push(t);
         }
     }
-    // 절차형 블록(IF/WHILE/CASE) 안의 문장 — 도매 파싱이 성공해도 DML·CALL이
-    // 블록 안에 중첩돼 있어 재귀로 내려가지 않으면 writes가 reads로 오분류되고
-    // CALL이 조용히 빠진다. 관계·식 수확은 visitor가 이미 트리 전체를 본다.
-    for s in nested_statements(stmt) {
-        collect_trigger_stmt(s, parsed, sqlserver_trigger);
-    }
+}
+
+/// 절차형 블록(IF/WHILE/CASE) 안의 문장을 nested_statements와 같은 순서로 옮겨 꺼낸다.
+///
+/// 도매 파싱이 성공해도 DML·CALL이 블록 안에 중첩돼 있어, 내려가지 않으면 writes가
+/// reads로 오분류되고 CALL이 조용히 빠진다. 관계·식 수확은 visitor가 이미 트리 전체를
+/// 보지만, 쓰기 대상과 DML 효과는 문장마다 모아야 한다.
+fn into_nested_statements(stmt: Statement) -> Vec<Statement> {
+    use sqlparser::ast::ConditionalStatements;
+    let blocks: Vec<sqlparser::ast::ConditionalStatementBlock> = match stmt {
+        Statement::If(s) => std::iter::once(s.if_block)
+            .chain(s.elseif_blocks)
+            .chain(s.else_block)
+            .collect(),
+        Statement::While(s) => vec![s.while_block],
+        Statement::Case(s) => s.when_blocks.into_iter().chain(s.else_block).collect(),
+        _ => return Vec::new(),
+    };
+    blocks
+        .into_iter()
+        .flat_map(|block| match block.conditional_statements {
+            ConditionalStatements::Sequence { statements } => statements,
+            ConditionalStatements::BeginEnd(block) => block.statements,
+        })
+        .collect()
 }
 
 fn is_column_dml_statement(stmt: &Statement) -> bool {
@@ -3266,6 +3333,29 @@ fn count_vertex_scan() {
 #[cfg(test)]
 fn take_vertex_scans() -> usize {
     VERTEX_SCANS.with(std::cell::Cell::take)
+}
+
+/// 테스트가 몸체 분석 작업량을 시간 대신 횟수로 확인하게 한다.
+///
+/// 이차 시간 회귀는 작은 입력에서 시간으로 잡히지 않고, 큰 입력의 시간 단언은 공유
+/// 기계에서 불안정하다. 테스트마다 스레드가 따로라 thread_local이면 서로 섞이지 않는다.
+#[cfg(test)]
+mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COMPARED_STATEMENTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// DML 문장 중복 확인에서 문장 전체를 비교한 횟수를 하나 더한다.
+    pub(crate) fn compared_statement() {
+        COMPARED_STATEMENTS.with(|count| count.set(count.get() + 1));
+    }
+
+    /// 현재 테스트 스레드의 문장 비교 횟수를 돌려주고 0으로 되돌린다.
+    pub(crate) fn take_compared_statements() -> usize {
+        COMPARED_STATEMENTS.with(Cell::take)
+    }
 }
 
 /// enrich 동안 고정된 정점 집합에서 이름 해석 후보를 찾는 색인.
@@ -6082,5 +6172,114 @@ mod tests {
         assert_eq!(routine_shapes.len(), 6, "{routine_shapes:?}");
         assert_eq!(member_shapes.len(), 6, "{member_shapes:?}");
         assert!(folded_only_hits > 0);
+    }
+
+    /// 같은 테이블에 쓰는 단일 행 INSERT `rows`개 뒤에, 공백만 다른 사본을 덧붙인다.
+    fn repeated_insert_body(rows: usize, duplicates: &[usize]) -> String {
+        let mut body: String = (0..rows)
+            .map(|row| format!("INSERT INTO orders (id, customer_id) VALUES ({row}, {row});\n"))
+            .collect();
+        for row in duplicates {
+            body.push_str(&format!(
+                "INSERT  INTO orders (id, customer_id)\n VALUES ({row}, {row});\n"
+            ));
+        }
+        body
+    }
+
+    #[test]
+    fn dml_문장_중복_확인은_해시가_같은_후보와만_비교한다() {
+        let body = repeated_insert_body(2_000, &[7, 1_999]);
+        work::take_compared_statements();
+        let parsed =
+            parse_routine_body(Some(&GenericDialect {}), &body).expect("INSERT만 있는 몸체");
+        // 위치만 다른 사본은 합쳐지고 처음 나온 순서가 그대로 남는다.
+        assert_eq!(parsed.dml_statements.len(), 2_000);
+        let leading: Vec<String> = parsed
+            .dml_statements
+            .iter()
+            .take(2)
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            leading,
+            [
+                "INSERT INTO orders (id, customer_id) VALUES (0, 0)",
+                "INSERT INTO orders (id, customer_id) VALUES (1, 1)"
+            ]
+        );
+        // 문장 전체를 비교하는 일은 실제 사본 두 개와 드문 해시 충돌에만 생긴다.
+        let compared = work::take_compared_statements();
+        assert!(compared <= 4, "statement comparisons: {compared}");
+    }
+
+    #[test]
+    fn 위치만_다른_같은_dml은_컬럼_근거를_한_번만_남긴다() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "touch_customer",
+                Some("sql"),
+                "UPDATE customers SET name = 'x' WHERE id = 1; \
+                 UPDATE  customers SET name = 'x'\n WHERE id = 1; \
+                 UPDATE customers SET name = 'y' WHERE id = 2",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        let writes = g
+            .edges()
+            .into_iter()
+            .find(|e| {
+                e.kind == EdgeKind::Writes
+                    && e.from.as_str() == "public.touch_customer"
+                    && e.to.as_str() == "public.customers.name"
+            })
+            .expect("컬럼 쓰기 간선");
+        // 서로 다른 UPDATE 두 개만 근거가 된다.
+        assert_eq!(writes.evidence.len(), 2, "{:?}", writes.evidence);
+    }
+
+    #[test]
+    fn 긴_union_all_insert는_복제하지_않고_쓰기_대상을_모은다() {
+        // Oracle·구 SQL Server의 다중 행 INSERT 관용구다. 문장을 복제하면 집합 연산
+        // 사슬 길이만큼 재귀해 기본 테스트 스레드(2MiB)의 스택이 넘친다.
+        let rows: Vec<String> = (0..3_000)
+            .map(|row| format!("SELECT {row} FROM customers"))
+            .collect();
+        let body = format!("INSERT INTO orders (id) {}", rows.join(" UNION ALL "));
+        let parsed = parse_routine_body(Some(&GenericDialect {}), &body).expect("INSERT SELECT");
+        assert_eq!(parsed.dml_statements.len(), 1);
+        assert_eq!(parsed.writes, [(None, "orders".to_owned())]);
+        assert_eq!(parsed.reads, [(None, "customers".to_owned())]);
+    }
+
+    #[test]
+    fn 절차형_블록의_안쪽_문장은_참조로_훑던_순서로_꺼낸다() {
+        let cases: [(&dyn Dialect, &str); 2] = [
+            (
+                &MsSqlDialect {},
+                "IF @a = 1 BEGIN UPDATE orders SET id = 1; DELETE FROM customers; END \
+                 ELSE BEGIN INSERT INTO orders (id) VALUES (2); END; \
+                 WHILE @a > 0 BEGIN UPDATE customers SET id = 3; END",
+            ),
+            (
+                &GenericDialect {},
+                "CASE WHEN 1 = 1 THEN UPDATE orders SET id = 1; \
+                 ELSE DELETE FROM customers; END CASE",
+            ),
+        ];
+        let mut blocks = 0;
+        for (dialect, sql) in cases {
+            let statements = sqlparser::parser::Parser::parse_sql(dialect, sql).expect("블록 문장");
+            for statement in statements {
+                let by_reference: Vec<Statement> =
+                    nested_statements(&statement).into_iter().cloned().collect();
+                blocks += usize::from(!by_reference.is_empty());
+                assert_eq!(into_nested_statements(statement), by_reference);
+            }
+        }
+        // IF·WHILE·CASE 블록을 모두 지났는지 센다.
+        assert_eq!(blocks, 3);
     }
 }
