@@ -7,7 +7,8 @@
 //! 뷰는 스키마·스코프별로 컬럼을 해석하고, 절차형 몸체는 지원하는 SQL 문장을
 //! 추출한다. 값의 계보와 조건절의 읽기 의존성을 구분하고 미해석은 진단한다.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId, VertexKind};
@@ -22,6 +23,7 @@ use sqlparser::dialect::{
 
 mod cache;
 mod constant_sql;
+mod parse_limits;
 pub use cache::{BodyCache, BodyResult, CacheContext};
 mod scope;
 #[cfg(test)]
@@ -32,6 +34,10 @@ mod scope_tests;
 /// 반환값은 (간선을 만든 객체 수, 실패·주의로 limitation에 실을 메시지들).
 /// 호출자가 limitations를 그래프에 싣는다 — 여기서 직접 싣지 않는 이유는
 /// reader가 이미 싣은 한계와 순서를 섞지 않기 위해서다.
+///
+/// 문장마다 연산 사슬 길이에 상한을 두고 넘는 문장은 파싱하지 않지만, 상한 안의
+/// 사슬도 분석 재귀가 release(aarch64) 기준 최대 166MiB 스택을 쓸 수 있다. 신뢰할 수
+/// 없는 SQL을 다루는 호출자는 그만한 스택의 스레드에서 부른다(CLI는 512MiB).
 pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<String>) {
     enrich_with_cache(g, doc, None)
 }
@@ -66,13 +72,20 @@ pub fn enrich_with_cache(
                 } else {
                     VertexKind::MaterializedView
                 };
-                if let Some(owner) =
-                    resolve_object(g, &schema.name, &obj.name, kind, &obj.kind, false)
-                {
+                if let Some(owner) = resolve_object(
+                    g,
+                    &schema.name,
+                    &obj.name,
+                    kind,
+                    &obj.kind,
+                    catalog_index.lookup(false),
+                ) {
+                    // 캐시 키는 재사용·저장에만 쓰인다. 캐시가 없으면 만들지 않는다.
                     let context = obj
                         .body
                         .as_deref()
-                        .map(|body| scope::cache_context(doc, g, &owner, body));
+                        .filter(|_| cache.is_some())
+                        .map(|body| catalog_index.cache_context(g, &owner, body));
                     if !cache::reuse(
                         &mut cache,
                         g,
@@ -99,8 +112,11 @@ pub fn enrich_with_cache(
                             &owner,
                             obj.body.as_deref(),
                             context.as_ref(),
-                            &notes[note_start..],
-                            enriched - enriched_start,
+                            cache::BodyOutcome {
+                                notes: &notes[note_start..],
+                                enriched: enriched - enriched_start,
+                                dml_origins: catalog_index.take_dml_origins(&owner),
+                            },
                         );
                     }
                 }
@@ -116,7 +132,7 @@ pub fn enrich_with_cache(
                     &trg.name,
                     VertexKind::Trigger,
                     "trigger",
-                    ci,
+                    catalog_index.lookup(ci),
                 ) else {
                     notes.push(format!(
                         "trigger {}.{}.{}: 정점을 못 찾음(이름 충돌?) — 몸체 간선 생략",
@@ -137,13 +153,15 @@ pub fn enrich_with_cache(
                     );
                     continue;
                 };
-                let context = scope::cache_context(doc, g, &trigger_id, body);
+                let context = cache
+                    .is_some()
+                    .then(|| catalog_index.cache_context(g, &trigger_id, body));
                 if cache::reuse(
                     &mut cache,
                     g,
                     &trigger_id,
                     Some(body),
-                    Some(&context),
+                    context.as_ref(),
                     &mut notes,
                     &mut enriched,
                 ) {
@@ -202,9 +220,12 @@ pub fn enrich_with_cache(
                     g,
                     &trigger_id,
                     Some(body),
-                    Some(&context),
-                    &notes[note_start..],
-                    enriched - enriched_start,
+                    context.as_ref(),
+                    cache::BodyOutcome {
+                        notes: &notes[note_start..],
+                        enriched: enriched - enriched_start,
+                        dml_origins: catalog_index.take_dml_origins(&trigger_id),
+                    },
                 );
             }
         }
@@ -225,7 +246,7 @@ pub fn enrich_with_cache(
                     routine.signature.as_deref(),
                     kind,
                     suffix,
-                    ci,
+                    catalog_index.lookup(ci),
                 ),
                 None => resolve_routine_vertex(
                     g,
@@ -235,7 +256,7 @@ pub fn enrich_with_cache(
                     routine.signature.as_deref(),
                     kind,
                     suffix,
-                    ci,
+                    catalog_index.lookup(ci),
                 ),
             };
             let Some(owner) = owner else {
@@ -262,13 +283,15 @@ pub fn enrich_with_cache(
                 );
                 continue;
             };
-            let context = scope::cache_context(doc, g, &owner, body);
+            let context = cache
+                .is_some()
+                .then(|| catalog_index.cache_context(g, &owner, body));
             if cache::reuse(
                 &mut cache,
                 g,
                 &owner,
                 Some(body),
-                Some(&context),
+                context.as_ref(),
                 &mut notes,
                 &mut enriched,
             ) {
@@ -301,9 +324,12 @@ pub fn enrich_with_cache(
                     g,
                     &owner,
                     Some(body),
-                    Some(&context),
-                    &notes[note_start..],
-                    enriched - enriched_start,
+                    context.as_ref(),
+                    cache::BodyOutcome {
+                        notes: &notes[note_start..],
+                        enriched: enriched - enriched_start,
+                        dml_origins: catalog_index.take_dml_origins(&owner),
+                    },
                 );
                 continue;
             }
@@ -468,9 +494,12 @@ pub fn enrich_with_cache(
                 g,
                 &owner,
                 Some(body),
-                Some(&context),
-                &notes[note_start..],
-                enriched - enriched_start,
+                context.as_ref(),
+                cache::BodyOutcome {
+                    notes: &notes[note_start..],
+                    enriched: enriched - enriched_start,
+                    dml_origins: catalog_index.take_dml_origins(&owner),
+                },
             );
         }
     }
@@ -488,7 +517,7 @@ pub fn enrich_with_cache(
                 routine.signature.as_deref(),
                 VertexKind::Query,
                 "query",
-                false,
+                catalog_index.lookup(false),
             ) {
                 if let Some(mut record) = g.analysis().get(&id).cloned() {
                     record.source = routine.source.clone();
@@ -722,6 +751,8 @@ struct ParsedTrigger {
     /// AST로 확인한 DML 문장. 컬럼 효과는 카탈로그 정점이 있는 적용 단계에서
     /// 해석한다 — 파싱 단계에서 임시·미수집 정점을 만들지 않는다.
     dml_statements: Vec<Statement>,
+    /// 문장 해시 → dml_statements 위치. 같은 문장인지 해시가 같은 후보와만 비교한다.
+    dml_buckets: BTreeMap<u64, Vec<usize>>,
     /// 직선 구간에서 만든 임시 relation 이름. graph 정점으로 만들지 않고
     /// source column으로 접어야 하므로 객체 수준 missing note에서도 제외한다.
     local_relations: BTreeSet<(Option<String>, String)>,
@@ -749,6 +780,36 @@ impl ParsedTrigger {
             && self.qualified_writes.is_empty()
             && self.dml_statements.is_empty())
     }
+
+    /// 컬럼 효과를 해석할 DML 문장을 처음 나온 순서대로 한 번씩만 보관한다.
+    ///
+    /// 위치만 다른 같은 문장은 효과와 근거가 같아 하나로 합친다. sqlparser의 비교와
+    /// 해시는 둘 다 위치(span)를 보지 않으므로 해시가 다르면 다른 문장이다. 앞서 모은
+    /// 문장 전체와 깊게 비교하면 문장 수의 제곱이 되므로, 해시가 같은 후보와만 비교한다.
+    /// 문장은 복제하지 않고 옮긴다 — 깊은 집합 연산 사슬의 복제는 사슬 길이만큼 스택을 쓴다.
+    fn retain_dml_statement(&mut self, statement: Statement) {
+        let bucket = self
+            .dml_buckets
+            .entry(statement_hash(&statement))
+            .or_default();
+        let duplicate = bucket.iter().any(|&index| {
+            #[cfg(test)]
+            work::compared_statement();
+            self.dml_statements[index] == statement
+        });
+        if !duplicate {
+            bucket.push(self.dml_statements.len());
+            self.dml_statements.push(statement);
+        }
+    }
+}
+
+/// 한 실행 안에서만 쓰는 문장 해시. 후보를 고르는 데만 쓰고 출력 순서에는 쓰지 않는다.
+fn statement_hash(statement: &Statement) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    statement.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// `CREATE TRIGGER ... BEGIN <문장들> END`를 파싱한다. sqlparser는
@@ -766,7 +827,7 @@ fn parse_trigger_body(
     let inner = extract_trigger_inner(body).unwrap_or(body);
     let locations_trusted =
         std::ptr::eq(inner.as_ptr(), body.as_ptr()) && inner.len() == body.len();
-    let statements = sqlparser::parser::Parser::parse_sql(dialect, inner.trim());
+    let statements = parse_limits::parse_sql(dialect, inner.trim());
     let mut parsed = ParsedTrigger {
         writes: Vec::new(),
         reads: Vec::new(),
@@ -776,6 +837,7 @@ fn parse_trigger_body(
         qualified_reads: Vec::new(),
         qualified_writes: Vec::new(),
         dml_statements: Vec::new(),
+        dml_buckets: BTreeMap::new(),
         local_relations: BTreeSet::new(),
         diagnostics: Vec::new(),
         scalar_symbols: BTreeSet::new(),
@@ -794,7 +856,7 @@ fn parse_trigger_body(
                     "procedural variables or dynamic SQL require statement extraction".to_owned(),
                 );
             }
-            for stmt in &stmts {
+            for stmt in stmts {
                 collect_trigger_stmt(stmt, &mut parsed, sqlserver_trigger);
             }
             invalidate_temp_state_if_unsafe(&mut parsed, body, 0);
@@ -874,6 +936,7 @@ fn empty_parsed_trigger() -> ParsedTrigger {
         qualified_reads: Vec::new(),
         qualified_writes: Vec::new(),
         dml_statements: Vec::new(),
+        dml_buckets: BTreeMap::new(),
         local_relations: BTreeSet::new(),
         diagnostics: Vec::new(),
         scalar_symbols: BTreeSet::new(),
@@ -937,11 +1000,12 @@ fn strip_informix_routine_body<'a>(tail: &'a str) -> Option<&'a str> {
 }
 
 fn find_parameter_list_end(text: &str) -> Option<usize> {
+    let quotes = QuoteScanner::new(text);
     let bytes = text.as_bytes();
     let mut open = None;
     let mut scan = 0;
     while scan < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(text, scan) {
+        if let Some(end) = quotes.end(scan) {
             scan = end;
             continue;
         }
@@ -955,7 +1019,7 @@ fn find_parameter_list_end(text: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut index = open;
     while index < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(text, index) {
+        if let Some(end) = quotes.end(index) {
             index = end;
             continue;
         }
@@ -975,10 +1039,11 @@ fn find_parameter_list_end(text: &str) -> Option<usize> {
 }
 
 fn find_top_level_semicolon(text: &str) -> Option<usize> {
+    let quotes = QuoteScanner::new(text);
     let bytes = text.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(text, index) {
+        if let Some(end) = quotes.end(index) {
             index = end;
             continue;
         }
@@ -1020,11 +1085,12 @@ fn informix_new_alias(body: &str) -> Option<String> {
 }
 
 fn replace_trigger_alias(body: &str, alias: &str) -> String {
+    let quotes = QuoteScanner::new(body);
     let bytes = body.as_bytes();
     let mut output = String::with_capacity(body.len());
     let mut index = 0;
     while index < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(body, index) {
+        if let Some(end) = quotes.end(index) {
             output.push_str(&body[index..end]);
             index = end;
             continue;
@@ -1097,10 +1163,11 @@ fn strip_outer_parentheses(text: &str) -> Option<&str> {
         return None;
     }
     let bytes = trimmed.as_bytes();
+    let quotes = QuoteScanner::new(trimmed);
     let mut depth = 0usize;
     let mut index = 0;
     while index < end {
-        if let Some(end) = quoted_or_comment_end(trimmed, index) {
+        if let Some(end) = quotes.end(index) {
             index = end;
             continue;
         }
@@ -1238,11 +1305,12 @@ fn extract_trigger_inner(body: &str) -> Option<&str> {
 
 /// 인용·주석 바깥의 키워드만 찾는다 — 문자열에 든 SQL은 실행 문맥에서만 푼다.
 fn find_all_keywords(s: &str, kw: &str) -> Vec<usize> {
+    let quotes = QuoteScanner::new(s);
     let bytes = s.as_bytes();
     let mut found = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(s, i) {
+        if let Some(end) = quotes.end(i) {
             i = end;
             continue;
         }
@@ -1281,6 +1349,15 @@ struct ExtractionState {
     evaluation_enabled: bool,
     outer_block_seen: bool,
     declared_symbols: BTreeSet<String>,
+    /// 지금 몸체를 꺼내 내려간 중첩 DO 블록 수.
+    do_depth: usize,
+    /// 추적 중인 변수 이름과 값의 바이트 합.
+    tracked_bytes: usize,
+    /// 추적 상한을 처음 넘은 사유. 그 뒤 동적 SQL을 실제로 접지 못했을 때만 진단에 싣는다.
+    tracking_overflow: Option<String>,
+    /// 추적 상한이 평가를 끈 뒤, 분기 같은 다른 이유로 꺼지기 전에 변수 값이 필요한 동적
+    /// SQL을 접지 못했는가.
+    overflow_blocked_folding: bool,
 }
 
 impl ExtractionState {
@@ -1294,61 +1371,114 @@ impl ExtractionState {
             evaluation_enabled: true,
             outer_block_seen: false,
             declared_symbols: BTreeSet::new(),
+            do_depth: 0,
+            tracked_bytes: 0,
+            tracking_overflow: None,
+            overflow_blocked_folding: false,
         }
     }
 
     fn invalidate(&mut self) {
         self.evaluation_enabled = false;
-        self.variables.clear();
+        self.invalidate_all_variables();
     }
 
     fn observe_begin(&mut self) {
         if self.outer_block_seen {
-            self.invalidate();
+            self.invalidate_control_flow();
         } else {
             self.outer_block_seen = true;
         }
     }
 
+    /// 분기·루프·중첩 블록 뒤로는 추적 상한과 무관하게 평가가 꺼진다. 그 전까지 상한 때문에
+    /// 접지 못한 동적 SQL이 없었다면 상한은 결과를 바꾸지 않으므로 사유를 버린다.
     fn invalidate_control_flow(&mut self) {
+        if !self.overflow_blocked_folding {
+            self.tracking_overflow = None;
+        }
         self.invalidate();
     }
 
-    fn assign(&mut self, name: &str, expression: &str) {
-        let variables = self.variables.clone();
-        self.assign_from(name, expression, &variables);
+    /// 동적 SQL 식을 접지 못했다. 추적 상한이 평가를 끈 뒤라면 그 탓일 수 있으므로 상한
+    /// 사유를 몸체 진단으로 남기게 표시한다.
+    fn record_unfolded_dynamic_sql(&mut self) {
+        if self.tracking_overflow.is_some() {
+            self.overflow_blocked_folding = true;
+        }
     }
 
-    fn assign_from(&mut self, name: &str, expression: &str, variables: &BTreeMap<String, String>) {
+    /// 몸체 진단에 실을 추적 상한 사유. 상한 뒤 동적 SQL을 실제로 접지 못했을 때만 돌려준다
+    /// — 그런 동적 SQL이 없으면 변수 값을 버린 것이 결과를 바꾸지 않았다.
+    fn take_tracking_limit(&mut self) -> Option<String> {
+        let blocked = self.overflow_blocked_folding;
+        self.tracking_overflow.take().filter(|_| blocked)
+    }
+
+    /// 대입 하나를 지금 변수 환경으로 평가해 값을 싣거나, 불명확하면 지운다.
+    fn assign(&mut self, name: &str, expression: &str) {
         let key = normalize_variable_name(name);
         if key.is_empty() {
             return;
         }
-        if self.evaluation_enabled {
-            if let Some(capacity) = self.capacities.get(&key).copied() {
-                if let Some(value) = constant_sql::evaluate_with_format(
-                    expression,
-                    self.dialect,
-                    variables,
-                    !self.format_shadowed,
-                ) {
-                    let unicode_safe = self.dialect != constant_sql::TextDialect::MsSql
-                        || self.unicode_capable.contains(&key)
-                        || value.is_ascii();
-                    if unicode_safe && constant_sql::fits_capacity(&value, capacity) {
-                        self.variables.insert(key, value);
-                        return;
-                    }
-                }
-            }
+        let value = self.assigned_value(&key, expression);
+        self.set_variable(key, value);
+    }
+
+    /// 대입식의 확정 텍스트 값. 추적하지 않는 타입·용량 초과·평가 실패는 None이다.
+    ///
+    /// 변수 환경은 빌려서 평가한다 — 대입마다 환경 전체(값당 최대 64KiB)를 복제하면
+    /// 대입 수의 제곱만큼 복사하게 된다.
+    fn assigned_value(&self, key: &str, expression: &str) -> Option<String> {
+        if !self.evaluation_enabled {
+            return None;
         }
-        self.variables.remove(&key);
+        let capacity = self.capacities.get(key).copied()?;
+        let value = constant_sql::evaluate_with_format(
+            expression,
+            self.dialect,
+            &self.variables,
+            !self.format_shadowed,
+        )?;
+        let unicode_safe = self.dialect != constant_sql::TextDialect::MsSql
+            || self.unicode_capable.contains(key)
+            || value.is_ascii();
+        (unicode_safe && constant_sql::fits_capacity(&value, capacity)).then_some(value)
+    }
+
+    /// 확정 값을 싣는다. 값이 없거나 평가가 꺼졌으면 지우고, 추적 상한을 넘으면
+    /// 평가를 끄고 사유를 남긴다 — 참조 대입(`b := a`)은 값을 통째로 복사하므로 변수
+    /// 수와 총량을 묶지 않으면 작은 몸체 하나가 GB 단위 메모리를 잡는다.
+    fn set_variable(&mut self, key: String, value: Option<String>) {
+        let previous = self
+            .variables
+            .get(&key)
+            .map_or(0, |old| key.len() + old.len());
+        let Some(value) = value.filter(|_| self.evaluation_enabled) else {
+            self.remove_variable(&key);
+            return;
+        };
+        let bytes = self.tracked_bytes - previous + key.len() + value.len();
+        let count = self.variables.len() + usize::from(previous == 0);
+        if let Some(reason) = constant_sql::tracking_overflow(count, bytes) {
+            self.tracking_overflow.get_or_insert(reason);
+            self.invalidate();
+            return;
+        }
+        self.tracked_bytes = bytes;
+        self.variables.insert(key, value);
+    }
+
+    fn remove_variable(&mut self, key: &str) {
+        if let Some(old) = self.variables.remove(key) {
+            self.tracked_bytes -= key.len() + old.len();
+        }
     }
 
     fn declare(&mut self, name: &str, type_text: &str, expression: Option<&str>) {
         let key = normalize_variable_name(name);
         self.declared_symbols.insert(key.clone());
-        self.variables.remove(&key);
+        self.remove_variable(&key);
         self.capacities.remove(&key);
         self.unicode_capable.remove(&key);
         let Some(capacity) = constant_sql::declared_text_capacity(type_text) else {
@@ -1365,10 +1495,11 @@ impl ExtractionState {
 
     fn invalidate_all_variables(&mut self) {
         self.variables.clear();
+        self.tracked_bytes = 0;
     }
 
     fn invalidate_variable(&mut self, name: &str) {
-        self.variables.remove(&normalize_variable_name(name));
+        self.remove_variable(&normalize_variable_name(name));
     }
 
     fn evaluate(&self, expression: &str) -> Option<String> {
@@ -1424,6 +1555,7 @@ fn parse_procedural_body(
         qualified_reads: Vec::new(),
         qualified_writes: Vec::new(),
         dml_statements: Vec::new(),
+        dml_buckets: BTreeMap::new(),
         local_relations: BTreeSet::new(),
         diagnostics: Vec::new(),
         scalar_symbols: state.declared_symbols.clone(),
@@ -1431,10 +1563,21 @@ fn parse_procedural_body(
         temp_state_safe: true,
         locations_trusted: false,
     };
+    if let Some(reason) = state.take_tracking_limit() {
+        // 상한 뒤의 변수 값은 버렸으므로 그 뒤 동적 SQL을 상수로 접지 못했다.
+        parsed.partial = true;
+        parsed.diagnostics.push(schemagraph_core::Diagnostic {
+            code: "SG_VARIABLE_STATE_LIMIT".into(),
+            message: format!(
+                "{reason}; dynamic SQL after the limit was not folded from variable values"
+            ),
+            location: None,
+        });
+    }
     for stmt in &stmts {
-        match sqlparser::parser::Parser::parse_sql(dialect, stmt) {
+        match parse_limits::parse_sql(dialect, stmt) {
             Ok(list) => {
-                for s in &list {
+                for s in list {
                     collect_trigger_stmt(s, &mut parsed, false);
                 }
             }
@@ -1699,13 +1842,14 @@ fn extract_procedural_statements(
 /// `;`로 끝나는 최상위 조각으로 나눈다 — 문자열·식별자 인용·주석·
 /// dollar-quote·Oracle q-quote 안의 `;`는 문장 경계가 아니다.
 fn split_top_level(s: &str) -> Vec<&str> {
+    let quotes = QuoteScanner::new(s);
     let b = s.as_bytes();
     let n = b.len();
     let mut parts = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
     while i < n {
-        if let Some(end) = quoted_or_comment_end(s, i) {
+        if let Some(end) = quotes.end(i) {
             i = end;
             continue;
         }
@@ -1728,12 +1872,13 @@ fn split_top_level(s: &str) -> Vec<&str> {
 /// 인용·주석·괄호 안이 아닌 최상위에서 needle의 첫 위치를 찾는다.
 /// word_boundary가 true면 식별자 문자와 붙은 위치는 건너뛴다.
 fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
+    let quotes = QuoteScanner::new(s);
     let b = s.as_bytes();
     let n = b.len();
     let mut depth = 0i32;
     let mut i = 0usize;
     while i < n {
-        if let Some(end) = quoted_or_comment_end(s, i) {
+        if let Some(end) = quotes.end(i) {
             i = end;
             continue;
         }
@@ -1761,27 +1906,125 @@ fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
     None
 }
 
-/// 같은 인용 규칙을 문장 분할과 키워드 탐색에 적용해 경계 해석이 어긋나지 않게 한다.
-fn quoted_or_comment_end(s: &str, i: usize) -> Option<usize> {
-    let bytes = s.as_bytes();
-    match bytes[i] {
-        b'\'' => Some(skip_string(s, i)),
-        b'"' | b'`' | b'[' => Some(skip_quoted_ident(s, i)),
-        b'-' if bytes.get(i + 1) == Some(&b'-') => Some(skip_line_comment(s, i)),
-        b'/' if bytes.get(i + 1) == Some(&b'*') => Some(skip_block_comment(s, i)),
-        b'$' => dollar_quote_end(s, i),
-        b'e' | b'E'
-            if bytes.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(bytes[i - 1])) =>
-        {
-            Some(skip_escape_string(s, i + 1))
+/// 한 문자열을 훑는 동안 인용·주석 경계를 찾는다.
+///
+/// 문장 분할과 키워드 탐색이 같은 인용 규칙을 써야 경계 해석이 어긋나지 않는다.
+/// 닫히지 않은 `$tag$`·`q'x` 여는 표식은 닫는 표식을 문자열 끝까지 찾고, 없으면
+/// 호출자가 1바이트만 전진한다. 서로 다른 닫히지 않은 표식이 n개면 스캔 한 번이
+/// O(n × 길이)가 되므로, 처음 실패한 검색 뒤에 표식마다 마지막 등장 위치를 한 번 모아
+/// 두고 그 위치가 찾을 범위보다 앞이면 찾지 않는다. 찾는 결과는 그대로다.
+struct QuoteScanner<'a> {
+    text: &'a str,
+    /// 다음 `$`까지의 `$…$` 조각마다 마지막으로 시작한 위치. dollar-quote의 닫는
+    /// 태그는 이 꼴로만 나타난다.
+    dollar_tags: OnceCell<HashMap<&'a str, usize>>,
+    /// 문자마다 `문자'`가 마지막으로 시작한 위치. q-quote의 닫는 표식이 이 꼴이다.
+    q_closers: OnceCell<HashMap<char, usize>>,
+}
+
+impl<'a> QuoteScanner<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            dollar_tags: OnceCell::new(),
+            q_closers: OnceCell::new(),
         }
-        b'q' | b'Q'
-            if bytes.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(bytes[i - 1])) =>
-        {
-            q_quote_end(s, i)
-        }
-        _ => None,
     }
+
+    /// i에서 시작하는 인용·주석의 끝 다음 위치. 인용·주석이 아니면 None이다.
+    fn end(&self, i: usize) -> Option<usize> {
+        let (s, bytes) = (self.text, self.text.as_bytes());
+        match bytes[i] {
+            b'\'' => Some(skip_string(s, i)),
+            b'"' | b'`' | b'[' => Some(skip_quoted_ident(s, i)),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => Some(skip_line_comment(s, i)),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => Some(skip_block_comment(s, i)),
+            b'$' => self.dollar_quote_end(i),
+            b'e' | b'E' if quote_prefix_opens(s, i) => Some(skip_escape_string(s, i + 1)),
+            b'q' | b'Q' if quote_prefix_opens(s, i) => self.q_quote_end(i),
+            _ => None,
+        }
+    }
+
+    /// i의 `$tag$`가 여는 인용이면 닫는 태그 다음 위치. 위치표가 i 뒤에 같은 태그가
+    /// 없다고 하면 찾지 않는다.
+    fn dollar_quote_end(&self, i: usize) -> Option<usize> {
+        let tag = dollar_tag(self.text, i)?;
+        let after = i + tag.len();
+        if known_absent(&self.dollar_tags, &tag, after) {
+            return None;
+        }
+        let end = closing_delimiter_end(self.text, after, tag);
+        if end.is_none() {
+            self.dollar_tags
+                .get_or_init(|| dollar_tag_positions(self.text));
+        }
+        end
+    }
+
+    /// i의 `q'x`가 여는 인용이면 닫는 `x'` 다음 위치. 위치표가 몸체 시작 뒤에 닫는
+    /// 표식이 없다고 하면 찾지 않는다.
+    fn q_quote_end(&self, i: usize) -> Option<usize> {
+        let (close, start) = q_quote_delimiter(self.text, i)?;
+        if known_absent(&self.q_closers, &close, start) {
+            return None;
+        }
+        let end = closing_delimiter_end(self.text, start, &format!("{close}'"));
+        if end.is_none() {
+            self.q_closers.get_or_init(|| q_closer_positions(self.text));
+        }
+        end
+    }
+}
+
+/// 마지막 등장 위치를 모아 뒀고 그 위치가 `from`보다 앞이면(또는 한 번도 없으면)
+/// `from` 뒤에는 그 표식이 없다.
+fn known_absent<K: std::hash::Hash + Eq>(
+    positions: &OnceCell<HashMap<K, usize>>,
+    key: &K,
+    from: usize,
+) -> bool {
+    positions
+        .get()
+        .is_some_and(|positions| positions.get(key).is_none_or(|&last| last < from))
+}
+
+/// `from` 뒤 첫 `delimiter`의 끝 다음 위치.
+fn closing_delimiter_end(s: &str, from: usize, delimiter: &str) -> Option<usize> {
+    let found = s[from..].find(delimiter);
+    #[cfg(test)]
+    work::searched_bytes(found.map_or(s.len() - from, |offset| offset + delimiter.len()));
+    found.map(|offset| from + offset + delimiter.len())
+}
+
+/// 연속한 `$` 두 개 사이 조각(`$…$`)마다 마지막으로 시작한 위치.
+fn dollar_tag_positions(text: &str) -> HashMap<&str, usize> {
+    let dollars: Vec<usize> = text
+        .bytes()
+        .enumerate()
+        .filter_map(|(index, byte)| (byte == b'$').then_some(index))
+        .collect();
+    dollars
+        .windows(2)
+        .map(|pair| (&text[pair[0]..=pair[1]], pair[0]))
+        .collect()
+}
+
+/// 작은따옴표 앞 문자마다 `문자'`가 마지막으로 시작한 위치.
+fn q_closer_positions(text: &str) -> HashMap<char, usize> {
+    text.char_indices()
+        .filter(|&(_, character)| character == '\'')
+        .filter_map(|(quote, _)| {
+            let before = text[..quote].chars().next_back()?;
+            Some((before, quote - before.len_utf8()))
+        })
+        .collect()
+}
+
+/// E-string·q-quote 접두 문자 — 식별자 중간의 `e'`·`q'`는 여는 인용이 아니다.
+fn quote_prefix_opens(s: &str, i: usize) -> bool {
+    let bytes = s.as_bytes();
+    bytes.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(bytes[i - 1]))
 }
 
 /// i의 여는 ' 다음에 오는 닫는 ' 다음 위치 — ''는 이스케이프다.
@@ -1863,6 +2106,12 @@ fn skip_block_comment(s: &str, i: usize) -> usize {
 /// i의 `$`가 `$tag$` 여는 인용이면 닫는 태그 다음 위치 — 태그는 식별자
 /// 규칙이라 `$1` 같은 위치 매개변수와 구분된다(숫자로 시작 못 함).
 fn dollar_quote_end(s: &str, i: usize) -> Option<usize> {
+    let tag = dollar_tag(s, i)?;
+    closing_delimiter_end(s, i + tag.len(), tag)
+}
+
+/// i에서 시작하는 `$tag$` 여는 태그. 태그 안에는 `$`가 없으므로 다음 `$`까지다.
+fn dollar_tag(s: &str, i: usize) -> Option<&str> {
     let b = s.as_bytes();
     let mut j = i + 1;
     if j < b.len() && (b[j].is_ascii_alphabetic() || b[j] == b'_') {
@@ -1870,16 +2119,18 @@ fn dollar_quote_end(s: &str, i: usize) -> Option<usize> {
             j += 1;
         }
     }
-    if j >= b.len() || b[j] != b'$' {
-        return None;
-    }
-    let tag = &s[i..=j];
-    s[j + 1..].find(tag).map(|k| j + 1 + k + tag.len())
+    (j < b.len() && b[j] == b'$').then(|| &s[i..=j])
 }
 
 /// Oracle `q'구분자...구분자'`의 끝 다음 위치 — 괄호 구분자는 대칭,
 /// 나머지는 같은 문자가 닫는다.
 fn q_quote_end(s: &str, i: usize) -> Option<usize> {
+    let (close, start) = q_quote_delimiter(s, i)?;
+    closing_delimiter_end(s, start, &format!("{close}'"))
+}
+
+/// q-quote의 닫는 구분 문자와 몸체 시작 위치.
+fn q_quote_delimiter(s: &str, i: usize) -> Option<(char, usize)> {
     let open = s.get(i + 2..)?.chars().next()?;
     let close = match open {
         '[' => ']',
@@ -1889,11 +2140,7 @@ fn q_quote_end(s: &str, i: usize) -> Option<usize> {
         c if !c.is_whitespace() && c != '\'' => c,
         _ => return None,
     };
-    let start = i + 2 + open.len_utf8();
-    let delimiter = format!("{close}'");
-    s[start..]
-        .find(&delimiter)
-        .map(|offset| start + offset + delimiter.len())
+    Some((close, i + 2 + open.len_utf8()))
 }
 
 /// 공백과 주석(`--…`, `/*…*/`)을 건너뛴다 — 조각 선두·중간의 주석이
@@ -2160,7 +2407,7 @@ fn push_dynamic_sql(
     allow_bindings: bool,
     stmts: &mut Vec<String>,
     unextracted: &mut usize,
-    state: &ExtractionState,
+    state: &mut ExtractionState,
 ) {
     let tail = skip_ws_comments(tail);
     let Some((expression, remaining)) = split_dynamic_expression(tail) else {
@@ -2168,6 +2415,7 @@ fn push_dynamic_sql(
         return;
     };
     let Some(sql) = state.evaluate(expression) else {
+        state.record_unfolded_dynamic_sql();
         *unextracted += 1;
         return;
     };
@@ -2249,7 +2497,14 @@ fn strip_tail_condition(rest: &str, kwlen: usize, stmts: &mut Vec<String>) {
     }
 }
 
+/// 몸체를 꺼내 따라 내려갈 중첩 DO 블록의 최대 깊이.
+///
+/// 실제 몸체의 DO 중첩은 한두 단계다. 상한이 없으면 태그를 바꿔 가며 중첩한 몸체
+/// 하나로 추출 재귀가 스택을 넘고, 단계마다 남은 몸체를 복사해 메모리가 GB 단위가 됐다.
+const MAX_DO_NESTING: usize = 32;
+
 /// `DO $$..$$`·`DO '..'` 중첩 익명 블록 — 몸체를 꺼내 재귀 추출한다.
+/// 깊이 상한을 넘거나 몸체를 꺼내지 못한 블록은 미추출로 센다.
 fn strip_do<'a>(
     rest: &'a str,
     kwlen: usize,
@@ -2257,23 +2512,31 @@ fn strip_do<'a>(
     unextracted: &mut usize,
     state: &mut ExtractionState,
 ) -> &'a str {
-    let tail = rest[kwlen..].trim_start();
-    let inner = if tail.starts_with('$') {
-        undollar_quote(tail).map(|c| c.into_owned())
+    let inner = (state.do_depth < MAX_DO_NESTING)
+        .then(|| do_block_body(&rest[kwlen..]))
+        .flatten();
+    let Some(body) = inner else {
+        *unextracted += 1;
+        return "";
+    };
+    state.do_depth += 1;
+    let (mut nested, nested_unextracted) = extract_procedural_statements(&body, state, false);
+    state.do_depth -= 1;
+    stmts.append(&mut nested);
+    *unextracted += nested_unextracted;
+    ""
+}
+
+/// DO 뒤 인용 몸체. dollar-quote는 원문을 빌려 단계마다 남은 몸체를 복사하지 않는다.
+fn do_block_body(tail: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let tail = tail.trim_start();
+    if tail.starts_with('$') {
+        undollar_quote(tail)
     } else if tail.starts_with('\'') {
-        unquote_sql_string(tail).map(|c| c.into_owned())
+        unquote_sql_string(tail)
     } else {
         None
-    };
-    match inner {
-        Some(b) => {
-            let (mut s, u) = extract_procedural_statements(&b, state, false);
-            stmts.append(&mut s);
-            *unextracted += u;
-        }
-        None => *unextracted += 1,
     }
-    ""
 }
 
 /// `PROCEDURE p(a int)`·`FUNCTION f RETURN t IS`·`PACKAGE BODY x IS` 같은
@@ -2417,19 +2680,21 @@ fn record_select_assignments(stmt: &str, head: &str, state: &mut ExtractionState
         .iter()
         .map(|(name, _)| normalize_variable_name(name))
         .collect();
-    let original = state.variables.clone();
-    for (name, expression) in assignments {
-        let key = normalize_variable_name(&name);
-        if constant_sql::references_variables(&expression, state.dialect, &targets) {
-            state.invalidate_variable(&name);
-        } else {
-            state.assign_from(&name, &expression, &original);
-            // 타입·용량 제약으로 값이 불명확해졌으면 이전 대입값을 되살리지
-            // 않고 불명확 상태를 유지한다.
-            if !state.variables.contains_key(&key) {
-                state.invalidate_variable(&name);
-            }
-        }
+    // 오른쪽 식을 모두 대입 전 환경으로 먼저 평가한 뒤 적용한다 — 동시 대입이라 앞선
+    // 대입 결과를 보지 않는다. 같은 문장의 대상을 참조하는 식이나 타입·용량 제약으로
+    // 불명확해진 값은 이전 값을 되살리지 않고 지운다.
+    let values: Vec<(String, Option<String>)> = assignments
+        .iter()
+        .map(|(name, expression)| {
+            let key = normalize_variable_name(name);
+            let value = (!constant_sql::references_variables(expression, state.dialect, &targets))
+                .then(|| state.assigned_value(&key, expression))
+                .flatten();
+            (key, value)
+        })
+        .collect();
+    for (key, value) in values.into_iter().filter(|(key, _)| !key.is_empty()) {
+        state.set_variable(key, value);
     }
 }
 
@@ -2447,13 +2712,14 @@ fn invalidate_variable_list(list: &str, state: &mut ExtractionState) {
 }
 
 fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let quotes = QuoteScanner::new(s);
     let bytes = s.as_bytes();
     let mut parts = Vec::new();
     let mut start = 0;
     let mut depth = 0i32;
     let mut position = 0;
     while position < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(s, position) {
+        if let Some(end) = quotes.end(position) {
             position = end;
             continue;
         }
@@ -2485,12 +2751,13 @@ fn invalidate_call_arguments(rest: &str, state: &mut ExtractionState) {
 }
 
 fn parenthesized_arguments(rest: &str) -> Option<&str> {
+    let quotes = QuoteScanner::new(rest);
     let bytes = rest.as_bytes();
     let mut position = 0;
     let mut open = None;
     let mut depth = 0i32;
     while position < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(rest, position) {
+        if let Some(end) = quotes.end(position) {
             position = end;
             continue;
         }
@@ -2600,10 +2867,11 @@ fn routine_parameter_symbols(body: &str) -> BTreeSet<String> {
 }
 
 fn declared_at_names(text: &str) -> BTreeSet<String> {
+    let quotes = QuoteScanner::new(text);
     let mut names = BTreeSet::new();
     let mut index = 0usize;
     while index < text.len() {
-        if let Some(end) = quoted_or_comment_end(text, index) {
+        if let Some(end) = quotes.end(index) {
             index = end;
             continue;
         }
@@ -2764,8 +3032,24 @@ fn is_query_text(s: &str) -> bool {
         || s.trim_start().starts_with('(')
 }
 
-/// 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
-fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_trigger: bool) {
+/// 소유한 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
+///
+/// 컬럼 DML은 복제하지 않고 옮겨 보관하고, 절차형 블록(IF/WHILE/CASE)은 안쪽 문장을
+/// 꺼내 같은 규칙으로 모은다. 컬럼 DML에는 안쪽 문장이 없으므로 처음 나온 순서가
+/// 참조로 훑던 때와 같다.
+fn collect_trigger_stmt(stmt: Statement, parsed: &mut ParsedTrigger, sqlserver_trigger: bool) {
+    collect_trigger_facts(&stmt, parsed, sqlserver_trigger);
+    if is_column_dml_statement(&stmt) {
+        parsed.retain_dml_statement(stmt);
+        return;
+    }
+    for nested in into_nested_statements(stmt) {
+        collect_trigger_stmt(nested, parsed, sqlserver_trigger);
+    }
+}
+
+/// 문장 하나의 관계·식·호출 참조를 모은다. 안쪽 문장은 호출자가 따로 넘긴다.
+fn collect_trigger_facts(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_trigger: bool) {
     if let Statement::CreateTable(create) = stmt {
         let local = create.temporary
             || create
@@ -2808,9 +3092,6 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_
                 .into(),
             location: None,
         });
-    }
-    if is_column_dml_statement(stmt) && !parsed.dml_statements.contains(stmt) {
-        parsed.dml_statements.push(stmt.clone());
     }
     // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
     // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
@@ -2911,12 +3192,31 @@ fn collect_trigger_stmt(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_
             parsed.calls.push(t);
         }
     }
-    // 절차형 블록(IF/WHILE/CASE) 안의 문장 — 도매 파싱이 성공해도 DML·CALL이
-    // 블록 안에 중첩돼 있어 재귀로 내려가지 않으면 writes가 reads로 오분류되고
-    // CALL이 조용히 빠진다. 관계·식 수확은 visitor가 이미 트리 전체를 본다.
-    for s in nested_statements(stmt) {
-        collect_trigger_stmt(s, parsed, sqlserver_trigger);
-    }
+}
+
+/// 절차형 블록(IF/WHILE/CASE) 안의 문장을 nested_statements와 같은 순서로 옮겨 꺼낸다.
+///
+/// 도매 파싱이 성공해도 DML·CALL이 블록 안에 중첩돼 있어, 내려가지 않으면 writes가
+/// reads로 오분류되고 CALL이 조용히 빠진다. 관계·식 수확은 visitor가 이미 트리 전체를
+/// 보지만, 쓰기 대상과 DML 효과는 문장마다 모아야 한다.
+fn into_nested_statements(stmt: Statement) -> Vec<Statement> {
+    use sqlparser::ast::ConditionalStatements;
+    let blocks: Vec<sqlparser::ast::ConditionalStatementBlock> = match stmt {
+        Statement::If(s) => std::iter::once(s.if_block)
+            .chain(s.elseif_blocks)
+            .chain(s.else_block)
+            .collect(),
+        Statement::While(s) => vec![s.while_block],
+        Statement::Case(s) => s.when_blocks.into_iter().chain(s.else_block).collect(),
+        _ => return Vec::new(),
+    };
+    blocks
+        .into_iter()
+        .flat_map(|block| match block.conditional_statements {
+            ConditionalStatements::Sequence { statements } => statements,
+            ConditionalStatements::BeginEnd(block) => block.statements,
+        })
+        .collect()
 }
 
 fn is_column_dml_statement(stmt: &Statement) -> bool {
@@ -3238,6 +3538,175 @@ enum RoutineHit {
     Ambiguous(usize),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 이름 해석이 그래프 정점 전체를 훑은 횟수. 테스트 스레드마다 따로 센다.
+    static VERTEX_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 이름 해석의 정점 전체 순회를 한 번 센다.
+#[cfg(test)]
+fn count_vertex_scan() {
+    VERTEX_SCANS.with(|scans| scans.set(scans.get() + 1));
+}
+
+/// 현재 테스트 스레드의 정점 순회 횟수를 돌려주고 0으로 되돌린다.
+#[cfg(test)]
+fn take_vertex_scans() -> usize {
+    VERTEX_SCANS.with(std::cell::Cell::take)
+}
+
+/// 테스트가 몸체 분석 작업량을 시간 대신 횟수로 확인하게 한다.
+///
+/// 이차 시간 회귀는 작은 입력에서 시간으로 잡히지 않고, 큰 입력의 시간 단언은 공유
+/// 기계에서 불안정하다. 테스트마다 스레드가 따로라 thread_local이면 서로 섞이지 않는다.
+#[cfg(test)]
+mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COMPARED_STATEMENTS: Cell<usize> = const { Cell::new(0) };
+        static SEARCHED_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// DML 문장 중복 확인에서 문장 전체를 비교한 횟수를 하나 더한다.
+    pub(crate) fn compared_statement() {
+        COMPARED_STATEMENTS.with(|count| count.set(count.get() + 1));
+    }
+
+    /// 현재 테스트 스레드의 문장 비교 횟수를 돌려주고 0으로 되돌린다.
+    pub(crate) fn take_compared_statements() -> usize {
+        COMPARED_STATEMENTS.with(Cell::take)
+    }
+
+    /// 닫는 인용 표식을 찾으며 훑은 바이트 수를 더한다.
+    pub(crate) fn searched_bytes(bytes: usize) {
+        SEARCHED_BYTES.with(|count| count.set(count.get() + bytes));
+    }
+
+    /// 현재 테스트 스레드에서 닫는 표식을 찾으며 훑은 바이트 수를 돌려주고 0으로 되돌린다.
+    pub(crate) fn take_searched_bytes() -> usize {
+        SEARCHED_BYTES.with(Cell::take)
+    }
+}
+
+/// enrich 동안 고정된 정점 집합에서 이름 해석 후보를 찾는 색인.
+///
+/// parser는 정점을 추가하지 않고 간선만 더하므로 처음 조회할 때 만든 색인이
+/// enrich 끝까지 유효하다. 참조마다 전체 정점을 훑던 해석을 키 조회로 바꾸되,
+/// 후보 0개·1개·2개 이상을 None·One·Ambiguous로 가르는 규칙은 그대로 둔다.
+/// 그래서 한 색인은 처음 조회한 그래프 하나에만 써야 한다.
+#[derive(Default)]
+pub(crate) struct VertexIndex {
+    exact: OnceCell<RoutineIndex>,
+    folded: OnceCell<RoutineIndex>,
+    /// ASCII 대문자로 접은 id → 정점. ci 방언의 단일 후보 판정에 쓴다.
+    folded_ids: OnceCell<BTreeMap<String, Vec<VertexId>>>,
+}
+
+impl VertexIndex {
+    /// 정확 일치만 볼지, 대소문자 무시 단일 후보까지 볼지 정한 조회 방식.
+    pub(crate) fn lookup(&self, ci: bool) -> Lookup<'_> {
+        Lookup { index: self, ci }
+    }
+
+    fn routines(&self, g: &Graph, ci: bool) -> &RoutineIndex {
+        if ci {
+            self.folded.get_or_init(|| RoutineIndex::new(g, fold_case))
+        } else {
+            self.exact
+                .get_or_init(|| RoutineIndex::new(g, str::to_owned))
+        }
+    }
+
+    fn folded_ids(&self, g: &Graph) -> &BTreeMap<String, Vec<VertexId>> {
+        self.folded_ids.get_or_init(|| {
+            #[cfg(test)]
+            count_vertex_scan();
+            let mut ids: BTreeMap<String, Vec<VertexId>> = BTreeMap::new();
+            for vertex in g.vertices() {
+                let key = fold_case(vertex.id.as_str());
+                ids.entry(key).or_default().push(vertex.id.clone());
+            }
+            ids
+        })
+    }
+}
+
+/// routine 이름 해석 후보. 이름 키는 만들 때 준 규칙으로 접은 값이다.
+#[derive(Default)]
+struct RoutineIndex {
+    /// (스키마, 표시 이름) → 함수·프로시저·패키지 정점.
+    routines: BTreeMap<(String, String), Vec<VertexId>>,
+    /// (패키지 id, 멤버 이름) → 함수·프로시저 정점. 패키지 id는 접지 않는다.
+    members: BTreeMap<(VertexId, String), Vec<VertexId>>,
+}
+
+impl RoutineIndex {
+    fn new(g: &Graph, fold: fn(&str) -> String) -> Self {
+        #[cfg(test)]
+        count_vertex_scan();
+        let mut index = Self::default();
+        for vertex in g.vertices() {
+            if matches!(
+                vertex.kind,
+                VertexKind::Function | VertexKind::Procedure | VertexKind::Package
+            ) {
+                let key = (fold(&vertex.schema), fold(&vertex.name));
+                index
+                    .routines
+                    .entry(key)
+                    .or_default()
+                    .push(vertex.id.clone());
+            }
+            if matches!(vertex.kind, VertexKind::Function | VertexKind::Procedure) {
+                if let Some(package) = vertex.id.parent() {
+                    let key = (package, fold(&vertex.name));
+                    index
+                        .members
+                        .entry(key)
+                        .or_default()
+                        .push(vertex.id.clone());
+                }
+            }
+        }
+        index
+    }
+}
+
+/// 이름 해석 방식과 그 색인. ci면 정확 일치가 없을 때 대소문자 무시 단일
+/// 후보를 본다.
+#[derive(Clone, Copy)]
+pub(crate) struct Lookup<'a> {
+    index: &'a VertexIndex,
+    ci: bool,
+}
+
+impl Lookup<'_> {
+    /// 이 조회 방식의 비교 규칙으로 이름 키를 만든다.
+    fn key(&self, value: &str) -> String {
+        if self.ci {
+            fold_case(value)
+        } else {
+            value.to_owned()
+        }
+    }
+}
+
+/// ci 비교 `a == b || a.eq_ignore_ascii_case(b)`와 같은 동치류를 만드는 키.
+fn fold_case(value: &str) -> String {
+    value.to_ascii_uppercase()
+}
+
+/// 후보 수로 routine 해석 결과를 정한다 — 둘 이상이면 추측하지 않는다.
+fn routine_hit(candidates: Option<&Vec<VertexId>>) -> RoutineHit {
+    match candidates.map(Vec::as_slice).unwrap_or_default() {
+        [] => RoutineHit::None,
+        [only] => RoutineHit::One(only.clone()),
+        many => RoutineHit::Ambiguous(many.len()),
+    }
+}
+
 /// 멤버 정점 id를 찾는다 — document_to_graph가 이름 충돌을 `name@kind`로
 /// 분리하므로, 평범한 id에 우리 kind가 없으면 접미사 id를 시도한다.
 /// 못 찾으면 None — 유령 id로 간선을 만들지 않는다.
@@ -3248,9 +3717,9 @@ fn resolve_member(
     name: &str,
     kind: VertexKind,
     suffix: &str,
-    ci: bool,
+    lookup: Lookup<'_>,
 ) -> Option<VertexId> {
-    resolve_renamed(g, VertexId::member(schema, obj, name), kind, suffix, ci)
+    resolve_renamed(g, VertexId::member(schema, obj, name), kind, suffix, lookup)
 }
 
 fn resolve_routine_vertex(
@@ -3261,14 +3730,14 @@ fn resolve_routine_vertex(
     signature: Option<&str>,
     kind: VertexKind,
     suffix: &str,
-    ci: bool,
+    lookup: Lookup<'_>,
 ) -> Option<VertexId> {
     resolve_renamed(
         g,
         VertexId::routine(schema, package, name, signature),
         kind,
         suffix,
-        ci,
+        lookup,
     )
 }
 
@@ -3279,9 +3748,9 @@ fn resolve_object(
     name: &str,
     kind: VertexKind,
     suffix: &str,
-    ci: bool,
+    lookup: Lookup<'_>,
 ) -> Option<VertexId> {
-    resolve_renamed(g, VertexId::object(schema, name), kind, suffix, ci)
+    resolve_renamed(g, VertexId::object(schema, name), kind, suffix, lookup)
 }
 
 /// base id가 다른 kind에게 점유됐으면 `base@suffix`를 시도한다 —
@@ -3291,12 +3760,12 @@ fn resolve_renamed(
     base: VertexId,
     kind: VertexKind,
     suffix: &str,
-    ci: bool,
+    lookup: Lookup<'_>,
 ) -> Option<VertexId> {
     let renamed = VertexId::from_raw(&format!("{}@{suffix}", base.as_str()));
     [base, renamed]
         .into_iter()
-        .filter_map(|id| vertex_hit(g, &id, ci))
+        .filter_map(|id| vertex_hit(g, &id, lookup))
         .find(|id| g.vertex(id).map(|v| v.kind == kind).unwrap_or(false))
 }
 
@@ -3304,52 +3773,28 @@ fn resolve_renamed(
 /// 찾는다. Oracle의 미인용 식별자는 대문자로 접혀 몸체의 `orders`와 카탈로그의
 /// `ORDERS`가 같은 대상이지만, 대소문자만 다른 두 객체가 있으면 어느 쪽인지
 /// 추측할 수 없어 None을 돌려 유령 간선을 막는다.
-fn vertex_hit(g: &Graph, id: &VertexId, ci: bool) -> Option<VertexId> {
+fn vertex_hit(g: &Graph, id: &VertexId, lookup: Lookup<'_>) -> Option<VertexId> {
     if g.vertex(id).is_some() {
         return Some(id.clone());
     }
-    if !ci {
+    if !lookup.ci {
         return None;
     }
-    let mut hits = g
-        .vertices()
-        .map(|v| &v.id)
-        .filter(|v| v.as_str().eq_ignore_ascii_case(id.as_str()));
-    let first = hits.next()?;
-    if hits.next().is_none() {
-        Some(first.clone())
-    } else {
-        None
+    match lookup.index.folded_ids(g).get(&fold_case(id.as_str())) {
+        Some(hits) if hits.len() == 1 => Some(hits[0].clone()),
+        _ => None,
     }
 }
 
 /// 스키마 안에서 routine 정점을 이름으로 찾는다. 정확한 id(name 그대로)가
 /// 먼저이고, 없으면 routine kind 정점의 표시 이름과 비교한다 — 호출자는
 /// 시그니처를 모르므로 이름이 유일할 때만 받아들인다(resolve()와 같은 철학).
-fn resolve_routine(g: &Graph, schema: &str, name: &str, ci: bool) -> RoutineHit {
+fn resolve_routine(g: &Graph, schema: &str, name: &str, lookup: Lookup<'_>) -> RoutineHit {
     // 정확한 base id가 있어도 같은 표시 이름의 시그니처 정점이 있으면
     // 호출 인자 수를 모르는 이 경로에서 무인자 overload를 임의로 고르면 안
     // 된다. 모든 routine 후보를 먼저 모아 하나일 때만 선택한다.
-    let name_eq = |a: &str, b: &str| a == b || (ci && a.eq_ignore_ascii_case(b));
-    let hits: Vec<VertexId> = g
-        .vertices()
-        .filter(|v| {
-            name_eq(&v.schema, schema)
-                && name_eq(&v.name, name)
-                && matches!(
-                    v.kind,
-                    schemagraph_core::VertexKind::Function
-                        | schemagraph_core::VertexKind::Procedure
-                        | schemagraph_core::VertexKind::Package
-                )
-        })
-        .map(|v| v.id.clone())
-        .collect();
-    match hits.len() {
-        0 => RoutineHit::None,
-        1 => RoutineHit::One(hits.into_iter().next().unwrap()),
-        n => RoutineHit::Ambiguous(n),
-    }
+    let routines = &lookup.index.routines(g, lookup.ci).routines;
+    routine_hit(routines.get(&(lookup.key(schema), lookup.key(name))))
 }
 
 /// trigger 파싱 결과를 그래프 간선으로 반영한다 — DML + calls + fired-columns.
@@ -3399,7 +3844,14 @@ fn apply_trigger(
         },
         &mut parsed.diagnostics,
     );
-    apply_call_edges(g, schema, trigger_id, &parsed.calls, notes, ci);
+    apply_call_edges(
+        g,
+        schema,
+        trigger_id,
+        &parsed.calls,
+        notes,
+        catalog.lookup(ci),
+    );
     // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다. 컬럼이 id 충돌로
     // `@column`으로 분리됐을 수 있어 kind-aware 해석자를 쓴다.
     let mut made = std::collections::BTreeSet::new();
@@ -3411,7 +3863,7 @@ fn apply_trigger(
             column,
             VertexKind::Column,
             "column",
-            ci,
+            catalog.lookup(ci),
         ) else {
             continue;
         };
@@ -3470,7 +3922,7 @@ fn apply_routine(
         },
         &mut parsed.diagnostics,
     );
-    apply_call_edges(g, schema, owner, &parsed.calls, notes, ci);
+    apply_call_edges(g, schema, owner, &parsed.calls, notes, catalog.lookup(ci));
     parsed.partial
 }
 
@@ -3507,7 +3959,8 @@ fn apply_dml_edges(
                 continue;
             }
             let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-            let Some(target) = vertex_hit(g, &VertexId::object(&target_schema, table), ci) else {
+            let target_id = VertexId::object(&target_schema, table);
+            let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
                 notes.push(format!(
                     "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
                 ));
@@ -3542,7 +3995,8 @@ fn apply_dml_edges(
                     continue;
                 }
             };
-            let Some(target) = vertex_hit(g, &VertexId::object(&target_schema, &table), ci) else {
+            let target_id = VertexId::object(&target_schema, &table);
+            let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
                 notes.push(format!(
                     "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
                 ));
@@ -3569,17 +4023,17 @@ fn apply_call_edges(
     from: &VertexId,
     calls: &[(Option<String>, String)],
     notes: &mut Vec<String>,
-    ci: bool,
+    lookup: Lookup<'_>,
 ) {
     for (ref_schema, name) in calls {
         let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-        let hit = match resolve_routine(g, &target_schema, name, ci) {
+        let hit = match resolve_routine(g, &target_schema, name, lookup) {
             RoutineHit::None => {
                 // `pkg.member()` 꼴 — qualifier가 스키마가 아니라 패키지면
                 // 멤버 정점 schema.pkg.member를 찾는다.
                 ref_schema
                     .as_ref()
-                    .map(|pkg| resolve_pkg_member(g, schema, pkg, name, ci))
+                    .map(|pkg| resolve_pkg_member(g, schema, pkg, name, lookup))
                     .unwrap_or(RoutineHit::None)
             }
             hit => hit,
@@ -3611,29 +4065,22 @@ fn apply_call_edges(
 /// 다 될 수 있어 둘을 시도하고, 시그니처가 붙은 id(`pkg.m(int)`)는
 /// `schema.pkg.` 접두 안의 이름 스캔으로 찾는다. 오버로드가 여럿이면
 /// Ambiguous — resolve_routine과 같이 추측하지 않는다.
-fn resolve_pkg_member(g: &Graph, schema: &str, pkg: &str, name: &str, ci: bool) -> RoutineHit {
+fn resolve_pkg_member(
+    g: &Graph,
+    schema: &str,
+    pkg: &str,
+    name: &str,
+    lookup: Lookup<'_>,
+) -> RoutineHit {
     let base = VertexId::routine(schema, Some(pkg), name, None);
-    if let Some(id) = resolve_renamed(g, base.clone(), VertexKind::Procedure, "procedure", ci)
-        .or_else(|| resolve_renamed(g, base, VertexKind::Function, "function", ci))
+    if let Some(id) = resolve_renamed(g, base.clone(), VertexKind::Procedure, "procedure", lookup)
+        .or_else(|| resolve_renamed(g, base, VertexKind::Function, "function", lookup))
     {
         return RoutineHit::One(id);
     }
     let package_id = VertexId::object(schema, pkg);
-    let name_eq = |a: &str, b: &str| a == b || (ci && a.eq_ignore_ascii_case(b));
-    let hits: Vec<VertexId> = g
-        .vertices()
-        .filter(|v| {
-            name_eq(&v.name, name)
-                && matches!(v.kind, VertexKind::Procedure | VertexKind::Function)
-                && v.id.parent().as_ref() == Some(&package_id)
-        })
-        .map(|v| v.id.clone())
-        .collect();
-    match hits.len() {
-        0 => RoutineHit::None,
-        1 => RoutineHit::One(hits.into_iter().next().unwrap()),
-        n => RoutineHit::Ambiguous(n),
-    }
+    let members = &lookup.index.routines(g, lookup.ci).members;
+    routine_hit(members.get(&(package_id, lookup.key(name))))
 }
 
 #[cfg(test)]
@@ -5663,5 +6110,783 @@ mod tests {
                 && edge.to.as_str() == "main.customers"
         }));
         assert!(notes.is_empty(), "notes: {notes:?}");
+    }
+
+    /// 대문자 카탈로그를 소문자 PL/SQL 몸체가 참조·호출하는 Oracle 문서 —
+    /// 관계마다 ci 해석, 호출마다 routine·패키지 멤버 해석을 탄다.
+    fn oracle_resolution_doc(procedures: usize) -> CatalogDocument {
+        let mut package = routine("PKG", Some("plsql"), "PACKAGE pkg IS END pkg;");
+        package.kind = "package".into();
+        let mut touch = routine(
+            "TOUCH",
+            Some("plsql"),
+            "PROCEDURE touch IS BEGIN NULL; END touch;",
+        );
+        touch.kind = "procedure".into();
+        touch.member_of = Some("PKG".into());
+        let mut routines = vec![package, touch];
+        for index in 0..procedures {
+            let mut procedure = routine(
+                &format!("P{index}"),
+                Some("plsql"),
+                &format!(
+                    "BEGIN UPDATE orders SET id = 1 WHERE customer_id = 0; \
+                     INSERT INTO customers(id) SELECT id FROM orders; p{}(1); pkg.touch(); END;",
+                    (index + 1) % procedures
+                ),
+            );
+            procedure.kind = "procedure".into();
+            routines.push(procedure);
+        }
+        CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
+            version: 1,
+            dialect: "oracle".into(),
+            reader: "test".into(),
+            limitations: vec![],
+            schemas: vec![SchemaDoc {
+                name: "APP".into(),
+                routines,
+                objects: vec![
+                    table("ORDERS", vec![col("ID", 1), col("CUSTOMER_ID", 2)]),
+                    table("CUSTOMERS", vec![col("ID", 1), col("NAME", 2)]),
+                ],
+            }],
+        }
+    }
+
+    fn has_edge(g: &Graph, from: &str, to: &str, kind: EdgeKind) -> bool {
+        g.edges()
+            .iter()
+            .any(|e| e.from.as_str() == from && e.to.as_str() == to && e.kind == kind)
+    }
+
+    #[test]
+    fn 이름_해석은_참조_수와_무관하게_정점을_몇_번만_훑는다() {
+        for procedures in [4, 16] {
+            let doc = oracle_resolution_doc(procedures);
+            take_vertex_scans();
+            let (g, notes) = build(&doc);
+            let scans = take_vertex_scans();
+            // ci id 색인과 ci routine 색인 — 참조·호출 수와 무관한 상수다.
+            assert!(scans <= 3, "{procedures} procedures: {scans} vertex scans");
+            for index in 0..procedures {
+                let from = format!("APP.P{index}");
+                assert!(
+                    has_edge(&g, &from, "APP.ORDERS", EdgeKind::Writes),
+                    "{notes:?}"
+                );
+                assert!(has_edge(&g, &from, "APP.CUSTOMERS", EdgeKind::Writes));
+                assert!(has_edge(&g, &from, "APP.ORDERS", EdgeKind::Reads));
+                let next = format!("APP.P{}", (index + 1) % procedures);
+                assert!(has_edge(&g, &from, &next, EdgeKind::Calls), "{notes:?}");
+                assert!(
+                    has_edge(&g, &from, "APP.PKG.TOUCH", EdgeKind::Calls),
+                    "{notes:?}"
+                );
+            }
+        }
+        // SQL 식 안의 호출은 Binder가 정확한 이름으로 해석한다.
+        let callers: Vec<_> = (0..16)
+            .map(|index| {
+                routine(
+                    &format!("f{index}"),
+                    Some("sql"),
+                    &format!("SELECT f{}(1) + f{}(2)", (index + 1) % 16, (index + 2) % 16),
+                )
+            })
+            .collect();
+        take_vertex_scans();
+        let (g, notes) = build(&doc_with_routine(callers, ""));
+        assert!(take_vertex_scans() <= 1);
+        assert!(
+            has_edge(&g, "public.f0", "public.f1", EdgeKind::Calls),
+            "{notes:?}"
+        );
+        assert!(
+            has_edge(&g, "public.f15", "public.f1", EdgeKind::Calls),
+            "{notes:?}"
+        );
+    }
+
+    /// 색인 이전의 선형 탐색 — 색인 해석이 같은 후보를 고르는지 대조하는 기준이다.
+    fn linear_vertex_hit(g: &Graph, id: &VertexId, ci: bool) -> Option<VertexId> {
+        if g.vertex(id).is_some() {
+            return Some(id.clone());
+        }
+        if !ci {
+            return None;
+        }
+        let mut hits = g
+            .vertices()
+            .map(|v| &v.id)
+            .filter(|v| v.as_str().eq_ignore_ascii_case(id.as_str()));
+        let first = hits.next()?;
+        hits.next().is_none().then(|| first.clone())
+    }
+
+    fn linear_renamed(
+        g: &Graph,
+        base: VertexId,
+        kind: VertexKind,
+        suffix: &str,
+        ci: bool,
+    ) -> Option<VertexId> {
+        let renamed = VertexId::from_raw(&format!("{}@{suffix}", base.as_str()));
+        [base, renamed]
+            .into_iter()
+            .filter_map(|id| linear_vertex_hit(g, &id, ci))
+            .find(|id| g.vertex(id).map(|v| v.kind == kind).unwrap_or(false))
+    }
+
+    fn linear_name_eq(a: &str, b: &str, ci: bool) -> bool {
+        a == b || (ci && a.eq_ignore_ascii_case(b))
+    }
+
+    fn linear_routine(g: &Graph, schema: &str, name: &str, ci: bool) -> Vec<VertexId> {
+        g.vertices()
+            .filter(|v| {
+                linear_name_eq(&v.schema, schema, ci)
+                    && linear_name_eq(&v.name, name, ci)
+                    && matches!(
+                        v.kind,
+                        VertexKind::Function | VertexKind::Procedure | VertexKind::Package
+                    )
+            })
+            .map(|v| v.id.clone())
+            .collect()
+    }
+
+    fn linear_pkg_member(
+        g: &Graph,
+        schema: &str,
+        pkg: &str,
+        name: &str,
+        ci: bool,
+    ) -> Vec<VertexId> {
+        let base = VertexId::routine(schema, Some(pkg), name, None);
+        if let Some(id) = linear_renamed(g, base.clone(), VertexKind::Procedure, "procedure", ci)
+            .or_else(|| linear_renamed(g, base, VertexKind::Function, "function", ci))
+        {
+            return vec![id];
+        }
+        let package_id = VertexId::object(schema, pkg);
+        g.vertices()
+            .filter(|v| {
+                linear_name_eq(&v.name, name, ci)
+                    && matches!(v.kind, VertexKind::Procedure | VertexKind::Function)
+                    && v.id.parent().as_ref() == Some(&package_id)
+            })
+            .map(|v| v.id.clone())
+            .collect()
+    }
+
+    /// RoutineHit을 후보 목록과 같은 모양으로 바꿔 비교한다.
+    fn hit_shape(hit: RoutineHit) -> (usize, Option<VertexId>) {
+        match hit {
+            RoutineHit::None => (0, None),
+            RoutineHit::One(id) => (1, Some(id)),
+            RoutineHit::Ambiguous(count) => (count, None),
+        }
+    }
+
+    fn candidate_shape(candidates: Vec<VertexId>) -> (usize, Option<VertexId>) {
+        match candidates.as_slice() {
+            [only] => (1, Some(only.clone())),
+            many => (many.len(), None),
+        }
+    }
+
+    #[test]
+    fn 색인_해석은_선형_탐색과_같은_후보를_고른다() {
+        let mut routines = Vec::new();
+        for (name, kind, signature, member_of) in [
+            ("F", "function", None, None),
+            ("f", "function", None, None),
+            ("G", "function", Some("integer"), None),
+            ("G", "function", Some("text"), None),
+            ("g", "procedure", None, None),
+            ("PKG", "package", None, None),
+            ("M", "procedure", None, Some("PKG")),
+            ("M", "function", Some("integer"), Some("PKG")),
+            ("N", "function", None, Some("PKG")),
+            ("K", "function", Some("integer"), Some("PKG")),
+            ("K", "function", Some("text"), Some("PKG")),
+            ("pkg", "package", None, None),
+            ("m", "procedure", None, Some("pkg")),
+            ("ORDERS", "function", None, None),
+        ] {
+            let mut doc_routine = routine(name, Some("plsql"), "BEGIN NULL; END");
+            doc_routine.kind = kind.into();
+            doc_routine.signature = signature.map(str::to_owned);
+            doc_routine.member_of = member_of.map(str::to_owned);
+            routines.push(doc_routine);
+        }
+        let mut other = routine("F", Some("plsql"), "BEGIN NULL; END");
+        other.kind = "procedure".into();
+        let doc = CatalogDocument {
+            context: None,
+            dependencies: Vec::new(),
+            version: 1,
+            dialect: "oracle".into(),
+            reader: "test".into(),
+            limitations: vec![],
+            schemas: vec![
+                SchemaDoc {
+                    name: "APP".into(),
+                    routines,
+                    objects: vec![
+                        table("ORDERS", vec![col("ID", 1), col("id", 2)]),
+                        table("orders", vec![col("ID", 1)]),
+                        table("Orders", vec![col("ID", 1)]),
+                        table("CUSTOMERS", vec![col("ID", 1)]),
+                    ],
+                },
+                SchemaDoc {
+                    name: "app".into(),
+                    routines: vec![other],
+                    objects: vec![table("customers", vec![col("id", 1)])],
+                },
+            ],
+        };
+        let g = schemagraph_source::graph::document_to_graph(&doc);
+        let index = VertexIndex::default();
+        let mut ids: Vec<VertexId> = g.vertices().map(|v| v.id.clone()).collect();
+        let variants: Vec<VertexId> = ids
+            .iter()
+            .flat_map(|id| {
+                [
+                    VertexId::from_raw(&id.as_str().to_ascii_lowercase()),
+                    VertexId::from_raw(&id.as_str().to_ascii_uppercase()),
+                ]
+            })
+            .collect();
+        ids.extend(variants);
+        ids.push(VertexId::from_raw("APP.MISSING"));
+        let schemas = ["APP", "app", "App", "OTHER"];
+        let names = [
+            "F", "f", "G", "g", "K", "k", "M", "m", "N", "n", "PKG", "pkg", "ORDERS", "orders", "X",
+        ];
+        // 비교가 후보 0개·1개·2개 이상과 ci에서만 찾는 경우를 모두 지나는지도 센다.
+        let mut routine_shapes = BTreeSet::new();
+        let mut member_shapes = BTreeSet::new();
+        let mut folded_only_hits = 0;
+        for ci in [false, true] {
+            let lookup = index.lookup(ci);
+            for id in &ids {
+                let expected = linear_vertex_hit(&g, id, ci);
+                folded_only_hits += usize::from(expected.is_some() && g.vertex(id).is_none());
+                assert_eq!(vertex_hit(&g, id, lookup), expected, "{id} ci={ci}");
+            }
+            for schema in schemas {
+                for name in names {
+                    let expected = candidate_shape(linear_routine(&g, schema, name, ci));
+                    routine_shapes.insert((ci, expected.0.min(2)));
+                    assert_eq!(
+                        hit_shape(resolve_routine(&g, schema, name, lookup)),
+                        expected,
+                        "{schema}.{name} ci={ci}"
+                    );
+                    for pkg in ["PKG", "pkg", "Pkg", "X"] {
+                        let expected =
+                            candidate_shape(linear_pkg_member(&g, schema, pkg, name, ci));
+                        member_shapes.insert((ci, expected.0.min(2)));
+                        assert_eq!(
+                            hit_shape(resolve_pkg_member(&g, schema, pkg, name, lookup)),
+                            expected,
+                            "{schema}.{pkg}.{name} ci={ci}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(routine_shapes.len(), 6, "{routine_shapes:?}");
+        assert_eq!(member_shapes.len(), 6, "{member_shapes:?}");
+        assert!(folded_only_hits > 0);
+    }
+
+    /// 같은 테이블에 쓰는 단일 행 INSERT `rows`개 뒤에, 공백만 다른 사본을 덧붙인다.
+    fn repeated_insert_body(rows: usize, duplicates: &[usize]) -> String {
+        let mut body: String = (0..rows)
+            .map(|row| format!("INSERT INTO orders (id, customer_id) VALUES ({row}, {row});\n"))
+            .collect();
+        for row in duplicates {
+            body.push_str(&format!(
+                "INSERT  INTO orders (id, customer_id)\n VALUES ({row}, {row});\n"
+            ));
+        }
+        body
+    }
+
+    #[test]
+    fn dml_문장_중복_확인은_해시가_같은_후보와만_비교한다() {
+        let body = repeated_insert_body(2_000, &[7, 1_999]);
+        work::take_compared_statements();
+        let parsed =
+            parse_routine_body(Some(&GenericDialect {}), &body).expect("INSERT만 있는 몸체");
+        // 위치만 다른 사본은 합쳐지고 처음 나온 순서가 그대로 남는다.
+        assert_eq!(parsed.dml_statements.len(), 2_000);
+        let leading: Vec<String> = parsed
+            .dml_statements
+            .iter()
+            .take(2)
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            leading,
+            [
+                "INSERT INTO orders (id, customer_id) VALUES (0, 0)",
+                "INSERT INTO orders (id, customer_id) VALUES (1, 1)"
+            ]
+        );
+        // 문장 전체를 비교하는 일은 실제 사본 두 개와 드문 해시 충돌에만 생긴다.
+        let compared = work::take_compared_statements();
+        assert!(compared <= 4, "statement comparisons: {compared}");
+    }
+
+    #[test]
+    fn 위치만_다른_같은_dml은_컬럼_근거를_한_번만_남긴다() {
+        let doc = doc_with_routine(
+            vec![routine(
+                "touch_customer",
+                Some("sql"),
+                "UPDATE customers SET name = 'x' WHERE id = 1; \
+                 UPDATE  customers SET name = 'x'\n WHERE id = 1; \
+                 UPDATE customers SET name = 'y' WHERE id = 2",
+            )],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        let writes = g
+            .edges()
+            .into_iter()
+            .find(|e| {
+                e.kind == EdgeKind::Writes
+                    && e.from.as_str() == "public.touch_customer"
+                    && e.to.as_str() == "public.customers.name"
+            })
+            .expect("컬럼 쓰기 간선");
+        // 서로 다른 UPDATE 두 개만 근거가 된다.
+        assert_eq!(writes.evidence.len(), 2, "{:?}", writes.evidence);
+    }
+
+    #[test]
+    fn 긴_union_all_insert는_복제하지_않고_쓰기_대상을_모은다() {
+        // Oracle·구 SQL Server의 다중 행 INSERT 관용구다. 문장을 복제하면 집합 연산
+        // 사슬 길이만큼 재귀해 기본 테스트 스레드(2MiB)의 스택이 넘친다.
+        let rows: Vec<String> = (0..3_000)
+            .map(|row| format!("SELECT {row} FROM customers"))
+            .collect();
+        let body = format!("INSERT INTO orders (id) {}", rows.join(" UNION ALL "));
+        let parsed = parse_routine_body(Some(&GenericDialect {}), &body).expect("INSERT SELECT");
+        assert_eq!(parsed.dml_statements.len(), 1);
+        assert_eq!(parsed.writes, [(None, "orders".to_owned())]);
+        assert_eq!(parsed.reads, [(None, "customers".to_owned())]);
+    }
+
+    #[test]
+    fn 집합_연산자가_상한을_넘는_뷰는_파싱하지_않고_센_수를_남긴다() {
+        let terms = parse_limits::MAX_SET_OPERATORS + 2;
+        let doc = doc_with_view(&vec!["SELECT id FROM orders"; terms].join(" UNION ALL "));
+        let (g, notes) = build(&doc);
+        let expected = format!(
+            "statement 1 has {} set operators, over the {} analysis limit",
+            terms - 1,
+            parse_limits::MAX_SET_OPERATORS
+        );
+        assert!(
+            notes.iter().any(|note| note.contains(&expected)),
+            "notes: {notes:?}"
+        );
+        let view = VertexId::object("main", "order_totals");
+        assert_eq!(
+            g.analysis()[&view].state,
+            schemagraph_core::AnalysisState::Unsupported
+        );
+    }
+
+    #[test]
+    fn 이항_연산자가_상한을_넘는_routine은_미추출로_센다() {
+        // `id = n OR …` 항마다 연산자가 둘이다 — 50,001항이면 100,001개로 상한을 넘는다.
+        let terms = parse_limits::MAX_INFIX_OPERATORS / 2 + 1;
+        let condition: Vec<String> = (0..terms).map(|term| format!("id = {term}")).collect();
+        let body = format!("SELECT id FROM orders WHERE {}", condition.join(" OR "));
+        let doc = doc_with_routine(vec![routine("wide_filter", Some("sql"), &body)], "");
+        let (_g, notes) = build(&doc);
+        let expected = format!(
+            "statement 1 has an operator chain of {} infix operators, over the {} analysis limit",
+            terms * 2 - 1,
+            parse_limits::MAX_INFIX_OPERATORS
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("wide_filter") && note.contains(&expected)),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn 갈래가_상한보다_많아도_사슬이_없는_case_뷰는_분석한다() {
+        // 갈래마다 연산자가 하나라 문장 전체로 합하면 상한을 넘지만, 갈래는 sqlparser가
+        // Vec으로 모으는 형제 원소라 트리가 깊어지지 않는다.
+        let arms: String = (0..=parse_limits::MAX_INFIX_OPERATORS)
+            .map(|arm| format!(" WHEN id = {arm} THEN 'v{arm}'"))
+            .collect();
+        let mut doc = doc_with_view(&format!("SELECT CASE{arms} END AS a FROM orders"));
+        doc.schemas[0].objects[2].columns = vec![col("a", 1)];
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        let view = VertexId::object("main", "order_totals");
+        assert_eq!(
+            g.analysis()[&view].state,
+            schemagraph_core::AnalysisState::Complete
+        );
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from == view
+            && e.to.as_str() == "main.orders"));
+    }
+
+    #[test]
+    fn 세미콜론_없이_이어진_tsql_문장은_합이_상한을_넘어도_분석한다() {
+        // 문장마다 연산자가 백여 개라 몸체 전체로 합하면 상한을 넘지만, sqlparser는 IF 블록
+        // 안의 문장을 형제 목록으로 모으므로 사슬은 문장 하나 길이다. 사슬을 더 길게 하면
+        // 디버그 빌드의 기본 테스트 스레드(2MiB)가 사슬 재귀로 넘친다.
+        let increments = " + 1".repeat(100);
+        let statements = parse_limits::MAX_INFIX_OPERATORS / 100 + 1;
+        let block =
+            format!("UPDATE orders SET customer_id = customer_id{increments} WHERE id = 1 ")
+                .repeat(statements);
+        let body = format!("CREATE PROCEDURE touch AS BEGIN IF 1 = 1 BEGIN {block}END; END");
+        let mut doc = doc_with_routine(vec![routine("touch", Some("sql"), &body)], "");
+        doc.dialect = "sqlserver".into();
+        let (g, notes) = build(&doc);
+        assert!(
+            !notes.iter().any(|note| note.contains("analysis limit")),
+            "notes: {notes:?}"
+        );
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.touch"
+            && e.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn 상한_안의_긴_union_뷰는_재귀_없이_출처를_합친다() {
+        // 왼쪽 깊은 집합 연산 사슬을 재귀로 내려가면 기본 테스트 스레드(2MiB)가 넘친다.
+        let terms: Vec<&str> = (0..5_000)
+            .map(|term| {
+                if term % 2 == 0 {
+                    "SELECT id AS a FROM orders"
+                } else {
+                    "SELECT customer_id FROM orders"
+                }
+            })
+            .collect();
+        let mut doc = doc_with_view(&terms.join(" UNION ALL "));
+        doc.schemas[0].objects[2].columns = vec![col("a", 1)];
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        let mut sources: Vec<String> = g
+            .edges()
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::DerivesFrom && e.from.as_str() == "main.order_totals.a")
+            .map(|e| e.to.as_str().to_owned())
+            .collect();
+        sources.sort();
+        assert_eq!(sources, ["main.orders.customer_id", "main.orders.id"]);
+    }
+
+    /// `DO $t0$ DO $t1$ … <inner> … $t1$; $t0$;`처럼 태그를 바꿔 가며 `levels`단 중첩한다.
+    fn nested_do(levels: usize, inner: &str) -> String {
+        (0..levels).rev().fold(inner.to_owned(), |body, level| {
+            format!("DO $t{level}$ {body} $t{level}$;")
+        })
+    }
+
+    #[test]
+    fn 한두_단계_do_블록의_안쪽_문장은_그대로_추출한다() {
+        let doc = doc_with_routine(
+            vec![
+                routine(
+                    "touch_nested",
+                    Some("plpgsql"),
+                    &nested_do(2, "UPDATE customers SET name = 'x' WHERE id = 1;"),
+                ),
+                routine(
+                    "read_quoted",
+                    Some("plpgsql"),
+                    "DO 'BEGIN PERFORM 1 FROM orders; END';",
+                ),
+            ],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.touch_nested"
+            && e.to.as_str() == "public.customers"));
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.read_quoted"
+            && e.to.as_str() == "public.orders"));
+    }
+
+    #[test]
+    fn 중첩_do_블록은_깊이_상한까지만_내려가고_나머지는_미추출로_센다() {
+        // 상한이 없으면 15,000단 몸체 하나로 추출 재귀가 스택을 넘는다.
+        let body = nested_do(15_000, "UPDATE customers SET name = 'x' WHERE id = 1;");
+        let doc = doc_with_routine(vec![routine("deep_do", Some("plpgsql"), &body)], "");
+        let (g, notes) = build(&doc);
+        // 상한 너머의 안쪽 UPDATE는 추측하지 않고 미추출 한 건으로 남긴다.
+        assert!(
+            !g.edges()
+                .iter()
+                .any(|e| e.kind == EdgeKind::Writes && e.from.as_str() == "public.deep_do"),
+            "nested DO beyond the limit must not be extracted"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("public.deep_do") && note.contains("1건 미추출")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn 참조_대입이_추적_총량을_넘으면_변수_평가를_끄고_진단을_남긴다() {
+        // `bN text := a`마다 64KiB 값이 하나씩 복사된다. 총량 상한을 넘은 뒤에는 앞서
+        // 알던 `target` 값으로도 동적 SQL을 접지 않는다.
+        let big = "x".repeat(65_000);
+        let copies: String = (0..100)
+            .map(|copy| format!(" b{copy} text := a;"))
+            .collect();
+        let body = format!(
+            "DECLARE target text := 'customers'; a text := '{big}';{copies} \
+             BEGIN EXECUTE 'SELECT 1 FROM ' || target; END"
+        );
+        let doc = doc_with_routine(vec![routine("copy_values", Some("plpgsql"), &body)], "");
+        let (g, notes) = build(&doc);
+        let record = &g.analysis()[&VertexId::object("public", "copy_values")];
+        assert_eq!(record.state, schemagraph_core::AnalysisState::Partial);
+        let limit = record
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "SG_VARIABLE_STATE_LIMIT")
+            .expect("variable tracking limit diagnostic");
+        assert!(
+            limit.message.contains(&format!(
+                "over the {}-byte limit",
+                constant_sql::MAX_TRACKED_TEXT_BYTES
+            )),
+            "{limit:?}"
+        );
+        assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.copy_values"
+            && e.to.as_str() == "public.customers"));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("copy_values") && note.contains("1건 미추출")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn 추적_상한_안의_변수는_동적_sql을_그대로_접는다() {
+        let big = "x".repeat(65_000);
+        let copies: String = (0..8).map(|copy| format!(" b{copy} text := a;")).collect();
+        let body = format!(
+            "DECLARE target text := 'customers'; a text := '{big}';{copies} \
+             BEGIN EXECUTE 'SELECT 1 FROM ' || target; END"
+        );
+        let doc = doc_with_routine(vec![routine("copy_values", Some("plpgsql"), &body)], "");
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
+            && e.from.as_str() == "public.copy_values"
+            && e.to.as_str() == "public.customers"));
+    }
+
+    /// 추적 변수 상한을 하나 넘기는 선언 목록.
+    fn declarations_over_the_variable_limit() -> String {
+        (0..=constant_sql::MAX_TRACKED_VARIABLES)
+            .map(|index| format!(" v{index} text := 'x';"))
+            .collect()
+    }
+
+    #[test]
+    fn 추적_상한을_넘어도_뒤에_동적_sql이_없으면_몸체는_complete다() {
+        // 상한은 변수 값을 버릴 뿐이다. 그 값으로 접을 동적 SQL이 없으면 결과가 그대로라
+        // 한계로 싣지 않는다.
+        let body = format!(
+            "DECLARE{} BEGIN UPDATE customers SET name = 'y' WHERE id = 1; END",
+            declarations_over_the_variable_limit()
+        );
+        let doc = doc_with_routine(vec![routine("many_variables", Some("plpgsql"), &body)], "");
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        let record = &g.analysis()[&VertexId::object("public", "many_variables")];
+        assert_eq!(
+            record.state,
+            schemagraph_core::AnalysisState::Complete,
+            "{record:?}"
+        );
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
+            && e.from.as_str() == "public.many_variables"
+            && e.to.as_str() == "public.customers"));
+    }
+
+    #[test]
+    fn 추적_상한_뒤_분기가_평가를_끈_동적_sql에는_상한_진단을_붙이지_않는다() {
+        // 분기 뒤로는 상한과 무관하게 평가가 꺼진다. 그 뒤 동적 SQL의 미추출은 상한 탓이 아니다.
+        let body = format!(
+            "DECLARE target text := 'customers';{} BEGIN \
+             IF 1 = 1 THEN UPDATE customers SET name = 'y' WHERE id = 1; END IF; \
+             EXECUTE 'SELECT 1 FROM ' || target; END",
+            declarations_over_the_variable_limit()
+        );
+        let doc = doc_with_routine(vec![routine("branch_first", Some("plpgsql"), &body)], "");
+        let (g, notes) = build(&doc);
+        let record = &g.analysis()[&VertexId::object("public", "branch_first")];
+        assert_eq!(record.state, schemagraph_core::AnalysisState::Partial);
+        assert!(
+            !record
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "SG_VARIABLE_STATE_LIMIT"),
+            "{record:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("branch_first") && note.contains("1건 미추출")),
+            "notes: {notes:?}"
+        );
+    }
+
+    /// 이 수정 전의 한 번씩 찾던 인용 경계 — 스캐너가 결과를 바꾸지 않았는지 대조한다.
+    fn reference_quote_end(s: &str, i: usize) -> Option<usize> {
+        let bytes = s.as_bytes();
+        let prefix = bytes.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(bytes[i - 1]));
+        match bytes[i] {
+            b'\'' => Some(skip_string(s, i)),
+            b'"' | b'`' | b'[' => Some(skip_quoted_ident(s, i)),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => Some(skip_line_comment(s, i)),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => Some(skip_block_comment(s, i)),
+            b'$' => {
+                let tag = dollar_tag(s, i)?;
+                let after = i + tag.len();
+                s[after..].find(tag).map(|k| after + k + tag.len())
+            }
+            b'e' | b'E' if prefix => Some(skip_escape_string(s, i + 1)),
+            b'q' | b'Q' if prefix => {
+                let (close, start) = q_quote_delimiter(s, i)?;
+                let delimiter = format!("{close}'");
+                s[start..]
+                    .find(&delimiter)
+                    .map(|offset| start + offset + delimiter.len())
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn 인용_경계_스캐너는_한_번씩_찾던_결과와_같다() {
+        let mut texts: Vec<String> = [
+            "SELECT $1, $2 FROM t WHERE a = $$x$$ AND b = $tag$ y $tag$",
+            "SELECT * FROM V$SESSION; UPDATE A$B$C SET x = 1; SELECT A$B$C",
+            "$a$ unclosed $b$ closed $b$ $c$ $a$ tail $",
+            "q'[a]' q'!b!' q'한c한' q'x unclosed q'(d)' Q'{e}' q'<f>' q' space",
+            "e'\\'' E'x' re'y' -- note $a$\n/* $b$ */ 'it''s' \"q\"\"x\" [br]]x] `bt`",
+            "$$ $$$ $a$$a$ $_$ $1$ $a1$x$a1$ q'aq'a'",
+            "SELECT '한글' FROM \"표\" WHERE q'가나다가' = x",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        // 까다로운 문자만 섞은 결정적 의사 난수 문자열도 대조한다.
+        let alphabet: Vec<char> = "$q'aQ_1 \n-*/\"[]e`한".chars().collect();
+        let mut seed = 0x2545_f491_u64;
+        for _ in 0..60 {
+            texts.push(
+                (0..120)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        alphabet[(seed >> 33) as usize % alphabet.len()]
+                    })
+                    .collect(),
+            );
+        }
+        let mut indexed = (0, 0);
+        for text in &texts {
+            let forward = QuoteScanner::new(text);
+            let backward = QuoteScanner::new(text);
+            for i in 0..text.len() {
+                assert_eq!(
+                    forward.end(i),
+                    reference_quote_end(text, i),
+                    "{text:?} at {i}"
+                );
+            }
+            for i in (0..text.len()).rev() {
+                assert_eq!(
+                    backward.end(i),
+                    reference_quote_end(text, i),
+                    "{text:?} at {i}"
+                );
+            }
+            indexed.0 += usize::from(forward.dollar_tags.get().is_some());
+            indexed.1 += usize::from(forward.q_closers.get().is_some());
+        }
+        // 실패한 검색 뒤 위치 색인을 쓰는 경로를 dollar·q-quote 모두 지났는지 센다.
+        assert!(indexed.0 > 10 && indexed.1 > 10, "{indexed:?}");
+    }
+
+    #[test]
+    fn 닫히지_않은_인용_표식이_많아도_스캔마다_끝까지_한_번만_찾는다() {
+        let tags: Vec<String> = (0..2_000).map(|tag| format!("$t{tag}$")).collect();
+        let dollar = format!("SELECT 1 FROM orders; {}", tags.join(" "));
+        let quotes = format!("SELECT 1 FROM orders; {}", vec!["q'a"; 2_000].join(" "));
+        for body in [&dollar, &quotes] {
+            work::take_searched_bytes();
+            assert_eq!(find_all_keywords(body, "SELECT"), [0]);
+            assert_eq!(split_top_level(body).len(), 2);
+            let searched = work::take_searched_bytes();
+            // 스캔 두 번이 각각 처음 실패한 검색에서만 끝까지 훑는다.
+            assert!(
+                searched <= 2 * body.len(),
+                "searched {searched} bytes of {}",
+                body.len()
+            );
+        }
+    }
+
+    #[test]
+    fn 절차형_블록의_안쪽_문장은_참조로_훑던_순서로_꺼낸다() {
+        let cases: [(&dyn Dialect, &str); 2] = [
+            (
+                &MsSqlDialect {},
+                "IF @a = 1 BEGIN UPDATE orders SET id = 1; DELETE FROM customers; END \
+                 ELSE BEGIN INSERT INTO orders (id) VALUES (2); END; \
+                 WHILE @a > 0 BEGIN UPDATE customers SET id = 3; END",
+            ),
+            (
+                &GenericDialect {},
+                "CASE WHEN 1 = 1 THEN UPDATE orders SET id = 1; \
+                 ELSE DELETE FROM customers; END CASE",
+            ),
+        ];
+        let mut blocks = 0;
+        for (dialect, sql) in cases {
+            let statements = sqlparser::parser::Parser::parse_sql(dialect, sql).expect("블록 문장");
+            for statement in statements {
+                let by_reference: Vec<Statement> =
+                    nested_statements(&statement).into_iter().cloned().collect();
+                blocks += usize::from(!by_reference.is_empty());
+                assert_eq!(into_nested_statements(statement), by_reference);
+            }
+        }
+        // IF·WHILE·CASE 블록을 모두 지났는지 센다.
+        assert_eq!(blocks, 3);
     }
 }

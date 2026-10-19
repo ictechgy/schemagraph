@@ -64,6 +64,11 @@ fn combine(mut documents: Vec<CatalogDocument>) -> Result<Graph> {
         });
         local.push(super::analyze_document(&doc, false));
     }
+    // 교차 DB 행마다 스키마 전체를 훑지 않게 로컬 그래프마다 색인 하나를 쓴다.
+    let mut references: Vec<_> = local
+        .iter()
+        .map(source::dependencies::ReferenceIndex::new)
+        .collect();
     let mut cross_edges = Vec::new();
     let mut limitations = Vec::new();
     for (index, document) in documents.iter().enumerate() {
@@ -84,18 +89,11 @@ fn combine(mut documents: Vec<CatalogDocument>) -> Result<Graph> {
             } else {
                 None
             };
-            let from = source::dependencies::resolve_reference(
-                &local[index],
-                document,
-                &dependency.source,
-            );
+            let from = references[index].resolve(document, &dependency.source);
             let to = target_index.and_then(|target| {
-                source::dependencies::resolve_reference(
-                    &local[target],
-                    &documents[target],
-                    &dependency.target,
-                )
-                .map(|id| (target, id))
+                references[target]
+                    .resolve(&documents[target], &dependency.target)
+                    .map(|id| (target, id))
             });
             match (from,to) {
                 (Some(from),Some((target,to))) => cross_edges.push(Edge {

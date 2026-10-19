@@ -1676,3 +1676,96 @@ fn missing_relation_blocks_wildcard_lineage_instead_of_shifting_columns() {
     );
     assert!(!edge(&g, "s.v.id", "s.orders.id", EdgeKind::DerivesFrom));
 }
+
+#[test]
+fn sqlserver_database_qualifier_matches_the_collected_database_case_insensitively() {
+    fn graph(relation: &str) -> Graph {
+        let mut view = object("v", &["id", "amount"]);
+        view.kind = "view".into();
+        view.body = Some(format!("SELECT id, amount FROM {relation}"));
+        let doc = CatalogDocument {
+            context: Some(CollectionContext {
+                source_id: "fixture".into(),
+                database: Some("MyDb".into()),
+                schema_filter: Some(vec!["dbo".into()]),
+                catalog_complete: true,
+            }),
+            dependencies: Vec::new(),
+            version: 1,
+            dialect: "sqlserver".into(),
+            reader: "fixture".into(),
+            limitations: vec![],
+            schemas: vec![SchemaDoc {
+                name: "dbo".into(),
+                objects: vec![
+                    object("orders", &["id", "amount"]),
+                    object("audit", &["id", "amount"]),
+                    view,
+                ],
+                routines: vec![RoutineDoc {
+                    name: "archive".into(),
+                    kind: "procedure".into(),
+                    language: Some("sql".into()),
+                    body: Some(format!(
+                        "INSERT INTO MyDb.dbo.audit(id, amount) SELECT id, amount FROM {relation}"
+                    )),
+                    signature: None,
+                    usage: None,
+                    member_of: None,
+                    source: None,
+                }],
+            }],
+        };
+        let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+        let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+        for note in notes {
+            graph.add_limitation(note);
+        }
+        graph
+    }
+
+    // SQL Server의 database 이름 비교는 수집된 database와 같은 규칙으로 접는다.
+    for relation in ["MyDb.dbo.orders", "[MyDb].dbo.orders", "mydb.dbo.orders"] {
+        let g = graph(relation);
+        let context = format!("{relation}: {:?}", g.limitations());
+        assert!(
+            edge(&g, "dbo.v", "dbo.orders", EdgeKind::Reads),
+            "{context}"
+        );
+        assert!(
+            edge(&g, "dbo.v", "dbo.orders.id", EdgeKind::Reads),
+            "{context}"
+        );
+        assert!(
+            edge(
+                &g,
+                "dbo.v.amount",
+                "dbo.orders.amount",
+                EdgeKind::DerivesFrom
+            ),
+            "{context}"
+        );
+        assert!(
+            edge(&g, "dbo.archive", "dbo.audit", EdgeKind::Writes),
+            "{context}"
+        );
+        assert!(
+            edge(&g, "dbo.archive", "dbo.orders", EdgeKind::Reads),
+            "{context}"
+        );
+        assert!(
+            edge(
+                &g,
+                "dbo.audit.amount",
+                "dbo.orders.amount",
+                EdgeKind::DerivesFrom
+            ),
+            "{context}"
+        );
+        assert!(!has_diagnostic(&g, "SG_CROSS_DATABASE"), "{context}");
+        assert!(!has_diagnostic(&g, "SG_DML_SOURCE_SHAPE"), "{context}");
+    }
+    let other = graph("Warehouse.dbo.orders");
+    assert!(!edge(&other, "dbo.v", "dbo.orders", EdgeKind::Reads));
+    assert!(has_diagnostic(&other, "SG_CROSS_DATABASE"));
+}

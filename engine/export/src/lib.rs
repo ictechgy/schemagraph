@@ -324,18 +324,25 @@ pub fn graph_from_doc(doc: &GraphDoc) -> Graph {
             None => dropped_v += 1,
         }
     }
+    // 다른 도구가 만든 문서는 같은 (from, to, kind)를 반복할 수 있어, 간선을 모아
+    // add_edges로 근거를 키마다 한 번에 합친다 — 간선마다 add_edge하면 중복 간선이
+    // 근거 병합을 되풀이해 적재가 이차 시간이 된다.
+    let mut edges = Vec::with_capacity(doc.edges.len());
     for e in &doc.edges {
         let Some(kind) = edge_kind_parse(&e.kind) else {
             dropped_e += 1;
             continue;
         };
-        let from = schemagraph_core::VertexId::from_raw(&e.from);
-        let to = schemagraph_core::VertexId::from_raw(&e.to);
-        if g.vertex(&from).is_none() || g.vertex(&to).is_none() {
+        // 정점의 공유 id를 써서, 모아 두는 동안 간선마다 id 문자열을 따로 들지 않는다.
+        let shared_id = |raw: &str| {
+            g.vertex(&schemagraph_core::VertexId::from_raw(raw))
+                .map(|vertex| vertex.id.clone())
+        };
+        let (Some(from), Some(to)) = (shared_id(&e.from), shared_id(&e.to)) else {
             dangling_e += 1;
             continue;
-        }
-        g.add_edge(Edge {
+        };
+        edges.push(Edge {
             from,
             to,
             kind,
@@ -351,6 +358,7 @@ pub fn graph_from_doc(doc: &GraphDoc) -> Graph {
                 .collect(),
         });
     }
+    g.add_edges(edges);
     if dropped_v > 0 {
         g.add_limitation(format!(
             "graph.json의 정점 {dropped_v}개가 알 수 없는 kind라 버림 (버전 불일치?)"
@@ -1018,6 +1026,198 @@ mod tests {
             .limitations()
             .iter()
             .any(|note| note.contains("존재하지 않는 정점")));
+    }
+
+    /// 근거를 (layer, detail) 쌍으로 받는 graph.json 간선.
+    fn edge_doc(from: &str, to: &str, kind: &str, evidence: &[(&str, &str)]) -> EdgeDoc {
+        EdgeDoc {
+            from: from.into(),
+            to: to.into(),
+            kind: kind.into(),
+            evidence: evidence
+                .iter()
+                .map(|(layer, detail)| EvidenceDoc {
+                    layer: (*layer).into(),
+                    detail: (*detail).into(),
+                })
+                .collect(),
+        }
+    }
+
+    /// 인접 리스트 순서와 근거까지 펼친 그래프 상태 — Graph에는 PartialEq가 없다.
+    fn adjacency(graph: &Graph) -> Vec<String> {
+        graph
+            .vertices()
+            .flat_map(|vertex| {
+                let outgoing = graph.outgoing(&vertex.id).iter();
+                let incoming = graph.incoming(&vertex.id).iter();
+                outgoing
+                    .map(|edge| format!("out {edge:?}"))
+                    .chain(incoming.map(|edge| format!("in {edge:?}")))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// 다른 도구가 만든 graph.json에는 같은 (from, to, kind) 간선이 반복될 수 있다.
+    #[test]
+    fn 중복_간선은_첫_등장_순서와_정렬된_근거로_복원한다() {
+        let mut doc = graph_to_doc(&chain_sample());
+        // 키의 첫 등장 순서가 정렬 순서와 다르고, 같은 키가 근거를 뒤섞인 채 반복한다.
+        // 알 수 없는 kind·layer와 없는 정점을 가리키는 간선도 사이에 끼운다.
+        doc.edges = vec![
+            edge_doc("main.c", "main.b", "reads", &[("body-parse", "d3")]),
+            edge_doc("main.c", "main.a", "reads", &[("body-parse", "x")]),
+            edge_doc(
+                "main.c",
+                "main.b",
+                "reads",
+                &[("stats", "d1"), ("body-parse", "d2")],
+            ),
+            edge_doc("main.a", "main.b", "references", &[]),
+            edge_doc("main.c", "main.missing", "reads", &[("body-parse", "gone")]),
+            edge_doc(
+                "main.c",
+                "main.b",
+                "future-kind",
+                &[("body-parse", "later")],
+            ),
+            edge_doc(
+                "main.c",
+                "main.b",
+                "reads",
+                &[
+                    ("future-layer", "z"),
+                    ("body-parse", "d0"),
+                    ("body-parse", "d3"),
+                ],
+            ),
+            edge_doc("main.c", "main.a", "reads", &[("catalog", "w")]),
+        ];
+        let graph = graph_from_doc(&doc);
+        let (b, c) = (VertexId::object("main", "b"), VertexId::object("main", "c"));
+        let outgoing: Vec<_> = graph
+            .outgoing(&c)
+            .iter()
+            .map(|edge| {
+                let evidence: Vec<_> = edge
+                    .evidence
+                    .iter()
+                    .map(|e| format!("{}:{}", layer_str(e.layer), e.detail))
+                    .collect();
+                (edge.to.as_str(), evidence)
+            })
+            .collect();
+        let owned =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|item| item.to_string()).collect() };
+        assert_eq!(
+            outgoing,
+            [
+                (
+                    "main.b",
+                    owned(&[
+                        "body-parse:d0",
+                        "body-parse:d2",
+                        "body-parse:d3",
+                        "body-parse:d3",
+                        "stats:d1",
+                    ]),
+                ),
+                ("main.a", owned(&["catalog:w", "body-parse:x"])),
+            ]
+        );
+        let incoming: Vec<_> = graph.incoming(&b).iter().map(|e| e.from.as_str()).collect();
+        assert_eq!(incoming, ["main.c", "main.a"]);
+        assert_eq!(
+            graph.incoming(&b)[0].evidence,
+            graph.outgoing(&c)[0].evidence
+        );
+        assert_eq!(
+            graph.limitations(),
+            [
+                "graph.json의 간선 1개가 알 수 없는 kind라 버림 (버전 불일치?)",
+                "graph.json의 간선 1개가 존재하지 않는 정점을 가리켜 버림",
+            ]
+        );
+    }
+
+    /// 외부 의존성 없이 무작위 문서를 만드는 결정적 xorshift64*.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % bound as u64) as usize
+        }
+
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items[self.below(items.len())]
+        }
+    }
+
+    /// 고치기 전 적재 — 유효한 간선을 문서 순서대로 하나씩 add_edge한다.
+    fn sequential_graph(doc: &GraphDoc) -> Graph {
+        let mut graph = Graph::new();
+        for v in &doc.vertices {
+            let kind = vertex_kind_parse(&v.kind).expect("test vertices use known kinds");
+            graph.add_vertex(Vertex {
+                id: VertexId::from_raw(&v.id),
+                kind,
+                name: v.name.clone(),
+                schema: v.schema.clone(),
+            });
+        }
+        for e in &doc.edges {
+            let (from, to) = (VertexId::from_raw(&e.from), VertexId::from_raw(&e.to));
+            let Some(kind) = edge_kind_parse(&e.kind) else {
+                continue;
+            };
+            if graph.vertex(&from).is_none() || graph.vertex(&to).is_none() {
+                continue;
+            }
+            let evidence = e.evidence.iter().filter_map(|ev| {
+                let layer = layer_parse(&ev.layer)?;
+                let detail = ev.detail.clone();
+                Some(Evidence { layer, detail })
+            });
+            let evidence = evidence.collect();
+            graph.add_edge(Edge {
+                from,
+                to,
+                kind,
+                evidence,
+            });
+        }
+        graph
+    }
+
+    #[test]
+    fn 무작위_중복_간선_문서는_하나씩_add_edge한_그래프와_같다() {
+        let ids = ["main.a", "main.b", "main.c", "main.missing"];
+        let kinds = ["reads", "writes", "references", "future-kind"];
+        let layers = ["catalog", "body-parse", "stats", "inferred", "future-layer"];
+        let details = ["d0", "d1", "d2", "d3"];
+        for seed in 1..=300u64 {
+            let mut rng = TestRng(seed);
+            let mut doc = graph_to_doc(&chain_sample());
+            doc.edges = (0..30)
+                .map(|_| {
+                    let evidence: Vec<_> = (0..rng.below(4))
+                        .map(|_| (rng.pick(&layers), rng.pick(&details)))
+                        .collect();
+                    let (from, to) = (rng.pick(&ids), rng.pick(&ids));
+                    edge_doc(from, to, rng.pick(&kinds), &evidence)
+                })
+                .collect();
+            let restored = graph_from_doc(&doc);
+            assert_eq!(
+                adjacency(&restored),
+                adjacency(&sequential_graph(&doc)),
+                "seed {seed}"
+            );
+        }
     }
 
     #[test]

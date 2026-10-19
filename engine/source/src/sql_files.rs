@@ -3,6 +3,7 @@
 //! 이 모듈은 SQL을 파싱하지 않는다. 파일 경로와 원문만 document에 보존하고,
 //! 의미 해석과 간선 생성은 parser/engine의 책임으로 남긴다.
 
+use std::collections::BTreeMap;
 use std::fs::{self, DirEntry, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -209,12 +210,16 @@ fn validate_conflicts(
     routines: &[CollectedRoutine],
 ) -> Result<(), String> {
     let schema = &document.schemas[schema_index];
+    // 파일마다 스키마의 routine 전체를 두 번 훑으면 파일 수 × routine 수가 된다. 검사하는 동안
+    // document는 바뀌지 않으므로 source·이름 색인을 한 번 만들고, 파일 순서와 파일 안의 세 검사
+    // 순서는 그대로 둔다.
+    let by_source = routines_by(&schema.routines, |routine| routine.source.as_deref());
+    let by_name = routines_by(&schema.routines, |routine| Some(routine.name.as_str()));
     for collected in routines {
-        let same_source: Vec<&RoutineDoc> = schema
-            .routines
-            .iter()
-            .filter(|routine| routine.source.as_deref() == Some(collected.relative.as_str()))
-            .collect();
+        let same_source = by_source
+            .get(collected.relative.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if same_source.len() > 1 {
             return Err(format!(
                 "multiple routines already claim SQL source '{}': refusing duplicate",
@@ -229,10 +234,14 @@ fn validate_conflicts(
                 ));
             }
         }
-        if schema.routines.iter().any(|routine| {
-            routine.name == collected.name
-                && routine.source.as_deref() != Some(collected.relative.as_str())
-        }) {
+        let named = by_name
+            .get(collected.name.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if named
+            .iter()
+            .any(|routine| routine.source.as_deref() != Some(collected.relative.as_str()))
+        {
             return Err(format!(
                 "SQL query name '{}' conflicts with an unrelated routine",
                 collected.name
@@ -242,13 +251,33 @@ fn validate_conflicts(
     Ok(())
 }
 
+/// routine을 key별로 문서 순서대로 모은다. key가 없는 routine은 넣지 않는다.
+fn routines_by<'d>(
+    routines: &'d [RoutineDoc],
+    key: impl Fn(&'d RoutineDoc) -> Option<&'d str>,
+) -> BTreeMap<&'d str, Vec<&'d RoutineDoc>> {
+    #[cfg(test)]
+    work::visited(routines.len());
+    let mut index = BTreeMap::<&str, Vec<&RoutineDoc>>::new();
+    for routine in routines {
+        if let Some(key) = key(routine) {
+            index.entry(key).or_default().push(routine);
+        }
+    }
+    index
+}
+
 fn apply_routines(
     document: &mut CatalogDocument,
     schema_index: usize,
     routines: Vec<CollectedRoutine>,
 ) {
     let schema = &mut document.schemas[schema_index];
-    for collected in routines {
+    // 파일마다 커지는 목록에서 같은 source를 찾으면 파일 수의 제곱이 된다. 새 routine은 모았다가
+    // 같은 순서로 끝에 붙이므로 정렬 전 목록과 정렬 결과가 순차 push와 같다.
+    let positions = replacement_positions(&schema.routines, &routines);
+    let mut added = Vec::new();
+    for (collected, position) in routines.into_iter().zip(positions) {
         let routine = RoutineDoc {
             name: collected.name,
             kind: "query".into(),
@@ -257,18 +286,14 @@ fn apply_routines(
             signature: None,
             usage: None,
             member_of: None,
-            source: Some(collected.relative.clone()),
+            source: Some(collected.relative),
         };
-        if let Some(existing) = schema
-            .routines
-            .iter_mut()
-            .find(|existing| existing.source.as_deref() == Some(collected.relative.as_str()))
-        {
-            *existing = routine;
-        } else {
-            schema.routines.push(routine);
+        match position {
+            Some(index) => schema.routines[index] = routine,
+            None => added.push(routine),
         }
     }
+    schema.routines.extend(added);
     schema.routines.sort_by(|left, right| {
         left.name
             .cmp(&right.name)
@@ -277,8 +302,53 @@ fn apply_routines(
     });
 }
 
+/// 수집한 파일마다 교체할 기존 routine의 위치를 붙이기 전 목록에서 찾는다.
+///
+/// 교체는 같은 source를 같은 자리에 다시 쓰고 수집 경로는 서로 달라서, 붙이는 도중의 목록에서
+/// 차례로 찾던 위치와 같다. 같은 source가 여럿이면 순차 find처럼 앞의 것을 고른다.
+fn replacement_positions(
+    existing: &[RoutineDoc],
+    routines: &[CollectedRoutine],
+) -> Vec<Option<usize>> {
+    #[cfg(test)]
+    work::visited(existing.len());
+    let mut positions = BTreeMap::new();
+    for (index, routine) in existing.iter().enumerate() {
+        if let Some(source) = routine.source.as_deref() {
+            positions.entry(source).or_insert(index);
+        }
+    }
+    routines
+        .iter()
+        .map(|collected| positions.get(collected.relative.as_str()).copied())
+        .collect()
+}
+
 fn io_error(action: &str, path: &Path, error: io::Error) -> String {
     format!("{action} '{}': {error}", path.display())
+}
+
+/// 테스트가 첨부 작업량을 시간 대신 횟수로 확인하게 한다.
+///
+/// 파일 수 × routine 수의 이차 회귀는 작은 입력에서 시간으로 드러나지 않고, 큰 입력의 시간
+/// 단언은 공유 기계에서 불안정하다. 테스트마다 스레드가 따로라 thread_local이면 섞이지 않는다.
+#[cfg(test)]
+mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static VISITED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// 충돌 검사와 교체가 들여다본 기존 routine 수를 더한다.
+    pub(super) fn visited(count: usize) {
+        VISITED.with(|visited| visited.set(visited.get() + count));
+    }
+
+    /// 지금까지 센 routine 수를 돌려주고 0으로 되돌린다.
+    pub(super) fn take_visited() -> usize {
+        VISITED.with(Cell::take)
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +357,19 @@ mod tests {
     use crate::document::{CatalogDocument, SchemaDoc};
     use std::fs;
     use tempfile::tempdir;
+
+    fn routine(name: &str, kind: &str, source: Option<&str>) -> RoutineDoc {
+        RoutineDoc {
+            name: name.into(),
+            kind: kind.into(),
+            language: Some("sql".into()),
+            body: Some("SELECT 0;".into()),
+            signature: None,
+            usage: None,
+            member_of: None,
+            source: source.map(str::to_owned),
+        }
+    }
 
     fn document() -> CatalogDocument {
         CatalogDocument {
@@ -344,6 +427,99 @@ mod tests {
         assert_eq!(
             doc.schemas[0].routines[0].body.as_deref(),
             Some("SELECT 2;")
+        );
+    }
+
+    #[test]
+    fn attach_indexes_existing_routines_once_instead_of_per_file() {
+        let directory = tempdir().unwrap();
+        let (files, functions) = (40, 30);
+        for index in 0..files {
+            fs::write(
+                directory.path().join(format!("q{index:02}.sql")),
+                format!("SELECT {index};"),
+            )
+            .unwrap();
+        }
+        let mut doc = document();
+        doc.schemas[0].routines = (0..functions)
+            .map(|index| routine(&format!("report_{index}"), "function", None))
+            .collect();
+        work::take_visited();
+        assert_eq!(attach(&mut doc, directory.path(), "public"), Ok(files));
+        let first = work::take_visited();
+        let attached = doc.clone();
+        assert_eq!(attach(&mut doc, directory.path(), "public"), Ok(files));
+        let again = work::take_visited();
+        assert_eq!(doc, attached);
+        let routines = doc.schemas[0].routines.len();
+        assert_eq!(routines, functions + files);
+        // 파일마다 routine 전체를 훑거나 커지는 목록에서 찾으면 files × routines가 된다.
+        assert!(
+            first <= 3 * functions,
+            "first attach visited {first} routines for {files} files"
+        );
+        assert!(
+            again <= 3 * routines,
+            "re-attach visited {again} routines for {files} files"
+        );
+    }
+
+    #[test]
+    fn indexed_conflict_checks_keep_the_sequential_order_and_messages() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("a.sql"), "SELECT 1;").unwrap();
+        fs::write(directory.path().join("b.sql"), "SELECT 2;").unwrap();
+        let (name_a, name_b) = (query_name("a.sql"), query_name("b.sql"));
+        let attach_to = |routines: Vec<RoutineDoc>| {
+            let mut doc = document();
+            doc.schemas[0].routines = routines;
+            let before = doc.clone();
+            let result = attach(&mut doc, directory.path(), "public");
+            if result.is_err() {
+                assert_eq!(doc, before);
+            }
+            result
+        };
+        let claimed_twice = vec![
+            routine(&name_a, "query", Some("a.sql")),
+            routine("other", "query", Some("a.sql")),
+        ];
+        assert_eq!(
+            attach_to(claimed_twice).unwrap_err(),
+            "multiple routines already claim SQL source 'a.sql': refusing duplicate"
+        );
+        assert_eq!(
+            attach_to(vec![routine(&name_a, "function", Some("a.sql"))]).unwrap_err(),
+            format!(
+                "SQL source 'a.sql' conflicts with existing routine '{name_a}': refusing overwrite"
+            )
+        );
+        assert_eq!(
+            attach_to(vec![routine(&name_a, "query", Some("elsewhere.sql"))]).unwrap_err(),
+            format!("SQL query name '{name_a}' conflicts with an unrelated routine")
+        );
+        // 파일 순서(a.sql 먼저)대로 검사하므로 b.sql의 이름 충돌보다 a.sql의 source 충돌이 먼저다.
+        let both = vec![
+            routine(&name_b, "function", None),
+            routine("renamed", "query", Some("a.sql")),
+        ];
+        assert_eq!(
+            attach_to(both).unwrap_err(),
+            "SQL source 'a.sql' conflicts with existing routine 'renamed': refusing overwrite"
+        );
+        // 한 파일 안에서는 source 검사를 통과한 뒤 같은 이름의 다른 source를 거절한다.
+        let shadowed = vec![
+            routine(&name_a, "query", Some("a.sql")),
+            routine(&name_a, "query", Some("other.sql")),
+        ];
+        assert_eq!(
+            attach_to(shadowed).unwrap_err(),
+            format!("SQL query name '{name_a}' conflicts with an unrelated routine")
+        );
+        assert_eq!(
+            attach_to(vec![routine(&name_a, "query", Some("a.sql"))]),
+            Ok(2)
         );
     }
 

@@ -524,6 +524,10 @@ fn validate_conflicts(
             }
         }
     }
+    // 항목마다 스키마 객체 전체의 id를 새로 만들고 routine 전체를 훑으면 가져오는 행 수 ×
+    // 카탈로그 크기가 된다. 색인은 한 번만 만들고, 항목 순서와 항목 안의 검사 순서는 그대로 둔다.
+    let object_ids = target_object_ids(document, pending);
+    let existing_routines = routines_by_name(document);
     for item in pending {
         if !pending_ids.insert(item.stable_id.clone()) {
             return Err(format!(
@@ -537,36 +541,26 @@ fn validate_conflicts(
             &item.routine.name,
             item.routine.signature.as_deref(),
         );
-        for schema in &document.schemas {
-            if schema.name != item.schema {
-                continue;
-            }
-            if schema
-                .objects
-                .iter()
-                .any(|object| VertexId::object(&schema.name, &object.name) == canonical_routine)
-            {
-                return Err(format!(
-                    "imported routine '{}' conflicts with an existing object id",
-                    item.routine.name
-                ));
-            }
+        if object_ids
+            .get(item.schema.as_str())
+            .is_some_and(|ids| ids.contains(&canonical_routine))
+        {
+            return Err(format!(
+                "imported routine '{}' conflicts with an existing object id",
+                item.routine.name
+            ));
         }
-        let mut matches = Vec::new();
-        for schema in &document.schemas {
-            for routine in &schema.routines {
-                if routine.name == item.routine.name {
-                    matches.push((schema.name.as_str(), routine));
-                }
-            }
-        }
+        let matches = existing_routines
+            .get(item.routine.name.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if matches.len() > 1 {
             return Err(format!(
                 "imported routine '{}' has duplicate existing identities",
                 item.routine.name
             ));
         }
-        for (schema_name, existing) in matches {
+        for &(schema_name, existing) in matches {
             if schema_name != item.schema {
                 return Err(format!(
                     "imported routine '{}' already exists in schema '{schema_name}'",
@@ -588,6 +582,49 @@ fn validate_conflicts(
         }
     }
     Ok(())
+}
+
+/// 가져오기가 겨냥한 스키마마다 기존 객체의 정점 id를 모은다.
+///
+/// 객체 id는 객체마다 한 번만 만든다. 같은 이름의 스키마가 여럿이면 순차 비교처럼 모두 본다.
+fn target_object_ids<'d>(
+    document: &'d CatalogDocument,
+    pending: &[PendingRoutine],
+) -> BTreeMap<&'d str, BTreeSet<VertexId>> {
+    let targets: BTreeSet<&str> = pending.iter().map(|item| item.schema.as_str()).collect();
+    let mut ids = BTreeMap::<&str, BTreeSet<VertexId>>::new();
+    for schema in &document.schemas {
+        if !targets.contains(schema.name.as_str()) {
+            continue;
+        }
+        #[cfg(test)]
+        work::visited(schema.objects.len());
+        ids.entry(schema.name.as_str()).or_default().extend(
+            schema
+                .objects
+                .iter()
+                .map(|object| VertexId::object(&schema.name, &object.name)),
+        );
+    }
+    ids
+}
+
+/// 모든 스키마의 기존 routine을 이름별로 (스키마, routine) 문서 순서대로 모은다.
+///
+/// 같은 이름이 둘 이상이면 가져온 query의 identity가 모호하므로 호출자가 거절한다.
+fn routines_by_name(document: &CatalogDocument) -> BTreeMap<&str, Vec<(&str, &RoutineDoc)>> {
+    let mut by_name = BTreeMap::<&str, Vec<(&str, &RoutineDoc)>>::new();
+    for schema in &document.schemas {
+        #[cfg(test)]
+        work::visited(schema.routines.len());
+        for routine in &schema.routines {
+            by_name
+                .entry(routine.name.as_str())
+                .or_default()
+                .push((schema.name.as_str(), routine));
+        }
+    }
+    by_name
 }
 
 fn comparison_scope(document: &CatalogDocument) -> Result<(String, String), String> {
@@ -1048,10 +1085,34 @@ fn parse_digits(value: &str) -> Result<u32, String> {
         .map_err(|_| "timestamp numeric field is invalid".into())
 }
 
+/// 테스트가 충돌 검사 작업량을 시간 대신 횟수로 확인하게 한다.
+///
+/// 가져오는 행 수 × 카탈로그 크기의 이차 회귀는 작은 입력에서 시간으로 드러나지 않고, 큰
+/// 입력의 시간 단언은 공유 기계에서 불안정하다. 테스트마다 스레드가 따로라 thread_local이면
+/// 서로 섞이지 않는다.
+#[cfg(test)]
+mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static VISITED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// 충돌 검사가 들여다본 기존 객체·routine 항목 수를 더한다.
+    pub(super) fn visited(count: usize) {
+        VISITED.with(|visited| visited.set(visited.get() + count));
+    }
+
+    /// 지금까지 센 항목 수를 돌려주고 0으로 되돌린다.
+    pub(super) fn take_visited() -> usize {
+        VISITED.with(Cell::take)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{CatalogDocument, CollectionContext, SchemaDoc};
+    use crate::document::{CatalogDocument, CollectionContext, ObjectDoc, SchemaDoc};
     use std::fs;
     use tempfile::tempdir;
 
@@ -1362,6 +1423,192 @@ mod tests {
         assert!(import_query_log(&collision, &log, limits())
             .unwrap_err()
             .contains("existing object id"));
+    }
+
+    fn table(name: &str) -> ObjectDoc {
+        ObjectDoc {
+            name: name.into(),
+            kind: "table".into(),
+            columns: vec![],
+            constraints: vec![],
+            indexes: vec![],
+            triggers: vec![],
+            body: None,
+            usage: None,
+        }
+    }
+
+    fn routine(name: &str, kind: &str, source: Option<&str>) -> RoutineDoc {
+        RoutineDoc {
+            name: name.into(),
+            kind: kind.into(),
+            language: Some("sql".into()),
+            body: Some("SELECT 1".into()),
+            signature: None,
+            usage: None,
+            member_of: None,
+            source: source.map(str::to_owned),
+        }
+    }
+
+    /// 충돌 검사에 직접 넘길 항목. 이름은 호출자가 고르므로 예약 namespace 밖일 수 있다.
+    fn pending(stable_id: &str, schema: &str, name: &str, source: Option<&str>) -> PendingRoutine {
+        PendingRoutine {
+            stable_id: stable_id.into(),
+            schema: schema.into(),
+            routine: routine(name, "query", source),
+            entry: ImportEntry {
+                stable_id: stable_id.into(),
+                schema: schema.into(),
+                routine_id: routine_id(schema, name),
+                source: source.map(str::to_owned),
+                original_path: None,
+                query_id: None,
+                sql_bytes: 8,
+                sql_sha256: String::new(),
+                observed_at: None,
+                executions: None,
+            },
+            sql: "SELECT 1".into(),
+        }
+    }
+
+    /// 헤더 뒤에 서로 다른 query `rows`개를 담은 query-log를 쓴다.
+    fn write_query_log(path: &Path, rows: usize) {
+        let mut text = String::from("{\"version\":1,\"type\":\"query-log\",\"source_id\":\"warehouse-prod\",\"database\":\"warehouse\",\"window_start\":\"2026-01-01T00:00:00Z\",\"window_end\":\"2026-01-01T01:00:00Z\",\"sampling\":\"all\"}\n");
+        for index in 0..rows {
+            text.push_str(&format!(
+                "{{\"query_id\":\"q-{index}\",\"schema\":\"analytics\",\"sql\":\"SELECT {index}\",\"observed_at\":\"2026-01-01T00:20:00Z\",\"executions\":1}}\n"
+            ));
+        }
+        fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn conflict_checks_index_the_catalog_once_instead_of_per_imported_row() {
+        let (objects, routines, rows) = (50, 30, 40);
+        let mut catalog = document();
+        catalog.schemas[0].objects = (0..objects)
+            .map(|index| table(&format!("t{index}")))
+            .collect();
+        catalog.schemas[0].routines = (0..routines)
+            .map(|index| routine(&format!("report_{index}"), "function", None))
+            .collect();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("queries.jsonl");
+        write_query_log(&path, rows);
+        let limits = ImportLimits {
+            max_rows: rows,
+            ..limits()
+        };
+        work::take_visited();
+        let result = import_query_log(&catalog, &path, limits).unwrap();
+        let visited = work::take_visited();
+        assert_eq!(result.report.imported, rows);
+        assert_eq!(result.document.schemas[0].routines.len(), routines + rows);
+        // 행마다 객체 id를 새로 만들고 routine 전체와 비교하면 rows × (objects + routines)가 된다.
+        assert!(
+            visited <= objects + routines,
+            "conflict checks visited {visited} catalog entries for {rows} imported rows"
+        );
+    }
+
+    #[test]
+    fn indexed_conflict_checks_keep_the_sequential_order_and_messages() {
+        // 공개 import에서는 기존 동명 routine이 예약 namespace 검사에 먼저 막힌다. 색인 조회가
+        // 순차 비교와 같은 판정을 같은 순서로 내는지 보려고 예약 밖 이름으로 가지마다 부른다.
+        fn conflict(catalog: &CatalogDocument, items: &[PendingRoutine]) -> String {
+            validate_conflicts(catalog, items, QUERY_LOG_ROUTINE_PREFIX)
+                .err()
+                .unwrap_or_default()
+        }
+        let mut catalog = document();
+        catalog.schemas[0].objects.push(table("orders"));
+        catalog.schemas.push(SchemaDoc {
+            name: "staging".into(),
+            objects: vec![],
+            routines: vec![],
+        });
+        let duplicate = [
+            pending("a", "analytics", "fresh", None),
+            pending("a", "analytics", "orders", None),
+        ];
+        assert_eq!(
+            conflict(&catalog, &duplicate),
+            "duplicate imported stable identity 'a'"
+        );
+        assert_eq!(
+            conflict(&catalog, &[pending("a", "analytics", "orders", None)]),
+            "imported routine 'orders' conflicts with an existing object id"
+        );
+        assert_eq!(
+            conflict(&catalog, &[pending("a", "staging", "orders", None)]),
+            ""
+        );
+
+        let mut ambiguous = catalog.clone();
+        ambiguous.schemas[0]
+            .routines
+            .push(routine("r", "query", None));
+        ambiguous.schemas[1]
+            .routines
+            .push(routine("r", "function", None));
+        assert_eq!(
+            conflict(&ambiguous, &[pending("a", "analytics", "r", None)]),
+            "imported routine 'r' has duplicate existing identities"
+        );
+        ambiguous.schemas[0]
+            .routines
+            .push(routine("orders", "query", None));
+        ambiguous.schemas[1]
+            .routines
+            .push(routine("orders", "query", None));
+        assert_eq!(
+            conflict(&ambiguous, &[pending("a", "analytics", "orders", None)]),
+            "imported routine 'orders' conflicts with an existing object id"
+        );
+
+        let mut elsewhere = catalog.clone();
+        elsewhere.schemas[1]
+            .routines
+            .push(routine("r", "function", None));
+        assert_eq!(
+            conflict(&elsewhere, &[pending("a", "analytics", "r", None)]),
+            "imported routine 'r' already exists in schema 'staging'"
+        );
+
+        let mut function = catalog.clone();
+        function.schemas[0]
+            .routines
+            .push(routine("r", "function", Some("models/r.sql")));
+        assert_eq!(
+            conflict(&function, &[pending("a", "analytics", "r", None)]),
+            "imported routine 'r' conflicts with existing function"
+        );
+
+        let mut sourced = catalog.clone();
+        sourced.schemas[0]
+            .routines
+            .push(routine("r", "query", Some("models/r.sql")));
+        assert_eq!(
+            conflict(&sourced, &[pending("a", "analytics", "r", None)]),
+            "imported routine 'r' conflicts with an existing query source"
+        );
+        assert_eq!(
+            conflict(
+                &sourced,
+                &[pending("a", "analytics", "r", Some("models/r.sql"))]
+            ),
+            ""
+        );
+        let ordered = [
+            pending("a", "analytics", "r", None),
+            pending("b", "analytics", "orders", None),
+        ];
+        assert_eq!(
+            conflict(&sourced, &ordered),
+            "imported routine 'r' conflicts with an existing query source"
+        );
     }
 
     #[cfg(unix)]

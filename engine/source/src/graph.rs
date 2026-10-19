@@ -8,6 +8,7 @@ use schemagraph_core::{
     ColumnMetadata, Edge, EdgeKind, Evidence, EvidenceLayer, ForeignKeyMetadata, Graph,
     IndexMetadata, SchemaMetadata, Usage, Vertex, VertexId, VertexKind,
 };
+use std::collections::BTreeMap;
 
 use crate::document::*;
 
@@ -17,15 +18,36 @@ pub fn document_to_graph(doc: &CatalogDocument) -> Graph {
     for l in &doc.limitations {
         g.add_limitation(l.clone());
     }
+    build_schemas(&mut g, doc);
+    // 같은 테이블 쌍·컬럼 쌍의 FK가 여럿이면 같은 키의 간선이 반복되므로, 모든 스키마의
+    // FK 간선을 모아 add_edges로 근거를 키마다 한 번에 합친다.
+    let mut foreign_keys = Vec::new();
     for schema in &doc.schemas {
-        build_schema(&mut g, schema);
+        collect_foreign_key_edges(&mut g, schema, &mut foreign_keys);
     }
-    for schema in &doc.schemas {
-        add_foreign_key_edges(&mut g, schema);
-    }
+    g.add_edges(foreign_keys);
     attach_schema_metadata(&mut g, doc);
     crate::dependencies::apply(&mut g, doc);
     g
+}
+
+/// document의 정점과 소유(Contains)·발화(Fires) 간선만 만든다.
+///
+/// routine id의 `@kind` 분리처럼 reader가 부여한 정점 id만 필요한 호출자(document diff)가
+/// FK 간선·스키마 메타데이터·카탈로그 의존성 해석까지 다시 하지 않게 한다. 정점은 스키마를
+/// 만드는 단계에서만 생기므로 정점 집합은 [`document_to_graph`]와 같다.
+pub(crate) fn document_vertices(doc: &CatalogDocument) -> Graph {
+    let mut g = Graph::new();
+    build_schemas(&mut g, doc);
+    g
+}
+
+/// 문서의 스키마마다 정점과 소유 간선을 만든다. 패키지 색인은 문서 전체가 공유한다.
+fn build_schemas(g: &mut Graph, doc: &CatalogDocument) {
+    let mut packages = PackageIndex::default();
+    for schema in &doc.schemas {
+        build_schema(g, schema, &mut packages);
+    }
 }
 
 /// 새 reader가 명시한 메타데이터만 실제 graph 정점으로 정규화한다.
@@ -233,7 +255,7 @@ fn member_id(graph: &Graph, table: &VertexId, name: &str, kind: VertexKind) -> O
         .map(|vertex| vertex.id.clone())
 }
 
-fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
+fn build_schema(g: &mut Graph, schema: &SchemaDoc, packages: &mut PackageIndex) {
     let schema_id = VertexId::schema(&schema.name);
     g.add_vertex(Vertex {
         id: schema_id.clone(),
@@ -370,10 +392,11 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
                 name: routine.name.clone(),
                 schema: schema.name.clone(),
             });
+            packages.register(g, &mem_id, kind);
             if let Some(u) = &routine.usage {
                 g.set_usage(mem_id.clone(), to_usage(u));
             }
-            match find_package(g, &schema.name, pkg) {
+            match find_package(g, packages, &schema.name, pkg) {
                 Some(pkg_id) => g.add_edge(contains(&pkg_id, &mem_id)),
                 // 부모 패키지가 수확 안 됐으면 멤버를 버리지 않고 스키마
                 // 직속으로 둔다 — 고립보다 귀속 없음이 덜 거짓이다.
@@ -409,6 +432,7 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
             name: routine.name.clone(),
             schema: schema.name.clone(),
         });
+        packages.register(g, &rt_id, kind);
         if let Some(u) = &routine.usage {
             g.set_usage(rt_id.clone(), to_usage(u));
         }
@@ -417,7 +441,7 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc) {
 }
 
 /// 스키마 안의 패키지 정점을 찾는다 — 정확 id 우선, `@package` 분리본도 본다.
-fn find_package(g: &Graph, schema: &str, pkg: &str) -> Option<VertexId> {
+fn find_package(g: &Graph, packages: &PackageIndex, schema: &str, pkg: &str) -> Option<VertexId> {
     let exact = VertexId::object(schema, pkg);
     if g.vertex(&exact)
         .map(|v| v.kind == VertexKind::Package)
@@ -425,13 +449,46 @@ fn find_package(g: &Graph, schema: &str, pkg: &str) -> Option<VertexId> {
     {
         return Some(exact);
     }
-    g.vertices()
-        .find(|v| v.schema == schema && v.name == pkg && v.kind == VertexKind::Package)
-        .map(|v| v.id.clone())
+    packages.find(schema, pkg)
 }
 
-/// fk 제약 하나를 object 레벨 + column 레벨 간선으로 푼다.
-fn add_foreign_key_edges(g: &mut Graph, schema: &SchemaDoc) {
+/// 스키마·이름별 패키지 정점 중 id 순으로 첫 정점.
+///
+/// 정확한 id로 부모 패키지를 못 찾은 멤버(없는 패키지, `@package`로 분리된 패키지)마다
+/// 정점 전체를 훑으면 멤버 × 정점이 된다. 결과를 (스키마, 패키지)별로 memo하면 서로 다른
+/// 없는 패키지를 가리키는 멤버들은 여전히 훑고, 멤버 패스 중에 생기는 패키지(패키지인
+/// 멤버)를 못 본다. 패키지 정점은 routine으로만 생기므로 routine 정점을 넣을 때마다
+/// 등록해, id 순 첫 패키지를 고르던 선형 탐색과 늘 같은 답을 낸다.
+#[derive(Default)]
+struct PackageIndex(BTreeMap<String, BTreeMap<String, VertexId>>);
+
+impl PackageIndex {
+    /// 방금 넣은 `kind` routine 정점 `id`가 패키지면 그래프에 있는 그 정점을 등록한다 —
+    /// 같은 이름이면 작은 id가 남는다. 대부분인 패키지 아닌 routine은 정점을 찾지 않는다.
+    fn register(&mut self, g: &Graph, id: &VertexId, kind: VertexKind) {
+        if kind != VertexKind::Package {
+            return;
+        }
+        let Some(vertex) = g.vertex(id).filter(|v| v.kind == VertexKind::Package) else {
+            return;
+        };
+        let by_name = self.0.entry(vertex.schema.clone()).or_default();
+        let first = by_name
+            .entry(vertex.name.clone())
+            .or_insert_with(|| vertex.id.clone());
+        if vertex.id < *first {
+            *first = vertex.id.clone();
+        }
+    }
+
+    /// 스키마 `schema`에서 이름이 `pkg`인 패키지 중 id 순으로 첫 정점.
+    fn find(&self, schema: &str, pkg: &str) -> Option<VertexId> {
+        self.0.get(schema)?.get(pkg).cloned()
+    }
+}
+
+/// 스키마의 fk 제약을 object 레벨 + column 레벨 간선으로 풀어 `edges`에 모은다.
+fn collect_foreign_key_edges(g: &mut Graph, schema: &SchemaDoc, edges: &mut Vec<Edge>) {
     for object in &schema.objects {
         let object_id = VertexId::object(&schema.name, &object.name);
         for constraint in object
@@ -439,17 +496,19 @@ fn add_foreign_key_edges(g: &mut Graph, schema: &SchemaDoc) {
             .iter()
             .filter(|constraint| constraint.kind == "fk")
         {
-            build_fk_edges(g, schema, object, constraint, &object_id);
+            build_fk_edges(g, schema, object, constraint, &object_id, edges);
         }
     }
 }
 
+/// fk 제약 하나의 간선을 `edges`에 더한다 — 대상 테이블이 없으면 limitation만 남긴다.
 fn build_fk_edges(
     g: &mut Graph,
     schema: &SchemaDoc,
     obj: &ObjectDoc,
     con: &ConstraintDoc,
     obj_id: &VertexId,
+    edges: &mut Vec<Edge>,
 ) {
     let Some(referenced) = &con.referenced else {
         return;
@@ -471,7 +530,7 @@ fn build_fk_edges(
         return;
     }
 
-    g.add_edge(Edge {
+    edges.push(Edge {
         from: obj_id.clone(),
         to: target_id.clone(),
         kind: EdgeKind::References,
@@ -502,7 +561,7 @@ fn build_fk_edges(
         let Some(remote_id) = member_id(g, &target_id, remote, VertexKind::Column) else {
             continue;
         };
-        g.add_edge(Edge {
+        edges.push(Edge {
             from: local_id,
             to: remote_id,
             kind: EdgeKind::References,
@@ -1023,5 +1082,219 @@ mod tests {
             .limitations()
             .iter()
             .any(|l| l.contains("부모 패키지 정점이 카탈로그에 없음")));
+    }
+
+    /// 패키지 `package`의 멤버 프로시저 `name`.
+    fn package_member(name: &str, package: &str) -> RoutineDoc {
+        RoutineDoc {
+            source: None,
+            name: name.into(),
+            kind: "procedure".into(),
+            language: Some("plsql".into()),
+            body: None,
+            signature: None,
+            usage: None,
+            member_of: Some(package.into()),
+        }
+    }
+
+    /// 패키지 routine — `member_of`가 있으면 다른 패키지의 멤버로 들어간다.
+    fn package(name: &str, member_of: Option<&str>) -> RoutineDoc {
+        RoutineDoc {
+            kind: "package".into(),
+            member_of: member_of.map(Into::into),
+            ..package_member(name, "")
+        }
+    }
+
+    /// 정점으로 들어오는 Contains 간선의 부모 id들.
+    fn contains_parents(g: &Graph, id: &VertexId) -> Vec<String> {
+        g.incoming(id)
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Contains)
+            .map(|edge| edge.from.to_string())
+            .collect()
+    }
+
+    /// 부모 패키지를 못 찾아 스키마 직속으로 둔 멤버 limitation 수.
+    fn orphan_member_notes(g: &Graph) -> usize {
+        g.limitations()
+            .iter()
+            .filter(|l| l.contains("부모 패키지 정점이 카탈로그에 없음"))
+            .count()
+    }
+
+    #[test]
+    fn 부모_패키지가_없는_멤버는_멤버마다_스키마_직속으로_남는다() {
+        let mut doc = doc_with_fk();
+        let members = [("m1", "ghost"), ("m2", "ghost"), ("m3", "other_ghost")];
+        doc.schemas[0].routines = members
+            .iter()
+            .map(|(name, package)| package_member(name, package))
+            .collect();
+        let g = document_to_graph(&doc);
+        for (name, package) in members {
+            let id = VertexId::member("main", package, name);
+            assert_eq!(contains_parents(&g, &id), ["main"], "{id}");
+        }
+        assert_eq!(orphan_member_notes(&g), members.len());
+    }
+
+    #[test]
+    fn 이름_충돌로_분리된_패키지도_멤버의_부모가_된다() {
+        let mut doc = doc_with_fk();
+        // 테이블 orders가 base id를 차지해 패키지 orders는 orders@package로 분리된다.
+        doc.schemas[0].routines = vec![package_member("run", "orders"), package("orders", None)];
+        let g = document_to_graph(&doc);
+        let member = VertexId::member("main", "orders", "run");
+        assert_eq!(contains_parents(&g, &member), ["main.orders@package"]);
+        assert_eq!(orphan_member_notes(&g), 0);
+    }
+
+    #[test]
+    fn 패키지인_멤버는_만들어진_뒤의_멤버부터_부모가_된다() {
+        let mut doc = doc_with_fk();
+        // 멤버 패스는 문서 순서다. 패키지 inner가 생기기 전의 early는 귀속처가 없고,
+        // 그 뒤의 late는 outer 아래에 생긴 inner를 이름으로 찾는다.
+        doc.schemas[0].routines = vec![
+            package_member("early", "inner"),
+            package("inner", Some("outer")),
+            package_member("late", "inner"),
+            package("outer", None),
+        ];
+        let g = document_to_graph(&doc);
+        let inner = VertexId::member("main", "outer", "inner");
+        assert_eq!(g.vertex(&inner).map(|v| v.kind), Some(VertexKind::Package));
+        assert_eq!(contains_parents(&g, &inner), ["main.outer"]);
+        let early = VertexId::member("main", "inner", "early");
+        assert_eq!(contains_parents(&g, &early), ["main"]);
+        let late = VertexId::member("main", "inner", "late");
+        assert_eq!(contains_parents(&g, &late), ["main.outer.inner"]);
+        assert_eq!(orphan_member_notes(&g), 1);
+    }
+
+    /// `columns` 컬럼과 `constraints` 제약을 가진 테이블.
+    fn table_doc(name: &str, columns: &[&str], constraints: Vec<ConstraintDoc>) -> ObjectDoc {
+        let mut object = doc_with_fk().schemas[0].objects[0].clone();
+        let column = object.columns[0].clone();
+        object.name = name.into();
+        object.columns = columns
+            .iter()
+            .map(|name| ColumnDoc {
+                name: (*name).into(),
+                ..column.clone()
+            })
+            .collect();
+        object.constraints = constraints;
+        object
+    }
+
+    /// `columns` → `target`(`target_columns`) FK 제약. `schema`가 None이면 같은 스키마다.
+    fn fk_doc(
+        name: &str,
+        columns: &[&str],
+        schema: Option<&str>,
+        target: &str,
+        target_columns: &[&str],
+    ) -> ConstraintDoc {
+        let names = |items: &[&str]| -> Vec<String> {
+            items.iter().map(|item| (*item).to_string()).collect()
+        };
+        ConstraintDoc {
+            name: name.into(),
+            kind: "fk".into(),
+            columns: names(columns),
+            referenced: Some(ReferencedDoc {
+                schema: schema.map(Into::into),
+                table: target.into(),
+                columns: names(target_columns),
+            }),
+        }
+    }
+
+    /// from → to References 간선의 근거 detail들.
+    fn reference_details(g: &Graph, from: &str, to: &str) -> Vec<String> {
+        let edge = g.edges().into_iter().find(|e| {
+            e.kind == EdgeKind::References && e.from.as_str() == from && e.to.as_str() == to
+        });
+        let edge = edge.unwrap_or_else(|| panic!("references {from} -> {to}"));
+        edge.evidence.iter().map(|e| e.detail.clone()).collect()
+    }
+
+    #[test]
+    fn 같은_테이블_쌍의_fk_근거는_정렬돼_간선_하나에_모인다() {
+        let mut doc = doc_with_fk();
+        // 이름이 내림차순으로 와서 근거를 하나씩 합치면 매번 기존 근거 앞에 들어간다.
+        let fk = |name: &str| fk_doc(name, &["customer_id"], None, "customers", &["id"]);
+        doc.schemas[0].objects[1]
+            .constraints
+            .extend([fk("orders_fk_z"), fk("orders_fk_m")]);
+        let g = document_to_graph(&doc);
+        let object_detail =
+            |name: &str| format!("fk {name}: main.orders(customer_id) -> main.customers(id)");
+        assert_eq!(
+            reference_details(&g, "main.orders", "main.customers"),
+            ["orders_fk_0", "orders_fk_m", "orders_fk_z"].map(object_detail)
+        );
+        assert_eq!(
+            reference_details(&g, "main.orders.customer_id", "main.customers.id"),
+            ["orders_fk_0", "orders_fk_m", "orders_fk_z"]
+                .map(|name| format!("fk {name}: customer_id -> id"))
+        );
+        // FK 간선은 테이블의 소유 간선(컬럼 하나, 제약 셋) 뒤에 한 번만 붙고, in/out 근거가 같다.
+        let orders = VertexId::object("main", "orders");
+        let kinds: Vec<_> = g.outgoing(&orders).iter().map(|e| e.kind).collect();
+        use EdgeKind::{Contains, References};
+        assert_eq!(kinds, [Contains, Contains, Contains, Contains, References]);
+        let customers = VertexId::object("main", "customers");
+        assert_eq!(
+            g.incoming(&customers).last().map(|e| &e.evidence),
+            g.outgoing(&orders).last().map(|e| &e.evidence)
+        );
+    }
+
+    #[test]
+    fn fk_간선은_스키마를_건너도_문서_순서대로_붙는다() {
+        let mut doc = doc_with_fk();
+        // 스키마 z가 a보다 먼저 온다. a.t를 z.v와 a.u가 참조하고 z.v는 같은 FK가 둘이다.
+        let to_t = |name: &str| fk_doc(name, &["t_id"], Some("a"), "t", &["id"]);
+        let z_v = table_doc("v", &["t_id"], vec![to_t("v_fk_2"), to_t("v_fk_1")]);
+        let a_u = table_doc("u", &["t_id"], vec![to_t("u_fk")]);
+        let a_t = table_doc("t", &["id"], vec![]);
+        doc.schemas = vec![
+            SchemaDoc {
+                name: "z".into(),
+                objects: vec![z_v],
+                routines: vec![],
+            },
+            SchemaDoc {
+                name: "a".into(),
+                objects: vec![a_t, a_u],
+                routines: vec![],
+            },
+        ];
+        let g = document_to_graph(&doc);
+        let sources = |id: &VertexId| -> Vec<(String, EdgeKind)> {
+            let edges = g.incoming(id).iter();
+            edges.map(|e| (e.from.to_string(), e.kind)).collect()
+        };
+        let reference = |from: &str| (from.to_string(), EdgeKind::References);
+        let contains = |from: &str| (from.to_string(), EdgeKind::Contains);
+        assert_eq!(
+            sources(&VertexId::object("a", "t")),
+            [contains("a"), reference("z.v"), reference("a.u")]
+        );
+        assert_eq!(
+            sources(&VertexId::member("a", "t", "id")),
+            [
+                contains("a.t"),
+                reference("z.v.t_id"),
+                reference("a.u.t_id")
+            ]
+        );
+        assert_eq!(
+            reference_details(&g, "z.v", "a.t"),
+            ["v_fk_1", "v_fk_2"].map(|name| format!("fk {name}: z.v(t_id) -> a.t(id)"))
+        );
     }
 }

@@ -1,14 +1,15 @@
 //! 스코프마다 FROM·CTE·출력 컬럼을 분리해 별칭이 다른 질의로 새지 않게 한다.
 
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::rc::Rc;
 
 use schemagraph_core::{
     AnalysisState, Diagnostic, Edge, EdgeKind, Evidence, EvidenceLayer, Graph, ObjectAnalysis,
-    Origin, SourceLocation, VertexId, VertexKind,
+    Origin, OriginKey, SourceLocation, VertexId, VertexKind,
 };
-use schemagraph_source::document::{CatalogDocument, ObjectDoc};
+use schemagraph_source::document::{CatalogDocument, ObjectDoc, RoutineDoc};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
     visit_relations, AccessExpr, AssignmentTarget, Expr, GroupByExpr, Ident, JoinConstraint,
@@ -18,6 +19,8 @@ use sqlparser::ast::{
     WildcardAdditionalOptions, WindowType,
 };
 use sqlparser::dialect::{Dialect, GenericDialect};
+
+use crate::cache::CacheContext;
 
 type Sources = BTreeSet<VertexId>;
 type Ctes = BTreeMap<String, Relation>;
@@ -62,11 +65,23 @@ impl Scope {
 }
 
 /// 객체 검색을 몸체마다 전체 카탈로그 순회로 되풀이하지 않는다.
+///
+/// enrich 한 번이 이 색인 하나를 공유하므로 캐시 키의 문서 단위 값과 캐시 저장이
+/// 쓰는 몸체별 DML origin 키도 여기에 둔다.
 pub(crate) struct CatalogIndex<'a> {
     tables: BTreeMap<(String, String), Vec<(&'a str, &'a ObjectDoc)>>,
     dialect: &'a str,
     routines: BTreeSet<(String, String)>,
     database: Option<String>,
+    doc: &'a CatalogDocument,
+    cache_keys: CacheKeyMemo<'a>,
+    /// enrich가 다루는 그래프 하나의 이름 해석 색인. 정점 집합이 고정이라
+    /// 처음 조회할 때 한 번만 만든다.
+    vertices: super::VertexIndex,
+    /// DML 분석이 owner별로 origin을 단 간선 키. 캐시 저장이 owner 밖의 컬럼에서
+    /// 시작하는 값 계보를 그래프의 모든 origin을 훑지 않고 찾게 한다. 몸체를 저장할
+    /// 때 꺼내 비우므로 지금 해석 중인 몸체의 키만 들고 있다.
+    dml_origins: RefCell<BTreeMap<VertexId, BTreeSet<OriginKey>>>,
 }
 
 impl<'a> CatalogIndex<'a> {
@@ -103,6 +118,52 @@ impl<'a> CatalogIndex<'a> {
                 .as_ref()
                 .and_then(|context| context.database.as_deref())
                 .map(|database| database_key(&doc.dialect, database)),
+            doc,
+            cache_keys: CacheKeyMemo::default(),
+            vertices: super::VertexIndex::default(),
+            dml_origins: RefCell::default(),
+        }
+    }
+
+    /// 이 enrich의 그래프에서 이름을 찾는 방식. ci면 대소문자 무시 단일 후보도 본다.
+    pub(crate) fn lookup(&self, ci: bool) -> super::Lookup<'_> {
+        self.vertices.lookup(ci)
+    }
+
+    /// owner의 DML 효과에 origin을 단 간선 키를 기록한다.
+    fn record_dml_origin(&self, owner: &VertexId, key: OriginKey) {
+        self.dml_origins
+            .borrow_mut()
+            .entry(owner.clone())
+            .or_default()
+            .insert(key);
+    }
+
+    /// owner 몸체가 기록한 DML origin 키를 꺼내고 비운다. 기록이 없으면 빈 집합이다.
+    pub(crate) fn take_dml_origins(&self, owner: &VertexId) -> BTreeSet<OriginKey> {
+        self.dml_origins
+            .borrow_mut()
+            .remove(owner)
+            .unwrap_or_default()
+    }
+
+    /// Binder와 캐시 footprint가 같은 규칙으로 관계 키를 만든다.
+    ///
+    /// `parts`는 `name` 규칙으로 정규화한 이름 부분이다. 한 부분이면 기본 스키마를
+    /// 붙이고, 세 부분이면 수집 database와 같을 때만 로컬 관계로 본다. database
+    /// 부분도 수집 database와 같은 `database_key`로 접는다 — SQL Server의
+    /// `MyDb.dbo.t`를 소문자로 접힌 수집 database와 비교해야 하기 때문이다.
+    fn relation_key(&self, parts: &[String], default_schema: &str) -> Option<(String, String)> {
+        match parts {
+            [table] => Some((catalog_key(self.dialect, default_schema), table.clone())),
+            [schema, table] => Some((schema.clone(), table.clone())),
+            [database, schema, table]
+                if self.database.as_deref()
+                    == Some(database_key(self.dialect, database).as_str()) =>
+            {
+                Some((schema.clone(), table.clone()))
+            }
+            _ => None,
         }
     }
 
@@ -160,128 +221,98 @@ pub(crate) fn body_hash(body: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
 }
 
-/// 몸체가 실제로 소비하는 카탈로그 모양을 fingerprint한다.
+/// 캐시 키 비용을 시간 대신 횟수로 검증하게 하는 테스트 전용 계수다.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CacheKeyCounters {
+    /// 몸체별 cache context 계산 횟수.
+    pub(crate) contexts: usize,
+    /// cache context가 문서 전체를 직렬화하거나 순회한 횟수.
+    pub(crate) document_passes: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 테스트는 스레드마다 병렬로 돌므로 계수도 스레드마다 따로 둔다.
+    static CACHE_KEY_COUNTERS: std::cell::Cell<CacheKeyCounters> =
+        const { std::cell::Cell::new(CacheKeyCounters { contexts: 0, document_passes: 0 }) };
+}
+
+/// 현재 테스트 스레드의 계수를 돌려주고 0으로 되돌린다.
+#[cfg(test)]
+pub(crate) fn take_cache_key_counters() -> CacheKeyCounters {
+    CACHE_KEY_COUNTERS.with(std::cell::Cell::take)
+}
+
+/// 현재 테스트 스레드의 계수를 갱신한다.
+#[cfg(test)]
+fn count_cache_key(update: impl FnOnce(&mut CacheKeyCounters)) {
+    CACHE_KEY_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        update(&mut value);
+        counters.set(value);
+    });
+}
+
+/// 캐시 키에 쓰는 문서 단위 값을 enrich 한 번에 처음 필요할 때 한 번만 만든다.
 ///
-/// SQL을 정상적으로 AST로 읽으면 참조한 관계의 후보·컬럼 순서와 routine
-/// overload 집합만 포함해 unrelated 구조 변경은 다른 소유자의 결과를
-/// 무효화하지 않는다. 문장을 읽지 못하면 전체 document 표현을 fingerprint에
-/// 넣어 보수적인 global miss로 돌아간다.
-pub(crate) fn cache_context(
-    doc: &CatalogDocument,
-    graph: &Graph,
-    owner: &VertexId,
-    body: &str,
-) -> crate::cache::CacheContext {
-    let conservative = || {
-        let mut hasher = Sha256::new();
-        hasher.update(format!("global\0{:?}\0{:?}", doc, graph.vertex(owner)).as_bytes());
-        crate::cache::CacheContext::conservative(format!("sha256:{:x}", hasher.finalize()))
-    };
-    let uppercase = body.to_ascii_uppercase();
-    if uppercase.contains("CREATE FUNCTION")
-        || uppercase.contains("CREATE PROCEDURE")
-        || uppercase.contains("CREATE TRIGGER")
-        || uppercase.contains("CREATE OR REPLACE FUNCTION")
-        || uppercase.contains("CREATE OR REPLACE PROCEDURE")
-        || uppercase.contains("CREATE OR REPLACE TRIGGER")
-        || uppercase.contains("EXECUTE ")
-        || uppercase.contains("EXECUTE(")
-        || uppercase.contains("EXEC ")
-        || uppercase.contains("EXEC(")
-    {
-        return conservative();
-    }
-    let dialect = super::dialect_for(&doc.dialect);
-    let default = GenericDialect {};
-    let parsed = sqlparser::parser::Parser::parse_sql(dialect.as_deref().unwrap_or(&default), body);
-    let Ok(statements) = parsed else {
-        return conservative();
-    };
+/// 몸체마다 문서 전체를 직렬화·순회하면 비용이 몸체 수 × 문서 크기가 된다.
+/// 캐시 없는 실행은 아무것도 만들지 않고, 신뢰 지문만 쓰는 실행은 문서 전체
+/// 지문을 만들지 않는다.
+#[derive(Default)]
+struct CacheKeyMemo<'a> {
+    /// `global\0{doc:?}`까지 흡수한 해시 상태. owner만 이어 붙여 기존 보수
+    /// 지문과 같은 값을 만든다 — 외부 BodyCache가 저장한 키를 그대로 찾는다.
+    conservative: OnceCell<Sha256>,
+    /// owner 메타데이터를 찾지 못한 몸체가 쓰는 전체 스키마 표현의 해시.
+    schemas: OnceCell<String>,
+    /// owner·참조 관계 후보와 routine overload 모양.
+    footprint: OnceCell<FootprintIndex<'a>>,
+}
 
-    let mut relation_names = BTreeSet::new();
-    for statement in &statements {
-        let _ = visit_relations(statement, |name| {
-            let idents: Vec<_> = name.0.iter().filter_map(|part| part.as_ident()).collect();
-            let count = idents.len();
-            relation_names.insert(
-                idents
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, ident)| {
-                        if index == 0 && count == 3 {
-                            database_ident_key(&doc.dialect, ident)
-                        } else {
-                            name_for_dialect(&doc.dialect, ident)
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            ControlFlow::<()>::Continue(())
-        });
-    }
-    let mut footprint = Vec::new();
-    let owner_schema = graph
-        .vertex(owner)
-        .map(|vertex| vertex.schema.clone())
-        .unwrap_or_default();
-    let owner_vertex = graph.vertex(owner);
-    let owner_name = owner_vertex
-        .map(|vertex| vertex.name.clone())
-        .unwrap_or_default();
-    let owner_base_name = owner_name
-        .split_once('@')
-        .map(|(name, _)| name)
-        .unwrap_or(owner_name.as_str());
-    let mut owner_metadata_found = false;
-    footprint.push(format!("dialect={}", doc.dialect));
-    footprint.push(format!("owner={}", owner));
-    footprint.push(format!("owner-vertex={:?}", graph.vertex(owner)));
-    footprint.push(format!("context={:?}", doc.context));
+/// 신뢰 지문이 쓰는 문서 후보를 ASCII 대문자로 접은 (스키마, 이름)으로 찾는다.
+///
+/// 키를 방언 비교 중 가장 느슨한 ASCII 대소문자 무시로 접어 두고 꺼낼 때 방언
+/// 비교로 거르면, 몸체마다 문서를 훑던 비교와 같은 후보를 같은 수만큼 얻는다.
+struct FootprintIndex<'a> {
+    objects: BTreeMap<(String, String), Vec<(&'a str, &'a ObjectDoc)>>,
+    /// 트리거 owner의 부모 id → 그 id를 만든 객체.
+    object_ids: BTreeMap<VertexId, Vec<(&'a str, &'a ObjectDoc)>>,
+    routines: BTreeMap<(String, String), Vec<(&'a str, &'a RoutineDoc)>>,
+    /// 모든 routine overload 모양을 정렬해 한 번만 계산한 해시.
+    overloads: String,
+}
 
-    for schema in &doc.schemas {
-        if !schema_name_eq(&doc.dialect, &schema.name, &owner_schema) {
-            continue;
-        }
-        for object in &schema.objects {
-            let object_owner = owner_vertex.is_some_and(|vertex| {
-                matches!(
-                    vertex.kind,
-                    VertexKind::Table
-                        | VertexKind::View
-                        | VertexKind::MaterializedView
-                        | VertexKind::Synonym
-                        | VertexKind::Sequence
-                        | VertexKind::Type
-                ) && name_eq(&doc.dialect, &object.name, owner_base_name)
-            });
-            let trigger_owner = owner_vertex.is_some_and(|vertex| {
-                vertex.kind == VertexKind::Trigger
-                    && vertex.id.parent() == Some(VertexId::object(&schema.name, &object.name))
-            });
-            if object_owner || trigger_owner {
-                owner_metadata_found = true;
-                footprint.push(format!(
-                    "owner-object={}.{}:{:?}:{}",
-                    schema.name,
-                    object.name,
-                    object.kind,
-                    object_shape(object)
-                ));
-                for trigger in &object.triggers {
-                    footprint.push(format!(
-                        "owner-trigger={}:{}",
-                        trigger.name,
-                        trigger.body.is_some()
-                    ));
-                }
+impl<'a> FootprintIndex<'a> {
+    fn new(doc: &'a CatalogDocument) -> Self {
+        #[cfg(test)]
+        count_cache_key(|counters| counters.document_passes += 1);
+        let mut index = Self {
+            objects: BTreeMap::new(),
+            object_ids: BTreeMap::new(),
+            routines: BTreeMap::new(),
+            overloads: String::new(),
+        };
+        let mut overloads = Vec::new();
+        for schema in &doc.schemas {
+            let schema_name = schema.name.as_str();
+            for object in &schema.objects {
+                let entry = (schema_name, object);
+                let key = folded_key(schema_name, &object.name);
+                index.objects.entry(key).or_default().push(entry);
+                let id = VertexId::object(schema_name, &object.name);
+                index.object_ids.entry(id).or_default().push(entry);
             }
-        }
-        for routine in &schema.routines {
-            if name_eq(&doc.dialect, &routine.name, owner_base_name) {
-                owner_metadata_found = true;
-                footprint.push(format!(
-                    "owner-routine={}.{}:{}:{}:{}:{}:{}",
-                    schema.name,
+            for routine in &schema.routines {
+                let key = folded_key(schema_name, &routine.name);
+                index
+                    .routines
+                    .entry(key)
+                    .or_default()
+                    .push((schema_name, routine));
+                overloads.push(format!(
+                    "routine={}.{}:{:?}:{}:{}:{}:{}",
+                    schema_name,
                     routine.name,
                     routine.kind,
                     routine.language.as_deref().unwrap_or(""),
@@ -291,61 +322,180 @@ pub(crate) fn cache_context(
                 ));
             }
         }
-    }
-    if !owner_metadata_found {
-        footprint.push(format!("owner-metadata-missing={:?}", doc.schemas));
+        overloads.sort();
+        index.overloads = digest_items(&overloads);
+        index
     }
 
-    for parts in relation_names {
-        let (ref_schema, ref_name) = match parts.as_slice() {
-            [name] => (owner_schema.clone(), name.clone()),
-            [schema, name] => (schema.clone(), name.clone()),
-            [database, schema, name]
-                if doc
-                    .context
-                    .as_ref()
-                    .and_then(|context| context.database.as_deref())
-                    .map(|value| database_key(&doc.dialect, value))
-                    .as_deref()
-                    == Some(database.as_str()) =>
-            {
-                (schema.clone(), name.clone())
-            }
-            _ => {
-                footprint.push(format!("cross-database={}", parts.join(".")));
-                continue;
-            }
+    /// 방언 비교로 스키마·이름이 같은 객체 후보.
+    fn objects(&self, dialect: &str, schema: &str, name: &str) -> Vec<(&'a str, &'a ObjectDoc)> {
+        let candidates = self.objects.get(&folded_key(schema, name));
+        candidates
+            .into_iter()
+            .flatten()
+            .filter(|(candidate, object)| {
+                schema_name_eq(dialect, candidate, schema) && name_eq(dialect, &object.name, name)
+            })
+            .copied()
+            .collect()
+    }
+
+    /// 트리거 정점의 부모 id를 만든 객체. owner 스키마 비교도 그대로 거친다.
+    fn trigger_owners(
+        &self,
+        dialect: &str,
+        schema: &str,
+        trigger: &VertexId,
+    ) -> Vec<(&'a str, &'a ObjectDoc)> {
+        let candidates = trigger
+            .parent()
+            .and_then(|parent| self.object_ids.get(&parent));
+        candidates
+            .into_iter()
+            .flatten()
+            .filter(|(candidate, _)| schema_name_eq(dialect, candidate, schema))
+            .copied()
+            .collect()
+    }
+
+    /// 방언 비교로 스키마·이름이 같은 routine 후보.
+    fn routines(&self, dialect: &str, schema: &str, name: &str) -> Vec<(&'a str, &'a RoutineDoc)> {
+        let candidates = self.routines.get(&folded_key(schema, name));
+        candidates
+            .into_iter()
+            .flatten()
+            .filter(|(candidate, routine)| {
+                schema_name_eq(dialect, candidate, schema) && name_eq(dialect, &routine.name, name)
+            })
+            .copied()
+            .collect()
+    }
+}
+
+impl<'a> CatalogIndex<'a> {
+    /// 몸체가 실제로 소비하는 카탈로그 모양을 fingerprint한다.
+    ///
+    /// SQL을 정상적으로 AST로 읽으면 참조한 관계의 후보·컬럼 순서와 routine
+    /// overload 집합만 포함해 unrelated 구조 변경은 다른 소유자의 결과를
+    /// 무효화하지 않는다. 문장을 읽지 못하면 전체 document 표현을 fingerprint에
+    /// 넣어 보수적인 global miss로 돌아간다. 문서 단위 값은 이 색인이 한 번만
+    /// 만들므로 몸체 수가 늘어도 몸체마다 문서 전체를 다시 읽지 않는다.
+    pub(crate) fn cache_context(
+        &self,
+        graph: &Graph,
+        owner: &VertexId,
+        body: &str,
+    ) -> CacheContext {
+        #[cfg(test)]
+        count_cache_key(|counters| counters.contexts += 1);
+        if wraps_definition_or_dynamic_sql(body) {
+            return self.conservative_context(graph, owner);
+        }
+        let dialect = super::dialect_for(self.dialect);
+        let default = GenericDialect {};
+        let parsed = super::parse_limits::parse_sql(dialect.as_deref().unwrap_or(&default), body);
+        let Ok(statements) = parsed else {
+            return self.conservative_context(graph, owner);
         };
-        let mut candidates = Vec::new();
-        for schema in &doc.schemas {
-            if !schema_name_eq(&doc.dialect, &schema.name, &ref_schema) {
-                continue;
-            }
-            for object in &schema.objects {
-                if name_eq(&doc.dialect, &object.name, &ref_name) {
-                    candidates.push(format!(
-                        "object={}.{}:{:?}:{}",
-                        schema.name,
-                        object.name,
-                        object.kind,
-                        object_shape(object)
-                    ));
-                }
-            }
-        }
-        if candidates.is_empty() {
-            candidates.push(format!("missing-object={ref_schema}.{ref_name}"));
-        }
-        footprint.extend(candidates);
+        self.scoped_context(graph, owner, &statements)
     }
 
-    // routine 호출의 한정 방식은 방언마다 다르다. 모든 스키마의 overload
-    // 모양을 포함해 불완전한 호출 문맥으로 signature를 고정하지 않는다.
-    for schema in &doc.schemas {
-        for routine in &schema.routines {
+    /// 문서 전체 표현과 owner 정점으로 전역 miss 지문을 만든다. 문서 부분은
+    /// enrich마다 한 번만 해시하고 몸체마다 owner만 이어 붙인다.
+    fn conservative_context(&self, graph: &Graph, owner: &VertexId) -> CacheContext {
+        let prefix = self.cache_keys.conservative.get_or_init(|| {
+            #[cfg(test)]
+            count_cache_key(|counters| counters.document_passes += 1);
+            let mut hasher = Sha256::new();
+            hash_formatted(&mut hasher, format_args!("global\0{:?}", self.doc));
+            hasher
+        });
+        let mut hasher = prefix.clone();
+        hash_formatted(&mut hasher, format_args!("\0{:?}", graph.vertex(owner)));
+        CacheContext::conservative(format!("sha256:{:x}", hasher.finalize()))
+    }
+
+    /// owner·참조 관계의 모양과 routine overload 모양으로 신뢰 지문을 만든다.
+    fn scoped_context(
+        &self,
+        graph: &Graph,
+        owner: &VertexId,
+        statements: &[Statement],
+    ) -> CacheContext {
+        let index = self
+            .cache_keys
+            .footprint
+            .get_or_init(|| FootprintIndex::new(self.doc));
+        let mut footprint = vec![
+            format!("dialect={}", self.doc.dialect),
+            format!("owner={}", owner),
+            format!("owner-vertex={:?}", graph.vertex(owner)),
+            format!("context={:?}", self.doc.context),
+        ];
+        let owner_metadata_found = self.owner_footprint(index, graph.vertex(owner), &mut footprint);
+        if !owner_metadata_found {
+            footprint.push(format!("owner-metadata-missing={}", self.schemas_digest()));
+        }
+        let owner_schema = graph.vertex(owner).map(|vertex| vertex.schema.as_str());
+        self.relation_footprint(
+            index,
+            owner_schema.unwrap_or_default(),
+            statements,
+            &mut footprint,
+        );
+        // routine 호출의 한정 방식은 방언마다 다르다. 모든 스키마의 overload
+        // 모양을 포함해 불완전한 호출 문맥으로 signature를 고정하지 않는다.
+        footprint.push(format!("routines={}", index.overloads));
+        footprint.sort();
+        CacheContext {
+            fingerprint: digest_items(&footprint),
+            trusted: owner_metadata_found,
+        }
+    }
+
+    /// owner 자신의 객체·트리거·routine 모양을 담고, 하나라도 찾았는지 돌려준다.
+    fn owner_footprint(
+        &self,
+        index: &FootprintIndex<'_>,
+        owner: Option<&schemagraph_core::Vertex>,
+        footprint: &mut Vec<String>,
+    ) -> bool {
+        let schema = owner
+            .map(|vertex| vertex.schema.as_str())
+            .unwrap_or_default();
+        let name = owner.map(|vertex| vertex.name.as_str()).unwrap_or_default();
+        let base_name = name.split_once('@').map(|(name, _)| name).unwrap_or(name);
+        let objects = match owner {
+            Some(vertex) if owns_catalog_object(vertex.kind) => {
+                index.objects(self.dialect, schema, base_name)
+            }
+            Some(vertex) if vertex.kind == VertexKind::Trigger => {
+                index.trigger_owners(self.dialect, schema, &vertex.id)
+            }
+            _ => Vec::new(),
+        };
+        let routines = index.routines(self.dialect, schema, base_name);
+        let found = !objects.is_empty() || !routines.is_empty();
+        for (schema_name, object) in objects {
             footprint.push(format!(
-                "routine={}.{}:{:?}:{}:{}:{}:{}",
-                schema.name,
+                "owner-object={}.{}:{:?}:{}",
+                schema_name,
+                object.name,
+                object.kind,
+                object_shape(object)
+            ));
+            for trigger in &object.triggers {
+                footprint.push(format!(
+                    "owner-trigger={}:{}",
+                    trigger.name,
+                    trigger.body.is_some()
+                ));
+            }
+        }
+        for (schema_name, routine) in routines {
+            footprint.push(format!(
+                "owner-routine={}.{}:{}:{}:{}:{}:{}",
+                schema_name,
                 routine.name,
                 routine.kind,
                 routine.language.as_deref().unwrap_or(""),
@@ -354,16 +504,153 @@ pub(crate) fn cache_context(
                 routine.source.as_deref().unwrap_or("")
             ));
         }
+        found
     }
-    footprint.sort();
+
+    /// 몸체가 참조한 관계마다 후보 객체의 모양을, 후보가 없으면 그 사실을 담는다.
+    fn relation_footprint(
+        &self,
+        index: &FootprintIndex<'a>,
+        owner_schema: &str,
+        statements: &[Statement],
+        footprint: &mut Vec<String>,
+    ) {
+        for parts in relation_names(self.dialect, statements) {
+            let Some((ref_schema, ref_name)) = self.relation_key(&parts, owner_schema) else {
+                footprint.push(format!("cross-database={}", parts.join(".")));
+                continue;
+            };
+            let candidates = self.relation_candidates(index, &ref_schema, &ref_name);
+            if candidates.is_empty() {
+                footprint.push(format!("missing-object={ref_schema}.{ref_name}"));
+            }
+            footprint.extend(candidates.into_iter().map(|(schema, object)| {
+                format!(
+                    "object={}.{}:{:?}:{}",
+                    schema,
+                    object.name,
+                    object.kind,
+                    object_shape(object)
+                )
+            }));
+        }
+    }
+
+    /// Binder가 고를 관계 후보. ci 방언은 DML 경로의 vertex_hit가 대소문자 무시
+    /// 단일 후보도 고르므로, Binder 후보를 포함하는 접힌 후보 전체를 담는다.
+    fn relation_candidates(
+        &self,
+        index: &FootprintIndex<'a>,
+        schema: &str,
+        name: &str,
+    ) -> Vec<(&'a str, &'a ObjectDoc)> {
+        if matches!(self.dialect, "oracle" | "db2") {
+            return index.objects(self.dialect, schema, name);
+        }
+        let key = (schema.to_owned(), name.to_owned());
+        self.tables.get(&key).cloned().unwrap_or_default()
+    }
+
+    /// owner 메타데이터가 없을 때 쓰는 전체 스키마 표현의 해시를 한 번만 만든다.
+    fn schemas_digest(&self) -> &str {
+        self.cache_keys.schemas.get_or_init(|| {
+            #[cfg(test)]
+            count_cache_key(|counters| counters.document_passes += 1);
+            let mut hasher = Sha256::new();
+            hash_formatted(&mut hasher, format_args!("{:?}", self.doc.schemas));
+            format!("sha256:{:x}", hasher.finalize())
+        })
+    }
+}
+
+/// 단일 몸체의 cache context — 테스트가 문서마다 새 색인으로 지문을 비교한다.
+#[cfg(test)]
+pub(crate) fn cache_context(
+    doc: &CatalogDocument,
+    graph: &Graph,
+    owner: &VertexId,
+    body: &str,
+) -> CacheContext {
+    CatalogIndex::new(doc).cache_context(graph, owner, body)
+}
+
+/// 정의 껍질이나 동적 SQL은 몸체만으로 소비하는 이름을 고정할 수 없다.
+fn wraps_definition_or_dynamic_sql(body: &str) -> bool {
+    let uppercase = body.to_ascii_uppercase();
+    [
+        "CREATE FUNCTION",
+        "CREATE PROCEDURE",
+        "CREATE TRIGGER",
+        "CREATE OR REPLACE FUNCTION",
+        "CREATE OR REPLACE PROCEDURE",
+        "CREATE OR REPLACE TRIGGER",
+        "EXECUTE ",
+        "EXECUTE(",
+        "EXEC ",
+        "EXEC(",
+    ]
+    .iter()
+    .any(|keyword| uppercase.contains(keyword))
+}
+
+/// 몸체가 참조한 관계 이름을 Binder::parts와 같은 `name` 규칙으로 정규화한다.
+/// 같은 규칙이어야 footprint 후보가 Binder가 해석할 후보와 같아진다.
+fn relation_names(dialect: &str, statements: &[Statement]) -> BTreeSet<Vec<String>> {
+    let mut relation_names = BTreeSet::new();
+    for statement in statements {
+        let _ = visit_relations(statement, |relation| {
+            let parts = relation.0.iter().filter_map(|part| part.as_ident());
+            relation_names.insert(parts.map(|ident| name(dialect, ident)).collect::<Vec<_>>());
+            ControlFlow::<()>::Continue(())
+        });
+    }
+    relation_names
+}
+
+/// 몸체가 catalog 객체 자신(뷰 등)인 owner kind.
+fn owns_catalog_object(kind: VertexKind) -> bool {
+    matches!(
+        kind,
+        VertexKind::Table
+            | VertexKind::View
+            | VertexKind::MaterializedView
+            | VertexKind::Synonym
+            | VertexKind::Sequence
+            | VertexKind::Type
+    )
+}
+
+/// 방언 비교 중 가장 느슨한 ASCII 대소문자 무시 비교의 키.
+fn folded_key(schema: &str, name: &str) -> (String, String) {
+    (schema.to_ascii_uppercase(), name.to_ascii_uppercase())
+}
+
+/// 정렬된 항목을 0 구분자로 이어 해시한다 — 항목 경계가 섞이지 않게 한다.
+fn digest_items(items: &[String]) -> String {
     let mut hasher = Sha256::new();
-    for item in footprint {
+    for item in items {
         hasher.update(item.as_bytes());
         hasher.update([0]);
     }
-    crate::cache::CacheContext {
-        fingerprint: format!("sha256:{:x}", hasher.finalize()),
-        trusted: owner_metadata_found,
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// 서식 결과를 문자열로 모으지 않고 해시에 흘려 문서 크기만 한 임시 할당을
+/// 피한다. 흘린 바이트는 같은 서식의 `format!` 결과와 같다.
+fn hash_formatted(hasher: &mut Sha256, arguments: std::fmt::Arguments<'_>) {
+    // DigestWriter는 오류를 내지 않고 derive(Debug)는 쓰기 오류만 전파하므로
+    // 이 쓰기는 실패할 수 없다.
+    std::fmt::Write::write_fmt(&mut DigestWriter(hasher), arguments)
+        .expect("hashing formatted output cannot fail");
+}
+
+/// `fmt::Write`로 받은 조각을 그대로 해시에 넣는다.
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl std::fmt::Write for DigestWriter<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0.update(text.as_bytes());
+        Ok(())
     }
 }
 
@@ -401,7 +688,7 @@ fn object_shape(object: &ObjectDoc) -> String {
 /// 목적지가 없는 단일 SELECT만 읽기 해석기로 보내고 SELECT INTO는 DML로 남긴다.
 pub(crate) fn is_select(dialect: Option<&dyn Dialect>, body: &str) -> bool {
     let default = GenericDialect {};
-    sqlparser::parser::Parser::parse_sql(dialect.unwrap_or(&default), body).is_ok_and(|s| {
+    super::parse_limits::parse_sql(dialect.unwrap_or(&default), body).is_ok_and(|s| {
         s.len() == 1
             && matches!(s[0], Statement::Query(_))
             && !super::is_column_dml_statement(&s[0])
@@ -537,9 +824,9 @@ impl Binder<'_, '_> {
             return;
         }
         let hit = if let Some((pkg, member)) = routine.split_once('.') {
-            super::resolve_pkg_member(self.graph, &schema, pkg, member, false)
+            super::resolve_pkg_member(self.graph, &schema, pkg, member, self.catalog.lookup(false))
         } else if known {
-            super::resolve_routine(self.graph, &schema, &routine, false)
+            super::resolve_routine(self.graph, &schema, &routine, self.catalog.lookup(false))
         } else {
             super::RoutineHit::None
         };
@@ -650,38 +937,7 @@ impl Binder<'_, '_> {
                 });
                 (result, scope)
             }
-            SetExpr::SetOperation {
-                op, left, right, ..
-            } => {
-                let (mut left, _) = self.set(left, ctes, outer.clone());
-                let (right, _) = self.set(right, ctes, outer.clone());
-                if left.columns.len() != right.columns.len() {
-                    self.note(
-                        "SG_SET_WIDTH",
-                        "set-operation column counts differ; output lineage is partial".into(),
-                        None,
-                    );
-                    left.unknown = true;
-                }
-                for (l, r) in left.columns.iter_mut().zip(right.columns) {
-                    // INTERSECT는 양쪽에 공통인 값을 반환하므로 양쪽 출처를
-                    // 보존한다. EXCEPT의 오른쪽은 행을 제외하는 읽기 조건이다.
-                    if matches!(
-                        op,
-                        sqlparser::ast::SetOperator::Union | sqlparser::ast::SetOperator::Intersect
-                    ) {
-                        l.sources.extend(r.sources);
-                    }
-                    l.unknown |= r.unknown;
-                }
-                left.unknown |= right.unknown;
-                let scope = Rc::new(Scope {
-                    columns: left.columns.clone(),
-                    outer,
-                    ..Scope::default()
-                });
-                (left, scope)
-            }
+            SetExpr::SetOperation { .. } => self.set_operation_chain(set, ctes, outer),
             SetExpr::Values(values) => {
                 let scope = Rc::new(Scope {
                     outer,
@@ -732,6 +988,68 @@ impl Binder<'_, '_> {
                 )
             }
         }
+    }
+
+    /// 왼쪽으로 깊어지는 집합 연산 사슬을 반복문으로 결합한다.
+    ///
+    /// sqlparser는 `a UNION b UNION c`를 왼쪽 깊은 트리로 만든다. 왼쪽을 재귀로 내려가면
+    /// 사슬 길이만큼 스택을 쓰므로, 왼쪽 등뼈를 모은 뒤 가장 안쪽 연산부터 재귀 때와
+    /// 같은 순서(왼쪽 결과 → 오른쪽 결과 → 결합)로 처리한다.
+    fn set_operation_chain(
+        &mut self,
+        set: &SetExpr,
+        ctes: &Ctes,
+        outer: Option<Rc<Scope>>,
+    ) -> (Relation, Rc<Scope>) {
+        let mut spine = Vec::new();
+        let mut leftmost = set;
+        while let SetExpr::SetOperation {
+            op, left, right, ..
+        } = leftmost
+        {
+            spine.push((op, right.as_ref()));
+            leftmost = left.as_ref();
+        }
+        let (mut result, _) = self.set(leftmost, ctes, outer.clone());
+        for (op, right) in spine.into_iter().rev() {
+            let (right, _) = self.set(right, ctes, outer.clone());
+            self.combine_set_operation(&mut result, right, op);
+        }
+        let scope = Rc::new(Scope {
+            columns: result.columns.clone(),
+            outer,
+            ..Scope::default()
+        });
+        (result, scope)
+    }
+
+    /// 집합 연산 한 단계의 오른쪽 결과를 왼쪽 결과에 합친다.
+    fn combine_set_operation(
+        &mut self,
+        left: &mut Relation,
+        right: Relation,
+        op: &sqlparser::ast::SetOperator,
+    ) {
+        if left.columns.len() != right.columns.len() {
+            self.note(
+                "SG_SET_WIDTH",
+                "set-operation column counts differ; output lineage is partial".into(),
+                None,
+            );
+            left.unknown = true;
+        }
+        for (l, r) in left.columns.iter_mut().zip(right.columns) {
+            // INTERSECT는 양쪽에 공통인 값을 반환하므로 양쪽 출처를
+            // 보존한다. EXCEPT의 오른쪽은 행을 제외하는 읽기 조건이다.
+            if matches!(
+                op,
+                sqlparser::ast::SetOperator::Union | sqlparser::ast::SetOperator::Intersect
+            ) {
+                l.sources.extend(r.sources);
+            }
+            l.unknown |= r.unknown;
+        }
+        left.unknown |= right.unknown;
     }
 
     fn select(
@@ -1317,24 +1635,19 @@ impl Binder<'_, '_> {
     }
 
     fn table(&mut self, parts: &[String], source: Option<SourceLocation>) -> Relation {
-        let (schema, table) = match parts {
-            [table] => (
-                catalog_key(self.catalog.dialect, self.schema),
-                table.clone(),
-            ),
-            [schema, table] => (schema.clone(), table.clone()),
-            [database, schema, table]
-                if self.catalog.database.as_deref() == Some(database.as_str()) =>
-            {
-                (schema.clone(), table.clone())
-            }
-            _ => {
-                self.note("SG_CROSS_DATABASE",format!("relation '{}' needs a database/catalog namespace; no local target inferred",parts.join(".")),source);
-                return Relation {
-                    unknown: true,
-                    ..Relation::default()
-                };
-            }
+        let Some((schema, table)) = self.catalog.relation_key(parts, self.schema) else {
+            self.note(
+                "SG_CROSS_DATABASE",
+                format!(
+                    "relation '{}' needs a database/catalog namespace; no local target inferred",
+                    parts.join(".")
+                ),
+                source,
+            );
+            return Relation {
+                unknown: true,
+                ..Relation::default()
+            };
         };
         let matches = self
             .catalog
@@ -1367,7 +1680,7 @@ impl Binder<'_, '_> {
             &object.name,
             kind,
             &object.kind,
-            false,
+            self.catalog.lookup(false),
         ) else {
             self.note(
                 "SG_RELATION_UNRESOLVED",
@@ -1395,7 +1708,7 @@ impl Binder<'_, '_> {
                     &column.name,
                     VertexKind::Column,
                     "column",
-                    false,
+                    self.catalog.lookup(false),
                 )
                 .into_iter()
                 .collect::<Sources>();
@@ -1666,8 +1979,10 @@ pub(crate) fn apply_dml_column_effects(
                 detail: effect.detail,
             }],
         });
+        let key = (effect.from, effect.to, effect.kind);
+        catalog.record_dml_origin(owner, key.clone());
         graph.add_origin(
-            (effect.from, effect.to, effect.kind),
+            key,
             Origin {
                 body_hash: options.body_hash.to_owned(),
                 role: effect.role,
@@ -2840,7 +3155,7 @@ pub(crate) fn enrich_view(
     };
     let hash = body_hash(body);
     let default = GenericDialect {};
-    let parsed = sqlparser::parser::Parser::parse_sql(dialect.unwrap_or(&default), body);
+    let parsed = super::parse_limits::parse_sql(dialect.unwrap_or(&default), body);
     let mut binder = Binder {
         catalog,
         graph,
@@ -2963,7 +3278,7 @@ pub(crate) fn enrich_view(
                 &column.name,
                 VertexKind::Column,
                 "column",
-                false,
+                catalog.lookup(false),
             ) else {
                 continue;
             };

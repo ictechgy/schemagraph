@@ -189,9 +189,12 @@ fn routine_id(schema: &str, r: &RoutineDoc) -> String {
 }
 
 /// 같은 이름의 테이블·함수·프로시저를 reader가 실제로 분리한 id로 비교한다.
+///
+/// 분리 판정에는 정점만 필요하다. 전체 그래프를 만들면 문서마다 카탈로그 의존성 행을 다시
+/// 해석하므로 정점 그래프만 만든다.
 fn routine_map(doc: &CatalogDocument) -> BTreeMap<String, &RoutineDoc> {
     use schemagraph_core::{VertexId, VertexKind};
-    let graph = crate::graph::document_to_graph(doc);
+    let graph = crate::graph::document_vertices(doc);
     let mut result = BTreeMap::new();
     for schema in &doc.schemas {
         for routine in &schema.routines {
@@ -612,5 +615,79 @@ mod tests {
         assert_eq!(d.summary.added, 0);
         assert_eq!(d.summary.removed, 0);
         assert_eq!(d.summary.changed, 0);
+    }
+
+    fn routine(name: &str, kind: &str, member_of: Option<&str>) -> RoutineDoc {
+        RoutineDoc {
+            source: None,
+            name: name.into(),
+            kind: kind.into(),
+            language: Some("plsql".into()),
+            body: None,
+            signature: None,
+            usage: None,
+            member_of: member_of.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn 이름이_충돌한_routine은_reader가_분리한_id로_보고한다() {
+        // 테이블·함수·프로시저가 같은 이름을 쓰고, 패키지 멤버 id가 같은 이름 객체의
+        // 컬럼 id와 겹친다. 정점은 `@kind`로 분리되므로 diff id도 그 정점을 가리켜야 한다.
+        let new = doc(
+            vec![
+                table("f", vec![]),
+                table("ops", vec![col("touch", "INTEGER")]),
+            ],
+            vec![
+                routine("f", "function", None),
+                routine("f", "procedure", None),
+                routine("ops", "package", None),
+                routine("touch", "procedure", Some("ops")),
+            ],
+        );
+        let d = diff_documents(&doc(vec![], vec![]), &new);
+        let ids: Vec<_> = d
+            .routines
+            .added
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "main.f@function",
+                "main.f@procedure",
+                "main.ops.touch@procedure",
+                "main.ops@package"
+            ]
+        );
+    }
+
+    #[test]
+    fn routine_id_대응은_카탈로그_의존성을_다시_해석하지_않는다() {
+        let mut document = doc(
+            vec![table("t", vec![col("a", "INTEGER")]), table("u", vec![])],
+            vec![routine("f", "function", None)],
+        );
+        let reference = |name: &str, member: Option<&str>| crate::document::CatalogObjectRef {
+            schema: "main".into(),
+            name: name.into(),
+            kind: Some("table".into()),
+            member: member.map(str::to_owned),
+            signature: None,
+            database: None,
+        };
+        document.dependencies = vec![crate::document::CatalogDependency {
+            source: reference("u", None),
+            target: reference("t", Some("a")),
+            catalog: "pg_depend".into(),
+            dependency_type: "n".into(),
+        }];
+        crate::dependencies::work::take_scanned();
+        let d = diff_documents(&document, &document);
+        assert_eq!(d.summary.changed, 0);
+        // routine id의 `@kind` 분리 판정에는 정점만 필요하다 — 의존성 행 해석은 낭비다.
+        assert_eq!(crate::dependencies::work::take_scanned(), 0);
     }
 }
