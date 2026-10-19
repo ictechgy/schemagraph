@@ -30,6 +30,41 @@ async fn unsupported_url_schemes_are_rejected_without_credentials() {
     }
 }
 
+/// JVM 프로브용 `jdbc:` URL은 `//`의 위치와 무관하게 거절한다. 하위 프로토콜 뒤의
+/// 속성(`;password=…`)이나 `사용자/비밀번호@` 형태는 SQLite 경로 오류로도 남지 않는다.
+#[tokio::test]
+async fn jdbc_urls_are_rejected_without_their_properties() {
+    for (url, scheme) in [
+        (
+            "jdbc:sqlserver://db:1433;databaseName=app;user=sa;password=FAKEPW1",
+            "jdbc",
+        ),
+        ("jdbc:oracle:thin:scott/FAKEPW2@db:1521/app", "jdbc"),
+        ("JDBC:db2://db:50000/app:user=u;password=FAKEPW3;", "JDBC"),
+        ("jdbc:sqlite:/data/app.db", "jdbc"),
+    ] {
+        let messages = [
+            local_database_path(url).unwrap_err().to_string(),
+            read(url).await.unwrap_err().to_string(),
+            read_with_dependencies(url).await.unwrap_err().to_string(),
+        ];
+        for message in messages {
+            assert!(
+                message.contains(&format!("unsupported database URL scheme '{scheme}'")),
+                "{message}"
+            );
+            // 해결 방향: JDBC URL은 JVM 프로브로 수집해 document로 넘긴다.
+            assert!(
+                message.contains("JDBC URLs") && message.contains("scan --document"),
+                "{message}"
+            );
+            for fragment in ["FAKEPW", "scott", "databaseName", "/data/app.db"] {
+                assert!(!message.contains(fragment), "{message}");
+            }
+        }
+    }
+}
+
 /// 경로로 남은 URL 오타가 열리지 않으면 접속 오류는 자격 증명을 가린 경로만 싣는다.
 #[tokio::test]
 async fn sqlite_connect_errors_redact_userinfo() {

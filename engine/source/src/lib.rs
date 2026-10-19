@@ -75,17 +75,36 @@ pub async fn read_with_dependencies(url: &str) -> Result<CatalogDocument, Source
     Ok(doc)
 }
 
-/// 다른 수집기용 `scheme://` URL을 SQLite 파일 경로로 재해석하지 않고 거절한다.
+/// 다른 수집기용 URL(`scheme://`, JVM 프로브의 `jdbc:`)을 SQLite 파일 경로로 재해석하지
+/// 않고 거절한다.
 ///
 /// 재해석하면 sqlx가 퍼센트 디코딩한 URL 원문(비밀번호 포함)이 경로 오류에 실린다.
 /// 그래서 오류에는 스킴만 싣는다.
 fn reject_foreign_scheme(url: &str) -> Result<(), SourceError> {
-    match url_scheme(url) {
-        Some(scheme) if !NATIVE_URL_SCHEMES.contains(&scheme) => Err(SourceError::Connect(format!(
-            "unsupported database URL scheme '{scheme}'; native readers accept sqlite:, postgres://, postgresql://, and mysql:// URLs; for other databases, run the JDBC or Go probe and pass its output to scan --document"
+    match foreign_scheme(url) {
+        Some(scheme) => Err(SourceError::Connect(format!(
+            "unsupported database URL scheme '{scheme}'; native readers accept sqlite:, postgres://, postgresql://, and mysql:// URLs; for JDBC URLs and other databases, run the JDBC or Go probe and pass its output to scan --document"
         ))),
-        _ => Ok(()),
+        None => Ok(()),
     }
+}
+
+/// 네이티브 reader가 읽지 않는 URL의 스킴.
+///
+/// JDBC URL은 `jdbc:하위프로토콜:…`이라 `//`가 하위 프로토콜 뒤에 오거나
+/// (`jdbc:sqlserver://…;password=…`) 아예 없다(`jdbc:oracle:thin:…`). 그래서
+/// `scheme://` 검사로는 잡히지 않아 따로 본다.
+fn foreign_scheme(url: &str) -> Option<&str> {
+    jdbc_scheme(url)
+        .or_else(|| url_scheme(url).filter(|scheme| !NATIVE_URL_SCHEMES.contains(scheme)))
+}
+
+/// `jdbc:` 접두의 스킴을 입력 표기 그대로 돌려준다. URL 스킴은 대소문자를 가리지 않으므로
+/// (RFC 3986) `JDBC:`도 같게 본다 — 어느 표기든 SQLite 경로로 남으면 속성이 경로 오류에 실린다.
+fn jdbc_scheme(url: &str) -> Option<&str> {
+    let scheme = url.get(..4)?;
+    // get(..4)가 성공했으니 4는 문자 경계라 슬라이스가 패닉하지 않는다.
+    (scheme.eq_ignore_ascii_case("jdbc") && url[4..].starts_with(':')).then_some(scheme)
 }
 
 /// `scheme://`로 시작하는 입력의 스킴. 2자 이상만 스킴으로 본다 — `C://data/app.db`

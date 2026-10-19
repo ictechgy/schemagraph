@@ -26,18 +26,31 @@ fn assert_redacted_error(output: &Output, message: &str, secrets: &[&str]) {
     }
 }
 
-/// 다른 수집기용 URL은 출력 전에 스킴만 담은 오류로 거절된다.
+/// 다른 수집기용 URL은 출력 전에 스킴만 담은 오류로 거절된다. JVM 프로브용 `jdbc:` URL도
+/// `scheme://` 형태가 아니지만 같은 거절을 받는다.
 #[test]
 fn unsupported_url_schemes_report_only_the_scheme() {
     let dir = tempfile::tempdir().unwrap();
     for (url, scheme) in [
         ("sqlserver://sa:S3cr%40t@db:1433/app", "sqlserver"),
         ("oracle://scott:tiger@db:1521/app", "oracle"),
+        (
+            "jdbc:sqlserver://db:1433;databaseName=app;user=sa;password=FAKEPW1",
+            "jdbc",
+        ),
     ] {
         assert_redacted_error(
             &scan(dir.path(), url),
             &format!("unsupported database URL scheme '{scheme}'"),
-            &["S3cr", "%40", "scott", "tiger", "@db"],
+            &[
+                "S3cr",
+                "%40",
+                "scott",
+                "tiger",
+                "@db",
+                "FAKEPW1",
+                "databaseName",
+            ],
         );
     }
     assert!(!dir.path().join("graph.json").exists());
