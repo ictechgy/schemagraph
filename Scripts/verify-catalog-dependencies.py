@@ -8,6 +8,7 @@ import getpass
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -20,10 +21,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(command: list[str], *, expected: int = 0, label: str) -> subprocess.CompletedProcess[str]:
+def run(command: list[str], *, expected: int = 0, label: str,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     """명령을 실행하되 URL·자격증명을 오류 출력에 포함하지 않는다."""
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        result = subprocess.run(command, capture_output=True, text=True, check=False, env=env)
     except OSError as error:
         raise RuntimeError(f"{label} could not start: {error}") from error
     if result.returncode != expected:
@@ -279,8 +281,20 @@ def free_port() -> int:
     return port
 
 
-def start_postgres(work: Path) -> tuple[subprocess.Popen[str], str] | None:
-    """공식 Homebrew PostgreSQL로 인증 없는 임시 cluster를 시작한다."""
+def private_file(path: Path, text: str) -> Path:
+    """비밀번호를 담는 파일을 처음부터 0600으로 만든다(만든 뒤 chmod하면 잠깐 열린다)."""
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+        stream.write(text)
+    return path
+
+
+def start_postgres(work: Path) -> tuple[subprocess.Popen[str], str, dict[str, str], tempfile.TemporaryDirectory[str]] | None:
+    """공식 Homebrew PostgreSQL로 이 실행만 접속할 수 있는 임시 cluster를 시작한다.
+
+    같은 호스트의 다른 계정이 loopback TCP로 슈퍼유저에 접속하지 못하게 host 인증은 실행마다
+    만든 비밀번호(scram)로만 받는다. 엔진·Go·JDBC는 돌려준 env의 0600 PGPASSFILE에서 비밀번호를
+    읽으므로 URL과 argv에는 비밀번호가 없다. 호출자는 서버를 멈춘 뒤 socket 디렉터리를 정리한다.
+    """
     bindir = Path(os.environ.get("PGBIN", "/opt/homebrew/opt/postgresql@16/bin"))
     initdb = bindir / "initdb"
     pg_ctl = bindir / "pg_ctl"
@@ -289,11 +303,19 @@ def start_postgres(work: Path) -> tuple[subprocess.Popen[str], str] | None:
         print("SKIP PostgreSQL catalog-dependencies: PostgreSQL 16 tools unavailable")
         return None
     data = work / "postgres-data"
-    # PostgreSQL의 Unix socket 경로는 macOS에서 103 bytes 제한이 있어
-    # TemporaryDirectory 전체 경로를 쓰지 않는다. 포트는 매번 임의로 고른다.
-    socket_dir = Path("/tmp")
-    run([str(initdb), "-D", str(data), "-A", "trust", "--no-locale"], label="PostgreSQL initdb")
+    password = secrets.token_hex(16)
+    initial = private_file(work / "initdb-password", password + "\n")
+    run([str(initdb), "-D", str(data), "--auth-local=trust", "--auth-host=scram-sha-256", f"--pwfile={initial}",
+         "--no-locale"], label="PostgreSQL initdb")
     port = free_port()
+    # 셸의 PGPASSWORD는 PGPASSFILE보다 먼저 쓰여 새 비밀번호를 가리므로 뺀다.
+    env = {key: value for key, value in os.environ.items() if key != "PGPASSWORD"}
+    env["PGPASSFILE"] = str(private_file(work / "pgpass", f"*:{port}:*:*:{password}\n"))
+    # PostgreSQL의 Unix socket 경로는 macOS에서 103 bytes 제한이 있어 TemporaryDirectory
+    # 전체 경로 대신 /tmp 아래 짧은 0700 디렉터리를 쓴다(trust라 공용 /tmp에 두지 않는다).
+    # 시작이 실패해도 TemporaryDirectory의 finalizer가 디렉터리를 지운다. 포트는 매번 임의로 고른다.
+    sockets = tempfile.TemporaryDirectory(prefix="sg-pg-", dir="/tmp")
+    socket_dir = Path(sockets.name)
     role = getpass.getuser()
     logfile = work / "postgres.log"
     process = subprocess.Popen(
@@ -312,7 +334,7 @@ def start_postgres(work: Path) -> tuple[subprocess.Popen[str], str] | None:
         )
     url = f"postgres://{role}@127.0.0.1:{port}/postgres"
     run([str(psql), "-h", str(socket_dir), "-p", str(port), "-U", role, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", postgres_fixture_sql()], label="PostgreSQL fixture")
-    return process, url
+    return process, url, env, sockets
 
 
 def postgres_fixture_sql() -> str:
@@ -342,11 +364,15 @@ END $$;
 """
 
 
-def check_postgres(engine: Path, url: str, work: Path, go_probe: Path | None, jdbc_jar: Path | None) -> None:
-    """실제 pg_depend 행이 모든 producer와 engine DependsOn으로 이어지는지 확인한다."""
+def check_postgres(engine: Path, url: str, work: Path, go_probe: Path | None, jdbc_jar: Path | None,
+                   env: dict[str, str]) -> None:
+    """실제 pg_depend 행이 모든 producer와 engine DependsOn으로 이어지는지 확인한다.
+
+    env는 start_postgres가 돌려준 접속 환경(PGPASSFILE)이다.
+    """
     native = work / "postgres-native.json"
     native_graph = work / "postgres-native.graph.json"
-    run([str(engine), "scan", url, "--schema", "app", "--source-id", "app", "--catalog-dependencies", "--emit-document", str(native), "-o", str(native_graph)], label="native PostgreSQL catalog-dependencies")
+    run([str(engine), "scan", url, "--schema", "app", "--source-id", "app", "--catalog-dependencies", "--emit-document", str(native), "-o", str(native_graph)], label="native PostgreSQL catalog-dependencies", env=env)
     native_value = load_json(native)
     native_dependencies = native_value.get("dependencies", [])
     if not native_dependencies:
@@ -397,7 +423,7 @@ def check_postgres(engine: Path, url: str, work: Path, go_probe: Path | None, jd
                     producer_url = f"jdbc:postgresql://{parsed.hostname}:{parsed.port}{parsed.path}{user_query}"
                 args = command + ["--url", producer_url]
                 args += ["--schema", "app", "--source-id", "app", "--catalog-dependencies", "--document-version", str(version), "--format", output_format, "-o", str(document)]
-                run(args, label=f"{producer} PostgreSQL v{version}/{output_format}")
+                run(args, label=f"{producer} PostgreSQL v{version}/{output_format}", env=env)
                 deps = check_document(engine, document, output_format, graph, expected_dependencies=True, label=f"{producer} PostgreSQL v{version}/{output_format}")
                 assert_expected_postgres_dependencies(deps, f"{producer} PostgreSQL v{version}/{output_format}")
                 assert_postgres_aggregates(load_json(graph), f"{producer} PostgreSQL v{version}/{output_format}")
@@ -579,12 +605,13 @@ def main() -> int:
             if not args.skip_postgres:
                 started = start_postgres(work)
                 if started is not None:
-                    process, url = started
+                    process, url, environment, sockets = started
                     try:
-                        check_postgres(engine, url, work, go_probe, jdbc_jar)
+                        check_postgres(engine, url, work, go_probe, jdbc_jar, environment)
                     finally:
                         bindir = Path(os.environ.get("PGBIN", "/opt/homebrew/opt/postgresql@16/bin"))
                         subprocess.run([str(bindir / "pg_ctl"), "-D", str(work / "postgres-data"), "-m", "fast", "stop"], capture_output=True, text=True, check=False)
+                        sockets.cleanup()
             if args.mssql_jdbc:
                 if not args.mssql_user or args.mssql_password is None:
                     raise RuntimeError("MSSQL live verification requires --mssql-user and --mssql-password")

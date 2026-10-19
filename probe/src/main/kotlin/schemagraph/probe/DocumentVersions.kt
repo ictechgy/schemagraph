@@ -1,6 +1,25 @@
 package schemagraph.probe
 
+import com.fasterxml.jackson.core.StreamWriteFeature
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectWriter
 import com.fasterxml.jackson.databind.node.ObjectNode
+import java.io.Writer
+
+/** 대상 writer를 닫지 않는다 — 끝 개행을 이어 써야 하고, 닫기는 writeOutput이 한다(교체할 파일은 force한 뒤). */
+private val documentJsonWriter: ObjectWriter = mapper.writer().without(StreamWriteFeature.AUTO_CLOSE_TARGET)
+
+/**
+ * JSON 문서를 문자열로 만들지 않고 writer에 흘려 쓴다. writeValueAsString으로 전체 문자열을 만들고
+ * "$json\n"으로 한 벌 더 복사하면, 큰 카탈로그에서 문서 크기의 몇 배가 직렬화 단계에 한꺼번에 힙에
+ * 올랐다(Latin-1 밖 글자가 있으면 UTF-16이라 두 배). Writer를 받으면 writeValueAsString과 같은
+ * WriterBasedJsonGenerator를 써서 바이트가 같다 — OutputStream을 주면 UTF8JsonGenerator가 BMP 밖
+ * 글자를 \uXXXX 쌍으로 바꿔 문서가 달라진다. 끝 개행은 이전처럼 '\n' 하나다.
+ */
+internal fun writeDocumentJson(writer: Writer, wire: JsonNode) {
+    documentJsonWriter.writeValue(writer, wire)
+    writer.write("\n")
+}
 
 /** 필드 변경은 전송 경계에서만 처리해 추출기 내부 모델과 v1 호환성을 유지한다. */
 internal fun documentWire(doc: CatalogDocument, version: Int): ObjectNode {

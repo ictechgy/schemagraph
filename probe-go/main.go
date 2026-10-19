@@ -17,11 +17,11 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 
 	_ "github.com/microsoft/go-mssqldb"
@@ -120,6 +120,11 @@ type RoutineDoc struct {
 
 func boolValue(value bool) *bool { return &value }
 
+// oracleNoObjectsLimitation — Oracle 카탈로그가 테이블·뷰를 주지 않았다는 limitation 원문.
+// 권한 공백의 신호라 남길 때는 항상 markIncomplete로 미완전 표시와 함께 남긴다. 수집 전체가
+// 비었을 때(checkOracleObjects)만 쓴다. 스키마 하나가 빈 것은 정상일 수 있다(oracleSchema).
+const oracleNoObjectsLimitation = "카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라"
+
 // Oracle 카탈로그가 노출하는 시스템 스키마 — probe/Extractor.kt의 목록과 동일.
 // PUBLIC은 시노님이 수천 개라 커서를 고갈시킨다 — 항상 억제한다.
 // DVF/DVSYS(Database Vault)는 실검증에서 잡음으로 확인돼 추가됐다.
@@ -134,7 +139,7 @@ var systemSchemas = map[string]bool{
 }
 
 type harvester struct {
-	db                  *sql.DB
+	db                  catalogSession
 	dialect             string
 	schemaFilter        map[string]bool
 	limitations         []string
@@ -173,6 +178,29 @@ func (h *harvester) bestEffortArgs(label, query string, args []any, row func(row
 		h.catalogIncomplete = true
 		h.limitations = append(h.limitations,
 			fmt.Sprintf("%s 원문 미수확(%s) — 간선이 빠질 수 있다", label, oneLine(err.Error())))
+	}
+}
+
+// markIncomplete — 수집 누락 limitation과 미완전 표시를 함께 남긴다. 한쪽만 남으면
+// limitation은 누락을 말하는데 catalog_complete=true인 모순 문서가 되고, review는
+// context만 보고 그 문서를 완전한 스냅샷으로 비교한다.
+func (h *harvester) markIncomplete(limitation string) {
+	h.catalogIncomplete = true
+	h.limitations = append(h.limitations, limitation)
+}
+
+// checkRequestedSchemas — 요청한 스키마가 방언의 스키마 목록에 없으면 미완전으로 신고한다.
+// Kotlin checkRequestedSchemas·엔진 context::annotate와 같은 문구다. 방출한 스키마가 아니라
+// 발견한 목록과 비교해, 존재하지만 비어 있는 스키마는 완전한 수집으로 남긴다.
+func (h *harvester) checkRequestedSchemas(discovered []string) {
+	found := make(map[string]bool, len(discovered))
+	for _, schema := range discovered {
+		found[schema] = true
+	}
+	for schema := range h.schemaFilter {
+		if !found[schema] {
+			h.markIncomplete(fmt.Sprintf("requested schema '%s' was not collected; verify existence and metadata permissions", schema))
+		}
 	}
 }
 
@@ -228,6 +256,13 @@ func main() {
 	if err != nil {
 		fatal("invalid connection settings", err)
 	}
+	// 출력 경로는 연결 전에 정한다. SQLite 원본을 가리키면 DB를 열기 전에 끝낸다.
+	var target outputTarget
+	if *output != "-" {
+		if target, err = prepareFileOutput(spec, *output); err != nil {
+			fatal("invalid output path", err)
+		}
+	}
 	db, err := sql.Open(spec.driver, spec.dsn)
 	if err != nil {
 		fatal("database driver setup failed", err)
@@ -236,7 +271,13 @@ func main() {
 	if err := db.Ping(); err != nil {
 		fatal("database connection failed", err)
 	}
-	h := &harvester{db: db, dialect: spec.dialect, schemaFilter: map[string]bool{}, catalogDependencies: *catalogDependencies, sourceID: *sourceID}
+	session, err := pinSession(db)
+	if err != nil {
+		fatal("database connection failed", err)
+	}
+	// db.Close보다 먼저 돌아 고정 연결을 풀에 돌려준다(defer는 역순이다).
+	defer session.Close()
+	h := &harvester{db: session, dialect: spec.dialect, schemaFilter: map[string]bool{}, catalogDependencies: *catalogDependencies, sourceID: *sourceID}
 	h.configureReadOnly()
 	if *schemaArg == "" && spec.schema != "" {
 		h.schemaFilter[spec.schema] = true
@@ -252,17 +293,16 @@ func main() {
 				fatal("document streaming failed", err)
 			}
 		} else {
-			file, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+			// 트레일러까지 쓴 임시 파일만 교체해, 끊긴 수집이 이전 스냅샷을 자르지 않게 한다.
+			file, err := openOutput(target)
 			if err != nil {
 				fatal("document output failed", err)
 			}
-			err = h.streamNDJSON(file, *wireVersion)
-			closeErr := file.Close()
-			if err != nil {
-				fatal("document streaming failed", err)
+			if err := h.streamNDJSON(file, *wireVersion); err != nil {
+				fatal("document streaming failed", errors.Join(err, file.discard()))
 			}
-			if closeErr != nil {
-				fatal("document output failed", closeErr)
+			if err := file.commit(); err != nil {
+				fatal("document output failed", err)
 			}
 		}
 		return
@@ -277,7 +317,7 @@ func main() {
 		if _, err := os.Stdout.Write(encoded); err != nil {
 			fatal("document output failed", err)
 		}
-	} else if err := os.WriteFile(*output, encoded, 0o644); err != nil {
+	} else if err := writeDocument(target, encoded); err != nil {
 		fatal("document write failed", err)
 	}
 }
@@ -325,63 +365,7 @@ func (h *harvester) extractCatalog() CatalogDocument {
 	if h.dialect == "sqlserver" {
 		return h.extractMSSQL()
 	}
-	objects := h.collectObjects()
-	views := h.collectViews()
-	triggers := h.collectTriggers()
-	routines := h.collectRoutines()
-
-	schemaSet := map[string]bool{}
-	for s := range objects {
-		schemaSet[s] = true
-	}
-	for s := range routines {
-		schemaSet[s] = true
-	}
-	schemas := make([]string, 0, len(schemaSet))
-	for s := range schemaSet {
-		schemas = append(schemas, s)
-	}
-	sort.Strings(schemas)
-
-	doc := CatalogDocument{
-		Version: documentVersion, Dialect: h.dialect, Reader: "probe-go",
-		Schemas: []SchemaDoc{},
-		// 빈 배열이 null로 직렬화되면 Kotlin 측 문서와 모양이 갈린다.
-		Limitations: append([]string{}, h.limitations...),
-	}
-	for _, schema := range schemas {
-		sd := SchemaDoc{Name: schema, Objects: []ObjectDoc{}, Routines: []RoutineDoc{}}
-		for _, obj := range objects[schema] {
-			if b, ok := views[schema+"."+obj.Name]; ok {
-				obj.Body = &b
-			}
-			obj.Triggers = triggers[schema+"."+obj.Name]
-			if obj.Triggers == nil {
-				obj.Triggers = []TriggerDoc{}
-			}
-			sd.Objects = append(sd.Objects, obj)
-		}
-		rts := routines[schema]
-		sort.Slice(rts, func(i, j int) bool {
-			if rts[i].Name != rts[j].Name {
-				return rts[i].Name < rts[j].Name
-			}
-			var a, b string
-			if rts[i].Signature != nil {
-				a = *rts[i].Signature
-			}
-			if rts[j].Signature != nil {
-				b = *rts[j].Signature
-			}
-			return a < b
-		})
-		sd.Routines = rts
-		if sd.Routines == nil {
-			sd.Routines = []RoutineDoc{}
-		}
-		doc.Schemas = append(doc.Schemas, sd)
-	}
-	return doc
+	return h.extractOracle()
 }
 
 // collectObjects — ALL_TABLES/ALL_VIEWS/ALL_MVIEWS/ALL_SYNONYMS에서 객체를
@@ -439,10 +423,6 @@ func (h *harvester) collectObjects() map[string][]ObjectDoc {
 	}
 	for s := range out {
 		sort.Slice(out[s], func(i, j int) bool { return out[s][i].Name < out[s][j].Name })
-	}
-	if len(out) == 0 {
-		h.limitations = append(h.limitations,
-			"카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라")
 	}
 	return out
 }
@@ -752,8 +732,8 @@ func (h *harvester) collectTriggers() map[string][]TriggerDoc {
 
 // collectRoutines — ALL_OBJECTS가 kind를, ALL_SOURCE가 LINE순 몸체를 준다.
 // PACKAGE는 스펙과 BODY를 따로 보관해 멤버 몸체를 멤버 헤더로 나눠 귀속한다 —
-// Kotlin Extractor의 slicePackageBody와 같은 규칙이다(경계를 못 찾은 멤버는
-// body 없이 limitation으로 센다).
+// Kotlin Extractor와 같은 attributePackageMembers 규칙이다(경계를 못 찾거나 짝이
+// 모호한 멤버는 body 없이 limitation으로 센다).
 func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 	type key struct{ schema, name, typ string }
 	bodies := map[key]*strings.Builder{}
@@ -910,32 +890,29 @@ func (h *harvester) collectRoutines() map[string][]RoutineDoc {
 		impl, hasImpl := implBodies[p]
 		var memberDocs []RoutineDoc
 		if hasImpl && len(pkgMembers[p]) > 0 {
-			names := map[string]bool{}
-			for _, m := range pkgMembers[p] {
-				names[m.name] = true
-			}
-			slices := slicePackageBodyLexical(impl, names)
-			seen := map[string]int{}
-			for _, m := range pkgMembers[p] {
-				// 같은 이름의 n번째 오버로드는 본문의 n번째 헤더와 짝짓는다.
-				nth := seen[m.name]
-				seen[m.name]++
-				ov := ""
+			keys := make([]string, len(pkgMembers[p]))
+			catalog := make([]packageMember, len(pkgMembers[p]))
+			for i, m := range pkgMembers[p] {
+				keys[i] = p + "." + m.name
 				if m.overload != "" {
-					ov = "#" + m.overload
+					keys[i] += "#" + m.overload
 				}
-				mk := p + "." + m.name + ov
+				catalog[i] = packageMember{name: m.name, function: memberFunctions[keys[i]], signature: memberParams[keys[i]]}
+			}
+			// 정의 수·오버로드 형이 카탈로그와 맞지 않는 멤버는 추측하지 않고 limitation으로 남긴다.
+			attributed := attributePackageMembers(impl, catalog)
+			for i, m := range pkgMembers[p] {
+				mk := keys[i]
 				kind := "procedure"
 				if memberFunctions[mk] {
 					kind = "function"
 				}
-				slice, ok := slices[m.name+"#"+strconv.Itoa(nth)]
 				var body *string
-				if ok {
+				if attributed[i].found {
+					slice := attributed[i].body
 					body = &slice
 				} else {
-					h.limitations = append(h.limitations,
-						mk+": 패키지 본문에서 멤버 경계를 못 찾음 — 해당 멤버의 몸체 간선 없음")
+					h.limitations = append(h.limitations, mk+": "+attributed[i].reason)
 				}
 				var sig *string
 				if s := memberParams[mk]; s != "" {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"sort"
 	"strings"
 )
 
@@ -186,11 +187,16 @@ func (h *harvester) oracleSchemas() []string {
 		}
 		return nil
 	})
+	h.checkRequestedSchemas(names)
 	return names
 }
 
+// oracleSchema — 소유자 하나를 수확한다. 소유자 목록(oracleSchemas, ALL_OBJECTS)에는 전역 임시
+// 테이블이나 객체 테이블처럼 collectObjects(ALL_TABLES WHERE TEMPORARY = 'N')가 받지 않는
+// 'TABLE'만 가진 소유자도 오른다. 그래서 객체도 routine도 없는 스키마는 권한 공백의 증거가 아니라
+// 존재하지만 빈 스키마다. 다른 방언과 JDBC 프로브처럼 limitation 없이 완전한 수집으로 남기고,
+// 권한 공백 신호는 수집 전체에 테이블·뷰가 없을 때(checkOracleObjects)만 낸다.
 func (h *harvester) oracleSchema(schema string) SchemaDoc {
-	limitationsStart := len(h.limitations)
 	objects := h.collectObjects()[schema]
 	views := h.collectViews()
 	triggers := h.collectTriggers()
@@ -205,33 +211,51 @@ func (h *harvester) oracleSchema(schema string) SchemaDoc {
 		}
 	}
 	routines := h.collectRoutines()[schema]
-	if len(objects) == 0 && len(routines) > 0 {
-		kept := h.limitations[:limitationsStart]
-		for _, limitation := range h.limitations[limitationsStart:] {
-			if limitation != "카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라" {
-				kept = append(kept, limitation)
-			}
-		}
-		h.limitations = kept
-	}
 	sd := SchemaDoc{Name: schema, Objects: objects, Routines: routines}
 	normalizeSchema(&sd)
 	return sd
 }
 
-func (h *harvester) streamOracle(stream *ndjsonStreamWriter) error {
-	schemas := h.oracleSchemas()
-	original := h.schemaFilter
-	originalActive := h.activeSchema
-	defer func() {
-		h.schemaFilter = original
-		h.activeSchema = originalActive
-	}()
+// oracleScopedSchema — 질의의 OWNER를 이 스키마로 바인딩해 수확하고 원래 범위로 되돌린다.
+// JSON과 NDJSON이 이 함수로 수확해 같은 질의와 같은 완전성 규칙을 쓴다.
+func (h *harvester) oracleScopedSchema(schema string) SchemaDoc {
+	original, originalActive := h.schemaFilter, h.activeSchema
+	defer func() { h.schemaFilter, h.activeSchema = original, originalActive }()
+	h.schemaFilter = map[string]bool{schema: true}
+	h.activeSchema = &schema
+	return h.oracleSchema(schema)
+}
+
+// checkOracleObjects — 수집한 스키마 전체에 테이블·뷰가 없으면 권한 공백으로 신고한다.
+func (h *harvester) checkOracleObjects(objects int) {
+	if objects == 0 {
+		h.markIncomplete(oracleNoObjectsLimitation)
+	}
+}
+
+// extractOracle — JSON 모드도 스키마마다 OWNER를 바인딩해 수확한다. 바인딩 없이 ALL_*를
+// 읽으면 --schema와 무관하게 SYS·PUBLIC 사전까지 받아 클라이언트에서 버린다.
+func (h *harvester) extractOracle() CatalogDocument {
+	doc := CatalogDocument{
+		Version: documentVersion, Dialect: h.dialect, Reader: "probe-go",
+		Schemas: []SchemaDoc{}, Limitations: []string{},
+	}
 	objects := 0
-	for _, schema := range schemas {
-		h.schemaFilter = map[string]bool{schema: true}
-		h.activeSchema = &schema
-		document := h.oracleSchema(schema)
+	for _, schema := range h.oracleSchemas() {
+		document := h.oracleScopedSchema(schema)
+		objects += len(document.Objects)
+		doc.Schemas = append(doc.Schemas, document)
+	}
+	h.checkOracleObjects(objects)
+	sort.Slice(doc.Schemas, func(i, j int) bool { return doc.Schemas[i].Name < doc.Schemas[j].Name })
+	doc.Limitations = append(doc.Limitations, h.limitations...)
+	return doc
+}
+
+func (h *harvester) streamOracle(stream *ndjsonStreamWriter) error {
+	objects := 0
+	for _, schema := range h.oracleSchemas() {
+		document := h.oracleScopedSchema(schema)
 		objects += len(document.Objects)
 		if err := stream.schema(document); err != nil {
 			return err
@@ -240,8 +264,6 @@ func (h *harvester) streamOracle(stream *ndjsonStreamWriter) error {
 			return err
 		}
 	}
-	if objects == 0 {
-		h.limitations = append(h.limitations, "카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라")
-	}
+	h.checkOracleObjects(objects)
 	return nil
 }

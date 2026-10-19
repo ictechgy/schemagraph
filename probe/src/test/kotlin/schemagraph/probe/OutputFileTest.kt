@@ -1,0 +1,293 @@
+package schemagraph.probe
+
+import java.io.ByteArrayOutputStream
+import java.io.FileOutputStream
+import java.io.PrintStream
+import java.nio.file.AccessDeniedException
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermissions
+import java.sql.DriverManager
+import java.sql.SQLException
+import kotlin.io.path.listDirectoryEntries
+import kotlin.io.path.name
+import kotlin.io.path.readText
+import kotlin.io.path.writeText
+import kotlin.test.Test
+import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+class OutputFileTest {
+    private fun <T> withTemporaryDirectory(block: (Path) -> T): T {
+        val directory = Files.createTempDirectory("schemagraph-output-")
+        try {
+            return block(directory)
+        } finally {
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    private fun createSqlite(path: Path) {
+        DriverManager.getConnection("jdbc:sqlite:$path").use { connection ->
+            connection.createStatement().use { it.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY)") }
+        }
+    }
+
+    /** sqlite-jdbc가 url로 실제로 연 main DB 파일. */
+    private fun sqliteMainFile(url: String): Path =
+        DriverManager.getConnection(url, connectionProperties("sqlite", null, null)).use { connection ->
+            connection.createStatement().use { statement ->
+                statement.executeQuery("PRAGMA database_list").use { rows ->
+                    assertTrue(rows.next())
+                    Path.of(rows.getString("file"))
+                }
+            }
+        }
+
+    /** main의 파일 출력처럼 연결 전에 출력을 정하고 쓴 뒤 교체한다. */
+    private fun commitOutput(path: Path, contents: String) =
+        writeOutput(prepareOutput(path.toString())) { it.write(contents) }
+
+    private fun entries(directory: Path) = directory.listDirectoryEntries().map { it.name }.sorted()
+
+    // 원본 SQLite를 -o로 주면 JSON은 수집 뒤 DB를 문서로 덮었고, NDJSON은 수집 전에 DB를 비운 뒤 빈
+    // 카탈로그를 냈다. 경로 표기·링크·-wal/-shm 모두 연결 전에 거절해야 한다. SQLite가 실제로 연
+    // 파일과 비교 대상이 같은지도 함께 본다. probe-go TestOutputNamingTheSQLiteSourceIsRejected와 같다.
+    @Test
+    fun outputNamingTheSqliteSourceIsRejected() = withTemporaryDirectory { directory ->
+        val database = directory.resolve("app.db")
+        createSqlite(database)
+        val original = Files.readAllBytes(database)
+        createSqlite(directory.resolve("100%.db"))
+        Files.createSymbolicLink(directory.resolve("link.db"), Path.of("app.db"))
+        Files.createLink(directory.resolve("hard.db"), database)
+        Files.createDirectory(directory.resolve("sub"))
+        // 작업 디렉터리 기준 상대 경로 — JVM은 chdir할 수 없어 실제 경로끼리 relativize한다.
+        val relative = Path.of("").toRealPath().relativize(directory.toRealPath())
+        val cases = mutableListOf(
+            "jdbc:sqlite:$database" to "$database",
+            "jdbc:sqlite:$database" to "$directory/sub/../app.db",
+            "jdbc:sqlite:$relative/app.db" to "$database",
+            "jdbc:sqlite:$database" to "$relative/link.db",
+            "jdbc:sqlite:$directory/link.db?busy_timeout=1000" to "$directory/hard.db",
+            "jdbc:sqlite:file:$database?mode=ro" to "$database",
+            "jdbc:sqlite:file://localhost$database" to "$database",
+            "jdbc:sqlite:file:$directory/%61pp.db" to "$database",
+            "jdbc:sqlite:file:$directory/100%.db" to "$directory/100%.db",
+            "jdbc:sqlite:$directory/link.db" to "$directory/app.db-wal",
+            "jdbc:sqlite:$database" to "$directory/app.db-shm",
+            "jdbc:sqlite:$directory/link.db" to "$directory/link.db-wal",
+            // 원본은 실제 경로, 출력은 상대 경로여도(macOS 임시 디렉터리는 symlink 아래) 없는 -wal을 같은 이름으로 본다.
+            "jdbc:sqlite:${directory.toRealPath()}/app.db" to "$relative/app.db-wal",
+        )
+        if (Files.exists(directory.resolve("APP.DB"))) {
+            // 대소문자를 무시하는 파일 시스템(macOS 기본값)에서는 다른 표기도 같은 파일이다.
+            cases += "jdbc:sqlite:$database" to "$directory/APP.DB"
+        }
+        for ((url, output) in cases) {
+            assertTrue(Files.isSameFile(sqliteMainFile(url), sqliteDatabasePath(url)!!), "SQLite opened another file for $url")
+            assertEquals(SQLITE_SOURCE_ALIAS_ERROR, sqliteOutputAliasError(url, prepareOutput(output)), "--url $url -o $output")
+        }
+        for (output in listOf("$directory/catalog.json", "$directory/app.db.json", "$directory/sub/app.db")) {
+            assertNull(sqliteOutputAliasError("jdbc:sqlite:$database", prepareOutput(output)), output)
+        }
+        assertNull(sqliteDatabasePath("jdbc:sqlite::memory:"))
+        assertNull(sqliteDatabasePath("jdbc:sqlite:file:shared?mode=memory&cache=shared"))
+        assertContentEquals(original, Files.readAllBytes(database))
+    }
+
+    // 대상이 없는 symlink는 제자리 쓰기가 링크를 따라 그 대상 파일을 만든다. 링크 이름만 원본과 비교하면
+    // -wal·-shm을 가리키는 링크가 거절을 지나, 읽는 중인 DB 옆 파일에 문서를 썼다. 사슬·절대 경로·".."를
+    // 거친 링크도 연결 전에 거절하고, 원본과 무관한 대상 없는 링크는 지금처럼 받아야 한다. probe-go
+    // TestDanglingSymlinkToTheSQLiteSidecarsIsRejected와 같은 사례다.
+    @Test
+    fun danglingSymlinkToTheSqliteSidecarsIsRejected() = withTemporaryDirectory { directory ->
+        val database = directory.resolve("app.db")
+        createSqlite(database)
+        Files.createDirectory(directory.resolve("sub"))
+        for ((link, target) in listOf(
+            "wal.json" to "app.db-wal",
+            "shm.json" to "$directory/app.db-shm",
+            "chain.json" to "sub/hop.json",
+            "sub/hop.json" to "../app.db-wal",
+            "dotdot.json" to "sub/../app.db-shm",
+            "other.json" to "created.json",
+        )) Files.createSymbolicLink(directory.resolve(link), Path.of(target))
+        val url = "jdbc:sqlite:$database"
+        // 작업 디렉터리 기준 상대 경로 — JVM은 chdir할 수 없어 실제 경로끼리 relativize한다.
+        val relative = Path.of("").toRealPath().relativize(directory.toRealPath())
+        for (output in listOf("$directory/wal.json", "$directory/shm.json", "$directory/chain.json", "$directory/dotdot.json", "$relative/wal.json")) {
+            assertEquals(SQLITE_SOURCE_ALIAS_ERROR, sqliteOutputAliasError(url, prepareOutput(output)), "-o $output")
+        }
+        assertNull(sqliteOutputAliasError(url, prepareOutput("$directory/other.json")))
+        // CLI 경로에서도 연결 전에 끝나 -shm을 만들지 않는다.
+        val (code, stderr) = probe("--url", url, "--format", "ndjson", "-o", "$directory/shm.json")
+        assertEquals(2, code, stderr)
+        assertTrue(SQLITE_SOURCE_ALIAS_ERROR in stderr, stderr)
+        assertEquals(listOf("app.db", "chain.json", "dotdot.json", "other.json", "shm.json", "sub", "wal.json"), entries(directory))
+    }
+
+    // sqlite-jdbc는 URL 접두를 소문자로 바꿔 비교하므로 jdbc:SQLite:도 같은 파일을 연다. 방언 판정이
+    // 대소문자를 구분하면 원본 -o 거절을 건너뛰어 JSON 문서가 DB를 덮었다. 그래서 실제 CLI 경로
+    // (runProbe)로 종료 코드와 원본 바이트를 본다.
+    @Test
+    fun outputNamingTheSqliteSourceIsRejectedForAnySubprotocolCase() = withTemporaryDirectory { directory ->
+        val database = directory.resolve("app.db")
+        createSqlite(database)
+        val original = Files.readAllBytes(database)
+        for (subprotocol in listOf("SQLite", "SQLITE")) {
+            val stderr = ByteArrayOutputStream()
+            val code = PrintStream(stderr, true, Charsets.UTF_8).use {
+                runProbe(arrayOf("--url", "jdbc:$subprotocol:$database", "-o", "$database"), it)
+            }
+            assertEquals(2, code, "jdbc:$subprotocol: stderr=$stderr")
+            assertTrue(SQLITE_SOURCE_ALIAS_ERROR in stderr.toString(Charsets.UTF_8), "jdbc:$subprotocol: stderr=$stderr")
+            assertContentEquals(original, Files.readAllBytes(database), "jdbc:$subprotocol: the database was rewritten")
+            assertTrue(Files.isSameFile(sqliteMainFile("jdbc:$subprotocol:$database"), sqliteDatabasePath("jdbc:$subprotocol:$database")!!))
+        }
+        assertEquals(listOf("app.db"), entries(directory))
+    }
+
+    // NDJSON은 연결 직후 -o를 잘라 열어, 트레일러 전에 끊긴 수집이 이전 스냅샷을 잃게 했다(writer도
+    // 닫지 않았다). 실패한 쓰기는 이전 파일과 디렉터리(임시 파일 없음)를 그대로 둬야 한다.
+    @Test
+    fun failedWriteKeepsThePreviousFileAndRemovesTheTemporaryFile() = withTemporaryDirectory { directory ->
+        val path = directory.resolve("catalog.ndjson")
+        path.writeText("previous snapshot\n")
+        val failure = assertFailsWith<SQLException> {
+            writeOutput(prepareOutput(path.toString())) { writer ->
+                writer.write("{\"type\":\"document\"}")
+                writer.newLine()
+                throw SQLException("connection reset")
+            }
+        }
+        assertEquals("connection reset", failure.message)
+        assertEquals("previous snapshot\n", path.readText())
+        assertEquals(listOf("catalog.ndjson"), entries(directory))
+    }
+
+    // 교체는 기존 권한을 지키고, 새 파일은 지금의 FileOutputStream처럼 0666&~umask로 만든다(0600
+    // 전환은 계약 결정이라 하지 않는다).
+    @Test
+    fun committedOutputReplacesTheFileAndKeepsPermissions() = withTemporaryDirectory { directory ->
+        val path = directory.resolve("catalog.json")
+        path.writeText("previous\n")
+        Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rw-r-----"))
+        commitOutput(path, "next\n")
+        assertEquals("next\n", path.readText())
+        assertEquals("rw-r-----", PosixFilePermissions.toString(Files.getPosixFilePermissions(path)))
+        val fresh = directory.resolve("fresh.json")
+        commitOutput(fresh, "next\n")
+        val control = directory.resolve("control.json")
+        FileOutputStream(control.toFile()).close()
+        assertEquals(Files.getPosixFilePermissions(control), Files.getPosixFilePermissions(fresh))
+        assertEquals(listOf("catalog.json", "control.json", "fresh.json"), entries(directory))
+    }
+
+    // symlink 출력은 지금처럼 가리키는 파일을 갱신하고 링크는 남긴다. 대상이 없는 링크는 지금처럼
+    // 링크를 따라 대상 파일을 만든다(symlink 거절은 계약 결정이라 하지 않는다).
+    @Test
+    fun symlinkOutputUpdatesTheLinkedFile() = withTemporaryDirectory { directory ->
+        val real = directory.resolve("real.json")
+        real.writeText("previous\n")
+        val link = Files.createSymbolicLink(directory.resolve("link.json"), Path.of("real.json"))
+        commitOutput(link, "next\n")
+        assertTrue(Files.isSymbolicLink(link))
+        assertEquals("next\n", real.readText())
+        val dangling = Files.createSymbolicLink(directory.resolve("dangling.json"), Path.of("created.json"))
+        commitOutput(dangling, "next\n")
+        assertTrue(Files.isSymbolicLink(dangling))
+        assertEquals("next\n", directory.resolve("created.json").readText())
+        assertEquals(listOf("created.json", "dangling.json", "link.json", "real.json"), entries(directory))
+    }
+
+    // 장치·디렉터리는 rename으로 바꿀 대상이 아니다. /dev/null은 지금처럼 제자리에 쓰고, 디렉터리는
+    // 지금처럼 쓰기 오류가 난다.
+    @Test
+    fun nonRegularOutputsAreWrittenInPlace() = withTemporaryDirectory { directory ->
+        val devNull = Path.of("/dev/null")
+        if (Files.exists(devNull, LinkOption.NOFOLLOW_LINKS)) {
+            assertTrue(prepareOutput("/dev/null").inPlace)
+            commitOutput(devNull, "next\n")
+        }
+        val target = prepareOutput(directory.toString())
+        assertTrue(target.inPlace)
+        assertFailsWith<java.io.FileNotFoundException> { writeOutput(target) { it.write("next\n") } }
+        assertEquals(emptyList(), entries(directory))
+    }
+
+    /** runProbe를 exitProcess 없이 돌려 종료 코드와 stderr를 돌려준다. */
+    private fun probe(vararg args: String): Pair<Int?, String> {
+        val buffer = ByteArrayOutputStream()
+        val code = PrintStream(buffer, true, Charsets.UTF_8).use { runProbe(arrayOf(*args), it) }
+        return code to buffer.toString(Charsets.UTF_8)
+    }
+
+    // 임시 파일 이름이 대상 이름을 통째로 담으면, 이름 길이 상한(255바이트) 근처의 -o는 수집을 다 마친
+    // 뒤 임시 파일을 만들지 못했다. JSON은 잡히지 않은 FileSystemException(exit 1), NDJSON은 추출
+    // 실패(exit 2)였다. 제자리에 쓰던 때는 성공하던 출력이다. probe-go
+    // TestOutputNamesNearTheNameLimitAreReplaced와 같은 길이다.
+    @Test
+    fun outputNamesNearTheNameLimitAreWritten() = withTemporaryDirectory { directory ->
+        val database = directory.resolve("app.db")
+        createSqlite(database)
+        for (length in listOf(213, 214, 236, 237, 255)) {
+            for (format in listOf("json", "ndjson")) {
+                val name = "c".repeat(length - ".$format".length) + ".$format"
+                val output = directory.resolve(name)
+                val (code, stderr) = probe("--url", "jdbc:sqlite:$database", "--format", format, "-o", "$output")
+                assertNull(code, "$length-byte $format name: $stderr")
+                assertTrue(output.readText().contains("\"accounts\""), "$length-byte $format name: ${output.readText()}")
+                Files.delete(output)
+                assertEquals(listOf("app.db"), entries(directory))
+            }
+        }
+    }
+
+    // 임시 파일 접두는 대상 이름의 앞 100바이트까지를 UTF-8 글자 경계에서 자른다. 짧은 이름은 그대로 쓴다.
+    @Test
+    fun stagingPrefixKeepsWholeCharactersWithinTheLimit() {
+        val name = "가".repeat(85) // UTF-8 255바이트
+        val kept = stagingPrefix(Path.of("out", name)).removePrefix(".").removeSuffix(".tmp-")
+        assertEquals("가".repeat(33), kept)
+        assertEquals(".catalog.json.tmp-", stagingPrefix(Path.of("out", "catalog.json")))
+    }
+
+    // rename 교체는 디렉터리에 임시 파일을 만들어야 한다. 그럴 수 없으면 수집을 다 마친 뒤가 아니라 연결
+    // 전에 실패해야 한다. 받아 주는 드라이버가 없는 URL을 써서, 연결까지 갔다면 드라이버 오류가 났을
+    // 것임을 이용해 순서를 본다. 기존 파일과 디렉터리는 그대로다.
+    @Test
+    fun unwritableOutputDirectoryIsRejectedBeforeConnecting() = withTemporaryDirectory { directory ->
+        if (System.getProperty("user.name") == "root") return@withTemporaryDirectory
+        val existing = directory.resolve("existing.json")
+        existing.writeText("previous\n")
+        Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("r-xr-xr-x"))
+        try {
+            for (output in listOf(directory.resolve("fresh.json"), existing)) {
+                val (code, stderr) = probe("--url", "jdbc:sgnone:catalog", "-o", "$output")
+                assertEquals(2, code, stderr)
+                assertTrue("invalid output path" in stderr && "must be writable" in stderr, stderr)
+            }
+            assertEquals("previous\n", existing.readText())
+            assertEquals(listOf("existing.json"), entries(directory))
+        } finally {
+            Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("rwx------"))
+        }
+    }
+
+    // 제자리 쓰기는 읽기 전용 파일에서 실패했다. rename은 파일 권한 없이도 바꿀 수 있으므로 같은
+    // 검사를 먼저 해서 보호된 스냅샷을 바꾸지 않는다.
+    @Test
+    fun readOnlyOutputIsNotReplaced() = withTemporaryDirectory { directory ->
+        if (System.getProperty("user.name") == "root") return@withTemporaryDirectory
+        val path = directory.resolve("catalog.json")
+        path.writeText("protected\n")
+        Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("r--r--r--"))
+        assertFailsWith<AccessDeniedException> { prepareOutput(path.toString()) }
+        assertEquals("protected\n", path.readText())
+    }
+}

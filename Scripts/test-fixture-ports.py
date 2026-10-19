@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """실제 fixture 기동 구문을 가짜 Docker로 실행해 포트 추측·재사용을 막는다."""
+import json
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -9,11 +12,33 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = (ROOT / 'Scripts/verify-fixtures.sh').read_text()
 HELPER = ROOT / 'Scripts/docker-fixture-port.sh'
+ACCURACY = ROOT / 'Fixtures/accuracy'
+MYSQL_IMAGES = json.loads((ACCURACY / 'mysql-environments.json').read_text())['engines']
+# verify-sqlserver-oracle-accuracy.py가 정확도 이미지에 강제하는 것과 같은 규칙이다.
+DIGEST_IMAGE = re.compile(r'.+@sha256:[0-9a-f]{64}')
 
 
 def owned_block(start, end):
     """검증 대상 기동 코드를 복제하지 않고 운영 스크립트에서 가져온다."""
     return FIXTURES.split(start, 1)[1].split(end, 1)[0]
+
+
+def docker_runs():
+    """운영 스크립트의 docker run마다 (컨테이너 이름 인자, 이미지) 쌍을 순서대로 돌려준다."""
+    runs = []
+    for command in re.findall(r'^\s*docker run (?:.*\\\n)*.*$', FIXTURES, re.MULTILINE):
+        words = shlex.split(command.replace('\\\n', ' '))[2:]
+        names = []
+        while words[0].startswith('-'):
+            option = words.pop(0)
+            if option in ('--name', '-e', '-p'):
+                value = words.pop(0)
+                names += [value] if option == '--name' else []
+            elif option != '-d':
+                # 값 개수를 모르는 옵션 뒤의 낱말을 이미지로 오인하지 않게 멈춘다.
+                raise AssertionError(f'unknown docker run option {option}; teach docker_runs() its arity')
+        runs.append((names[0], words[0]))
+    return runs
 
 
 class FixturePorts(unittest.TestCase):
@@ -125,7 +150,7 @@ oracle_pass=fixture
         self.assertEqual(result.stdout.splitlines(), ['mysql://root@127.0.0.1:49001/sgfix',
                                                       'mysql://root@127.0.0.1:49002/sgfix'])
         self.assertEqual(calls.count('port fixture 3306/tcp'), 2)
-        self.assertIn('mariadb:11.4 --performance-schema=ON', calls)
+        self.assertIn(MYSQL_IMAGES['mariadb']['image'] + ' --performance-schema=ON', calls)
         self.assertEqual(calls.count('readiness'), 2)
 
     def test_jdbc_startup_uses_each_assigned_port(self):
@@ -140,6 +165,27 @@ oracle_pass=fixture
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, expected)
                 self.assertIn('127.0.0.1:49152', calls)
+
+
+class FixtureImages(unittest.TestCase):
+    """CI가 실행하는 fixture 컨테이너 이미지를 정적으로 검사한다."""
+
+    def test_every_fixture_image_is_pinned_by_digest(self):
+        """업스트림 태그가 옮겨 가거나 교체돼도 검토하지 않은 이미지를 실행하지 않는다."""
+        runs = docker_runs()
+        self.assertEqual([name for name, _ in runs],
+                         ['$my_container', '$maria_container', '$mssql_container', '$oracle_container'])
+        for name, image in runs:
+            with self.subTest(container=name):
+                self.assertTrue(DIGEST_IMAGE.fullmatch(image), image)
+
+    def test_shared_engines_use_the_accuracy_environment_images(self):
+        """정확도 코퍼스와 fixture 패리티가 같은 고정 이미지를 쓴다는 SUPPORT-MATRIX 서술을 지킨다."""
+        oracle = json.loads((ACCURACY / 'sqlserver-oracle-environments.json').read_text())['engines']['oracle']
+        images = dict(docker_runs())
+        self.assertEqual(images['$my_container'], MYSQL_IMAGES['mysql']['image'])
+        self.assertEqual(images['$maria_container'], MYSQL_IMAGES['mariadb']['image'])
+        self.assertEqual(images['$oracle_container'], oracle['image'])
 
 
 if __name__ == '__main__':
