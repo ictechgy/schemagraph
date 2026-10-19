@@ -23,6 +23,7 @@ use sqlparser::dialect::{
 
 mod cache;
 mod constant_sql;
+mod parse_limits;
 pub use cache::{BodyCache, BodyResult, CacheContext};
 mod scope;
 #[cfg(test)]
@@ -33,6 +34,10 @@ mod scope_tests;
 /// 반환값은 (간선을 만든 객체 수, 실패·주의로 limitation에 실을 메시지들).
 /// 호출자가 limitations를 그래프에 싣는다 — 여기서 직접 싣지 않는 이유는
 /// reader가 이미 싣은 한계와 순서를 섞지 않기 위해서다.
+///
+/// 문장마다 연산 사슬 길이에 상한을 두고 넘는 문장은 파싱하지 않지만, 상한 안의
+/// 사슬도 분석 재귀가 release(aarch64) 기준 최대 166MiB 스택을 쓸 수 있다. 신뢰할 수
+/// 없는 SQL을 다루는 호출자는 그만한 스택의 스레드에서 부른다(CLI는 512MiB).
 pub fn enrich_from_document(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<String>) {
     enrich_with_cache(g, doc, None)
 }
@@ -810,7 +815,7 @@ fn parse_trigger_body(
     let inner = extract_trigger_inner(body).unwrap_or(body);
     let locations_trusted =
         std::ptr::eq(inner.as_ptr(), body.as_ptr()) && inner.len() == body.len();
-    let statements = sqlparser::parser::Parser::parse_sql(dialect, inner.trim());
+    let statements = parse_limits::parse_sql(dialect, inner.trim());
     let mut parsed = ParsedTrigger {
         writes: Vec::new(),
         reads: Vec::new(),
@@ -1479,7 +1484,7 @@ fn parse_procedural_body(
         locations_trusted: false,
     };
     for stmt in &stmts {
-        match sqlparser::parser::Parser::parse_sql(dialect, stmt) {
+        match parse_limits::parse_sql(dialect, stmt) {
             Ok(list) => {
                 for s in list {
                     collect_trigger_stmt(s, &mut parsed, false);
@@ -6252,6 +6257,74 @@ mod tests {
         assert_eq!(parsed.dml_statements.len(), 1);
         assert_eq!(parsed.writes, [(None, "orders".to_owned())]);
         assert_eq!(parsed.reads, [(None, "customers".to_owned())]);
+    }
+
+    #[test]
+    fn 집합_연산자가_상한을_넘는_뷰는_파싱하지_않고_센_수를_남긴다() {
+        let terms = parse_limits::MAX_SET_OPERATORS + 2;
+        let doc = doc_with_view(&vec!["SELECT id FROM orders"; terms].join(" UNION ALL "));
+        let (g, notes) = build(&doc);
+        let expected = format!(
+            "statement 1 has {} chained set operators, over the {} analysis limit",
+            terms - 1,
+            parse_limits::MAX_SET_OPERATORS
+        );
+        assert!(
+            notes.iter().any(|note| note.contains(&expected)),
+            "notes: {notes:?}"
+        );
+        let view = VertexId::object("main", "order_totals");
+        assert_eq!(
+            g.analysis()[&view].state,
+            schemagraph_core::AnalysisState::Unsupported
+        );
+    }
+
+    #[test]
+    fn 이항_연산자가_상한을_넘는_routine은_미추출로_센다() {
+        // `id = n OR …` 항마다 연산자가 둘이다 — 50,001항이면 100,001개로 상한을 넘는다.
+        let terms = parse_limits::MAX_INFIX_OPERATORS / 2 + 1;
+        let condition: Vec<String> = (0..terms).map(|term| format!("id = {term}")).collect();
+        let body = format!("SELECT id FROM orders WHERE {}", condition.join(" OR "));
+        let doc = doc_with_routine(vec![routine("wide_filter", Some("sql"), &body)], "");
+        let (_g, notes) = build(&doc);
+        let expected = format!(
+            "statement 1 has {} chained infix operators, over the {} analysis limit",
+            terms * 2 - 1,
+            parse_limits::MAX_INFIX_OPERATORS
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("wide_filter") && note.contains(&expected)),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn 상한_안의_긴_union_뷰는_재귀_없이_출처를_합친다() {
+        // 왼쪽 깊은 집합 연산 사슬을 재귀로 내려가면 기본 테스트 스레드(2MiB)가 넘친다.
+        let terms: Vec<&str> = (0..5_000)
+            .map(|term| {
+                if term % 2 == 0 {
+                    "SELECT id AS a FROM orders"
+                } else {
+                    "SELECT customer_id FROM orders"
+                }
+            })
+            .collect();
+        let mut doc = doc_with_view(&terms.join(" UNION ALL "));
+        doc.schemas[0].objects[2].columns = vec![col("a", 1)];
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        let mut sources: Vec<String> = g
+            .edges()
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::DerivesFrom && e.from.as_str() == "main.order_totals.a")
+            .map(|e| e.to.as_str().to_owned())
+            .collect();
+        sources.sort();
+        assert_eq!(sources, ["main.orders.customer_id", "main.orders.id"]);
     }
 
     #[test]

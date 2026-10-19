@@ -886,7 +886,7 @@ async fn scan(
         inferred,
         cache
             .as_mut()
-            .map(|cache| cache as &mut dyn schemagraph_parser::BodyCache),
+            .map(|cache| cache as &mut (dyn schemagraph_parser::BodyCache + Send)),
     );
     if let Some(cache) = &cache {
         let stats = cache.stats();
@@ -915,7 +915,57 @@ fn analyze_document(doc: &source::CatalogDocument, inferred: bool) -> Graph {
     analyze_document_with_cache(doc, inferred, None)
 }
 
+/// SQL 몸체 분석 스레드의 스택 예약 크기.
+///
+/// sqlparser는 집합·이항 연산 사슬을 반복문으로 왼쪽 깊은 트리로 만들고, 그 트리를
+/// 방문·비교·복제·해제하는 코드는 재귀라 사슬 길이만큼 스택을 쓴다. parser가 문장별
+/// 사슬 연산자 수에 상한을 두므로 상한까지의 입력이 쓰는 스택도 정해진다. release
+/// (aarch64)에서 두 상한을 한 문장의 WINDOW 정의에 채운 입력이 166MiB로 가장 많이
+/// 썼고, 프레임 크기가 다른 대상을 감안해 3배쯤 여유를 둔다. 메인 스레드 스택은
+/// 플랫폼과 ulimit마다 달라 같은 입력이 어디서는 abort가 되므로 크기를 고정한다.
+/// 운영체제는 실제로 닿은 페이지만 메모리로 잡는다.
+const ANALYSIS_STACK_BYTES: usize = 512 * 1024 * 1024;
+
 fn analyze_document_with_cache(
+    doc: &source::CatalogDocument,
+    inferred: bool,
+    cache: Option<&mut (dyn schemagraph_parser::BodyCache + Send)>,
+) -> Graph {
+    let mut work = Some(move || {
+        analyze_on_current_thread(
+            doc,
+            inferred,
+            cache.map(|cache| cache as &mut dyn schemagraph_parser::BodyCache),
+        )
+    });
+    let spawned = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("sql-analysis".into())
+            .stack_size(ANALYSIS_STACK_BYTES)
+            .spawn_scoped(scope, || work.take().map(|analyze| analyze()))
+            .map(|worker| worker.join())
+    });
+    match spawned {
+        // 분석 중 panic은 메인 스레드에서 그대로 다시 일으켜 종료 코드를 바꾸지 않는다.
+        Ok(joined) => joined
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .expect("the analysis worker runs the work it was given exactly once"),
+        Err(error) => {
+            eprintln!(
+                "warning: could not reserve a {} MiB SQL analysis stack ({error}); analyzing on the main thread, so extremely long SQL operator chains may abort",
+                ANALYSIS_STACK_BYTES >> 20
+            );
+            // 스레드를 만들지 못했으면 클로저가 실행되지 않았으므로 아직 남아 있다.
+            let analyze = work
+                .take()
+                .expect("unspawned analysis work is still pending");
+            analyze()
+        }
+    }
+}
+
+/// 문서의 그래프를 만들고 몸체를 파싱해 간선과 한계를 싣는다.
+fn analyze_on_current_thread(
     doc: &source::CatalogDocument,
     inferred: bool,
     cache: Option<&mut dyn schemagraph_parser::BodyCache>,

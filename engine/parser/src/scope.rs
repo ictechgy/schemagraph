@@ -371,8 +371,7 @@ impl<'a> CatalogIndex<'a> {
         }
         let dialect = super::dialect_for(self.dialect);
         let default = GenericDialect {};
-        let parsed =
-            sqlparser::parser::Parser::parse_sql(dialect.as_deref().unwrap_or(&default), body);
+        let parsed = super::parse_limits::parse_sql(dialect.as_deref().unwrap_or(&default), body);
         let Ok(statements) = parsed else {
             return self.conservative_context(graph, owner);
         };
@@ -667,7 +666,7 @@ fn object_shape(object: &ObjectDoc) -> String {
 /// 목적지가 없는 단일 SELECT만 읽기 해석기로 보내고 SELECT INTO는 DML로 남긴다.
 pub(crate) fn is_select(dialect: Option<&dyn Dialect>, body: &str) -> bool {
     let default = GenericDialect {};
-    sqlparser::parser::Parser::parse_sql(dialect.unwrap_or(&default), body).is_ok_and(|s| {
+    super::parse_limits::parse_sql(dialect.unwrap_or(&default), body).is_ok_and(|s| {
         s.len() == 1
             && matches!(s[0], Statement::Query(_))
             && !super::is_column_dml_statement(&s[0])
@@ -916,38 +915,7 @@ impl Binder<'_, '_> {
                 });
                 (result, scope)
             }
-            SetExpr::SetOperation {
-                op, left, right, ..
-            } => {
-                let (mut left, _) = self.set(left, ctes, outer.clone());
-                let (right, _) = self.set(right, ctes, outer.clone());
-                if left.columns.len() != right.columns.len() {
-                    self.note(
-                        "SG_SET_WIDTH",
-                        "set-operation column counts differ; output lineage is partial".into(),
-                        None,
-                    );
-                    left.unknown = true;
-                }
-                for (l, r) in left.columns.iter_mut().zip(right.columns) {
-                    // INTERSECT는 양쪽에 공통인 값을 반환하므로 양쪽 출처를
-                    // 보존한다. EXCEPT의 오른쪽은 행을 제외하는 읽기 조건이다.
-                    if matches!(
-                        op,
-                        sqlparser::ast::SetOperator::Union | sqlparser::ast::SetOperator::Intersect
-                    ) {
-                        l.sources.extend(r.sources);
-                    }
-                    l.unknown |= r.unknown;
-                }
-                left.unknown |= right.unknown;
-                let scope = Rc::new(Scope {
-                    columns: left.columns.clone(),
-                    outer,
-                    ..Scope::default()
-                });
-                (left, scope)
-            }
+            SetExpr::SetOperation { .. } => self.set_operation_chain(set, ctes, outer),
             SetExpr::Values(values) => {
                 let scope = Rc::new(Scope {
                     outer,
@@ -998,6 +966,68 @@ impl Binder<'_, '_> {
                 )
             }
         }
+    }
+
+    /// 왼쪽으로 깊어지는 집합 연산 사슬을 반복문으로 결합한다.
+    ///
+    /// sqlparser는 `a UNION b UNION c`를 왼쪽 깊은 트리로 만든다. 왼쪽을 재귀로 내려가면
+    /// 사슬 길이만큼 스택을 쓰므로, 왼쪽 등뼈를 모은 뒤 가장 안쪽 연산부터 재귀 때와
+    /// 같은 순서(왼쪽 결과 → 오른쪽 결과 → 결합)로 처리한다.
+    fn set_operation_chain(
+        &mut self,
+        set: &SetExpr,
+        ctes: &Ctes,
+        outer: Option<Rc<Scope>>,
+    ) -> (Relation, Rc<Scope>) {
+        let mut spine = Vec::new();
+        let mut leftmost = set;
+        while let SetExpr::SetOperation {
+            op, left, right, ..
+        } = leftmost
+        {
+            spine.push((op, right.as_ref()));
+            leftmost = left.as_ref();
+        }
+        let (mut result, _) = self.set(leftmost, ctes, outer.clone());
+        for (op, right) in spine.into_iter().rev() {
+            let (right, _) = self.set(right, ctes, outer.clone());
+            self.combine_set_operation(&mut result, right, op);
+        }
+        let scope = Rc::new(Scope {
+            columns: result.columns.clone(),
+            outer,
+            ..Scope::default()
+        });
+        (result, scope)
+    }
+
+    /// 집합 연산 한 단계의 오른쪽 결과를 왼쪽 결과에 합친다.
+    fn combine_set_operation(
+        &mut self,
+        left: &mut Relation,
+        right: Relation,
+        op: &sqlparser::ast::SetOperator,
+    ) {
+        if left.columns.len() != right.columns.len() {
+            self.note(
+                "SG_SET_WIDTH",
+                "set-operation column counts differ; output lineage is partial".into(),
+                None,
+            );
+            left.unknown = true;
+        }
+        for (l, r) in left.columns.iter_mut().zip(right.columns) {
+            // INTERSECT는 양쪽에 공통인 값을 반환하므로 양쪽 출처를
+            // 보존한다. EXCEPT의 오른쪽은 행을 제외하는 읽기 조건이다.
+            if matches!(
+                op,
+                sqlparser::ast::SetOperator::Union | sqlparser::ast::SetOperator::Intersect
+            ) {
+                l.sources.extend(r.sources);
+            }
+            l.unknown |= r.unknown;
+        }
+        left.unknown |= right.unknown;
     }
 
     fn select(
@@ -3101,7 +3131,7 @@ pub(crate) fn enrich_view(
     };
     let hash = body_hash(body);
     let default = GenericDialect {};
-    let parsed = sqlparser::parser::Parser::parse_sql(dialect.unwrap_or(&default), body);
+    let parsed = super::parse_limits::parse_sql(dialect.unwrap_or(&default), body);
     let mut binder = Binder {
         catalog,
         graph,
