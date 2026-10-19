@@ -28,3 +28,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.10.9"
 ctrlc = "3.5.2"
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+# --cache-dir 디렉터리 소유자를 현재 effective uid와 비교한다.
+rustix = { version = "1.1.5", features = ["process"] }

@@ -1199,6 +1199,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "rustix",
  "schemagraph-analysis",
  "schemagraph-core",
  "schemagraph-export",

@@ -220,7 +220,8 @@ these rules does not change an existing strict gate.
 
 ```sh
 schemagraph scan --document catalog.json --sql-dir ./queries --query-schema main \
-  --cache-dir .schemagraph-cache --emit-document with-queries.json -o graph.json
+  --cache-dir "${XDG_CACHE_HOME:-$HOME/.cache}/schemagraph" \
+  --emit-document with-queries.json -o graph.json
 ```
 
 SQL files become `query` vertices named from their relative paths. The collector
@@ -238,10 +239,26 @@ dependencies invalidate them. Executable, dialect, and collection context are
 also part of compatibility. Bodies without a trustworthy resolution footprint
 use a conservative whole-catalog namespace. Corrupt or oversized
 entries are reported on stderr and reparsed. Cache counts also go to stderr so
-graph JSON stays machine-readable. Cache files are disposable build artifacts.
+graph JSON stays machine-readable. Cache files can be deleted at any time; the
+next scan recomputes them.
 The full catalog and graph are still rebuilt and held in memory. This caches
 SQL analysis; it is not a persistent incremental graph engine. Version
 v0.4.3 uses whole-catalog structural invalidation for all entries.
+
+The cache directory is a trusted input: a hit restores the stored analysis
+without parsing the SQL again. Point `--cache-dir` at a private directory that
+only the current user can write and that is outside any checked-out code. Never
+use a path inside a pull-request checkout; in CI, use
+`--cache-dir "$RUNNER_TEMP/schemagraph-cache"`. A missing directory is created
+with mode `0700`. If the directory is a symbolic link, is owned by another user,
+or is writable by group or other users, the scan prints a warning, disables the
+cache, and analyzes every body as if no cache had been given; graph output and
+the exit code do not change. Run `chmod go-w` on a directory that was created
+group-writable. Only the last path component is checked, so a parent such as
+macOS `/tmp` may be a symbolic link. Entries are opened without following
+symbolic links and must be regular files of at most 16 MiB; a symlinked or
+special entry is also reported on stderr, reparsed, and replaced. The cache
+needs Unix ownership checks; on other platforms it is disabled with a warning.
 
 Version 0.5.0 DML analysis records destination-column `writes`, source and
 predicate `reads`, and value-only `derives-from` edges for the supported static

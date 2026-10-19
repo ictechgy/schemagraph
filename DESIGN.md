@@ -305,7 +305,11 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
   namespace로 폴백한다. 같은 owner의 Writes로 뒷받침되는 DML DerivesFrom만
   외부 컬럼 효과로 복원하며, 원문·현재 usage는 cache하지 않는다.
   cache 오류는 분석 실패가 아니라 stderr 경고와 miss다. 전체 catalog/graph의
-  구성·메모리 보유는 매번 수행한다.
+  구성·메모리 보유는 매번 수행한다. cache 디렉터리는 신뢰 입력이다(hit는 몸체를
+  다시 해석하지 않는다). 링크이거나 다른 사용자 소유이거나 group/other가 쓸 수
+  있으면 경고하고 cache를 끈다(마지막 경로 성분만 본다). 없으면 0700으로 만든다.
+  항목은 링크를 따르지 않고(O_NOFOLLOW·O_NONBLOCK) 같은 fd의 fstat으로 정규
+  파일·16MiB 상한을 확인해 읽는다. 링크·FIFO 항목은 경고와 miss다.
   `merge`는 각 document의 명시적 `context.source_id`를 `source::id` namespace로
   보존하고, 외부 dependency 대상이 하나로 결정될 때만 `depends-on`을 만든다.
   여러 후보·미수집 대상은 간선을 만들지 않고 limitation으로 남긴다.

@@ -95,7 +95,9 @@ enum Command {
         /// Default schema for application SQL (required when several are collected).
         #[arg(long, requires = "sql_dir")]
         query_schema: Option<String>,
-        /// Reuse SQL body analysis from this local directory (catalog and usage stay fresh).
+        /// Reuse SQL body analysis from this trusted, private directory (catalog and usage
+        /// stay fresh). Keep it outside checked-out code; a symlinked, foreign-owned, or
+        /// group/other-writable directory disables the cache with a warning.
         #[arg(long)]
         cache_dir: Option<PathBuf>,
     },

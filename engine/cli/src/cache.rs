@@ -2,6 +2,9 @@
 //!
 //! 캐시는 parser 효과만 저장한다. 카탈로그·usage는 매 실행마다 새로 만들고,
 //! SQL 원문은 namespace 계산과 entry 저장 어디에도 복사하지 않는다.
+//! 캐시 디렉터리는 신뢰 입력이다. 신뢰를 세우지 못하면 캐시를 끈다([`trust`]).
+
+mod trust;
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -42,6 +45,8 @@ pub(crate) struct DiskBodyCache {
     directory: PathBuf,
     namespace: String,
     scoped_namespace: String,
+    /// false면 신뢰 경계를 세우지 못해 꺼진 캐시다. load는 항상 miss, store는 쓰지 않는다.
+    enabled: bool,
     stats: CacheStats,
 }
 
@@ -57,15 +62,20 @@ impl DiskBodyCache {
         document: &CatalogDocument,
         executable_hash: &str,
     ) -> io::Result<Self> {
-        fs::create_dir_all(directory)?;
+        let untrusted = trust::prepare_directory(directory)?;
         let namespace = namespace_hash(document, executable_hash)?;
         let scoped_namespace = scoped_namespace_hash(document, executable_hash)?;
-        Ok(Self {
+        let mut cache = Self {
             directory: directory.to_owned(),
             namespace,
             scoped_namespace,
+            enabled: untrusted.is_none(),
             stats: CacheStats::default(),
-        })
+        };
+        if let Some(reason) = untrusted {
+            cache.warning(format!("SQL analysis cache disabled: {reason}"));
+        }
+        Ok(cache)
     }
 
     pub(crate) fn stats(&self) -> CacheStats {
@@ -78,6 +88,10 @@ impl DiskBodyCache {
         body: &str,
         context: Option<&CacheContext>,
     ) -> Option<BodyResult> {
+        if !self.enabled {
+            self.stats.misses += 1;
+            return None;
+        }
         let key = context
             .map(|context| scoped_body_key(&self.scoped_namespace, owner, body, context))
             .unwrap_or_else(|| body_key(&self.namespace, owner, body));
@@ -158,6 +172,9 @@ impl DiskBodyCache {
         result: &BodyResult,
         context: Option<&CacheContext>,
     ) {
+        if !self.enabled {
+            return;
+        }
         let key = context
             .map(|context| scoped_body_key(&self.scoped_namespace, owner, body, context))
             .unwrap_or_else(|| body_key(&self.namespace, owner, body));
@@ -997,28 +1014,15 @@ impl Write for LimitedWriter {
     }
 }
 
+/// 항목을 링크를 따르지 않고(O_NOFOLLOW), FIFO에서 멈추지 않고(O_NONBLOCK), 같은 fd의
+/// fstat으로 정규 파일·크기 상한을 확인해 읽는다. 없는 항목만 조용한 miss(`Ok(None)`)이고
+/// 링크·특수 파일·상한 초과는 오류라 호출자가 경고와 함께 miss로 센다.
 fn read_bounded(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if metadata.len() > MAX_ENTRY_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cache entry exceeds size limit",
-        ));
+    match schemagraph_source::imports::read_bounded_regular_file(path, MAX_ENTRY_BYTES) {
+        Ok((bytes, _)) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-    let file = File::open(path)?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_ENTRY_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_ENTRY_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cache entry exceeds size limit",
-        ));
-    }
-    Ok(Some(bytes))
 }
 
 #[cfg(test)]
