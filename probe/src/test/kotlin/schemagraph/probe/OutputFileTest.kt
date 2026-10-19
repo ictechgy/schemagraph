@@ -100,6 +100,37 @@ class OutputFileTest {
         assertContentEquals(original, Files.readAllBytes(database))
     }
 
+    // 대상이 없는 symlink는 제자리 쓰기가 링크를 따라 그 대상 파일을 만든다. 링크 이름만 원본과 비교하면
+    // -wal·-shm을 가리키는 링크가 거절을 지나, 읽는 중인 DB 옆 파일에 문서를 썼다. 사슬·절대 경로·".."를
+    // 거친 링크도 연결 전에 거절하고, 원본과 무관한 대상 없는 링크는 지금처럼 받아야 한다. probe-go
+    // TestDanglingSymlinkToTheSQLiteSidecarsIsRejected와 같은 사례다.
+    @Test
+    fun danglingSymlinkToTheSqliteSidecarsIsRejected() = withTemporaryDirectory { directory ->
+        val database = directory.resolve("app.db")
+        createSqlite(database)
+        Files.createDirectory(directory.resolve("sub"))
+        for ((link, target) in listOf(
+            "wal.json" to "app.db-wal",
+            "shm.json" to "$directory/app.db-shm",
+            "chain.json" to "sub/hop.json",
+            "sub/hop.json" to "../app.db-wal",
+            "dotdot.json" to "sub/../app.db-shm",
+            "other.json" to "created.json",
+        )) Files.createSymbolicLink(directory.resolve(link), Path.of(target))
+        val url = "jdbc:sqlite:$database"
+        // 작업 디렉터리 기준 상대 경로 — JVM은 chdir할 수 없어 실제 경로끼리 relativize한다.
+        val relative = Path.of("").toRealPath().relativize(directory.toRealPath())
+        for (output in listOf("$directory/wal.json", "$directory/shm.json", "$directory/chain.json", "$directory/dotdot.json", "$relative/wal.json")) {
+            assertEquals(SQLITE_SOURCE_ALIAS_ERROR, sqliteOutputAliasError(url, prepareOutput(output)), "-o $output")
+        }
+        assertNull(sqliteOutputAliasError(url, prepareOutput("$directory/other.json")))
+        // CLI 경로에서도 연결 전에 끝나 -shm을 만들지 않는다.
+        val (code, stderr) = probe("--url", url, "--format", "ndjson", "-o", "$directory/shm.json")
+        assertEquals(2, code, stderr)
+        assertTrue(SQLITE_SOURCE_ALIAS_ERROR in stderr, stderr)
+        assertEquals(listOf("app.db", "chain.json", "dotdot.json", "other.json", "shm.json", "sub", "wal.json"), entries(directory))
+    }
+
     // sqlite-jdbc는 URL 접두를 소문자로 바꿔 비교하므로 jdbc:SQLite:도 같은 파일을 연다. 방언 판정이
     // 대소문자를 구분하면 원본 -o 거절을 건너뛰어 JSON 문서가 DB를 덮었다. 그래서 실제 CLI 경로
     // (runProbe)로 종료 코드와 원본 바이트를 본다.

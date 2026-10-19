@@ -24,6 +24,8 @@ type outputTarget struct {
 	// inPlace면 지금처럼 제자리에 연다. 장치·FIFO·디렉터리·/dev 아래 경로·대상이 없는 symlink는
 	// rename으로 바꿀 대상이 아니다. root가 -o /dev/null을 주면 장치를 일반 파일로 바꾸게 된다.
 	inPlace bool
+	// danglingLink면 path는 대상이 없는 symlink다. 제자리 쓰기는 링크를 따라 그 대상 파일을 만든다.
+	danglingLink bool
 	// existing이면 교체할 기존 파일의 권한 perm을 임시 파일에 옮긴다.
 	existing bool
 	perm     fs.FileMode
@@ -85,7 +87,7 @@ func prepareOutput(path string) (outputTarget, error) {
 	}
 	if _, err := os.Lstat(path); err == nil {
 		// 대상이 없는 symlink다. 지금처럼 링크를 따라 대상 파일을 만든다.
-		return outputTarget{path: path, inPlace: true}, nil
+		return outputTarget{path: path, inPlace: true, danglingLink: true}, nil
 	}
 	named, err := resolvedName(path)
 	return outputTarget{path: named}, err
@@ -142,7 +144,8 @@ func resolvedName(path string) (string, error) {
 }
 
 // checkOutputSource — 출력이 SQLite 원본이나 그 -wal·-shm이면 거절한다. 같은 경로 문자열과
-// 같은 파일(하드 링크, 대소문자를 무시하는 파일 시스템의 다른 표기)을 모두 본다.
+// 같은 파일(하드 링크, 대소문자를 무시하는 파일 시스템의 다른 표기)을 모두 보고, 대상이 없는
+// symlink는 제자리 쓰기가 링크를 따라 만들 파일과도 비교한다.
 func checkOutputSource(spec connectionSpec, target outputTarget) error {
 	if spec.file == "" {
 		return nil
@@ -151,16 +154,66 @@ func checkOutputSource(spec connectionSpec, target outputTarget) error {
 	if err != nil {
 		return fmt.Errorf("cannot resolve the SQLite database path to compare with -o: %w", err)
 	}
-	for _, source := range sources {
-		same, err := sameExistingFile(target.path, source)
+	outputs := []string{target.path}
+	if target.danglingLink {
+		created, err := danglingLinkTarget(target.path)
 		if err != nil {
-			return err
+			return fmt.Errorf("cannot resolve the output symlink to compare with the SQLite database: %w", err)
 		}
-		if same || target.path == source {
-			return sqliteSourceAliasError
+		outputs = append(outputs, created)
+	}
+	for _, output := range outputs {
+		for _, source := range sources {
+			same, err := sameExistingFile(output, source)
+			if err != nil {
+				return err
+			}
+			if same || output == source {
+				return sqliteSourceAliasError
+			}
 		}
 	}
 	return nil
+}
+
+// maxSymlinkHops — danglingLinkTarget가 따라갈 symlink 사슬의 최대 단계 수다. 커널 상한(macOS 32,
+// Linux 40)보다 긴 사슬과 고리는 prepareOutput의 os.Stat이 먼저 오류로 돌려 정상 입력은 닿지 않는다.
+const maxSymlinkHops = 40
+
+// danglingLinkTarget — 대상이 없는 symlink를 사슬 끝까지 따라가 제자리 쓰기(O_CREAT)가 만들 파일의
+// 경로를 돌려준다. 링크 이름만 비교하면 -wal·-shm을 가리키는 링크가 원본 비교를 지나, 읽는 중인
+// DB 옆 파일에 문서를 쓴다(NDJSON은 읽기 연결이 매핑한 -shm을 잘라 프로브가 SIGBUS로 죽었다).
+// 상대 링크는 링크가 있는 디렉터리 기준으로 OS처럼 풀고, 디렉터리만 실제 경로로 바꿔
+// sqliteSourceFiles의 이름과 같은 기준으로 비교한다.
+func danglingLinkTarget(link string) (string, error) {
+	current := link
+	for range maxSymlinkHops {
+		destination, err := os.Readlink(current)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(destination) {
+			// filepath.Join은 ".."를 글자로 지우므로 링크가 있는 디렉터리 뒤에 그대로 잇는다.
+			destination = strings.TrimSuffix(current, filepath.Base(current)) + destination
+		}
+		next, err := resolvedName(destination)
+		if err != nil {
+			return "", err
+		}
+		info, err := os.Lstat(next)
+		if errors.Is(err, fs.ErrNotExist) {
+			return next, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			// 검사 사이에 대상이 생겼다. 쓰기는 그 파일을 열므로 같은 이름으로 비교한다.
+			return next, nil
+		}
+		current = next
+	}
+	return "", fmt.Errorf("too many levels of symbolic links in %s", link)
 }
 
 // sqliteSourceFiles — SQLite가 쓰는 원본 파일들이다. -wal·-shm은 SQLite 버전에 따라 링크 이름

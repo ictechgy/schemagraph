@@ -148,6 +148,44 @@ func TestOutputNamingTheSQLiteSourceIsRejected(t *testing.T) {
 	}
 }
 
+// 대상이 없는 symlink는 제자리 쓰기가 링크를 따라 그 대상 파일을 만든다. 링크 이름만 원본과 비교하면
+// -wal·-shm을 가리키는 링크가 거절을 지나, 읽는 중인 DB 옆 파일에 문서를 썼다(NDJSON은 읽기 연결이
+// 매핑한 -shm을 잘라 프로브가 SIGBUS로 죽었다). 사슬·절대 경로·".."를 거친 링크도 연결 전에 거절하고,
+// 원본과 무관한 대상 없는 링크는 지금처럼 받아야 한다. Kotlin OutputFileTest와 같은 사례다.
+func TestDanglingSymlinkToTheSQLiteSidecarsIsRejected(t *testing.T) {
+	directory := t.TempDir()
+	t.Chdir(directory)
+	createSQLiteFixture(t, filepath.Join(directory, "app.db"))
+	if err := os.Mkdir("sub", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, link := range [][2]string{
+		{"wal.json", "app.db-wal"},
+		{"shm.json", filepath.Join(directory, "app.db-shm")},
+		{"chain.json", "sub/hop.json"},
+		{"sub/hop.json", "../app.db-wal"},
+		{"dotdot.json", "sub/../app.db-shm"},
+		{"other.json", "created.json"},
+	} {
+		if err := os.Symlink(link[1], link[0]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec, err := parseConnection("sqlite:app.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, output := range []string{"wal.json", "shm.json", "chain.json", "dotdot.json", filepath.Join(directory, "wal.json")} {
+		if _, err := prepareFileOutput(spec, output); !errors.Is(err, sqliteSourceAliasError) {
+			t.Errorf("-o %s (a dangling symlink to a SQLite sidecar) was accepted: %v", output, err)
+		}
+	}
+	if _, err := prepareFileOutput(spec, "other.json"); err != nil {
+		t.Errorf("-o other.json (a dangling symlink to an unrelated file) was rejected: %v", err)
+	}
+	assertEntries(t, directory, "app.db", "chain.json", "dotdot.json", "other.json", "shm.json", "sub", "wal.json")
+}
+
 func sameFileForTest(t *testing.T, left, right string) bool {
 	t.Helper()
 	same, err := sameExistingFile(left, right)

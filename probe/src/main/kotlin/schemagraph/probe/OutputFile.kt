@@ -33,11 +33,13 @@ private val DEVICE_DIRECTORY: Path = Path.of("/dev")
  * @property inPlace 지금처럼 제자리에 연다. 장치·FIFO·디렉터리·/dev 아래·대상 없는 symlink는
  *   rename으로 바꿀 대상이 아니다(root가 -o /dev/null을 주면 장치를 일반 파일로 바꾸게 된다).
  * @property permissions 교체할 기존 파일의 POSIX 권한. 새 파일이거나 POSIX가 아니면 null.
+ * @property danglingLink [path]가 대상이 없는 symlink다. 제자리 쓰기는 링크를 따라 그 대상 파일을 만든다.
  */
 internal class OutputTarget(
     val path: Path,
     val inPlace: Boolean,
     val permissions: Set<PosixFilePermission>? = null,
+    val danglingLink: Boolean = false,
 )
 
 /**
@@ -53,7 +55,7 @@ internal fun prepareOutput(output: String): OutputTarget {
     ) return OutputTarget(path, inPlace = true)
     if (Files.exists(path)) return existingOutput(path)
     // 대상이 없는 symlink는 지금처럼 링크를 따라 대상 파일을 만든다.
-    if (Files.isSymbolicLink(path)) return OutputTarget(path, inPlace = true)
+    if (Files.isSymbolicLink(path)) return OutputTarget(path, inPlace = true, danglingLink = true)
     return OutputTarget(resolvedName(path), inPlace = false)
 }
 
@@ -77,12 +79,38 @@ private fun resolvedName(path: Path): Path {
 
 /**
  * 출력이 SQLite 원본이나 그 -wal·-shm이면 사용자에게 보일 오류 문구를, 아니면 null을 돌려준다.
- * 같은 경로와 같은 파일(하드 링크, 대소문자를 무시하는 파일 시스템의 다른 표기)을 모두 본다.
+ * 같은 경로와 같은 파일(하드 링크, 대소문자를 무시하는 파일 시스템의 다른 표기)을 모두 보고, 대상이
+ * 없는 symlink는 제자리 쓰기가 링크를 따라 만들 파일과도 비교한다. 링크를 풀 수 없으면 IOException이다.
  */
 internal fun sqliteOutputAliasError(url: String, target: OutputTarget): String? {
     val database = sqliteDatabasePath(url) ?: return null
-    val aliased = sqliteSourceFiles(database).any { it == target.path || sameExistingFile(it, target.path) }
+    val sources = sqliteSourceFiles(database)
+    val outputs = listOfNotNull(target.path, if (target.danglingLink) danglingLinkTarget(target.path) else null)
+    val aliased = outputs.any { output -> sources.any { it == output || sameExistingFile(it, output) } }
     return if (aliased) SQLITE_SOURCE_ALIAS_ERROR else null
+}
+
+/**
+ * [danglingLinkTarget]가 따라갈 symlink 사슬의 최대 단계 수 — Go maxSymlinkHops와 같다. 커널 상한
+ * (macOS 32, Linux 40)보다 긴 사슬과 고리는 제자리 쓰기도 실패하므로 여기서 오류로 끝낸다.
+ */
+private const val MAX_SYMLINK_HOPS = 40
+
+/**
+ * 대상이 없는 symlink를 사슬 끝까지 따라가 제자리 쓰기(FileOutputStream)가 만들 파일의 경로를 돌려준다.
+ * 링크 이름만 비교하면 -wal·-shm을 가리키는 링크가 원본 비교를 지나, 읽는 중인 DB 옆 파일에 문서를
+ * 쓴다. 상대 링크는 링크가 있는 디렉터리 기준으로 OS처럼 풀고(Path.resolve는 ".."를 지우지 않는다),
+ * 디렉터리만 실제 경로로 바꿔 [sqliteSourceFiles]의 이름과 같은 기준으로 비교한다. Go danglingLinkTarget과 같다.
+ */
+private fun danglingLinkTarget(link: Path): Path {
+    var current = link.toAbsolutePath()
+    repeat(MAX_SYMLINK_HOPS) {
+        val next = resolvedName(current.resolveSibling(Files.readSymbolicLink(current)))
+        // 대상이 없거나 검사 사이에 일반 파일이 생겼으면 쓰기가 열 파일은 그 이름이다.
+        if (!Files.isSymbolicLink(next)) return next
+        current = next
+    }
+    throw IOException("too many levels of symbolic links in $link")
 }
 
 /**
