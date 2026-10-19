@@ -1,13 +1,13 @@
 //! 스코프마다 FROM·CTE·출력 컬럼을 분리해 별칭이 다른 질의로 새지 않게 한다.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::rc::Rc;
 
 use schemagraph_core::{
     AnalysisState, Diagnostic, Edge, EdgeKind, Evidence, EvidenceLayer, Graph, ObjectAnalysis,
-    Origin, SourceLocation, VertexId, VertexKind,
+    Origin, OriginKey, SourceLocation, VertexId, VertexKind,
 };
 use schemagraph_source::document::{CatalogDocument, ObjectDoc, RoutineDoc};
 use sha2::{Digest, Sha256};
@@ -66,8 +66,8 @@ impl Scope {
 
 /// 객체 검색을 몸체마다 전체 카탈로그 순회로 되풀이하지 않는다.
 ///
-/// enrich 한 번이 이 색인 하나를 공유하므로 캐시 키의 문서 단위 값도 여기에
-/// 처음 필요할 때 한 번만 만든다.
+/// enrich 한 번이 이 색인 하나를 공유하므로 캐시 키의 문서 단위 값과 캐시 저장이
+/// 쓰는 몸체별 DML origin 키도 여기에 둔다.
 pub(crate) struct CatalogIndex<'a> {
     tables: BTreeMap<(String, String), Vec<(&'a str, &'a ObjectDoc)>>,
     dialect: &'a str,
@@ -78,6 +78,10 @@ pub(crate) struct CatalogIndex<'a> {
     /// enrich가 다루는 그래프 하나의 이름 해석 색인. 정점 집합이 고정이라
     /// 처음 조회할 때 한 번만 만든다.
     vertices: super::VertexIndex,
+    /// DML 분석이 owner별로 origin을 단 간선 키. 캐시 저장이 owner 밖의 컬럼에서
+    /// 시작하는 값 계보를 그래프의 모든 origin을 훑지 않고 찾게 한다. 몸체를 저장할
+    /// 때 꺼내 비우므로 지금 해석 중인 몸체의 키만 들고 있다.
+    dml_origins: RefCell<BTreeMap<VertexId, BTreeSet<OriginKey>>>,
 }
 
 impl<'a> CatalogIndex<'a> {
@@ -117,12 +121,30 @@ impl<'a> CatalogIndex<'a> {
             doc,
             cache_keys: CacheKeyMemo::default(),
             vertices: super::VertexIndex::default(),
+            dml_origins: RefCell::default(),
         }
     }
 
     /// 이 enrich의 그래프에서 이름을 찾는 방식. ci면 대소문자 무시 단일 후보도 본다.
     pub(crate) fn lookup(&self, ci: bool) -> super::Lookup<'_> {
         self.vertices.lookup(ci)
+    }
+
+    /// owner의 DML 효과에 origin을 단 간선 키를 기록한다.
+    fn record_dml_origin(&self, owner: &VertexId, key: OriginKey) {
+        self.dml_origins
+            .borrow_mut()
+            .entry(owner.clone())
+            .or_default()
+            .insert(key);
+    }
+
+    /// owner 몸체가 기록한 DML origin 키를 꺼내고 비운다. 기록이 없으면 빈 집합이다.
+    pub(crate) fn take_dml_origins(&self, owner: &VertexId) -> BTreeSet<OriginKey> {
+        self.dml_origins
+            .borrow_mut()
+            .remove(owner)
+            .unwrap_or_default()
     }
 
     /// Binder와 캐시 footprint가 같은 규칙으로 관계 키를 만든다.
@@ -1957,8 +1979,10 @@ pub(crate) fn apply_dml_column_effects(
                 detail: effect.detail,
             }],
         });
+        let key = (effect.from, effect.to, effect.kind);
+        catalog.record_dml_origin(owner, key.clone());
         graph.add_origin(
-            (effect.from, effect.to, effect.kind),
+            key,
             Origin {
                 body_hash: options.body_hash.to_owned(),
                 role: effect.role,

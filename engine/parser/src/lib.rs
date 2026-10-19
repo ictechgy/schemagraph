@@ -112,8 +112,11 @@ pub fn enrich_with_cache(
                             &owner,
                             obj.body.as_deref(),
                             context.as_ref(),
-                            &notes[note_start..],
-                            enriched - enriched_start,
+                            cache::BodyOutcome {
+                                notes: &notes[note_start..],
+                                enriched: enriched - enriched_start,
+                                dml_origins: catalog_index.take_dml_origins(&owner),
+                            },
                         );
                     }
                 }
@@ -218,8 +221,11 @@ pub fn enrich_with_cache(
                     &trigger_id,
                     Some(body),
                     context.as_ref(),
-                    &notes[note_start..],
-                    enriched - enriched_start,
+                    cache::BodyOutcome {
+                        notes: &notes[note_start..],
+                        enriched: enriched - enriched_start,
+                        dml_origins: catalog_index.take_dml_origins(&trigger_id),
+                    },
                 );
             }
         }
@@ -319,8 +325,11 @@ pub fn enrich_with_cache(
                     &owner,
                     Some(body),
                     context.as_ref(),
-                    &notes[note_start..],
-                    enriched - enriched_start,
+                    cache::BodyOutcome {
+                        notes: &notes[note_start..],
+                        enriched: enriched - enriched_start,
+                        dml_origins: catalog_index.take_dml_origins(&owner),
+                    },
                 );
                 continue;
             }
@@ -486,8 +495,11 @@ pub fn enrich_with_cache(
                 &owner,
                 Some(body),
                 context.as_ref(),
-                &notes[note_start..],
-                enriched - enriched_start,
+                cache::BodyOutcome {
+                    notes: &notes[note_start..],
+                    enriched: enriched - enriched_start,
+                    dml_origins: catalog_index.take_dml_origins(&owner),
+                },
             );
         }
     }
