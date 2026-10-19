@@ -186,7 +186,9 @@ fn is_secret_option(before_equals: &str) -> bool {
 ///
 /// 따옴표·중괄호로 감싼 값은 형식마다 이스케이프 규칙이 달라(libpq `\'`, ODBC `}}`)
 /// 문자열 끝까지 가린다. 덜 가리는 것보다 더 가리는 편이 안전하기 때문이다. 그 밖의
-/// 값은 `;`·`&`·공백 앞에서 끝난다.
+/// 값은 구분자 뒤에 다음 속성이 오거나 문자열이 끝나는 곳에서 끝난다([`ends_value_at`]).
+/// libpq 값은 `;`·`&`를 담을 수 있고 백슬래시로 공백을 이스케이프하므로, 구분자 하나만으로
+/// 끝을 정하면 값의 뒷부분이 오류 메시지에 남는다. 그런 경계가 없으면 끝까지 가린다.
 fn secret_value_span(after_equals: &str) -> (usize, usize) {
     let start = after_equals.len() - after_equals.trim_start().len();
     let value = &after_equals[start..];
@@ -194,10 +196,31 @@ fn secret_value_span(after_equals: &str) -> (usize, usize) {
         value.len()
     } else {
         value
-            .find(|c: char| matches!(c, ';' | '&') || c.is_whitespace())
-            .unwrap_or(value.len())
+            .char_indices()
+            .find(|&(index, c)| {
+                is_option_separator(c) && ends_value_at(&value[index + c.len_utf8()..])
+            })
+            .map_or(value.len(), |(index, _)| index)
     };
     (start, start + length)
+}
+
+/// 접속 문자열 속성 사이에 오는 구분자(`;`·`&`·공백)인지 본다.
+fn is_option_separator(c: char) -> bool {
+    matches!(c, ';' | '&') || c.is_whitespace()
+}
+
+/// 구분자 뒤의 나머지가 값의 끝을 뜻하는지 본다. 구분자만 남았거나, 다음 속성 이름
+/// (영숫자·`_`·`-`·`.`) 뒤에 `=`가 오면(libpq처럼 `=` 앞 공백 허용) 끝이다.
+fn ends_value_at(rest: &str) -> bool {
+    let rest = rest.trim_start_matches(is_option_separator);
+    if rest.is_empty() {
+        return true;
+    }
+    let name = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .unwrap_or(rest.len());
+    name > 0 && rest[name..].trim_start().starts_with('=')
 }
 
 /// 경로·URL 문자열의 `사용자:비밀번호@` 부분을 `***@`로 가린다.

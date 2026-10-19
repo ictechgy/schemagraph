@@ -123,7 +123,8 @@ fn userinfo_is_redacted_from_path_like_inputs() {
 }
 
 /// 스킴이 없는 접속 문자열(libpq DSN, ODBC·ADO.NET, JDBC식 속성 목록)도 SQLite 경로로
-/// 남는다. 비밀 속성 값은 `;`·`&`·공백 앞까지, 따옴표·중괄호로 감싼 값은 끝까지 가린다.
+/// 남는다. 비밀 속성 값은 구분자(`;`·`&`·공백) 뒤에 다음 속성(`이름=`)이 오거나 문자열이 끝나는
+/// 곳까지, 그런 경계가 없거나 따옴표·중괄호로 감싼 값은 끝까지 가린다.
 #[test]
 fn secret_options_are_redacted_from_connection_strings() {
     for (text, expected) in [
@@ -159,9 +160,27 @@ fn secret_options_are_redacted_from_connection_strings() {
             "postgres:/u:pw@db/app;password=FAKEPW11",
             "postgres:/***@db/app;password=***",
         ),
-        // 형식이 깨져 다음 속성 이름이 앞에서 가린 값 안에 들어가도 그 값을 가린다.
-        ("pwd=x.password =FAKEPW12", "pwd=*** =***"),
+        // 형식이 깨져 다음 속성 이름이 앞에서 가린 값 안에 들어가도 그 값을 가린다. 뒤에 `이름=`
+        // 경계가 없으므로 끝까지 가린다.
+        ("pwd=x.password =FAKEPW12", "pwd=***"),
         ("password=xpwd=FAKEPW13;user=u", "password=***;user=u"),
+        // libpq 값은 `;`·`&`를 담을 수 있고 백슬래시로 공백을 이스케이프한다. 구분자 하나만으로
+        // 끝을 정하면 값의 뒷부분이 드러나므로, 다음 `이름=`이나 문자열 끝이 올 때까지 가린다.
+        ("password=FAKE;PW14", "password=***"),
+        ("password=FAKE\\ PW15", "password=***"),
+        (
+            "host=db password=FAKE;PW16 dbname=app",
+            "host=db password=*** dbname=app",
+        ),
+        (
+            "host=db password=FAKE&PW17 sslmode=require",
+            "host=db password=*** sslmode=require",
+        ),
+        ("Pwd=FAKE PW&18;", "Pwd=***;"),
+        (
+            "Server=db;Pwd=FAKE PW&19;Database=app",
+            "Server=db;Pwd=***;Database=app",
+        ),
     ] {
         assert_eq!(redact_connection_secrets(text), expected, "{text}");
     }
