@@ -33,6 +33,12 @@ pub(crate) const MAX_INFIX_OPERATORS: usize = 100_000;
 
 /// `Parser::parse_sql`과 같은 문장을 돌려주되, 사슬 상한을 넘는 문장이 있으면 트리를
 /// 만들지 않고 실제로 센 수를 담은 오류를 돌려준다.
+///
+/// 상한 검사는 파싱보다 먼저 모든 문장에 걸린다. 그래서 뒤 문장이 상한을 넘으면 앞 문장의
+/// 문법 오류 대신 상한 오류를 알린다(sqlparser만 쓰면 앞 문장의 문법 오류에서 멈춘다).
+/// 어느 쪽이든 몸체는 같은 파싱 실패 경로를 탄다. 앞 문장만 먼저 파싱해 문법 오류를
+/// 고르지 않는 이유는, `;`로 자른 토큰 접두가 sqlparser의 문장 경계와 늘 같지는 않아서다.
+/// 블록 안의 `;`에서 자르면 원문에 없던 문법 오류를 지어낸다.
 pub(crate) fn parse_sql(dialect: &dyn Dialect, sql: &str) -> Result<Vec<Statement>, ParserError> {
     // Parser::parse_sql(try_with_sql)과 같은 토큰화 옵션이다. 토큰을 한 번만 만들어
     // 세기와 파싱에 함께 쓴다.
@@ -813,6 +819,26 @@ mod tests {
         assert_eq!(
             parse_sql(&GenericDialect {}, within).expect("within limits"),
             Parser::parse_sql(&GenericDialect {}, within).expect("sqlparser")
+        );
+    }
+
+    #[test]
+    fn 뒤_문장의_상한_초과는_앞_문장의_문법_오류보다_먼저_알린다() {
+        // sqlparser만 쓰면 앞 문장의 문법 오류에서 멈춘다. 상한은 트리를 만들기 전에 모든
+        // 문장에 걸리므로 같은 몸체에서 상한 오류가 나간다 — 의도한 우선순위다.
+        let chain = vec!["SELECT 1"; MAX_SET_OPERATORS + 2].join(" UNION ALL ");
+        let sql = format!("SELEC 1; {chain}");
+        // sqlparser는 첫 문장에서 멈추므로 긴 사슬의 트리를 만들지 않는다.
+        let syntax = Parser::parse_sql(&GenericDialect {}, &sql).expect_err("syntax error");
+        assert!(syntax.to_string().contains("SELEC"), "{syntax}");
+        let error = parse_sql(&GenericDialect {}, &sql).expect_err("over the set-operator limit");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "sql parser error: statement 2 has {} set operators, over the {} analysis limit; it was not parsed",
+                MAX_SET_OPERATORS + 1,
+                MAX_SET_OPERATORS
+            )
         );
     }
 }
