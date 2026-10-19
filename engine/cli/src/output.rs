@@ -17,8 +17,10 @@ pub(crate) fn validate_paths(inputs: &[&Path], outputs: &[&Path]) -> Result<()> 
         .iter()
         .map(|path| {
             fs::canonicalize(path).with_context(|| {
-                // 슬래시가 빠진 접속 URL 오타도 SQLite 경로로 여기까지 온다 — 비밀번호를 싣지 않는다.
-                let shown = schemagraph_source::redact_url_userinfo(&path.display().to_string());
+                // 스킴 없는 접속 문자열과 슬래시가 빠진 URL 오타도 SQLite 경로로 여기까지 온다
+                // — 비밀번호를 싣지 않는다.
+                let shown =
+                    schemagraph_source::redact_connection_secrets(&path.display().to_string());
                 format!("cannot resolve input {shown}")
             })
         })

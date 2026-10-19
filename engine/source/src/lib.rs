@@ -122,13 +122,90 @@ fn is_scheme_like(text: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
+/// 경로 오류에 싣는 문자열에서 접속 자격 증명 형태를 가린다.
+///
+/// 네이티브 reader가 읽지 않는 입력 중 스킴 검사로 거절되지 않는 것은 SQLite 경로로
+/// 남아 경로 오류에 실린다. 스킴이 없는 접속 문자열(libpq `host=… password=…`,
+/// ODBC·ADO.NET `Server=…;Pwd=…`)과 슬래시가 빠진 URL 오타(`postgres:/u:pw@db`)가
+/// 그렇다. 그래서 경로를 오류 메시지에 넣는 곳이 이 함수를 거친다. 비밀 속성의 값과
+/// URL userinfo를 각각 `***`로 바꾸고, 나머지는 사용자가 무엇을 고칠지 알도록 그대로 둔다.
+pub fn redact_connection_secrets(text: &str) -> String {
+    redact_url_userinfo(&redact_secret_options(text))
+}
+
+/// 이름이 이 접미사로 끝나는 접속 속성은 값이 비밀이다(대소문자 무관). 예를 들어
+/// `password`·`sslpassword`·`trustStorePassword`·ODBC `PWD`·`client_secret`·`accessToken`이다.
+const SECRET_OPTION_SUFFIXES: [&str; 5] = ["password", "passwd", "pwd", "secret", "token"];
+
+/// `이름=값` 접속 속성 중 비밀 속성의 값을 `***`로 가린다.
+///
+/// 구분자 형식(`;`·`&`·공백)을 몰라도 되도록 원문의 `=`마다 바로 앞 속성 이름을 본다.
+/// 이름은 가리기 전 원문에서 본다. 형식이 깨진 입력(`pwd=x.password =y`)에서는 다음
+/// 속성 이름이 앞에서 가린 값 안에 들어가기 때문이다. 값 구간이 겹치면 같은 `***`로
+/// 이어 가린다.
+fn redact_secret_options(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (start, end) in secret_value_ranges(text) {
+        if start > copied {
+            shown.push_str(&text[copied..start]);
+            shown.push_str("***");
+        }
+        copied = copied.max(end);
+    }
+    shown.push_str(&text[copied..]);
+    shown
+}
+
+/// 원문에서 비밀 속성 값의 바이트 구간을 `=` 순서(곧 시작 위치 순서)로 돌려준다.
+fn secret_value_ranges(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    text.match_indices('=')
+        .filter(|(equals, _)| is_secret_option(&text[..*equals]))
+        .map(|(equals, _)| {
+            let value = equals + 1;
+            let (start, end) = secret_value_span(&text[value..]);
+            (value + start, value + end)
+        })
+}
+
+/// `=` 앞 문자열의 마지막 속성 이름(영숫자·`_`·`-`·`.`)이 비밀 속성인지 본다.
+/// libpq·ODBC는 `=` 앞뒤 공백을 허용하므로 이름 뒤 공백은 건너뛴다.
+fn is_secret_option(before_equals: &str) -> bool {
+    let name = before_equals
+        .trim_end()
+        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    SECRET_OPTION_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+/// `=` 뒤에서 비밀 값의 (시작, 끝) 바이트 위치를 찾는다. 앞쪽 공백은 값이 아니다.
+///
+/// 따옴표·중괄호로 감싼 값은 형식마다 이스케이프 규칙이 달라(libpq `\'`, ODBC `}}`)
+/// 문자열 끝까지 가린다. 덜 가리는 것보다 더 가리는 편이 안전하기 때문이다. 그 밖의
+/// 값은 `;`·`&`·공백 앞에서 끝난다.
+fn secret_value_span(after_equals: &str) -> (usize, usize) {
+    let start = after_equals.len() - after_equals.trim_start().len();
+    let value = &after_equals[start..];
+    let length = if value.starts_with(['\'', '"', '{']) {
+        value.len()
+    } else {
+        value
+            .find(|c: char| matches!(c, ';' | '&') || c.is_whitespace())
+            .unwrap_or(value.len())
+    };
+    (start, start + length)
+}
+
 /// 경로·URL 문자열의 `사용자:비밀번호@` 부분을 `***@`로 가린다.
 ///
-/// `postgres:/u:pw@db`처럼 슬래시가 빠진 URL 오타는 SQLite 경로로 남아 경로 오류에
-/// 실리므로, 경로를 오류 메시지에 넣는 곳이 이 함수를 거친다. 디코딩된 비밀번호는
-/// `@`·`/`를 담을 수 있어 마지막 `@`까지, 앞의 스킴·드라이브 접두 다음부터 가린다.
-/// 그 구간에 `:`가 없으면 자격 증명 형태가 아니라 그대로 둔다(`backup@2024.db`).
-pub fn redact_url_userinfo(text: &str) -> String {
+/// 디코딩된 비밀번호는 `@`·`/`를 담을 수 있어 마지막 `@`까지, 앞의 스킴·드라이브
+/// 접두 다음부터 가린다. 그 구간에 `:`가 없으면 자격 증명 형태가 아니라 그대로
+/// 둔다(`backup@2024.db`).
+fn redact_url_userinfo(text: &str) -> String {
     let Some(at) = text.rfind('@') else {
         return text.to_owned();
     };

@@ -43,8 +43,8 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         .connect_with(options)
         .await
         .map_err(|e| {
-            // URL 오타가 경로로 남았을 수 있어 경로의 자격 증명 형태는 가린다.
-            let path = crate::redact_url_userinfo(&path);
+            // 접속 문자열이나 URL 오타가 경로로 남았을 수 있어 경로의 자격 증명 형태는 가린다.
+            let path = crate::redact_connection_secrets(&path);
             SourceError::Connect(format!("sqlite 접속 실패 ({path}): {e}"))
         })?;
 
