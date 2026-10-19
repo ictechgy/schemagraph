@@ -1358,14 +1358,40 @@ fn to_dot(g: &Graph) -> String {
             continue;
         }
         out.push_str(&format!(
-            "    \"{}\" -> \"{}\" [label=\"{}\"];\n",
-            edge.from.as_str(),
-            edge.to.as_str(),
-            export::edge_kind_str(edge.kind),
+            "    {} -> {} [label={}];\n",
+            dot_quoted(edge.from.as_str()),
+            dot_quoted(edge.to.as_str()),
+            dot_quoted(export::edge_kind_str(edge.kind)),
         ));
     }
     out.push_str("}\n");
     out
+}
+
+/// 값을 DOT 따옴표 문자열 하나로 싣는다.
+///
+/// Graphviz 어휘 분석기는 따옴표 문자열 안의 `\"`를 따옴표로, `\\`를 짝으로 읽고
+/// 역슬래시+개행은 줄 이음으로 지운다. 정점 id에는 카탈로그 식별자나 graph.json 원문이
+/// 그대로 오므로 따옴표·역슬래시를 escape하지 않으면 id가 문자열을 닫아 속성이나 가짜
+/// 노드를 주입한다. 줄바꿈은 Graphviz 라벨 escape(`\n`, `\r`)로, 다른 제어 문자는
+/// `\uXXXX` 글자로 바꿔 간선 문장이 한 줄에 머물고 렌더한 SVG에 날 제어 문자가 들어가지
+/// 않게 한다. 다른 글자는 그대로 두므로 escape할 글자가 없는 id의 출력은 전과 같다.
+fn dot_quoted(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' | '\\' => quoted.extend(['\\', character]),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            _ if character.is_control() => {
+                quoted.push_str(&format!("\\u{:04X}", u32::from(character)));
+            }
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn query(
@@ -1942,6 +1968,7 @@ fn write_graph(mut writer: impl Write, graph: &Graph) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, VertexId};
 
     /// 기대값은 Python `datetime.fromtimestamp(s, timezone.utc)`로 독립 계산했다 —
     /// 엔진 출력에서 역산하면 달력 변환 오류가 기대값에 그대로 복사된다.
@@ -1999,6 +2026,162 @@ mod tests {
         );
         assert!(parts[2].starts_with('8'));
         assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'));
+    }
+
+    /// 주어진 간선만 가진 작은 그래프 — DOT 출력 검사에 쓴다.
+    fn dot_graph(edges: &[(VertexId, VertexId, EdgeKind)]) -> Graph {
+        let mut graph = Graph::new();
+        for (from, to, kind) in edges {
+            graph.add_edge(Edge {
+                from: from.clone(),
+                to: to.clone(),
+                kind: *kind,
+                evidence: vec![Evidence {
+                    layer: EvidenceLayer::Catalog,
+                    detail: "fixture".into(),
+                }],
+            });
+        }
+        graph
+    }
+
+    /// Graphviz 어휘 분석기(scan.l)의 따옴표 문자열 규칙대로 한 줄을 토큰으로 나눈다.
+    /// 문자열 안에서 `\"`는 따옴표, `\\`는 짝으로 읽고, 닫는 따옴표가 없으면 오류다.
+    fn dot_tokens(line: &str) -> Result<Vec<String>, String> {
+        let mut tokens = Vec::new();
+        let mut characters = line.chars().peekable();
+        while let Some(character) = characters.next() {
+            match character {
+                ' ' | '\t' => {}
+                '"' => tokens.push(dot_quoted_token(&mut characters)?),
+                '-' if characters.next_if_eq(&'>').is_some() => tokens.push("->".into()),
+                '[' | ']' | '=' | ';' => tokens.push(character.to_string()),
+                _ if character.is_alphanumeric() => {
+                    let mut word = character.to_string();
+                    while let Some(next) = characters.next_if(|next| next.is_alphanumeric()) {
+                        word.push(next);
+                    }
+                    tokens.push(word);
+                }
+                _ => return Err(format!("unexpected {character:?} in {line:?}")),
+            }
+        }
+        Ok(tokens)
+    }
+
+    /// 여는 따옴표 다음부터 닫는 따옴표까지를 원문 그대로(따옴표 포함) 돌려준다.
+    fn dot_quoted_token(
+        characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    ) -> Result<String, String> {
+        let mut token = String::from("\"");
+        loop {
+            match characters.next() {
+                Some('\\') => {
+                    token.push('\\');
+                    token.push(characters.next().ok_or("dangling backslash")?);
+                }
+                Some('"') => {
+                    token.push('"');
+                    return Ok(token);
+                }
+                Some(character) => token.push(character),
+                None => return Err(format!("unterminated quoted string {token:?}")),
+            }
+        }
+    }
+
+    /// 따옴표 토큰을 원래 id로 되돌린다 — escape가 손실 없이 왕복하는지 본다.
+    fn dot_unquote(token: &str) -> String {
+        let inner = &token[1..token.len() - 1];
+        let mut value = String::new();
+        let mut characters = inner.chars();
+        while let Some(character) = characters.next() {
+            if character != '\\' {
+                value.push(character);
+                continue;
+            }
+            match characters.next() {
+                Some('n') => value.push('\n'),
+                Some('r') => value.push('\r'),
+                Some('u') => {
+                    let hex: String = characters.by_ref().take(4).collect();
+                    let code = u32::from_str_radix(&hex, 16).expect("four hex digits");
+                    value.push(char::from_u32(code).expect("escaped scalar value"));
+                }
+                Some(other) => value.push(other),
+                None => panic!("dangling backslash in {token:?}"),
+            }
+        }
+        value
+    }
+
+    /// 따옴표·끝 역슬래시·개행·제어 문자가 든 id도 간선 문장 하나로 읽혀야 한다.
+    /// 그대로 넣으면 식별자가 문자열을 닫고 속성(`[style=invis]`)이나 가짜 노드를 주입한다.
+    #[test]
+    fn dot_hostile_ids_stay_inside_one_edge_statement() {
+        let ids = [
+            VertexId::object("public", "x\" [style=invis] \"y"),
+            VertexId::from_raw("public.trailing\\"),
+            VertexId::from_raw("public.line\nbreak"),
+            VertexId::from_raw("public.carriage\rreturn"),
+            VertexId::from_raw("public.bell\u{7}tab\tdel\u{7f}"),
+            VertexId::from_raw("public.\\\"pre-escaped\\\\"),
+            VertexId::from_raw("public.continued\\\nline"),
+        ];
+        let edges: Vec<_> = (0..ids.len())
+            .map(|index| {
+                let to = ids[(index + 1) % ids.len()].clone();
+                (ids[index].clone(), to, EdgeKind::Reads)
+            })
+            .collect();
+        let graph = dot_graph(&edges);
+        let dot = to_dot(&graph);
+        let lines: Vec<&str> = dot.lines().collect();
+        assert_eq!(lines.len(), edges.len() + 3, "{dot}");
+        assert_eq!(lines[..2], ["digraph schemagraph {", "    rankdir=LR;"]);
+        assert_eq!(lines[lines.len() - 1], "}");
+        let mut decoded = Vec::new();
+        for line in &lines[2..lines.len() - 1] {
+            let tokens = dot_tokens(line).unwrap_or_else(|error| panic!("{error}\n{dot}"));
+            let shape: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            assert!(
+                matches!(shape[..], [_, "->", _, "[", "label", "=", _, "]", ";"]),
+                "{line:?} tokenized as {shape:?}"
+            );
+            assert_eq!(dot_unquote(&tokens[6]), "reads");
+            decoded.push((dot_unquote(&tokens[0]), dot_unquote(&tokens[2])));
+        }
+        let expected: Vec<_> = graph
+            .edges()
+            .iter()
+            .map(|edge| (edge.from.as_str().to_owned(), edge.to.as_str().to_owned()))
+            .collect();
+        assert_eq!(decoded, expected);
+    }
+
+    /// escape할 글자가 없는 id·라벨은 기존 DOT 출력과 바이트가 같아야 한다.
+    #[test]
+    fn dot_plain_ids_keep_their_previous_bytes() {
+        let orders = VertexId::object("public", "orders");
+        let customers = VertexId::object("public", "customers");
+        let total = VertexId::routine("app", None, "order.total", Some("integer"));
+        let korean = VertexId::object("판매", "주문");
+        let public = VertexId::schema("public");
+        let graph = dot_graph(&[
+            (orders.clone(), customers, EdgeKind::References),
+            (total.clone(), orders.clone(), EdgeKind::Reads),
+            (korean.clone(), total, EdgeKind::Calls),
+            (orders.clone(), korean, EdgeKind::DerivesFrom),
+            (public, orders, EdgeKind::Contains),
+        ]);
+        assert_eq!(
+            to_dot(&graph),
+            "digraph schemagraph {\n    rankdir=LR;\n    \
+             \"app.order%2Etotal(integer)\" -> \"public.orders\" [label=\"reads\"];\n    \
+             \"public.orders\" -> \"public.customers\" [label=\"references\"];\n    \
+             \"public.orders\" -> \"판매.주문\" [label=\"derives-from\"];\n    \
+             \"판매.주문\" -> \"app.order%2Etotal(integer)\" [label=\"calls\"];\n}\n"
+        );
     }
 
     /// 이벤트 시각은 RFC 3339 형태만 받는다.
