@@ -59,10 +59,10 @@ def input_file(value, workspace, label):
     return path
 
 
-def execute(command, stdout, stderr, timeout):
+def execute(command, stdout, stderr, timeout, cwd=None):
     """명령은 인자 배열로 실행하고 시간 초과 시 소유한 프로세스만 종료한다."""
     with stdout.open('wb') as out, stderr.open('wb') as err:
-        process = subprocess.Popen(command, stdout=out, stderr=err,
+        process = subprocess.Popen(command, stdout=out, stderr=err, cwd=cwd,
                                    start_new_session=os.name == 'posix')
         try:
             code = process.wait(timeout=timeout)
@@ -88,23 +88,27 @@ def engine_path(workspace, directory):
     cargo = shutil.which('cargo')
     if cargo is None:
         raise ValueError('Install Rust 1.96.0 or provide engine-path')
-    version = subprocess.run([cargo, '--version'], capture_output=True, text=True, timeout=30)
+    # cargo와 rustup은 cwd에서 위로 올라가며 .cargo/config.toml과 rust-toolchain.toml을 찾는다.
+    # step의 cwd인 검토 대상 워크스페이스(output-directory 포함)의 설정이 고정 소스 빌드를 바꾸지
+    # 못하도록 세 명령 모두 action checkout의 engine 디렉터리에서 실행한다.
+    repository = Path(__file__).resolve().parents[1]
+    source = repository/'engine'
+    version = subprocess.run([cargo, '--version'], capture_output=True, text=True, timeout=30, cwd=source)
     prefix = [cargo]
     if version.returncode or not re.match(r'cargo 1\.96\.0\b', version.stdout):
         rustup = shutil.which('rustup')
         if rustup is None:
             raise ValueError('Install Rust 1.96.0 or provide engine-path')
         code = execute([rustup, 'toolchain', 'install', '1.96.0', '--profile', 'minimal'],
-                       directory/'toolchain.log', directory/'toolchain.stderr', 300)
+                       directory/'toolchain.log', directory/'toolchain.stderr', 300, cwd=source)
         if code:
             raise ValueError('Rust toolchain setup failed; see toolchain.stderr')
         prefix += ['+1.96.0']
-    repository = Path(__file__).resolve().parents[1]
     target = directory/'build'
-    code = execute(prefix + ['build', '--manifest-path', str(repository/'engine/Cargo.toml'),
+    code = execute(prefix + ['build', '--manifest-path', str(source/'Cargo.toml'),
                              '--locked', '--release', '-p', 'schemagraph-cli',
                              '--target-dir', str(target)],
-                   directory/'build.log', directory/'build.stderr', 900)
+                   directory/'build.log', directory/'build.stderr', 900, cwd=source)
     if code:
         raise ValueError('Source build failed; provide native build prerequisites or engine-path (see build.stderr)')
     return target/'release'/('schemagraph.exe' if os.name == 'nt' else 'schemagraph')

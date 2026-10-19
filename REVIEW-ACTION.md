@@ -101,7 +101,11 @@ jobs:
             ${{ steps.schema.outputs.sarif }}
 ```
 
-The default builds the pinned action source with Rust 1.96.0. A compatible local
+The default builds the pinned action source with Rust 1.96.0. The build runs from
+the action's own `engine` directory, so `.cargo/config.toml` and
+`rust-toolchain.toml` in the reviewed workspace do not apply; the calling
+workflow's environment and `CARGO_HOME` settings still do. A local `uses: ./`
+action is itself workspace content and has no such boundary. A compatible local
 binary can be supplied using `engine-path`. The runner needs Python 3.9+, Rust,
 and native build prerequisites; the workflow above targets GitHub-hosted Ubuntu.
 Inputs must be files inside the checked-out workspace. Optional `output-directory`
