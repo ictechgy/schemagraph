@@ -123,13 +123,18 @@ fn indexes_by_table(metadata: &SchemaMetadata) -> BTreeMap<&VertexId, Vec<&Index
     by_table
 }
 
-/// PK 컬럼을 테이블별로 묶는다. `parent()`는 호출마다 새 id를 할당하므로 컬럼당 한 번만 부른다.
+/// PK 컬럼을 테이블별로 묶는다. `parent()`는 호출마다 새 id를 할당하므로 PK 컬럼에만
+/// 한 번씩 부른다. PK 여부와 `parent()`를 한 튜플 패턴으로 맞추면 두 값을 먼저 모두
+/// 평가해 PK가 아닌 컬럼까지 할당하므로, PK가 아닌 컬럼은 먼저 건너뛴다.
 fn primary_keys_by_table(metadata: &SchemaMetadata) -> BTreeMap<VertexId, Vec<(u32, &VertexId)>> {
     let mut by_table = BTreeMap::<VertexId, Vec<(u32, &VertexId)>>::new();
     for (id, column) in &metadata.columns {
         #[cfg(test)]
         count_metadata_visits(1);
-        if let (true, Some(table)) = (column.pk_position > 0, id.parent()) {
+        if column.pk_position == 0 {
+            continue;
+        }
+        if let Some(table) = id.parent() {
             by_table
                 .entry(table)
                 .or_default()
