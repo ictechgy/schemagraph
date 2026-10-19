@@ -176,6 +176,14 @@ const HTML_SUFFIX: &str = r##"</script>
   const graph = JSON.parse(document.getElementById("graph-data").textContent);
   for (const key of ["analysis", "origins", "limitations"]) graph[key] ??= [];
   const analysisById = new Map(graph.analysis.map((record) => [record.id, record]));
+  // 카드마다 origins 전체를 거르면 클릭 한 번이 카드 수 × origins 수가 된다.
+  // 로드 때 간선별로 한 번 묶고 카드는 이 색인만 조회한다. 묶음 안 순서는 문서 순서다.
+  const originsByEdge = new Map();
+  for (const origin of graph.origins) {
+    const key = edgeKey(origin);
+    if (!originsByEdge.has(key)) originsByEdge.set(key, []);
+    originsByEdge.get(key).push(origin);
+  }
   const MAX_RESULTS = 30;
   const MAX_NEIGHBORS = 100;
   const vertices = new Map(graph.vertices.map((vertex) => [vertex.id, vertex]));
@@ -353,14 +361,17 @@ const HTML_SUFFIX: &str = r##"</script>
     endpoints.textContent = `${edge.from} → ${edge.to}`;
     card.appendChild(endpoints);
     addEvidence(card, edge.evidence);
-    const origins = graph.origins.filter((origin) =>
-      origin.from === edge.from && origin.to === edge.to && origin.kind === edge.kind
-    );
-    addOrigins(card, origins);
+    addOrigins(card, originsByEdge.get(edgeKey(edge)) ?? []);
     // 표시하는 카드는 모두 문서의 접점 간선에서만 왔는지 바로 확인한다.
     // 브라우저가 관계를 추론해 간선을 만들어서는 안 된다.
     if (edge.from !== selectedId && edge.to !== selectedId) return;
     neighbors.appendChild(card);
+  }
+
+  // from·to·kind를 JSON 배열 문자열로 묶는다. 구분 글자를 끼워 이으면 그 글자가 든 id끼리
+  // 키가 겹칠 수 있지만, JSON 문자열 표기는 서로 다른 값을 서로 다른 키로 만든다.
+  function edgeKey(record) {
+    return JSON.stringify([record.from, record.to, record.kind]);
   }
 
   function addEvidence(parent, evidence) {
@@ -474,5 +485,32 @@ mod tests {
             rendered(&sample_graph_with_evidence_order(false)),
             rendered(&sample_graph_with_evidence_order(true))
         );
+    }
+
+    /// 탐색기 스크립트에서 `function name(`부터 다음 함수 선언 앞까지를 잘라낸다.
+    fn script_function(name: &str) -> &'static str {
+        let start = HTML_SUFFIX
+            .find(&format!("\n  function {name}("))
+            .unwrap_or_else(|| panic!("explorer script defines {name}"));
+        let body = &HTML_SUFFIX[start + 1..];
+        let end = body.find("\n  function ").unwrap_or(body.len());
+        &body[..end]
+    }
+
+    /// 간선 카드마다 origins 배열 전체를 거르면 클릭 한 번이 카드 수 × origins 수에
+    /// 비례해 origins가 많은 그래프에서 화면이 멈춘다. 선택 정점의 이웃과 카드를 그리는
+    /// 함수는 로드 때 한 번 만든 간선별 색인만 조회해야 한다.
+    #[test]
+    fn neighbor_rendering_reads_origins_from_the_load_time_index() {
+        for name in [
+            "selectVertex",
+            "renderNeighbors",
+            "renderEdge",
+            "addOrigins",
+        ] {
+            let function = script_function(name);
+            assert!(!function.contains("graph.origins"), "{function}");
+        }
+        assert!(script_function("renderEdge").contains("originsByEdge.get(edgeKey(edge))"));
     }
 }
