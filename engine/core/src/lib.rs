@@ -456,8 +456,9 @@ impl Graph {
 
     /// 새 간선을 양쪽 인접 리스트 끝에 붙이고 그 위치를 슬롯으로 기록한다.
     fn insert_new_edge(&mut self, key: OriginKey, edge: Edge) {
-        let out_slot = self.outgoing(&edge.from).len();
-        let in_slot = self.incoming(&edge.to).len();
+        // 슬롯은 목록 길이만 보므로, 테스트가 세는 인접 목록 탐색량에 넣지 않는다.
+        let out_slot = self.out_edges.get(&edge.from).map_or(0, Vec::len);
+        let in_slot = self.in_edges.get(&edge.to).map_or(0, Vec::len);
         self.edge_slots.insert(key, (out_slot, in_slot));
         self.in_edges
             .entry(edge.to.clone())
@@ -486,13 +487,25 @@ impl Graph {
     }
 
     /// 정점에서 나가는 간선(from = 의존하는 쪽).
+    ///
+    /// 테스트 빌드는 돌려준 목록 길이를 인접 간선 탐색량으로 센다. 간선 색인 대신 인접
+    /// 목록을 훑는 회귀(origin마다 outgoing 확인 등)가 생기면 이 합이 차수에 비례해 는다.
     pub fn outgoing(&self, id: &VertexId) -> &[Edge] {
-        self.out_edges.get(id).map(Vec::as_slice).unwrap_or(&[])
+        let edges = self.out_edges.get(id).map(Vec::as_slice).unwrap_or(&[]);
+        #[cfg(test)]
+        work::scanned(edges.len());
+        edges
     }
 
     /// 정점으로 들어오는 간선(to = 의존 대상).
+    ///
+    /// 테스트 빌드는 outgoing과 같이 돌려준 목록 길이를 탐색량으로 센다. 조상을 찾을 때마다
+    /// incoming을 다시 거르는 회귀가 생기면 hot 정점의 진입 차수만큼 는다.
     pub fn incoming(&self, id: &VertexId) -> &[Edge] {
-        self.in_edges.get(id).map(Vec::as_slice).unwrap_or(&[])
+        let edges = self.in_edges.get(id).map(Vec::as_slice).unwrap_or(&[]);
+        #[cfg(test)]
+        work::scanned(edges.len());
+        edges
     }
 
     /// 모든 정점을 주어진 레벨의 조상으로 사상한 투영 그래프.
@@ -790,7 +803,10 @@ mod work {
         MERGED.with(|merged| merged.replace(0))
     }
 
-    /// 그래프 내부 질의가 훑은 인접 간선 수를 더한다.
+    /// 그래프 질의가 훑은 인접 간선 수를 더한다.
+    ///
+    /// outgoing·incoming이 돌려준 목록 길이와 투영 조상 색인이 한 바퀴 훑은 간선을 센다.
+    /// 계수를 지금 구현의 경로에만 두면 옛 훑기로 되돌린 회귀가 0을 세어 단언을 통과한다.
     pub(crate) fn scanned(count: usize) {
         SCANNED.with(|scanned| scanned.set(scanned.get() + count));
     }
