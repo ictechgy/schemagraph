@@ -20,7 +20,9 @@ use schemagraph_source::document::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CACHE_FORMAT_VERSION: u32 = 2;
+/// 3: notes를 정렬하지 않고 parser 순서로 저장한다. 정렬된 채 저장된 2의 항목은
+/// namespace가 달라 다시 쓰지 않는다.
+const CACHE_FORMAT_VERSION: u32 = 3;
 const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const CACHE_SUFFIX: &str = ".json";
@@ -403,13 +405,13 @@ impl BodyResultDoc {
                     location_key(right.location.as_ref()),
                 ))
         });
-        let mut notes = result.notes.clone();
-        notes.sort();
+        // notes는 hit 때 그대로 graph.json limitations에 이어 붙는다. 캐시 없는 실행과
+        // 같은 바이트가 되도록 정렬하지 않고 parser가 낸 순서를 저장한다.
         Self {
             edges,
             origins,
             analysis,
-            notes,
+            notes: result.notes.clone(),
             enriched: result.enriched,
         }
     }
@@ -1123,6 +1125,23 @@ mod tests {
         assert_eq!(loaded.analysis, parser_result.analysis);
         assert_eq!(reader.stats().hits, 1);
         assert_eq!(reader.stats().misses, 0);
+    }
+
+    #[test]
+    fn notes_keep_their_parser_order_through_the_disk_cache() {
+        let directory = tempdir().unwrap();
+        let doc = document("postgres", "orders");
+        let owner = VertexId::object("public", "view");
+        let body = "SELECT id FROM orders";
+        let mut parser_result = result(&owner, body, "public.orders");
+        // notes는 graph.json limitations에 이 순서 그대로 실린다. 캐시 없는 실행과
+        // 같은 바이트가 되려면 hit도 생성 순서를 돌려줘야 한다.
+        parser_result.notes = vec!["z: written first".into(), "a: read second".into()];
+        cache(directory.path(), &doc, "exe-a").store(&owner, body, &parser_result);
+        let loaded = cache(directory.path(), &doc, "exe-a")
+            .load(&owner, body)
+            .unwrap();
+        assert_eq!(loaded.notes, parser_result.notes);
     }
 
     #[test]
