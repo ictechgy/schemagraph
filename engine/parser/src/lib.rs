@@ -8,7 +8,7 @@
 //! 추출한다. 값의 계보와 조건절의 읽기 의존성을 구분하고 미해석은 진단한다.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId, VertexKind};
@@ -988,11 +988,12 @@ fn strip_informix_routine_body<'a>(tail: &'a str) -> Option<&'a str> {
 }
 
 fn find_parameter_list_end(text: &str) -> Option<usize> {
+    let quotes = QuoteScanner::new(text);
     let bytes = text.as_bytes();
     let mut open = None;
     let mut scan = 0;
     while scan < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(text, scan) {
+        if let Some(end) = quotes.end(scan) {
             scan = end;
             continue;
         }
@@ -1006,7 +1007,7 @@ fn find_parameter_list_end(text: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut index = open;
     while index < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(text, index) {
+        if let Some(end) = quotes.end(index) {
             index = end;
             continue;
         }
@@ -1026,10 +1027,11 @@ fn find_parameter_list_end(text: &str) -> Option<usize> {
 }
 
 fn find_top_level_semicolon(text: &str) -> Option<usize> {
+    let quotes = QuoteScanner::new(text);
     let bytes = text.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(text, index) {
+        if let Some(end) = quotes.end(index) {
             index = end;
             continue;
         }
@@ -1071,11 +1073,12 @@ fn informix_new_alias(body: &str) -> Option<String> {
 }
 
 fn replace_trigger_alias(body: &str, alias: &str) -> String {
+    let quotes = QuoteScanner::new(body);
     let bytes = body.as_bytes();
     let mut output = String::with_capacity(body.len());
     let mut index = 0;
     while index < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(body, index) {
+        if let Some(end) = quotes.end(index) {
             output.push_str(&body[index..end]);
             index = end;
             continue;
@@ -1148,10 +1151,11 @@ fn strip_outer_parentheses(text: &str) -> Option<&str> {
         return None;
     }
     let bytes = trimmed.as_bytes();
+    let quotes = QuoteScanner::new(trimmed);
     let mut depth = 0usize;
     let mut index = 0;
     while index < end {
-        if let Some(end) = quoted_or_comment_end(trimmed, index) {
+        if let Some(end) = quotes.end(index) {
             index = end;
             continue;
         }
@@ -1289,11 +1293,12 @@ fn extract_trigger_inner(body: &str) -> Option<&str> {
 
 /// 인용·주석 바깥의 키워드만 찾는다 — 문자열에 든 SQL은 실행 문맥에서만 푼다.
 fn find_all_keywords(s: &str, kw: &str) -> Vec<usize> {
+    let quotes = QuoteScanner::new(s);
     let bytes = s.as_bytes();
     let mut found = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(s, i) {
+        if let Some(end) = quotes.end(i) {
             i = end;
             continue;
         }
@@ -1799,13 +1804,14 @@ fn extract_procedural_statements(
 /// `;`로 끝나는 최상위 조각으로 나눈다 — 문자열·식별자 인용·주석·
 /// dollar-quote·Oracle q-quote 안의 `;`는 문장 경계가 아니다.
 fn split_top_level(s: &str) -> Vec<&str> {
+    let quotes = QuoteScanner::new(s);
     let b = s.as_bytes();
     let n = b.len();
     let mut parts = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
     while i < n {
-        if let Some(end) = quoted_or_comment_end(s, i) {
+        if let Some(end) = quotes.end(i) {
             i = end;
             continue;
         }
@@ -1828,12 +1834,13 @@ fn split_top_level(s: &str) -> Vec<&str> {
 /// 인용·주석·괄호 안이 아닌 최상위에서 needle의 첫 위치를 찾는다.
 /// word_boundary가 true면 식별자 문자와 붙은 위치는 건너뛴다.
 fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
+    let quotes = QuoteScanner::new(s);
     let b = s.as_bytes();
     let n = b.len();
     let mut depth = 0i32;
     let mut i = 0usize;
     while i < n {
-        if let Some(end) = quoted_or_comment_end(s, i) {
+        if let Some(end) = quotes.end(i) {
             i = end;
             continue;
         }
@@ -1861,27 +1868,125 @@ fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
     None
 }
 
-/// 같은 인용 규칙을 문장 분할과 키워드 탐색에 적용해 경계 해석이 어긋나지 않게 한다.
-fn quoted_or_comment_end(s: &str, i: usize) -> Option<usize> {
-    let bytes = s.as_bytes();
-    match bytes[i] {
-        b'\'' => Some(skip_string(s, i)),
-        b'"' | b'`' | b'[' => Some(skip_quoted_ident(s, i)),
-        b'-' if bytes.get(i + 1) == Some(&b'-') => Some(skip_line_comment(s, i)),
-        b'/' if bytes.get(i + 1) == Some(&b'*') => Some(skip_block_comment(s, i)),
-        b'$' => dollar_quote_end(s, i),
-        b'e' | b'E'
-            if bytes.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(bytes[i - 1])) =>
-        {
-            Some(skip_escape_string(s, i + 1))
+/// 한 문자열을 훑는 동안 인용·주석 경계를 찾는다.
+///
+/// 문장 분할과 키워드 탐색이 같은 인용 규칙을 써야 경계 해석이 어긋나지 않는다.
+/// 닫히지 않은 `$tag$`·`q'x` 여는 표식은 닫는 표식을 문자열 끝까지 찾고, 없으면
+/// 호출자가 1바이트만 전진한다. 서로 다른 닫히지 않은 표식이 n개면 스캔 한 번이
+/// O(n × 길이)가 되므로, 처음 실패한 검색 뒤에 표식마다 마지막 등장 위치를 한 번 모아
+/// 두고 그 위치가 찾을 범위보다 앞이면 찾지 않는다. 찾는 결과는 그대로다.
+struct QuoteScanner<'a> {
+    text: &'a str,
+    /// 다음 `$`까지의 `$…$` 조각마다 마지막으로 시작한 위치. dollar-quote의 닫는
+    /// 태그는 이 꼴로만 나타난다.
+    dollar_tags: OnceCell<HashMap<&'a str, usize>>,
+    /// 문자마다 `문자'`가 마지막으로 시작한 위치. q-quote의 닫는 표식이 이 꼴이다.
+    q_closers: OnceCell<HashMap<char, usize>>,
+}
+
+impl<'a> QuoteScanner<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            dollar_tags: OnceCell::new(),
+            q_closers: OnceCell::new(),
         }
-        b'q' | b'Q'
-            if bytes.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(bytes[i - 1])) =>
-        {
-            q_quote_end(s, i)
-        }
-        _ => None,
     }
+
+    /// i에서 시작하는 인용·주석의 끝 다음 위치. 인용·주석이 아니면 None이다.
+    fn end(&self, i: usize) -> Option<usize> {
+        let (s, bytes) = (self.text, self.text.as_bytes());
+        match bytes[i] {
+            b'\'' => Some(skip_string(s, i)),
+            b'"' | b'`' | b'[' => Some(skip_quoted_ident(s, i)),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => Some(skip_line_comment(s, i)),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => Some(skip_block_comment(s, i)),
+            b'$' => self.dollar_quote_end(i),
+            b'e' | b'E' if quote_prefix_opens(s, i) => Some(skip_escape_string(s, i + 1)),
+            b'q' | b'Q' if quote_prefix_opens(s, i) => self.q_quote_end(i),
+            _ => None,
+        }
+    }
+
+    /// i의 `$tag$`가 여는 인용이면 닫는 태그 다음 위치. 위치표가 i 뒤에 같은 태그가
+    /// 없다고 하면 찾지 않는다.
+    fn dollar_quote_end(&self, i: usize) -> Option<usize> {
+        let tag = dollar_tag(self.text, i)?;
+        let after = i + tag.len();
+        if known_absent(&self.dollar_tags, &tag, after) {
+            return None;
+        }
+        let end = closing_delimiter_end(self.text, after, tag);
+        if end.is_none() {
+            self.dollar_tags
+                .get_or_init(|| dollar_tag_positions(self.text));
+        }
+        end
+    }
+
+    /// i의 `q'x`가 여는 인용이면 닫는 `x'` 다음 위치. 위치표가 몸체 시작 뒤에 닫는
+    /// 표식이 없다고 하면 찾지 않는다.
+    fn q_quote_end(&self, i: usize) -> Option<usize> {
+        let (close, start) = q_quote_delimiter(self.text, i)?;
+        if known_absent(&self.q_closers, &close, start) {
+            return None;
+        }
+        let end = closing_delimiter_end(self.text, start, &format!("{close}'"));
+        if end.is_none() {
+            self.q_closers.get_or_init(|| q_closer_positions(self.text));
+        }
+        end
+    }
+}
+
+/// 마지막 등장 위치를 모아 뒀고 그 위치가 `from`보다 앞이면(또는 한 번도 없으면)
+/// `from` 뒤에는 그 표식이 없다.
+fn known_absent<K: std::hash::Hash + Eq>(
+    positions: &OnceCell<HashMap<K, usize>>,
+    key: &K,
+    from: usize,
+) -> bool {
+    positions
+        .get()
+        .is_some_and(|positions| positions.get(key).is_none_or(|&last| last < from))
+}
+
+/// `from` 뒤 첫 `delimiter`의 끝 다음 위치.
+fn closing_delimiter_end(s: &str, from: usize, delimiter: &str) -> Option<usize> {
+    let found = s[from..].find(delimiter);
+    #[cfg(test)]
+    work::searched_bytes(found.map_or(s.len() - from, |offset| offset + delimiter.len()));
+    found.map(|offset| from + offset + delimiter.len())
+}
+
+/// 연속한 `$` 두 개 사이 조각(`$…$`)마다 마지막으로 시작한 위치.
+fn dollar_tag_positions(text: &str) -> HashMap<&str, usize> {
+    let dollars: Vec<usize> = text
+        .bytes()
+        .enumerate()
+        .filter_map(|(index, byte)| (byte == b'$').then_some(index))
+        .collect();
+    dollars
+        .windows(2)
+        .map(|pair| (&text[pair[0]..=pair[1]], pair[0]))
+        .collect()
+}
+
+/// 작은따옴표 앞 문자마다 `문자'`가 마지막으로 시작한 위치.
+fn q_closer_positions(text: &str) -> HashMap<char, usize> {
+    text.char_indices()
+        .filter(|&(_, character)| character == '\'')
+        .filter_map(|(quote, _)| {
+            let before = text[..quote].chars().next_back()?;
+            Some((before, quote - before.len_utf8()))
+        })
+        .collect()
+}
+
+/// E-string·q-quote 접두 문자 — 식별자 중간의 `e'`·`q'`는 여는 인용이 아니다.
+fn quote_prefix_opens(s: &str, i: usize) -> bool {
+    let bytes = s.as_bytes();
+    bytes.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(bytes[i - 1]))
 }
 
 /// i의 여는 ' 다음에 오는 닫는 ' 다음 위치 — ''는 이스케이프다.
@@ -1963,6 +2068,12 @@ fn skip_block_comment(s: &str, i: usize) -> usize {
 /// i의 `$`가 `$tag$` 여는 인용이면 닫는 태그 다음 위치 — 태그는 식별자
 /// 규칙이라 `$1` 같은 위치 매개변수와 구분된다(숫자로 시작 못 함).
 fn dollar_quote_end(s: &str, i: usize) -> Option<usize> {
+    let tag = dollar_tag(s, i)?;
+    closing_delimiter_end(s, i + tag.len(), tag)
+}
+
+/// i에서 시작하는 `$tag$` 여는 태그. 태그 안에는 `$`가 없으므로 다음 `$`까지다.
+fn dollar_tag(s: &str, i: usize) -> Option<&str> {
     let b = s.as_bytes();
     let mut j = i + 1;
     if j < b.len() && (b[j].is_ascii_alphabetic() || b[j] == b'_') {
@@ -1970,16 +2081,18 @@ fn dollar_quote_end(s: &str, i: usize) -> Option<usize> {
             j += 1;
         }
     }
-    if j >= b.len() || b[j] != b'$' {
-        return None;
-    }
-    let tag = &s[i..=j];
-    s[j + 1..].find(tag).map(|k| j + 1 + k + tag.len())
+    (j < b.len() && b[j] == b'$').then(|| &s[i..=j])
 }
 
 /// Oracle `q'구분자...구분자'`의 끝 다음 위치 — 괄호 구분자는 대칭,
 /// 나머지는 같은 문자가 닫는다.
 fn q_quote_end(s: &str, i: usize) -> Option<usize> {
+    let (close, start) = q_quote_delimiter(s, i)?;
+    closing_delimiter_end(s, start, &format!("{close}'"))
+}
+
+/// q-quote의 닫는 구분 문자와 몸체 시작 위치.
+fn q_quote_delimiter(s: &str, i: usize) -> Option<(char, usize)> {
     let open = s.get(i + 2..)?.chars().next()?;
     let close = match open {
         '[' => ']',
@@ -1989,11 +2102,7 @@ fn q_quote_end(s: &str, i: usize) -> Option<usize> {
         c if !c.is_whitespace() && c != '\'' => c,
         _ => return None,
     };
-    let start = i + 2 + open.len_utf8();
-    let delimiter = format!("{close}'");
-    s[start..]
-        .find(&delimiter)
-        .map(|offset| start + offset + delimiter.len())
+    Some((close, i + 2 + open.len_utf8()))
 }
 
 /// 공백과 주석(`--…`, `/*…*/`)을 건너뛴다 — 조각 선두·중간의 주석이
@@ -2564,13 +2673,14 @@ fn invalidate_variable_list(list: &str, state: &mut ExtractionState) {
 }
 
 fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let quotes = QuoteScanner::new(s);
     let bytes = s.as_bytes();
     let mut parts = Vec::new();
     let mut start = 0;
     let mut depth = 0i32;
     let mut position = 0;
     while position < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(s, position) {
+        if let Some(end) = quotes.end(position) {
             position = end;
             continue;
         }
@@ -2602,12 +2712,13 @@ fn invalidate_call_arguments(rest: &str, state: &mut ExtractionState) {
 }
 
 fn parenthesized_arguments(rest: &str) -> Option<&str> {
+    let quotes = QuoteScanner::new(rest);
     let bytes = rest.as_bytes();
     let mut position = 0;
     let mut open = None;
     let mut depth = 0i32;
     while position < bytes.len() {
-        if let Some(end) = quoted_or_comment_end(rest, position) {
+        if let Some(end) = quotes.end(position) {
             position = end;
             continue;
         }
@@ -2717,10 +2828,11 @@ fn routine_parameter_symbols(body: &str) -> BTreeSet<String> {
 }
 
 fn declared_at_names(text: &str) -> BTreeSet<String> {
+    let quotes = QuoteScanner::new(text);
     let mut names = BTreeSet::new();
     let mut index = 0usize;
     while index < text.len() {
-        if let Some(end) = quoted_or_comment_end(text, index) {
+        if let Some(end) = quotes.end(index) {
             index = end;
             continue;
         }
@@ -3415,6 +3527,7 @@ mod work {
 
     thread_local! {
         static COMPARED_STATEMENTS: Cell<usize> = const { Cell::new(0) };
+        static SEARCHED_BYTES: Cell<usize> = const { Cell::new(0) };
     }
 
     /// DML 문장 중복 확인에서 문장 전체를 비교한 횟수를 하나 더한다.
@@ -3425,6 +3538,16 @@ mod work {
     /// 현재 테스트 스레드의 문장 비교 횟수를 돌려주고 0으로 되돌린다.
     pub(crate) fn take_compared_statements() -> usize {
         COMPARED_STATEMENTS.with(Cell::take)
+    }
+
+    /// 닫는 인용 표식을 찾으며 훑은 바이트 수를 더한다.
+    pub(crate) fn searched_bytes(bytes: usize) {
+        SEARCHED_BYTES.with(|count| count.set(count.get() + bytes));
+    }
+
+    /// 현재 테스트 스레드에서 닫는 표식을 찾으며 훑은 바이트 수를 돌려주고 0으로 되돌린다.
+    pub(crate) fn take_searched_bytes() -> usize {
+        SEARCHED_BYTES.with(Cell::take)
     }
 }
 
@@ -6500,6 +6623,102 @@ mod tests {
         assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Reads
             && e.from.as_str() == "public.copy_values"
             && e.to.as_str() == "public.customers"));
+    }
+
+    /// 이 수정 전의 한 번씩 찾던 인용 경계 — 스캐너가 결과를 바꾸지 않았는지 대조한다.
+    fn reference_quote_end(s: &str, i: usize) -> Option<usize> {
+        let bytes = s.as_bytes();
+        let prefix = bytes.get(i + 1) == Some(&b'\'') && (i == 0 || !is_ident_char(bytes[i - 1]));
+        match bytes[i] {
+            b'\'' => Some(skip_string(s, i)),
+            b'"' | b'`' | b'[' => Some(skip_quoted_ident(s, i)),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => Some(skip_line_comment(s, i)),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => Some(skip_block_comment(s, i)),
+            b'$' => {
+                let tag = dollar_tag(s, i)?;
+                let after = i + tag.len();
+                s[after..].find(tag).map(|k| after + k + tag.len())
+            }
+            b'e' | b'E' if prefix => Some(skip_escape_string(s, i + 1)),
+            b'q' | b'Q' if prefix => {
+                let (close, start) = q_quote_delimiter(s, i)?;
+                let delimiter = format!("{close}'");
+                s[start..]
+                    .find(&delimiter)
+                    .map(|offset| start + offset + delimiter.len())
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn 인용_경계_스캐너는_한_번씩_찾던_결과와_같다() {
+        let mut texts: Vec<String> = [
+            "SELECT $1, $2 FROM t WHERE a = $$x$$ AND b = $tag$ y $tag$",
+            "SELECT * FROM V$SESSION; UPDATE A$B$C SET x = 1; SELECT A$B$C",
+            "$a$ unclosed $b$ closed $b$ $c$ $a$ tail $",
+            "q'[a]' q'!b!' q'한c한' q'x unclosed q'(d)' Q'{e}' q'<f>' q' space",
+            "e'\\'' E'x' re'y' -- note $a$\n/* $b$ */ 'it''s' \"q\"\"x\" [br]]x] `bt`",
+            "$$ $$$ $a$$a$ $_$ $1$ $a1$x$a1$ q'aq'a'",
+            "SELECT '한글' FROM \"표\" WHERE q'가나다가' = x",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        // 까다로운 문자만 섞은 결정적 의사 난수 문자열도 대조한다.
+        let alphabet: Vec<char> = "$q'aQ_1 \n-*/\"[]e`한".chars().collect();
+        let mut seed = 0x2545_f491_u64;
+        for _ in 0..60 {
+            texts.push(
+                (0..120)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        alphabet[(seed >> 33) as usize % alphabet.len()]
+                    })
+                    .collect(),
+            );
+        }
+        let mut indexed = (0, 0);
+        for text in &texts {
+            let forward = QuoteScanner::new(text);
+            let backward = QuoteScanner::new(text);
+            for i in 0..text.len() {
+                assert_eq!(
+                    forward.end(i),
+                    reference_quote_end(text, i),
+                    "{text:?} at {i}"
+                );
+            }
+            for i in (0..text.len()).rev() {
+                assert_eq!(
+                    backward.end(i),
+                    reference_quote_end(text, i),
+                    "{text:?} at {i}"
+                );
+            }
+            indexed.0 += usize::from(forward.dollar_tags.get().is_some());
+            indexed.1 += usize::from(forward.q_closers.get().is_some());
+        }
+        // 실패한 검색 뒤 위치 색인을 쓰는 경로를 dollar·q-quote 모두 지났는지 센다.
+        assert!(indexed.0 > 10 && indexed.1 > 10, "{indexed:?}");
+    }
+
+    #[test]
+    fn 닫히지_않은_인용_표식이_많아도_스캔마다_끝까지_한_번만_찾는다() {
+        let tags: Vec<String> = (0..2_000).map(|tag| format!("$t{tag}$")).collect();
+        let dollar = format!("SELECT 1 FROM orders; {}", tags.join(" "));
+        let quotes = format!("SELECT 1 FROM orders; {}", vec!["q'a"; 2_000].join(" "));
+        for body in [&dollar, &quotes] {
+            work::take_searched_bytes();
+            assert_eq!(find_all_keywords(body, "SELECT"), [0]);
+            assert_eq!(split_top_level(body).len(), 2);
+            let searched = work::take_searched_bytes();
+            // 스캔 두 번이 각각 처음 실패한 검색에서만 끝까지 훑는다.
+            assert!(
+                searched <= 2 * body.len(),
+                "searched {searched} bytes of {}",
+                body.len()
+            );
+        }
     }
 
     #[test]
