@@ -19,8 +19,20 @@ pub mod sqlite;
 
 pub use document::CatalogDocument;
 
+/// 네이티브 reader와 SQLite 경로 해석이 직접 다루는 URL 스킴. reader 분기와 같이
+/// 대소문자를 구분한다. `mysqlx`는 전용 미지원 안내가 있어 여기서 거절하지 않는다.
+const NATIVE_URL_SCHEMES: [&str; 6] = [
+    "sqlite",
+    "file",
+    "postgres",
+    "postgresql",
+    "mysql",
+    "mysqlx",
+];
+
 /// 출력 파일 보호가 접속 URL을 임의로 재해석하지 않도록 로컬 DB 경로를 제공한다.
 pub fn local_database_path(url: &str) -> Result<Option<std::path::PathBuf>, SourceError> {
+    reject_foreign_scheme(url)?;
     if ["postgres://", "postgresql://", "mysql://", "mysqlx://"]
         .iter()
         .any(|scheme| url.starts_with(scheme))
@@ -34,6 +46,7 @@ pub fn local_database_path(url: &str) -> Result<Option<std::path::PathBuf>, Sour
 /// URL 스킴으로 네이티브 reader를 고른다. 지원 안 하는 스킴은 명확한 오류 —
 /// 조용히 다른 reader로 돌리지 않는다(엉뚱한 DB를 읽는 것보다 낫다).
 pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
+    reject_foreign_scheme(url)?;
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         postgres::read(url).await
     } else if url.starts_with("mysql://") {
@@ -60,6 +73,66 @@ pub async fn read_with_dependencies(url: &str) -> Result<CatalogDocument, Source
         context.catalog_complete = false;
     }
     Ok(doc)
+}
+
+/// 다른 수집기용 `scheme://` URL을 SQLite 파일 경로로 재해석하지 않고 거절한다.
+///
+/// 재해석하면 sqlx가 퍼센트 디코딩한 URL 원문(비밀번호 포함)이 경로 오류에 실린다.
+/// 그래서 오류에는 스킴만 싣는다.
+fn reject_foreign_scheme(url: &str) -> Result<(), SourceError> {
+    match url_scheme(url) {
+        Some(scheme) if !NATIVE_URL_SCHEMES.contains(&scheme) => Err(SourceError::Connect(format!(
+            "unsupported database URL scheme '{scheme}'; native readers accept sqlite:, postgres://, postgresql://, and mysql:// URLs; for other databases, run the JDBC or Go probe and pass its output to scan --document"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// `scheme://`로 시작하는 입력의 스킴. 2자 이상만 스킴으로 본다 — `C://data/app.db`
+/// 같은 Windows 드라이브 경로는 계속 SQLite 경로로 읽어야 하기 때문이다.
+fn url_scheme(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once(':')?;
+    (scheme.len() >= 2 && is_scheme_like(scheme) && rest.starts_with("//")).then_some(scheme)
+}
+
+/// RFC 3986 스킴 문자 규칙(글자로 시작, 글자·숫자·`+`·`-`·`.`)을 따르는지 본다.
+fn is_scheme_like(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_alphabetic())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// 경로·URL 문자열의 `사용자:비밀번호@` 부분을 `***@`로 가린다.
+///
+/// `postgres:/u:pw@db`처럼 슬래시가 빠진 URL 오타는 SQLite 경로로 남아 경로 오류에
+/// 실리므로, 경로를 오류 메시지에 넣는 곳이 이 함수를 거친다. 디코딩된 비밀번호는
+/// `@`·`/`를 담을 수 있어 마지막 `@`까지, 앞의 스킴·드라이브 접두 다음부터 가린다.
+/// 그 구간에 `:`가 없으면 자격 증명 형태가 아니라 그대로 둔다(`backup@2024.db`).
+pub fn redact_url_userinfo(text: &str) -> String {
+    let Some(at) = text.rfind('@') else {
+        return text.to_owned();
+    };
+    let start = userinfo_start(&text[..at]);
+    if text[start..at].contains(':') {
+        format!("{}***{}", &text[..start], &text[at..])
+    } else {
+        text.to_owned()
+    }
+}
+
+/// `scheme:` 또는 드라이브 문자 뒤에 `/`·`\`가 이어지면 그 구분자 다음이 userinfo 시작이다.
+/// 구분자가 없으면(`user:pw@host`) 앞의 `글자:`도 userinfo일 수 있어 처음부터 본다.
+fn userinfo_start(head: &str) -> usize {
+    let Some((prefix, rest)) = head.split_once(':') else {
+        return 0;
+    };
+    let separators = rest.len() - rest.trim_start_matches(['/', '\\']).len();
+    if is_scheme_like(prefix) && separators > 0 {
+        prefix.len() + 1 + separators
+    } else {
+        0
+    }
 }
 
 /// reader 실패. Connect(접속 자체 실패)와 Query(카탈로그 읽기 실패)를 구분해
