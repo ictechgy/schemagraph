@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"net/url"
@@ -13,6 +15,8 @@ import (
 
 type connectionSpec struct {
 	driver, dialect, dsn, schema string
+	// file은 SQLite가 열 DB 파일 경로다(다른 방언은 빈 값). -o가 원본을 덮지 않게 연결 전에 비교한다.
+	file string
 }
 
 // URL을 직접 받거나 환경 변수에서 한 번만 읽어 접속 입력을 확정한다.
@@ -47,7 +51,7 @@ func parseConnection(raw string) (connectionSpec, error) {
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "oracle":
-		return connectionSpec{driver: "oracle", dialect: "oracle", dsn: raw}, nil
+		return oracleConnection(raw, u), nil
 	case "postgres", "postgresql":
 		return connectionSpec{driver: "pgx", dialect: "postgres", dsn: raw}, nil
 	case "mysql", "mariadb":
@@ -63,6 +67,37 @@ func parseConnection(raw string) (connectionSpec, error) {
 	default:
 		return connectionSpec{}, fmt.Errorf("unsupported database URL; use sqlite:, postgres://, mysql://, oracle://, or sqlserver://")
 	}
+}
+
+// oraclePrefetchRows는 사용자가 PREFETCH_ROWS를 정하지 않았을 때 왕복당 받을 행 수다.
+// ALL_SOURCE는 소스 한 줄이 한 행이라, go-ora 기본값(25를 행 크기로 다시 계산해 원문
+// 조회는 왕복당 약 31행)이면 대형 PL/SQL 스키마의 수집 시간을 RTT가 정한다.
+// 행 최대 약 4KB × 1000행이라 버퍼 상한은 작다. JDBC 프로브의 ORACLE_FETCH_ROWS와 같다.
+const oraclePrefetchRows = "1000"
+
+// Oracle URL은 원문 바이트(비밀번호 인코딩 포함)를 그대로 두고 PREFETCH_ROWS가 없을 때만
+// 질의 끝에 덧붙인다. go-ora는 질의 키를 대문자로 바꿔 비교하므로 키는 대소문자 없이 찾는다.
+func oracleConnection(raw string, u *url.URL) connectionSpec {
+	spec := connectionSpec{driver: "oracle", dialect: "oracle", dsn: raw}
+	for key := range u.Query() {
+		if strings.EqualFold(key, "PREFETCH_ROWS") {
+			return spec
+		}
+	}
+	// url.Parse처럼 첫 '#' 앞이 질의를 담는 부분이다.
+	base, fragment, hasFragment := strings.Cut(raw, "#")
+	separator := "&"
+	switch {
+	case !strings.Contains(base, "?"):
+		separator = "?"
+	case strings.HasSuffix(base, "?") || strings.HasSuffix(base, "&"):
+		separator = ""
+	}
+	spec.dsn = base + separator + "PREFETCH_ROWS=" + oraclePrefetchRows
+	if hasFragment {
+		spec.dsn += "#" + fragment
+	}
+	return spec
 }
 
 func mysqlConnection(u *url.URL) (connectionSpec, error) {
@@ -107,13 +142,94 @@ func sqliteConnection(raw string) (connectionSpec, error) {
 	query := u.Query()
 	query.Set("mode", "ro")
 	u.RawQuery = query.Encode()
-	return connectionSpec{driver: "sqlite", dialect: "sqlite", dsn: u.String()}, nil
+	return connectionSpec{driver: "sqlite", dialect: "sqlite", dsn: u.String(), file: sqliteFilePath(u)}, nil
 }
 
-// 연결 하나로 고정해 읽기 전용 세션 설정이 모든 카탈로그 조회에 적용되게 한다.
+// sqliteFilePath — SQLite가 URI 파일명에서 얻는 경로다. Path는 net/url이 이미 풀었고(잘못된 %는
+// 위에서 거절됨), 불투명 경로(file:app.db)는 DSN에 그대로 실려 SQLite가 %HH만 푼다.
+func sqliteFilePath(u *url.URL) string {
+	if u.Opaque == "" {
+		return u.Path
+	}
+	return decodeSQLitePercent(u.Opaque)
+}
+
+// decodeSQLitePercent — sqlite3ParseUri처럼 뒤에 16진수 두 자리가 오는 %만 바이트로 바꾸고,
+// 나머지 %는 글자 그대로 둔다(url.PathUnescape는 그런 %를 오류로 본다).
+func decodeSQLitePercent(value string) string {
+	var decoded strings.Builder
+	for index := 0; index < len(value); index++ {
+		if value[index] == '%' && index+2 < len(value) {
+			high, highOK := hexValue(value[index+1])
+			low, lowOK := hexValue(value[index+2])
+			if highOK && lowOK {
+				decoded.WriteByte(high<<4 | low)
+				index += 2
+				continue
+			}
+		}
+		decoded.WriteByte(value[index])
+	}
+	return decoded.String()
+}
+
+// hexValue — 16진수 한 자리의 값. 16진수가 아니면 false다.
+func hexValue(character byte) (byte, bool) {
+	switch {
+	case '0' <= character && character <= '9':
+		return character - '0', true
+	case 'a' <= character && character <= 'f':
+		return character - 'a' + 10, true
+	case 'A' <= character && character <= 'F':
+		return character - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// catalogSession — 수확기가 쓰는 조회 연산이다. 운영 경로는 pinSession이 만든 고정 연결이고,
+// 단위 테스트는 단일 연결 풀(*sql.DB)을 그대로 넘긴다.
+type catalogSession interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// pinnedSession — 모든 카탈로그 조회를 물리 연결 하나로 보낸다. *sql.Conn에는 context 없는
+// 조회 메서드가 없어 수확기 호출 모양에 맞춰 감싼다.
+type pinnedSession struct{ conn *sql.Conn }
+
+// pinSession — 수집 전체를 연결 하나에 고정한다. database/sql 풀은 끊긴 연결을 새 물리 연결로
+// 몰래 바꾸는데(ErrBadConn 재시도), 새 연결에는 configureReadOnly의 search_path·읽기 전용 설정이
+// 없다. 고정 연결은 끊기면 교체되지 않아 이후 조회가 오류가 되고, bestEffort가 그 사실을
+// limitation과 미완전으로 남긴다. JDBC 프로브가 Connection 하나로 수집하는 것과 같다.
+func pinSession(db *sql.DB) (*pinnedSession, error) {
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &pinnedSession{conn: conn}, nil
+}
+
+func (s *pinnedSession) Query(query string, args ...any) (*sql.Rows, error) {
+	return s.conn.QueryContext(context.Background(), query, args...)
+}
+
+func (s *pinnedSession) QueryRow(query string, args ...any) *sql.Row {
+	return s.conn.QueryRowContext(context.Background(), query, args...)
+}
+
+func (s *pinnedSession) Exec(query string, args ...any) (sql.Result, error) {
+	return s.conn.ExecContext(context.Background(), query, args...)
+}
+
+// Close는 고정 연결을 풀에 돌려 db.Close가 서버 세션을 정상 종료하게 한다.
+func (s *pinnedSession) Close() error {
+	return s.conn.Close()
+}
+
+// 고정 세션(pinSession)에 읽기 전용 설정을 건다. 같은 물리 연결이 이후 모든 카탈로그 조회를 실행한다.
 func (h *harvester) configureReadOnly() {
 	if h.dialect == "postgres" {
-		h.db.SetMaxOpenConns(1)
 		// 서버가 반환하는 뷰 정의를 스키마 한정 이름으로 고정한다.
 		if _, err := h.db.Exec("SET search_path = pg_catalog"); err != nil {
 			h.catalogIncomplete = true
@@ -122,9 +238,6 @@ func (h *harvester) configureReadOnly() {
 	}
 	var statements []string
 	switch h.dialect {
-	case "sqlite":
-		h.db.SetMaxOpenConns(1)
-		return
 	case "postgres":
 		statements = []string{"SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"}
 	case "mysql":
@@ -132,7 +245,6 @@ func (h *harvester) configureReadOnly() {
 	default:
 		return
 	}
-	h.db.SetMaxOpenConns(1)
 	for _, statement := range statements {
 		if _, err := h.db.Exec(statement); err == nil {
 			return

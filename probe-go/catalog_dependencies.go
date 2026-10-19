@@ -140,8 +140,30 @@ func (h *harvester) readCatalogDependencies(schema string) []CatalogDependency {
 		dependencies = append(dependencies, CatalogDependency{Source: CatalogObjectRef{Schema: ss.String, Name: sn.String, Kind: ns(sk), Signature: ns(sg)}, Target: CatalogObjectRef{Schema: ts.String, Name: tn.String, Kind: ns(tk), Signature: ns(tg), Member: ns(tm), Database: ns(td)}, Catalog: catalog, DependencyType: dt.String})
 		return nil
 	})
-	sort.Slice(dependencies, func(i, j int) bool { return dependencyKey(dependencies[i]) < dependencyKey(dependencies[j]) })
+	sortDependencies(dependencies)
 	return dependencies
+}
+
+// keyedDependency는 정렬 키를 미리 만들어 둔 의존성이다.
+type keyedDependency struct {
+	key        string
+	dependency CatalogDependency
+}
+
+// sortDependencies는 의존성을 dependencyKey 순으로 제자리 정렬한다. 키는 원소마다 한 번만 만든다.
+// 조회의 ORDER BY는 DB 정렬 규칙(SQL Server의 대소문자 무시 정렬 등)을 따라 바이트 순서와 어긋날
+// 수 있다. 그렇게 섞인 입력에서 비교 함수가 키(필드 14개 Join)를 매번 만들면 의존성 D개에 키
+// 조립이 약 2·D·log2 D번 일어나, 수십만 행이면 정렬에만 초 단위가 든다. 비교 결과와 알고리즘이
+// 예전과 같으므로 같은 입력의 출력 순서도 같다.
+func sortDependencies(dependencies []CatalogDependency) {
+	keyed := make([]keyedDependency, len(dependencies))
+	for i, dependency := range dependencies {
+		keyed[i] = keyedDependency{key: dependencyKey(dependency), dependency: dependency}
+	}
+	sort.Slice(keyed, func(i, j int) bool { return keyed[i].key < keyed[j].key })
+	for i := range keyed {
+		dependencies[i] = keyed[i].dependency
+	}
 }
 
 func (h *harvester) streamDependencies(stream *ndjsonStreamWriter, schema string) error {

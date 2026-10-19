@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import socket
 import sqlite3
@@ -67,6 +68,14 @@ def run(command: list[Any], *, env: dict[str, str] | None = None, timeout: int =
                 detail = detail.replace(value, "<redacted>")
         raise RuntimeError(f"{Path(values[0]).name} failed ({result.returncode}): {detail.strip()}")
     return result
+
+
+def private_file(path: Path, text: str) -> Path:
+    """비밀번호를 담는 파일을 처음부터 0600으로 만든다(만든 뒤 chmod하면 잠깐 열린다)."""
+
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+        stream.write(text)
+    return path
 
 
 def ensure_file(path: Path, label: str) -> Path:
@@ -301,7 +310,12 @@ def create_sqlite_db(corpus: dict[str, Any], path: Path) -> None:
 
 
 class PostgresRunner:
-    """임시 PostgreSQL cluster의 같은 psql command 경계를 관리한다."""
+    """임시 PostgreSQL cluster의 같은 psql command 경계를 관리한다.
+
+    같은 호스트의 다른 계정이 loopback TCP로 슈퍼유저에 접속하지 못하게 host 인증은 실행마다
+    만든 비밀번호(scram)로만 받는다. 비밀번호는 0600 파일로만 initdb와 클라이언트(PGPASSFILE을
+    읽는 psql·엔진)에 주고, trust인 Unix socket은 /tmp 아래 짧은 0700 디렉터리에 둔다.
+    """
 
     def __init__(self, bindir: Path, work: Path):
         self.bindir = bindir
@@ -309,10 +323,10 @@ class PostgresRunner:
         self.data = work / "data"
         self.port = self._port()
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("PG")}
-        password_file = work / "empty-pgpass"
-        password_file.write_text("")
-        password_file.chmod(0o600)
-        self.env["PGPASSFILE"] = str(password_file)
+        password = secrets.token_hex(16)
+        self.initial = private_file(work / "initdb-password", password + "\n")
+        self.env["PGPASSFILE"] = str(private_file(work / "pgpass", f"*:{self.port}:*:*:{password}\n"))
+        self.sockets: tempfile.TemporaryDirectory[str] | None = None
         self.started = False
 
     @staticmethod
@@ -329,16 +343,24 @@ class PostgresRunner:
     def __enter__(self) -> "PostgresRunner":
         for tool in ("initdb", "pg_ctl", "psql"):
             ensure_file(self.bindir / tool, f"PostgreSQL {tool}")
-        run([self.bindir / "initdb", "-D", self.data, "-U", "postgres", "-A", "trust", "--no-locale", "--encoding=UTF8"], env=self.env)
+        run([self.bindir / "initdb", "-D", self.data, "-U", "postgres", "--auth-local=trust",
+             "--auth-host=scram-sha-256", f"--pwfile={self.initial}", "--no-locale", "--encoding=UTF8"], env=self.env)
         log = self.work / "postgres.log"
-        run([self.bindir / "pg_ctl", "-D", self.data, "-l", log, "-o", f"-p {self.port} -k /tmp -h 127.0.0.1", "-w", "start"], env=self.env)
+        # 작업 디렉터리 전체 경로는 macOS socket 경로 한도(103 bytes)를 넘을 수 있다.
+        # __enter__가 중간에 실패해도 TemporaryDirectory의 finalizer가 이 디렉터리를 지운다.
+        self.sockets = tempfile.TemporaryDirectory(prefix="sg-pg-", dir="/tmp")
+        run([self.bindir / "pg_ctl", "-D", self.data, "-l", log, "-o", f"-p {self.port} -k {self.sockets.name} -h 127.0.0.1", "-w", "start"], env=self.env)
         self.started = True
         run([self.bindir / "psql", "-X", "-q", "-h", "127.0.0.1", "-p", self.port, "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", "CREATE DATABASE dml_accuracy"], env=self.env)
         return self
 
     def __exit__(self, _type, _value, _traceback) -> None:
-        if self.started:
-            run([self.bindir / "pg_ctl", "-D", self.data, "-m", "fast", "-w", "stop"], env=self.env)
+        try:
+            if self.started:
+                run([self.bindir / "pg_ctl", "-D", self.data, "-m", "fast", "-w", "stop"], env=self.env)
+        finally:
+            if self.sockets is not None:
+                self.sockets.cleanup()
 
     def script(self, sql: str) -> list[str]:
         path = self.work / "statement.sql"
@@ -461,14 +483,17 @@ def score_document(engine: Path, corpus: dict[str, Any], dialect: str, document:
 
 
 def scan_native(engine: Path, corpus: dict[str, Any], dialect: str, url: str, sql_dir: Path,
-                schema: str, output: Path, work: Path) -> dict[str, Any]:
-    """SQLite/PostgreSQL native reader document와 graph를 보존한다."""
+                schema: str, output: Path, work: Path, env: dict[str, str] | None = None) -> dict[str, Any]:
+    """SQLite/PostgreSQL native reader document와 graph를 보존한다.
+
+    PostgreSQL은 URL에 비밀번호가 없으므로 PostgresRunner.env(PGPASSFILE)를 env로 넘긴다.
+    """
 
     output.mkdir(parents=True, exist_ok=True)
     document = output / "native.document.json"
     graph = output / "native.graph.json"
     run([engine, "scan", url, "--sql-dir", sql_dir, "--query-schema", schema,
-         "--emit-document", document, "-o", graph])
+         "--emit-document", document, "-o", graph], env=env)
     catalog = DML.validate_catalog_document(json.loads(document.read_text(encoding="utf-8")), corpus, dialect)
     if catalog["failures"]:
         raise RuntimeError("native catalog preflight failed: " + "; ".join(catalog["failures"]))
@@ -512,7 +537,8 @@ def native_baseline(engine: Path, corpus: dict[str, Any], dialect: str, pg_bin: 
         else:
             with postgres_cluster(corpus, pg_bin, work) as runner:
                 runtime = {"dialect": "postgres", "cases": prepare_postgres(corpus, runner)}
-                scan = scan_native(engine, corpus, dialect, f"postgres://postgres@127.0.0.1:{runner.port}/dml_accuracy", sql_dir, "public", output, work)
+                scan = scan_native(engine, corpus, dialect, f"postgres://postgres@127.0.0.1:{runner.port}/dml_accuracy",
+                                   sql_dir, "public", output, work, runner.env)
     return {"runtime": runtime, **scan}
 
 

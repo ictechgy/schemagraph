@@ -2,8 +2,12 @@ package main
 
 import (
 	"bytes"
+	"database/sql/driver"
 	"encoding/json"
+	"math/rand/v2"
 	"reflect"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -137,5 +141,93 @@ func TestCatalogDependencySourceAndFilterMetadataAreValidated(t *testing.T) {
 	h := &harvester{dialect: "sqlite", catalogDependencies: true}
 	if got := h.streamFeatures(); !reflect.DeepEqual(got, []string{"catalog-dependencies-v1"}) {
 		t.Fatalf("catalog dependency feature = %#v", got)
+	}
+}
+
+// randomCatalogDependencies는 pg_depend 조회 결과처럼 보이는 의존성을 만든다. 이름을 작은 집합에서
+// 뽑아 정렬 키 앞부분이 자주 겹치게 하고, NULL 선택 필드와 완전히 같은 행(중복)도 섞는다.
+func randomCatalogDependencies(count int, seed uint64) []CatalogDependency {
+	random := rand.New(rand.NewPCG(seed, seed^0x5eed))
+	pick := func(values ...string) string { return values[random.IntN(len(values))] }
+	optional := func(values ...string) *string {
+		if random.IntN(3) == 0 {
+			return nil
+		}
+		value := pick(values...)
+		return &value
+	}
+	dependencies := make([]CatalogDependency, 0, count)
+	for len(dependencies) < count {
+		if len(dependencies) > 0 && random.IntN(8) == 0 {
+			dependencies = append(dependencies, dependencies[random.IntN(len(dependencies))])
+			continue
+		}
+		dependencies = append(dependencies, CatalogDependency{
+			Source:  CatalogObjectRef{Schema: pick("app", "billing"), Name: pick("orders_v", "orders_mv", "report"), Kind: optional("view", "function"), Signature: optional("", "integer")},
+			Target:  CatalogObjectRef{Schema: pick("app", "billing"), Name: pick("orders", "items", "total"), Kind: optional("table", "function"), Signature: optional("integer, text"), Member: optional("id", "amount", "status"), Database: optional("main")},
+			Catalog: "pg_depend", DependencyType: pick("n", "a"),
+		})
+	}
+	return dependencies
+}
+
+// dependencyRow는 의존성을 readCatalogDependencies가 읽는 열 11개짜리 행으로 되돌린다.
+func dependencyRow(dependency CatalogDependency) []driver.Value {
+	text := func(value *string) driver.Value {
+		if value == nil {
+			return nil
+		}
+		return *value
+	}
+	source, target := dependency.Source, dependency.Target
+	return []driver.Value{source.Schema, source.Name, text(source.Kind), text(source.Signature),
+		target.Schema, target.Name, text(target.Kind), text(target.Signature), text(target.Member), text(target.Database),
+		dependency.DependencyType}
+}
+
+// dependencyReadAllocs는 dependencies를 행으로 돌려주는 가짜 PostgreSQL에서 readCatalogDependencies의
+// 실행당 평균 할당 수와 결과를 잰다. 할당 수는 같은 코드·같은 입력에서 늘 같아 시간보다 안정적이다.
+func dependencyReadAllocs(t *testing.T, dependencies []CatalogDependency) (float64, []CatalogDependency) {
+	t.Helper()
+	rows := make([][]driver.Value, 0, len(dependencies))
+	for _, dependency := range dependencies {
+		rows = append(rows, dependencyRow(dependency))
+	}
+	db, _ := newScriptedDB(func(query string, _ []driver.NamedValue) scriptedReply {
+		if strings.Contains(query, "FROM pg_depend") {
+			return scriptedRows(rows...)
+		}
+		return scriptedReply{}
+	})
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close scripted database: %v", err)
+		}
+	}()
+	h := &harvester{db: db, dialect: "postgres", schemaFilter: map[string]bool{}, catalogDependencies: true}
+	var got []CatalogDependency
+	allocs := testing.AllocsPerRun(3, func() { got = h.readCatalogDependencies("app") })
+	if len(h.limitations) > 0 {
+		t.Fatalf("scripted dependency read reported limitations: %q", h.limitations)
+	}
+	return allocs, got
+}
+
+// 의존성은 dependencyKey 바이트 순서로 나오고, Go 프로브는 같은 행을 합치지 않는다.
+// 정렬 키를 비교할 때마다 새로 만들면 할당 수가 입력 순서를 따라간다. 이미 정렬된 입력은 비교가
+// 약 D번이고 섞인 입력은 약 D·log2 D번이다. 키를 원소마다 한 번만 만들면 같은 행 집합의 할당 수는
+// 순서와 무관하다. 그래서 시간 대신 두 순서의 할당 수 차이로 반복 계산을 판정한다.
+func TestCatalogDependencySortBuildsEachKeyOnce(t *testing.T) {
+	dependencies := randomCatalogDependencies(1024, 20261019)
+	want := slices.Clone(dependencies)
+	sort.SliceStable(want, func(i, j int) bool { return dependencyKey(want[i]) < dependencyKey(want[j]) })
+	shuffledAllocs, shuffled := dependencyReadAllocs(t, dependencies)
+	presortedAllocs, presorted := dependencyReadAllocs(t, want)
+	if !reflect.DeepEqual(shuffled, want) || !reflect.DeepEqual(presorted, want) {
+		t.Fatalf("dependencies are not in dependencyKey order with duplicates kept (got %d and %d, want %d)", len(shuffled), len(presorted), len(want))
+	}
+	if extra := shuffledAllocs - presortedAllocs; extra > float64(len(dependencies))/8 {
+		t.Fatalf("sorting %d shuffled dependencies made %.0f more allocations than presorted input (%.0f vs %.0f); sort keys are rebuilt per comparison",
+			len(dependencies), extra, shuffledAllocs, presortedAllocs)
 	}
 }

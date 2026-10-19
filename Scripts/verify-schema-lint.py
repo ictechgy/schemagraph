@@ -156,7 +156,7 @@ def restricted_case(engine, url, psql, work, env):
     """일부 관계만 보이는 역할의 수집은 불완전하므로 PK 부재가 미확인이어야 한다."""
     admin = list(psql)
     admin[admin.index('-U') + 1], admin[admin.index('-d') + 1] = 'postgres', 'postgres'
-    ACCURACY.run(admin + ['-qc', 'CREATE ROLE collector LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT'], env=env)
+    ACCURACY.create_login_role(admin, 'collector', 'NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT', env)
     ACCURACY.run(psql + ['-qc', 'GRANT REFERENCES ON public.nopk TO collector'], env=env)
     graph = work / 'restricted.graph.json'
     ACCURACY.run([engine, 'scan', url.replace('corpus@', 'collector@'), '--schema', 'public', '-o', graph], env=env)
