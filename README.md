@@ -207,12 +207,15 @@ sync it, and rename it over the destination only after the whole document is
 written; for NDJSON that includes the final `limitations` record. A failed or
 interrupted collection leaves the previous file in place, although a killed
 probe can leave a hidden temporary file such as `.catalog.json.tmp-*` beside
-it. Existing file permissions are kept, new files get the same default
-permissions as before, and a symlink destination updates the file it points
-to. An `-o` path that names the SQLite database being read, or its `-wal` or
-`-shm` file, is rejected before connecting. Use `-o -` for stdout. Devices,
-pipes, other non-regular files, and paths under `/dev` are written in place
-without this protection.
+it. The destination directory must be writable: before connecting, the probe
+creates and removes a temporary file there, so an unwritable directory fails
+before collection starts. Long destination names are shortened in the
+temporary file name. Existing file permissions are kept, new files get the
+same default permissions as before, and a symlink destination updates the
+file it points to. An `-o` path that names the SQLite database being read, or
+its `-wal` or `-shm` file, is rejected before connecting. Use `-o -` for
+stdout. Devices, pipes, other non-regular files, and paths under `/dev` are
+written in place without this protection.
 
 ## Interpreting results
 
