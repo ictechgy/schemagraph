@@ -296,6 +296,13 @@ jobs:
           python3 Scripts/verify-bridge-facts.py --engine engine/target/debug/schemagraph \
             --output "$RUNNER_TEMP/bridge-facts.json"
 
+      - name: Verify native PostgreSQL TLS modes against a real server
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+        run: |
+          python3 Scripts/verify-native-tls.py --engine engine/target/debug/schemagraph \
+            --output "$RUNNER_TEMP/native-tls.json"
+
       - name: Verify every database fixture
         env:
           SG_MYSQL_JAR: ${{ runner.temp }}/mysql-connector-j.jar
@@ -323,6 +330,7 @@ jobs:
             ${{ runner.temp }}/mysql-accuracy.json
             ${{ runner.temp }}/scope-*.json
             ${{ runner.temp }}/imports-check.json
+            ${{ runner.temp }}/native-tls.json
           if-no-files-found: ignore
           retention-days: 7
 
