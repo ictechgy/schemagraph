@@ -18,10 +18,7 @@ pub fn document_to_graph(doc: &CatalogDocument) -> Graph {
     for l in &doc.limitations {
         g.add_limitation(l.clone());
     }
-    let mut packages = PackageIndex::default();
-    for schema in &doc.schemas {
-        build_schema(&mut g, schema, &mut packages);
-    }
+    build_schemas(&mut g, doc);
     // 같은 테이블 쌍·컬럼 쌍의 FK가 여럿이면 같은 키의 간선이 반복되므로, 모든 스키마의
     // FK 간선을 모아 add_edges로 근거를 키마다 한 번에 합친다.
     let mut foreign_keys = Vec::new();
@@ -32,6 +29,25 @@ pub fn document_to_graph(doc: &CatalogDocument) -> Graph {
     attach_schema_metadata(&mut g, doc);
     crate::dependencies::apply(&mut g, doc);
     g
+}
+
+/// document의 정점과 소유(Contains)·발화(Fires) 간선만 만든다.
+///
+/// routine id의 `@kind` 분리처럼 reader가 부여한 정점 id만 필요한 호출자(document diff)가
+/// FK 간선·스키마 메타데이터·카탈로그 의존성 해석까지 다시 하지 않게 한다. 정점은 스키마를
+/// 만드는 단계에서만 생기므로 정점 집합은 [`document_to_graph`]와 같다.
+pub(crate) fn document_vertices(doc: &CatalogDocument) -> Graph {
+    let mut g = Graph::new();
+    build_schemas(&mut g, doc);
+    g
+}
+
+/// 문서의 스키마마다 정점과 소유 간선을 만든다. 패키지 색인은 문서 전체가 공유한다.
+fn build_schemas(g: &mut Graph, doc: &CatalogDocument) {
+    let mut packages = PackageIndex::default();
+    for schema in &doc.schemas {
+        build_schema(g, schema, &mut packages);
+    }
 }
 
 /// 새 reader가 명시한 메타데이터만 실제 graph 정점으로 정규화한다.

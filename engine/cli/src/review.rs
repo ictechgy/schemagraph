@@ -303,20 +303,17 @@ impl Changes<'_> {
             }
         }
         let mut dependency_details: BTreeMap<VertexId, (Vec<Value>, Vec<Value>)> = BTreeMap::new();
+        // 바뀐 행이 많아도 행마다 스키마 전체를 훑지 않게 그래프마다 색인 하나를 쓴다.
+        let mut before_references = source::dependencies::ReferenceIndex::new(self.before);
+        let mut after_references = source::dependencies::ReferenceIndex::new(self.after);
         for (added, dependencies) in [
             (true, &diff.dependencies.added),
             (false, &diff.dependencies.removed),
         ] {
             for dependency in dependencies {
-                let id =
-                    source::dependencies::resolve_reference(self.before, old, &dependency.source)
-                        .or_else(|| {
-                            source::dependencies::resolve_reference(
-                                self.after,
-                                new,
-                                &dependency.source,
-                            )
-                        });
+                let id = before_references
+                    .resolve(old, &dependency.source)
+                    .or_else(|| after_references.resolve(new, &dependency.source));
                 if let Some(id) = id {
                     let values = if added {
                         &mut dependency_details.entry(id).or_default().0
@@ -535,14 +532,13 @@ pub(crate) fn run_with_options(options: ReviewOptions<'_>) -> Result<i32> {
     let diff = source::diff::diff_documents(&old, &new);
     let mut notes = source::context::comparison_notes(&old, &new);
     for (label, document, graph) in [("before", &old, &before), ("after", &new, &after)] {
+        let mut references = source::dependencies::ReferenceIndex::new(graph);
         let missing = document
             .dependencies
             .iter()
             .filter(|dependency| {
-                source::dependencies::resolve_reference(graph, document, &dependency.source)
-                    .is_none()
-                    || source::dependencies::resolve_reference(graph, document, &dependency.target)
-                        .is_none()
+                references.resolve(document, &dependency.source).is_none()
+                    || references.resolve(document, &dependency.target).is_none()
             })
             .count();
         if missing > 0 {
