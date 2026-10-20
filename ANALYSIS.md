@@ -492,8 +492,13 @@ a cut result adds `truncated: true`; `cycles` also adds the full count as
 `total`, while `stats` `totals` and `diagnostics` `summary` always count every
 entry. A `notFound` result lists at most 64 `candidates` and, when cut, adds
 `candidatesTotal` and `candidatesTruncated: true`; ask again with a
-schema-qualified id. A `max` outside that range is rejected with JSON-RPC error
--32602, like every other invalid argument.
+schema-qualified id.
+
+Numeric arguments are never clamped. On every tool, an integer outside its
+declared range, such as `max` above 10000 or a negative `depth`, returns an
+`isError: true` result whose text is `{"error": "…"}` with the allowed range,
+so the agent can retry with a valid value. Arguments of the wrong type, unknown
+arguments, unknown tools, and malformed requests are JSON-RPC errors (-32602).
 
 Start with `search` when the exact id is unknown. Its default `names` detail
 lists ids only; request `summary` for the candidates you need. The `dead` tool

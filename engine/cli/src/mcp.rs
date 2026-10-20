@@ -720,7 +720,7 @@ fn handle_tools_call(id: Value, object: &Map<String, Value>) -> MessageAction {
         Ok(call) => call,
         Err(error) => {
             return MessageAction::Reply {
-                response: Some(error_response(id, -32602, &error)),
+                response: Some(argument_error_response(id, error)),
                 initialized: true,
             }
         }
@@ -893,10 +893,44 @@ enum PreparedToolCall {
     },
 }
 
+/// 도구 인자 검증 실패. 어느 채널로 알릴지가 종류마다 다르다.
+///
+/// 범위 밖 숫자(`max`·`depth`·예산 인자)는 설계 원칙 4("사용자가 준 인자 값이 허용 범위를
+/// 벗어나면 MCP isError로 거부한다")와 MCP 사양 2025-11-25("value out of range" 같은 입력 검증
+/// 오류는 `isError` 도구 실행 오류)를 따른다. 에이전트는 이 결과를 읽고 값을 고쳐 다시 부를
+/// 수 있다. 같은 검사기를 쓰는 모든 도구가 같은 채널을 쓴다. 모르는 도구, 형식이 틀린 값,
+/// 모르는 인자, 이름 오류는 기존대로 JSON-RPC -32602다.
+#[derive(Debug)]
+enum ArgumentError {
+    /// JSON-RPC -32602로 답한다.
+    Invalid(String),
+    /// 선언한 범위(0부터 최대값까지)를 벗어난 정수. `isError` 도구 결과로 답한다.
+    OutOfRange(String),
+}
+
+/// 기존 인자 검사기(`String` 오류)는 모두 -32602 채널이다.
+impl From<String> for ArgumentError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+/// 인자 검증 실패를 JSON-RPC 응답으로 만든다. 범위 오류 결과의 본문도 다른 도구 결과처럼
+/// `content[0].text`의 압축 JSON(`{"error": …}`)이라, 텍스트를 JSON으로 읽는 소비자가 깨지지
+/// 않는다.
+fn argument_error_response(id: Value, error: ArgumentError) -> Value {
+    match error {
+        ArgumentError::Invalid(message) => error_response(id, -32602, &message),
+        ArgumentError::OutOfRange(message) => {
+            success_response(id, tool_result(&json!({"error": message}), true))
+        }
+    }
+}
+
 fn prepare_tool_call(
     name: &str,
     arguments: &Map<String, Value>,
-) -> Result<PreparedToolCall, String> {
+) -> Result<PreparedToolCall, ArgumentError> {
     match name {
         "query" => {
             let name = required_name(arguments, "name")?;
@@ -1004,12 +1038,12 @@ fn prepare_tool_call(
             reject_unknown(arguments, &["max"])?;
             Ok(PreparedToolCall::Unused { max })
         }
-        _ => Err(format!("Unknown tool: {name}")),
+        _ => Err(format!("Unknown tool: {name}").into()),
     }
 }
 
 /// `search` 인자를 CLI와 같은 규칙으로 검증한다.
-fn prepare_search(arguments: &Map<String, Value>) -> Result<PreparedToolCall, String> {
+fn prepare_search(arguments: &Map<String, Value>) -> Result<PreparedToolCall, ArgumentError> {
     let pattern = required_name(arguments, "pattern")?;
     let kind = optional_name(arguments, "kind")?;
     let detail = match optional_name(arguments, "detail")?.as_deref() {
@@ -1345,26 +1379,40 @@ fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 0부터 `maximum`까지의 정수 인자를 읽는다. 없으면 `default`다.
+///
+/// 범위 밖 정수(음수 포함)는 조용히 깎지 않고 [`ArgumentError::OutOfRange`]로 거부한다(설계
+/// 원칙 4). 정수가 아닌 값은 형식 오류([`ArgumentError::Invalid`])다.
 fn bounded_u64(
     arguments: &Map<String, Value>,
     key: &str,
     default: u64,
     maximum: u64,
-) -> Result<u64, String> {
+) -> Result<u64, ArgumentError> {
     let Some(value) = arguments.get(key) else {
         return Ok(default);
     };
-    let Some(value) = value.as_u64() else {
-        return Err(format!("argument '{key}' must be a non-negative integer"));
-    };
-    if value > maximum {
-        return Err(format!("argument '{key}' exceeds the maximum of {maximum}"));
+    match value.as_u64() {
+        Some(value) if value <= maximum => Ok(value),
+        Some(_) => Err(out_of_range(
+            key,
+            &format!("exceeds the maximum of {maximum}"),
+            maximum,
+        )),
+        None if value.is_i64() => Err(out_of_range(key, "is negative", maximum)),
+        None => Err(format!("argument '{key}' must be a non-negative integer").into()),
     }
-    Ok(value)
 }
 
-/// `stats`·`cycles`·`diagnostics`의 `max` — 범위를 벗어나면 다른 인자처럼 -32602로 거부한다.
-fn whole_graph_max(arguments: &Map<String, Value>) -> Result<usize, String> {
+/// 범위 밖 숫자 인자 오류. 받을 수 있는 범위를 함께 알려 에이전트가 고쳐 다시 부르게 한다.
+fn out_of_range(key: &str, problem: &str, maximum: u64) -> ArgumentError {
+    ArgumentError::OutOfRange(format!(
+        "argument '{key}' {problem}; pass an integer from 0 to {maximum}"
+    ))
+}
+
+/// `stats`·`cycles`·`diagnostics`의 `max` — 범위 밖 값은 다른 도구의 숫자 인자처럼 isError다.
+fn whole_graph_max(arguments: &Map<String, Value>) -> Result<usize, ArgumentError> {
     Ok(bounded_u64(arguments, "max", DEFAULT_WHOLE_GRAPH_MAX, MAX_RESULTS)? as usize)
 }
 
@@ -1936,6 +1984,7 @@ mod tests {
         );
     }
 
+    /// 범위 밖 정수는 isError 도구 결과(원칙 4), 정수가 아닌 값은 JSON-RPC -32602다.
     #[test]
     fn bounded_whole_graph_tools_reject_max_outside_the_declared_range() {
         let responses = call(&[
@@ -1945,21 +1994,102 @@ mod tests {
             r#"{"name":"diagnostics","arguments":{"name":"orders","max":1.5}}"#,
             r#"{"name":"stats","arguments":{"max":10000}}"#,
         ]);
-        for response in &responses[..4] {
-            assert_eq!(response["error"]["code"], -32602, "{response}");
+        for (response, problem) in responses[..2]
+            .iter()
+            .zip(["exceeds the maximum of 10000", "is negative"])
+        {
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            let message = tool_value(response)["error"].as_str().unwrap().to_owned();
+            assert_eq!(
+                message,
+                format!("argument 'max' {problem}; pass an integer from 0 to 10000")
+            );
         }
-        assert!(responses[0]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("exceeds the maximum of 10000"));
-        assert!(responses[1]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("must be a non-negative integer"));
+        for response in &responses[2..4] {
+            assert_eq!(response["error"]["code"], -32602, "{response}");
+            assert!(response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("must be a non-negative integer"));
+        }
         assert_eq!(
             tool_value(&responses[4]),
             export::stats_to_value(&fixture())
         );
+    }
+
+    /// 숫자 인자는 도구와 무관하게 같은 검사기를 지나 같은 채널(isError)로 거부된다. 새
+    /// `max`만 isError로 내면 같은 서버의 `dead`·`unused` `max`와 채널이 갈린다.
+    #[test]
+    fn out_of_range_numbers_are_tool_errors_for_every_tool() {
+        let cases = [
+            (
+                r#"{"name":"query","arguments":{"name":"orders","depth":65}}"#,
+                "depth",
+                64,
+            ),
+            (
+                r#"{"name":"query","arguments":{"name":"orders","max":10001}}"#,
+                "max",
+                10_000,
+            ),
+            (
+                r#"{"name":"impact","arguments":{"name":"orders","maxVisited":100001}}"#,
+                "maxVisited",
+                100_000,
+            ),
+            (
+                r#"{"name":"explain","arguments":{"name":"orders","max":10001}}"#,
+                "max",
+                10_000,
+            ),
+            (
+                r#"{"name":"path","arguments":{"from":"orders","to":"customers","maxPaths":1025}}"#,
+                "maxPaths",
+                1024,
+            ),
+            (
+                r#"{"name":"path","arguments":{"from":"orders","to":"customers","maxEdges":1000001}}"#,
+                "maxEdges",
+                1_000_000,
+            ),
+            (
+                r#"{"name":"search","arguments":{"pattern":"o","max":10001}}"#,
+                "max",
+                10_000,
+            ),
+            (
+                r#"{"name":"dead","arguments":{"max":10001}}"#,
+                "max",
+                10_000,
+            ),
+            (
+                r#"{"name":"lint","arguments":{"max":10001}}"#,
+                "max",
+                10_000,
+            ),
+            (
+                r#"{"name":"unused","arguments":{"max":10001}}"#,
+                "max",
+                10_000,
+            ),
+            (
+                r#"{"name":"query","arguments":{"name":"orders","depth":-1}}"#,
+                "depth",
+                64,
+            ),
+        ];
+        let calls: Vec<&str> = cases.iter().map(|(call, _, _)| *call).collect();
+        let responses = call(&calls);
+        for (response, (call, key, maximum)) in responses.iter().zip(cases) {
+            assert_eq!(response["result"]["isError"], true, "{call}: {response}");
+            let message = tool_value(response)["error"].as_str().unwrap().to_owned();
+            assert!(
+                message.starts_with(&format!("argument '{key}' "))
+                    && message.ends_with(&format!("; pass an integer from 0 to {maximum}")),
+                "{call}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -2085,12 +2215,14 @@ mod tests {
         assert_eq!(report["traversals"]["dependencies"]["complete"], false);
     }
 
+    /// 범위 밖 숫자는 isError 결과다(`out_of_range_numbers_are_tool_errors_for_every_tool`).
+    /// 형식이 틀린 인자·모르는 도구·메서드는 JSON-RPC 오류로 남는다.
     #[test]
     fn invalid_arguments_unknown_tools_and_methods_are_json_rpc_errors() {
         let input = format!(
             "{}{}\n{}\n{}\n",
             handshake(),
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"name":"orders","depth":999}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"name":"orders","depth":"deep"}}}"#,
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"unknown","arguments":{}}}"#,
             r#"{"jsonrpc":"2.0","id":4,"method":"nope"}"#
         );

@@ -93,8 +93,13 @@ These changes are not yet in a published release.
   `truncated: true`, and `cycles` then also adds the full count as `total`;
   `stats` `totals` and `diagnostics` `summary` still count every entry. MCP
   not-found results list at most 64 `candidates` and add `candidatesTotal` and
-  `candidatesTruncated: true` when cut. A `max` outside that range is rejected
-  with JSON-RPC error -32602. CLI output is unchanged.
+  `candidatesTruncated: true` when cut. CLI output is unchanged.
+- On every MCP tool, an integer argument outside its declared range (such as
+  `max` above 10000, `depth` above 64, or a negative value) now returns an
+  `isError: true` tool result whose text is `{"error": "…"}` with the allowed
+  range, instead of JSON-RPC error -32602, so agents can correct the value and
+  retry. Arguments of the wrong type, unknown arguments, and unknown tools are
+  still JSON-RPC errors (-32602).
 
 # schemagraph 0.7.1
 
