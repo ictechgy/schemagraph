@@ -211,6 +211,50 @@ func TestPostgresSchemaBatchFailureIsReportedOncePerSchema(t *testing.T) {
 	}
 }
 
+// 스키마 단위 세부 조회의 커서가 도중에 실패하면(rows.Err) 그때까지 읽은 행도 쓰지 않고 그 부분을 스키마의 모든
+// 객체에서 비운다. 남기면 어느 객체까지, 다중 컬럼 제약·인덱스는 어느 키 컬럼까지 채워지는지가 실패 시점에 따라
+// 달라진다. limitation은 예전 문구로 한 번 남고 미완전으로 표시된다.
+func TestPostgresSchemaBatchCursorFailureLeavesThatPartEmpty(t *testing.T) {
+	failure := fmt.Errorf("injected cursor failure")
+	tests := []struct {
+		label, marker string
+		empty         func(ObjectDoc) bool
+	}{
+		{"columns", "information_schema.columns", func(object ObjectDoc) bool { return len(object.Columns) == 0 }},
+		{"constraints", "FROM pg_constraint con", func(object ObjectDoc) bool { return len(object.Constraints) == 0 }},
+		{"indexes", "FROM pg_index idx", func(object ObjectDoc) bool { return len(object.Indexes) == 0 }},
+		{"triggers", "FROM pg_trigger tg", func(object ObjectDoc) bool { return len(object.Triggers) == 0 }},
+	}
+	for _, test := range tests {
+		t.Run(test.label, func(t *testing.T) {
+			db, _ := newScriptedDB(func(query string, args []driver.NamedValue) scriptedReply {
+				reply := postgresCatalogReply(query, args)
+				if strings.Contains(query, test.marker) {
+					reply.rowsErr = failure
+				}
+				return reply
+			})
+			defer closeScriptedDB(t, db)
+			h := &harvester{db: db, dialect: "postgres", schemaFilter: map[string]bool{"app": true}}
+			schema := h.postgresSchema("app")
+			failures := 0
+			for _, limitation := range h.limitations {
+				if limitation == test.label+" unavailable — injected cursor failure" {
+					failures++
+				}
+			}
+			if failures != 1 || !h.catalogIncomplete {
+				t.Fatalf("%s failure must be reported once and mark the catalog incomplete: %q", test.label, h.limitations)
+			}
+			for _, object := range schema.Objects {
+				if !test.empty(object) {
+					t.Fatalf("%s: %s kept rows read before the cursor failed: %#v", object.Name, test.label, object)
+				}
+			}
+		})
+	}
+}
+
 // 컬럼 조회는 엔진과 cmp로 같은 정본(columns-postgres.sql)에서 실행 시 파생한다. 정본이 바뀌어
 // 치환 원문이 맞지 않으면 이 테스트가 먼저 실패해야 한다.
 func TestPostgresSchemaColumnQueryDerivesFromTheSharedCanonicalQuery(t *testing.T) {

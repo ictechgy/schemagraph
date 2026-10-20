@@ -311,7 +311,7 @@ func (h *harvester) postgresRelationColumns(schema string) map[string][]ColumnDo
 }
 
 // postgresSchemaColumns는 테이블·뷰·materialized view 컬럼을 스키마마다 한 번 읽어 관계 이름별로 나눈다.
-// 관계 안의 순서는 정본과 같은 ordinal_position이다.
+// 관계 안의 순서는 정본과 같은 ordinal_position이다. 끝까지 읽지 못하면 모든 관계의 컬럼을 비운다.
 func (h *harvester) postgresSchemaColumns(schema, canonical string) map[string][]ColumnDoc {
 	columns := map[string][]ColumnDoc{}
 	query, err := postgresSchemaColumnQuery(canonical)
@@ -319,7 +319,7 @@ func (h *harvester) postgresSchemaColumns(schema, canonical string) map[string][
 		h.markIncomplete(fmt.Sprintf("bundled PostgreSQL column query could not be adapted to schema-wide reads (%s); rebuild the probe", err))
 		return columns
 	}
-	h.pgRows("columns", query, []any{schema}, func(rows *sql.Rows) error {
+	complete := h.pgRows("columns", query, []any{schema}, func(rows *sql.Rows) error {
 		var relation, name, dataType, nullable string
 		var def sql.NullString
 		var ordinal int
@@ -329,6 +329,9 @@ func (h *harvester) postgresSchemaColumns(schema, canonical string) map[string][
 		columns[relation] = append(columns[relation], ColumnDoc{Name: name, DataType: dataType, Nullable: nullable == "YES", Default: ns(def), Ordinal: ordinal})
 		return nil
 	})
+	if !complete {
+		return map[string][]ColumnDoc{}
+	}
 	return columns
 }
 
@@ -339,10 +342,11 @@ type postgresConstraintRow struct {
 }
 
 // postgresSchemaConstraints는 PK·FK·UNIQUE 제약을 스키마마다 한 번 읽어 관계 이름별로 나눈다. 관계 안의
-// 순서는 테이블마다 읽던 때와 같은 (제약 이름, 키 순서)다.
+// 순서는 테이블마다 읽던 때와 같은 (제약 이름, 키 순서)다. 끝까지 읽지 못하면 일부 키 컬럼만 가진 제약을 내지
+// 않도록 모든 관계의 제약을 비운다.
 func (h *harvester) postgresSchemaConstraints(schema string) map[string][]ConstraintDoc {
 	groups := newRelationGroups[ConstraintDoc]()
-	h.pgRows("constraints", `
+	complete := h.pgRows("constraints", `
 		SELECT rel.relname, con.conname, con.contype::text, local_attr.attname,
 		       ref_attr.attname, ref_rel.relname, ref_ns.nspname, local_cols.ord
 		FROM pg_constraint con
@@ -370,6 +374,9 @@ func (h *harvester) postgresSchemaConstraints(schema string) map[string][]Constr
 		addPostgresConstraintRow(constraint, r)
 		return nil
 	})
+	if !complete {
+		return map[string][]ConstraintDoc{}
+	}
 	return groups.lists()
 }
 
@@ -403,10 +410,11 @@ func postgresConstraintKind(kind string) string {
 }
 
 // postgresSchemaIndexes는 PK가 아닌 인덱스를 스키마마다 한 번 읽어 테이블 이름별로 나눈다. 테이블 안의
-// 순서는 테이블마다 읽던 때와 같은 (인덱스 이름, 키 순서)다. 식 키는 컬럼이 없어 정의가 불완전하다.
+// 순서는 테이블마다 읽던 때와 같은 (인덱스 이름, 키 순서)다. 식 키는 컬럼이 없어 정의가 불완전하다. 끝까지 읽지
+// 못하면 일부 키 컬럼만 가진 인덱스를 내지 않도록 모든 테이블의 인덱스를 비운다.
 func (h *harvester) postgresSchemaIndexes(schema string) map[string][]IndexDoc {
 	groups := newRelationGroups[IndexDoc]()
-	h.pgRows("indexes", `
+	complete := h.pgRows("indexes", `
 		SELECT tbl.relname, cls.relname, idx.indisunique, attr.attname, index_cols.ord,
 		       idx.indisvalid AND idx.indisready, pg_get_expr(idx.indpred, idx.indrelid)
 		FROM pg_index idx
@@ -434,13 +442,17 @@ func (h *harvester) postgresSchemaIndexes(schema string) map[string][]IndexDoc {
 		}
 		return nil
 	})
+	if !complete {
+		return map[string][]IndexDoc{}
+	}
 	return groups.lists()
 }
 
-// postgresSchemaTriggers는 내부용이 아닌 트리거를 스키마마다 한 번 읽어 관계 이름별로 나눈다.
+// postgresSchemaTriggers는 내부용이 아닌 트리거를 스키마마다 한 번 읽어 관계 이름별로 나눈다. 끝까지 읽지 못하면
+// 모든 트리거를 비운다.
 func (h *harvester) postgresSchemaTriggers(schema string) map[string][]TriggerDoc {
 	triggers := map[string][]TriggerDoc{}
-	h.pgRows("triggers", `
+	complete := h.pgRows("triggers", `
 		SELECT rel.relname, tg.tgname, pg_get_triggerdef(tg.oid)
 		FROM pg_trigger tg
 		JOIN pg_class rel ON rel.oid = tg.tgrelid
@@ -455,6 +467,9 @@ func (h *harvester) postgresSchemaTriggers(schema string) map[string][]TriggerDo
 		triggers[relation] = append(triggers[relation], TriggerDoc{Name: name, Body: ns(body)})
 		return nil
 	})
+	if !complete {
+		return map[string][]TriggerDoc{}
+	}
 	return triggers
 }
 
@@ -640,26 +655,30 @@ func routinePositions(routines []RoutineDoc) map[string][]int {
 	return positions
 }
 
-// pgRows는 보조 조회 실패를 빈 결과로 위장하지 않고 limitation에 남긴다.
-func (h *harvester) pgRows(label, query string, args []any, scan func(*sql.Rows) error) {
+// pgRows는 보조 조회 실패를 빈 결과로 위장하지 않고 limitation에 남긴다. 끝까지 읽었으면 true다. 스키마 단위
+// 세부 조회(컬럼·제약·인덱스·트리거)는 false면 그때까지 읽은 행도 버리고 그 부분을 스키마의 모든 객체에서 비운다 —
+// 커서가 도중에 끊기면 어느 객체까지 채워지는지가 실패 시점에 따라 달라지기 때문이다. 나머지 호출은 이 값을 보지 않는다.
+func (h *harvester) pgRows(label, query string, args []any, scan func(*sql.Rows) error) bool {
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("%s unavailable — %s", label, oneLine(err.Error())))
-		return
+		return false
 	}
 	defer rows.Close()
 	for rows.Next() {
 		if err := scan(rows); err != nil {
 			h.catalogIncomplete = true
 			h.limitations = append(h.limitations, fmt.Sprintf("%s row read failed — %s", label, oneLine(err.Error())))
-			return
+			return false
 		}
 	}
 	if err := rows.Err(); err != nil {
 		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("%s unavailable — %s", label, oneLine(err.Error())))
+		return false
 	}
+	return true
 }
 
 func newObject(name, kind string) ObjectDoc {
