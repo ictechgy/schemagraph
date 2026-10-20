@@ -672,6 +672,25 @@ def tool(tool_name: str, /, **arguments: object) -> dict:
     return {"method": "tools/call", "params": {"name": tool_name, "arguments": arguments}}
 
 
+def tool_payload(response: dict) -> object:
+    """도구 결과의 유일한 본문인 `content[0].text`를 JSON으로 읽는다.
+
+    서버는 보고 JSON을 압축 텍스트 한 벌로만 싣고 `structuredContent`로 다시 싣지 않는다.
+    """
+    result = response.get("result")
+    if not isinstance(result, dict) or "structuredContent" in result:
+        fail(f"MCP tool result must carry its JSON once, in text content: {response}")
+    content = result.get("content")
+    if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict):
+        fail(f"MCP tool result must have exactly one content block: {response}")
+    if content[0].get("type") != "text" or not isinstance(content[0].get("text"), str):
+        fail(f"MCP tool content must be one text block: {response}")
+    try:
+        return json.loads(content[0]["text"])
+    except json.JSONDecodeError as error:
+        fail(f"MCP tool text content was not JSON ({error}): {response}")
+
+
 def check_mcp_parity(engine: Path, graph_path: Path) -> None:
     """MCP 도구 결과가 같은 그래프에 대한 CLI JSON과 일치하는지 확인한다."""
     cli = {
@@ -699,7 +718,7 @@ def check_mcp_parity(engine: Path, graph_path: Path) -> None:
         {"method": "tools/list"},
     ])
     for key, response in zip(cli, responses):
-        if response.get("result", {}).get("structuredContent") != expected[key]:
+        if tool_payload(response) != expected[key]:
             fail(f"MCP {key} report differed from CLI: {response}")
     if not expected["search-names"]["matches"] or not expected["search-summary"]["truncated"]:
         fail(f"search fixture did not exercise matches and truncation: {expected['search-names']} {expected['search-summary']}")
@@ -717,7 +736,7 @@ def check_mcp_retention(engine: Path, graph_path: Path, unretained: dict) -> Non
     root = unretained["candidates"][0]["id"]
     retained_cli = json.loads(run(engine, "dead", "--graph", graph_path, "--retain", root))
     response = mcp_session(engine, graph_path, [tool("dead")], "--retain", root)[0]
-    if response.get("result", {}).get("structuredContent") != retained_cli:
+    if tool_payload(response) != retained_cli:
         fail(f"MCP dead with serve --retain differed from CLI: {response}")
     if retained_cli == unretained:
         fail(f"retention root did not change the dead report: {retained_cli}")
@@ -729,7 +748,7 @@ def check_mcp_retention(engine: Path, graph_path: Path, unretained: dict) -> Non
         f'retain = ["{root}"]\n[[suppress]]\npattern = "*"\nreason = "x"\nuntil = "2099-01-01"\n', encoding="utf-8")
     run(engine, "dead", "--graph", graph_path, "--config", workdir / "schemagraph.toml", expected=2)
     response = mcp_session(engine, graph_path, [tool("dead")], cwd=workdir)[0]
-    if response.get("result", {}).get("structuredContent") != unretained:
+    if tool_payload(response) != unretained:
         fail(f"serve read schemagraph.toml from its working directory: {response}")
 
 

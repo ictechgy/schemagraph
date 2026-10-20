@@ -104,6 +104,8 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   in `truncationReasons`; partial results never establish absence. MCP clients
   cancel by request ID; cancelled calls may have no response. See ANALYSIS.md
   for preparation/output boundaries and completion races.
+- MCP tool results carry the report JSON once, as compact JSON in
+  `content[0].text`; there is no `structuredContent`. Parse the text.
 - `dead` — objects nothing inside the database consumes. Consumer-kind
   objects (views, routines, packages) with no caller are the usual
   candidates; each carries its usage evidence when collected.

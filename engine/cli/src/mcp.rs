@@ -1355,11 +1355,18 @@ fn reject_unknown(arguments: &Map<String, Value>, allowed: &[&str]) -> Result<()
     Ok(())
 }
 
+/// 도구 결과를 MCP `CallToolResult`로 감싼다 — 보고 JSON은 `content[0].text`에 한 번만 싣는다.
+///
+/// 서버가 받는 모든 프로토콜 버전(2024-11-05~2025-11-25)과 클라이언트가 공통으로 읽는
+/// 채널이 `content`다. `structuredContent`는 2025-06-18에 생긴 선택 필드이고 도구에
+/// `outputSchema`가 없어 요구되지 않는다. 같은 값을 두 번(그것도 pretty 텍스트로) 실으면
+/// 응답이 두 배 넘게 커질 뿐 더 전하는 사실이 없다. `Value`의 `Display`는 압축 JSON을
+/// 쓰고, serde_json의 `preserve_order`가 꺼져 있어 맵 키가 정렬된다 — CLI JSON과 같은
+/// 값이 결정적인 바이트로 나간다. 문자열 키와 유한한 숫자만 담는 `Value`라 직렬화는
+/// 실패하지 않는다.
 fn tool_result(value: &Value, is_error: bool) -> Value {
-    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".into());
     json!({
-        "content": [{"type": "text", "text": text}],
-        "structuredContent": value,
+        "content": [{"type": "text", "text": value.to_string()}],
         "isError": is_error,
     })
 }
@@ -1627,6 +1634,56 @@ mod tests {
         responses
     }
 
+    /// 도구 결과의 유일한 본문인 `content[0].text`를 JSON으로 읽는다.
+    ///
+    /// 같은 값을 `structuredContent`로 한 번 더 싣지 않는지, 텍스트가 키 정렬된 압축
+    /// 직렬화와 바이트까지 같은지도 함께 확인한다 — 모든 도구 테스트가 이 계약을 지나간다.
+    fn tool_value(response: &Value) -> Value {
+        let result = &response["result"];
+        assert!(
+            result.get("structuredContent").is_none(),
+            "tool results carry their JSON once: {result}"
+        );
+        let content = result["content"]
+            .as_array()
+            .expect("tool content is an array");
+        assert_eq!(content.len(), 1, "one content block: {result}");
+        assert_eq!(content[0]["type"], "text");
+        let text = content[0]["text"]
+            .as_str()
+            .expect("text content is a string");
+        let value: Value = serde_json::from_str(text).expect("text content is JSON");
+        assert_eq!(
+            text,
+            value.to_string(),
+            "text is compact JSON with sorted keys"
+        );
+        value
+    }
+
+    #[test]
+    fn tool_results_carry_the_report_once_as_compact_text() {
+        let responses = call(&[
+            r#"{"name":"stats"}"#,
+            r#"{"name":"query","arguments":{"name":"missing"}}"#,
+        ]);
+        for (response, is_error) in responses.iter().zip([false, true]) {
+            let keys: Vec<&str> = response["result"]
+                .as_object()
+                .expect("tool result is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys, ["content", "isError"]);
+            assert_eq!(response["result"]["isError"], is_error);
+        }
+        assert_eq!(
+            tool_value(&responses[0]),
+            export::stats_to_value(&fixture())
+        );
+        assert_eq!(tool_value(&responses[1])["found"], false);
+    }
+
     #[test]
     fn search_discloses_names_then_summary_and_rejects_unknown_kind() {
         let responses = call(&[
@@ -1634,14 +1691,14 @@ mod tests {
             r#"{"name":"search","arguments":{"pattern":"public.*","kind":"VIEW","detail":"summary"}}"#,
             r#"{"name":"search","arguments":{"pattern":"x","kind":"tabel"}}"#,
         ]);
-        let names = &responses[0]["result"]["structuredContent"];
+        let names = &tool_value(&responses[0]);
         assert_eq!(names["matches"], json!(["public.orders", "public.report"]));
         assert_eq!(
             (names["total"].as_u64(), names["truncated"].as_bool()),
             (Some(2), Some(false))
         );
         assert!(names.get("kind").is_none());
-        let summary = &responses[1]["result"]["structuredContent"];
+        let summary = &tool_value(&responses[1]);
         assert_eq!(summary["kind"], "view");
         assert_eq!(summary["matches"][0]["id"], "public.report");
         assert_eq!(summary["matches"][0]["dependencies"], 1);
@@ -1663,7 +1720,7 @@ mod tests {
             r#"{"name":"cycles","arguments":{"level":"table"}}"#,
             r#"{"name":"unused","arguments":{}}"#,
         ]);
-        let content = |index: usize| responses[index]["result"]["structuredContent"].clone();
+        let content = |index: usize| tool_value(&responses[index]);
         assert_eq!(
             content(0),
             export::dead_to_value(&analysis::dead(&graph, 1024))
@@ -1727,7 +1784,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"impact","arguments":{"name":"missing"}}}"#
         );
         let responses = run(&input);
-        let report = &responses[1]["result"]["structuredContent"];
+        let report = &tool_value(&responses[1]);
         assert_eq!(report["subject"]["id"], "public.orders");
         assert_eq!(report["format"], "schemagraph-query");
         assert_eq!(report["version"], 1);
@@ -1737,11 +1794,9 @@ mod tests {
         assert_eq!(report["dependencies"][0]["id"], "public.customers");
         assert_eq!(report["dependencies"][0]["via"], "public.orders");
         assert_eq!(responses[2]["result"]["isError"], true);
-        assert_eq!(responses[2]["result"]["structuredContent"]["found"], false);
+        assert_eq!(tool_value(&responses[2])["found"], false);
         // notFound는 impact 보고가 아니라 별도 모양이다 — 형식 머리를 싣지 않는다.
-        assert!(responses[2]["result"]["structuredContent"]
-            .get("format")
-            .is_none());
+        assert!(tool_value(&responses[2]).get("format").is_none());
     }
 
     #[test]
@@ -1752,7 +1807,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"impact","arguments":{"name":"customers"}}}"#
         );
         let responses = run(&input);
-        let report = &responses[1]["result"]["structuredContent"];
+        let report = &tool_value(&responses[1]);
         assert_eq!(report["format"], "schemagraph-impact");
         assert_eq!(report["version"], 1);
         // report -> orders -> customers: orders는 subject에서, report는 orders에서 온다.
@@ -1779,7 +1834,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"name":"orders","maxVisited":1,"maxExaminedEdges":100}}}"#
         );
         let responses = run(&input);
-        let report = &responses[1]["result"]["structuredContent"];
+        let report = &tool_value(&responses[1]);
         assert_eq!(report["complete"], false);
         assert_eq!(report["visited"], 2);
         assert!(report["truncationReasons"]
@@ -2005,7 +2060,7 @@ mod tests {
         let bytes = writer.lock().unwrap();
         let response: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(response["id"], 3);
-        assert_eq!(response["result"]["structuredContent"]["complete"], true);
+        assert_eq!(tool_value(&response)["complete"], true);
         assert!(registry.lock().unwrap().requests.is_empty());
     }
 

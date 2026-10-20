@@ -471,9 +471,12 @@ metadata; share it with the same audience as the graph snapshot.
 `path`, `diagnostics`, `search`, `dead`, `cycles`, `lint`, `stats`, and `unused`. It loads
 one graph at startup and exposes no database connection or arbitrary file-reading
 tools. Configure the MCP client to launch the command above. The tool results
-preserve the CLI analysis contract and explicit result/traversal limits; each
-tool returns the same JSON as the CLI command with the same options. `query` and
-`impact` return their default JSON; `--format language-traversal` is CLI-only.
+preserve the CLI analysis contract and explicit result/traversal limits. Each
+result carries its JSON report once, as compact JSON with sorted keys in its
+single text content block (`content[0].text`); there is no `structuredContent`,
+so parse the text. The report is the same JSON value that the CLI command prints
+with the same options (the CLI pretty-prints it). `query` and `impact` return
+their default JSON; `--format language-traversal` is CLI-only.
 
 Start with `search` when the exact id is unknown. Its default `names` detail
 lists ids only; request `summary` for the candidates you need. The `dead` tool
