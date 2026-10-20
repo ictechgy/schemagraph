@@ -105,6 +105,122 @@ the larger rows, use `--tables-per-schema 4000`, and for the direct times,
 `--latency-ms 0`. `results.json` keeps every sample with its statement count
 and document SHA-256, a per-build summary, and the relay's connection errors.
 
+## Remote MySQL and MariaDB collection (2026-10-20)
+
+The Go probe used to ask MySQL and MariaDB for each object's primary-key
+positions, columns, constraints, indexes, and triggers separately, and for each
+routine's parameters. go-sql-driver/mysql sends a statement with arguments as a
+prepare and an execute unless `interpolateParams` is set, so each table cost
+about ten round trips on the probe's one pinned connection. The probe now reads
+each kind once per schema and splits the rows by exact table name.
+
+Constraints and their key columns come from two schema-wide queries that the
+probe matches by exact schema, table, and constraint name. Joining the two
+`information_schema` tables on the server made MariaDB 11.4 compare every
+constraint row with every key-column row (a block nested-loop join without an
+index): for 4,000 tables that one query took about 4 s, and its time grew with
+the square of the table count. Read separately, each half took about 0.05 s.
+
+Routine parameters are read once per schema as well, except for routine names
+that the server's case- and accent-insensitive comparison could match with
+another name. Those routines are still asked one at a time, so their signatures
+stay byte-for-byte the same as before and the same as the native reader's. When
+a schema has a routine name that is not printable ASCII or that ends with a
+space, every routine in that schema is asked one at a time.
+
+`Scripts/benchmark-probe-mysql.py` produced these measurements on the same
+macOS 26.7.1 ARM64 host while other jobs ran (load average 2 to 7). It starts
+the `mysql:8.4` and `mariadb:11.4` images pinned by digest in
+`Fixtures/accuracy/mysql-environments.json` (MySQL 8.4.11 and MariaDB 11.4.13)
+in Colima 0.10.2 with 2 CPUs and 4 GiB, publishes the port on 127.0.0.1 only,
+and loads one schema of tables like these, with one procedure for every ten
+tables:
+
+```sql
+CREATE TABLE t00000 (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT,
+  c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT,
+  KEY t00000_parent (parent_id));
+CREATE TABLE t00001 (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT,
+  c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT,
+  KEY t00001_parent (parent_id),
+  CONSTRAINT t00001_fk FOREIGN KEY (parent_id) REFERENCES t00000 (id));
+-- Every later table references the one before it in the same way.
+CREATE PROCEDURE p00000(IN a INT, IN b VARCHAR(10)) SELECT a, b;
+```
+
+Both servers run with their default `performance_schema` setting: on for
+MySQL, so a MySQL collection also reads the two `sys` usage views, and off for
+MariaDB. With `--latency-ms 1`, every collection connects through
+`Scripts/latency-relay.py`, which adds about 2 ms per round trip. Statements are
+the increase of the server's `Questions` status variable during one
+collection, with the cost of reading it removed. `Questions` counts executes
+and plain statements but not prepares, which are counted separately from
+`Com_stmt_prepare`.
+
+The previous Go probe was built from `da64c1d`, which still asks per object
+and per routine, and the changed one from `92af86d`. Go is 1.27.1. Each cell is
+the median of three fresh processes after one warm-up per build, with the
+builds alternating.
+
+| Server | Tables | Format | Before s | After s | Before statements | After statements |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| MySQL | 2,000 | JSON | 63.184 | 0.269 | 10,211 | 18 |
+| MySQL | 2,000 | NDJSON | 65.013 | 1.757 | 10,211 | 18 |
+| MySQL | 4,000 | JSON | 153.222 | 0.476 | 20,411 | 18 |
+| MariaDB | 2,000 | JSON | 113.698 | 0.197 | 10,208 | 15 |
+| MariaDB | 2,000 | NDJSON | 118.590 | 0.186 | 10,208 | 15 |
+| MariaDB | 4,000 | JSON | 316.888 | 0.390 | 20,408 | 15 |
+
+Every pair wrote the same document bytes, the relay recorded no connection
+errors, and no other container ran in the Colima VM. Before the change, each
+table added five statements and each routine one. After it, a collection sent
+18 statements, 12 of them prepared, on MySQL and 15, 10 of them prepared, on
+MariaDB at both sizes. Each remaining prepare belongs to one schema-wide query,
+so `interpolateParams` would save at most that many round trips per schema. The
+probe leaves it off, and a URL can still turn it on with
+`?interpolateParams=true`. Without the relay, 4,000 tables took 15.314 s before
+and 0.383 s after on MySQL, and 204.666 s and 0.309 s on MariaDB, whose
+per-table catalog queries cost more on the server itself. An intermediate build
+that still joined the two constraint tables on the server took 1.169 s for
+2,000 and 3.994 s for 4,000 MariaDB tables through the relay.
+
+The MySQL NDJSON row is slower for a reason outside this change. In some MySQL
+containers built from the same image and fixture, the optimizer ran
+`sys.schema_unused_indexes`, the index-usage query that the probe sends once
+per schema both before and after the change, as a nested loop that looks up the
+schema's tables again for every index-usage row, instead of a hash join. That
+one query then took about 1.56 s for 2,000 tables instead of about 0.01 s. In a
+later check, three of five fresh containers chose that plan. In another, two of
+five were as slow, whether the probe connected through the forwarded port or
+ran inside the container. It adds the same time to both builds of a row.
+
+These tests check that the number of catalog queries per schema does not depend
+on the table or routine count, that no catalog query joins `information_schema`
+tables on the server, and that a constraint keeps only its own key columns:
+
+```sh
+(cd probe-go && go test -run 'TestMySQL(QueriesPerSchema|CatalogQueriesDoNotJoin|ConstraintsKeepOnlyTheirOwn)' .)
+```
+
+The table comes from these commands. Build the previous Go probe from the older
+commit with `git archive`, as in the Reproduce section at the end of this file.
+The script needs Docker and pulls the pinned images on first use.
+
+```sh
+python3 Scripts/test-probe-mysql-benchmark.py
+python3 Scripts/benchmark-probe-mysql.py --server mysql \
+  --baseline-probe /path/to/previous/schemagraph-probe-go \
+  --new-probe /path/to/new/schemagraph-probe-go \
+  --engine /path/to/schemagraph --tables 2000 --routines 200 --columns 8 \
+  --format json --latency-ms 1 --warmup 1 --repeat 3 --output /path/to/report
+```
+
+For MariaDB, use `--server mariadb`. For the NDJSON rows, use
+`--format ndjson`. For the larger rows, use `--tables 4000 --routines 400`, and
+for the direct times, `--latency-ms 0`. `results.json` keeps every sample with
+its statement and prepare counts and document SHA-256, a per-build summary, and
+the relay's connection errors.
+
 ## PL/pgSQL routine bodies at scale (2026-10-18)
 
 These release-mode measurements compare the 0.7.1 engine (`a2f0dffc7af4…`,

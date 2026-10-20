@@ -24,6 +24,26 @@ These changes are not yet in a published release.
   records its usual limitation once. The JDBC probe records its usual
   per-object limitation for each object and, for indexes, still falls back to
   `getIndexInfo`.
+- Go probe: MySQL and MariaDB constraints now list only their own key
+  columns. The probe joins `table_constraints` with `key_column_usage`, and
+  MariaDB compares the names in that join without regard to case or accents.
+  A constraint with a shared name (`PRIMARY`, or `UNIQUE` keys with the same
+  name) therefore also listed the key columns of tables whose names differed
+  only in case or accents, such as `P` and `p` or `resume` and `résumé`, and of
+  same-named tables in a schema whose name differed only in case. The order of
+  those columns also varied between servers. Each constraint now keeps only its
+  own table's key columns, as the native reader already did. MySQL documents
+  are unchanged, and so are MariaDB documents without such names. Snapshots
+  collected again from such databases differ from older ones, and `review`
+  against an older snapshot can report `constraints-changed` for those tables.
+- The Go probe (MySQL and MariaDB) reads primary-key positions, columns,
+  constraints, indexes, triggers, and routine parameters once per schema
+  instead of once per object or routine; see `PERFORMANCE.md`. Successful
+  collections produce the same output, apart from the constraint change above.
+  A failed schema-wide catalog query now leaves that part empty for every
+  object in the schema and records its usual limitation once. If the
+  schema-wide routine parameter query fails, every routine in the schema
+  records its usual limitation and has no signature.
 
 # schemagraph 0.7.1
 
