@@ -41,6 +41,42 @@ internal const val ORACLE_FETCH_ROWS = 1000
 private fun ResultSet.strOrNull(col: String): String? =
     try { getString(col) } catch (_: Exception) { null }
 
+/** getColumns 한 행. 객체마다 읽는 경로와 스키마 단위 경로(PostgresSchemaMetadata)가 같은 규칙을 쓴다. */
+internal fun readColumnDoc(rs: ResultSet) = ColumnDoc(
+    name = rs.getString("COLUMN_NAME"),
+    dataType = rs.strOrNull("TYPE_NAME") ?: "unknown",
+    // NULLABLE: 0=no, 1=yes, 2=알 수 없음 → 모름은 널 가능 쪽으로
+    nullable = rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls,
+    default = rs.strOrNull("COLUMN_DEF"),
+    ordinal = rs.getInt("ORDINAL_POSITION"),
+    pkPosition = 0,
+)
+
+/** getPrimaryKeys 결과 한 행에서 읽는 값. */
+internal class PrimaryKeyRow(val keySeq: Int, val column: String, val name: String?)
+
+/** getPrimaryKeys 한 행. PK_NAME을 읽지 못하는 드라이버면 이름은 null이다. */
+internal fun readPrimaryKeyRow(rs: ResultSet) =
+    PrimaryKeyRow(rs.getInt("KEY_SEQ"), rs.getString("COLUMN_NAME"), rs.strOrNull("PK_NAME"))
+
+/** 테이블 하나의 PK 행을 (KEY_SEQ, COLUMN_NAME) 쌍과 첫 non-null PK_NAME으로 묶는다. */
+internal fun List<PrimaryKeyRow>.toPrimaryKeyRows() =
+    PrimaryKeyRows(map { it.keySeq to it.column }, firstNotNullOfOrNull { it.name })
+
+/** getImportedKeys 결과 한 행. 열을 읽는 순서는 이전과 같다. */
+internal fun readImportedKeyRow(rs: ResultSet): ImportedKeyRow {
+    val fkName = rs.strOrNull("FK_NAME")?.takeIf { it.isNotBlank() }
+    val pkTable = rs.getString("PKTABLE_NAME")
+    return ImportedKeyRow(
+        name = fkName,
+        keySeq = rs.getInt("KEY_SEQ"),
+        column = rs.getString("FKCOLUMN_NAME"),
+        referencedSchema = rs.strOrNull("PKTABLE_SCHEM") ?: rs.strOrNull("PKTABLE_CAT"),
+        referencedTable = pkTable,
+        referencedColumn = rs.getString("PKCOLUMN_NAME"),
+    )
+}
+
 /** 프로브 추출기 — Connection 하나를 받아 CatalogDocument를 만든다. */
 class Extractor(
     private val conn: Connection,
@@ -175,12 +211,14 @@ class Extractor(
      *  객체·routine의 합집합이던 계약과 같다). */
     private fun extractSchema(schema: String, usage: UsageHarvest): SchemaDoc? {
         val bodies = collectBodies(schema)
-        val objects = rawObjectsOf(schema).map { raw ->
+        val raws = rawObjectsOf(schema)
+        val batch = postgresSchemaMetadata(raws)
+        val objects = raws.map { raw ->
             // 시퀀스에는 테이블 컬럼·키가 없다. 드라이버에 테이블 메타데이터로
             // 질의하면 불필요한 카탈로그 작업이나 방언별 오류를 일으킨다.
-            val columns = if (raw.kind == "sequence") emptyList() else columnsOf(raw)
+            val columns = if (raw.kind == "sequence") emptyList() else columnsOf(raw, batch)
             val (constraints, pkPos) = if (raw.kind == "sequence")
-                emptyList<ConstraintDoc>() to emptyMap<String, Int>() else constraintsOf(raw)
+                emptyList<ConstraintDoc>() to emptyMap<String, Int>() else constraintsOf(raw, batch)
             ObjectDoc(
                 name = raw.name,
                 kind = raw.kind,
@@ -190,7 +228,7 @@ class Extractor(
                 // 인덱스는 테이블·물화뷰에만 있는 게 보통이라 거기만 수확한다(정확한
                 // 통계를 요구하던 때 view에 getIndexInfo를 부르면 Oracle이 ORA-20000(DBMS_STATS)을 던졌다).
                 indexes = if (raw.kind == "table" || raw.kind == "materialized-view")
-                    indexesOf(raw).map { idx ->
+                    indexesOf(raw, batch).map { idx ->
                         idx.copy(usage = usage.indexes[Triple(schema, raw.name, idx.name)])
                     }
                 else emptyList(),
@@ -285,24 +323,20 @@ class Extractor(
         emptyList()
     }
 
-    private fun columnsOf(obj: RawObject): List<ColumnDoc> = runCatching {
+    /** pgjdbc로 읽는 PostgreSQL이면 스키마의 컬럼·키·인덱스를 묶음마다 한 번씩 읽는 원본(PostgresSchemaMetadata.kt)이다.
+     *  다른 드라이버·방언은 table=null 지원이 제각각이라 객체마다 묻는다. 객체들은 같은 getTables 결과라
+     *  catalog·schema 인자가 같으므로 첫 객체의 값을 쓴다. 객체가 없으면 묻지 않는다. */
+    private fun postgresSchemaMetadata(objects: List<RawObject>): PostgresSchemaMetadata? {
+        val first = objects.firstOrNull() ?: return null
+        if (dialect != "postgres" || meta.driverName != PGJDBC_DRIVER_NAME) return null
+        return PostgresSchemaMetadata(conn, meta, first.catalog, first.schemaName ?: first.schema)
+    }
+
+    private fun columnsOf(obj: RawObject, batch: PostgresSchemaMetadata?): List<ColumnDoc> = runCatching {
         if (dialect == "sqlite") return@runCatching sqliteCatalogColumns(conn, obj.schema, obj.name)
+        if (batch != null) return@runCatching batch.columnsOf(obj.name)
         meta.getColumns(obj.catalog, obj.schemaName, obj.name, null).use { rs ->
-            buildList {
-                while (rs.next()) {
-                    add(
-                        ColumnDoc(
-                            name = rs.getString("COLUMN_NAME"),
-                            dataType = rs.strOrNull("TYPE_NAME") ?: "unknown",
-                            // NULLABLE: 0=no, 1=yes, 2=알 수 없음 → 모름은 널 가능 쪽으로
-                            nullable = rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls,
-                            default = rs.strOrNull("COLUMN_DEF"),
-                            ordinal = rs.getInt("ORDINAL_POSITION"),
-                            pkPosition = 0,
-                        )
-                    )
-                }
-            }
+            buildList { while (rs.next()) add(readColumnDoc(rs)) }
         }
     }.getOrElse {
         limitations += "${obj.schema}.${obj.name}: getColumns 실패 — ${it.message}"
@@ -319,38 +353,29 @@ class Extractor(
     private fun sqliteKeysFor(obj: RawObject): SQLiteKeyReader? =
         sqliteKeys?.takeIf { obj.catalog == null && obj.schemaName == null }
 
-    private fun constraintsOf(obj: RawObject): Pair<List<ConstraintDoc>, Map<String, Int>> {
+    private fun constraintsOf(obj: RawObject, batch: PostgresSchemaMetadata?): Pair<List<ConstraintDoc>, Map<String, Int>> {
         val out = mutableListOf<ConstraintDoc>()
         val pkPos = mutableMapOf<String, Int>()
         runCatching {
-            val replicated = sqliteKeysFor(obj)?.primaryKeyRows(obj.name)
-            if (replicated != null) addPrimaryKey(obj, replicated, out, pkPos)
-            else meta.getPrimaryKeys(obj.catalog, obj.schemaName, obj.name).use { rs ->
-                addPrimaryKey(obj, readPrimaryKeyRows(rs), out, pkPos)
-            }
+            val rows = sqliteKeysFor(obj)?.primaryKeyRows(obj.name)
+                ?: batch?.primaryKeysOf(obj.name)
+                ?: meta.getPrimaryKeys(obj.catalog, obj.schemaName, obj.name).use { rs -> readPrimaryKeyRows(rs) }
+            addPrimaryKey(obj, rows, out, pkPos)
         }.onFailure { limitations += "${obj.schema}.${obj.name}: getPrimaryKeys 실패 — ${it.message}" }
 
         runCatching {
-            val replicated = sqliteKeysFor(obj)?.importedKeyRows(obj.name)
-            if (replicated != null) addForeignKeys(obj, replicated, out)
-            else meta.getImportedKeys(obj.catalog, obj.schemaName, obj.name).use { rs ->
-                addForeignKeys(obj, readImportedKeyRows(rs), out)
-            }
+            val rows = sqliteKeysFor(obj)?.importedKeyRows(obj.name)
+                ?: batch?.importedKeysOf(obj.name)
+                ?: meta.getImportedKeys(obj.catalog, obj.schemaName, obj.name).use { rs -> readImportedKeyRows(rs) }
+            addForeignKeys(obj, rows, out)
         }.onFailure { limitations += "${obj.schema}.${obj.name}: getImportedKeys 실패 — ${it.message}" }
 
         return out.sortedBy { it.name } to pkPos
     }
 
     /** getPrimaryKeys 결과를 읽는다. PK_NAME은 첫 non-null 값만 쓴다. */
-    private fun readPrimaryKeyRows(rs: ResultSet): PrimaryKeyRows {
-        val cols = mutableListOf<Pair<Int, String>>()
-        var pkName: String? = null
-        while (rs.next()) {
-            cols += rs.getInt("KEY_SEQ") to rs.getString("COLUMN_NAME")
-            pkName = pkName ?: rs.strOrNull("PK_NAME")
-        }
-        return PrimaryKeyRows(cols, pkName)
-    }
+    private fun readPrimaryKeyRows(rs: ResultSet): PrimaryKeyRows =
+        buildList { while (rs.next()) add(readPrimaryKeyRow(rs)) }.toPrimaryKeyRows()
 
     /** KEY_SEQ 순서로 PK 하나를 만들고 컬럼별 PK 위치를 [pkPos]에 적는다. 이름이 없으면 `{table}_pk`다. */
     private fun addPrimaryKey(
@@ -362,21 +387,9 @@ class Extractor(
         out += ConstraintDoc(rows.name ?: "${obj.name}_pk", "pk", ordered)
     }
 
-    /** getImportedKeys 결과를 읽는다. 열을 읽는 순서는 이전과 같다. */
-    private fun readImportedKeyRows(rs: ResultSet): List<ImportedKeyRow> = buildList {
-        while (rs.next()) {
-            val fkName = rs.strOrNull("FK_NAME")?.takeIf { it.isNotBlank() }
-            val pkTable = rs.getString("PKTABLE_NAME")
-            add(ImportedKeyRow(
-                name = fkName,
-                keySeq = rs.getInt("KEY_SEQ"),
-                column = rs.getString("FKCOLUMN_NAME"),
-                referencedSchema = rs.strOrNull("PKTABLE_SCHEM") ?: rs.strOrNull("PKTABLE_CAT"),
-                referencedTable = pkTable,
-                referencedColumn = rs.getString("PKCOLUMN_NAME"),
-            ))
-        }
-    }
+    /** getImportedKeys 결과를 읽는다. */
+    private fun readImportedKeyRows(rs: ResultSet): List<ImportedKeyRow> =
+        buildList { while (rs.next()) add(readImportedKeyRow(rs)) }
 
     /** FK 행을 이름(없으면 대상 테이블)으로 묶어 제약을 만든다. 이름 없는 묶음은 행 순서대로 `{table}_fk_{n}`이다. */
     private fun addForeignKeys(obj: RawObject, rows: List<ImportedKeyRow>, out: MutableList<ConstraintDoc>) {
@@ -401,10 +414,10 @@ class Extractor(
         }
     }
 
-    private fun indexesOf(obj: RawObject): List<IndexDoc> {
+    private fun indexesOf(obj: RawObject, batch: PostgresSchemaMetadata?): List<IndexDoc> {
         if (dialect == "postgres" || dialect == "sqlite") {
             try {
-                return catalogIndexes(conn, dialect, obj.schema, obj.name).orEmpty()
+                return batch?.indexesOf(obj.name) ?: catalogIndexes(conn, dialect, obj.schema, obj.name).orEmpty()
             } catch (error: Exception) {
                 limitations += "${obj.schema}.${obj.name}: index definition catalog unavailable; falling back to JDBC metadata with unknown definition completeness"
             }
