@@ -2,11 +2,14 @@
 //!
 //! 캐시 hit는 parser 효과를 그대로 그래프에 복원한다. 그래서 링크로 다른 곳을 가리키는
 //! 디렉터리·항목, 다른 사용자가 쓸 수 있는 디렉터리, FIFO 같은 특수 파일은 hit가 되면
-//! 안 되고 분석을 멈추게 해서도 안 된다. 어느 경우든 캐시 오류는 경고와 miss이고,
-//! 종료 코드와 graph.json 바이트는 캐시 없는 실행과 같다.
+//! 안 되고 분석을 멈추게 해서도 안 된다. 항목은 사용자별 비밀 키의 HMAC-SHA256 태그로
+//! 인증하므로, 공개 정보만으로 다시 계산한 위조 항목과 다른 키로 쓴 항목도 miss다.
+//! 어느 경우든 캐시 오류는 경고와 miss이고, 종료 코드와 graph.json 바이트는 캐시 없는
+//! 실행과 같다.
 #![cfg(unix)]
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -276,4 +279,221 @@ fn fifo_entry_does_not_block_the_scan() {
     assert_eq!(stats(&scan.stderr), [0, 1, 1, 1], "{}", scan.stderr);
     assert!(scan.graph == expected, "FIFO entry changed graph.json");
     assert!(fs::symlink_metadata(&entry).unwrap().file_type().is_file());
+}
+
+/// 테스트 전용 가짜 키(32바이트 이상). 실제 비밀값이 아니다.
+const FIRST_KEY: &str = "PLACEHOLDER-cache-key-for-tests-first";
+const SECOND_KEY: &str = "PLACEHOLDER-cache-key-for-tests-second";
+
+fn key_file(root: &Path) -> PathBuf {
+    root.join("config/schemagraph/cache.key")
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// 공개 정보만으로 만든 위조: payload의 `core.salaries`를 `public.harmless`로 바꾸고 두 번째
+/// 필드(형식 3의 `checksum`, 형식 4의 `tag`)를 serde 압축 직렬화의 SHA-256으로 다시 쓴다.
+/// 같은 릴리스 바이너리와 문서를 가진 사람은 이 값을 계산할 수 있지만 사용자별 키는 모른다.
+fn forge_with_recomputed_checksum(entry: &Path) {
+    let raw = fs::read(entry).unwrap();
+    let marker = b",\"payload\":";
+    let index = raw
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap();
+    let payload = String::from_utf8(raw[index + marker.len()..raw.len() - 1].to_vec()).unwrap();
+    let payload = payload.replace("core.salaries", "public.harmless");
+    let checksum = format!("{:x}", Sha256::digest(payload.as_bytes()));
+    // 머리는 `{"format":N,"<필드>":"<64 hex>"`다. 따옴표로 감싼 hex 66바이트를 바꾼다.
+    let header = String::from_utf8(raw[..index - 66].to_vec()).unwrap();
+    fs::write(
+        entry,
+        format!("{header}\"{checksum}\",\"payload\":{payload}}}"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn forged_entry_with_a_recomputed_checksum_is_recomputed_and_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    catalog(root);
+    let expected = uncached(root);
+    run_scan(
+        scan_command(root, "cold.json", Some("cache")),
+        root,
+        "cold.json",
+    );
+    let entry = only_entry(&root.join("cache"));
+    forge_with_recomputed_checksum(&entry);
+
+    let forged = run_scan(
+        scan_command(root, "graph.json", Some("cache")),
+        root,
+        "graph.json",
+    );
+    assert_eq!(stats(&forged.stderr), [0, 1, 1, 1], "{}", forged.stderr);
+    assert!(
+        forged.stderr.contains("invalid authentication tag"),
+        "{}",
+        forged.stderr
+    );
+    assert!(forged.graph == expected, "forged entry changed graph.json");
+    // 다시 계산한 결과가 위조 항목을 덮어써 다음 실행은 hit다.
+    let warm = run_scan(
+        scan_command(root, "warm.json", Some("cache")),
+        root,
+        "warm.json",
+    );
+    assert_eq!(stats(&warm.stderr), [1, 0, 0, 0], "{}", warm.stderr);
+    assert!(warm.graph == expected);
+}
+
+#[test]
+fn environment_key_is_reused_and_entries_from_another_key_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    catalog(root);
+    let expected = uncached(root);
+    let scan_with_key = |output: &str, key: &str| {
+        let mut command = scan_command(root, output, Some("cache"));
+        command.env("SCHEMAGRAPH_CACHE_KEY", key);
+        run_scan(command, root, output)
+    };
+    let cold = scan_with_key("cold.json", FIRST_KEY);
+    assert_eq!(stats(&cold.stderr), [0, 1, 1, 0], "{}", cold.stderr);
+    let warm = scan_with_key("warm.json", FIRST_KEY);
+    assert_eq!(stats(&warm.stderr), [1, 0, 0, 0], "{}", warm.stderr);
+
+    let other = scan_with_key("other.json", SECOND_KEY);
+    assert_eq!(stats(&other.stderr), [0, 1, 1, 1], "{}", other.stderr);
+    assert!(
+        other.stderr.contains("invalid authentication tag"),
+        "{}",
+        other.stderr
+    );
+    assert!(
+        other.graph == expected,
+        "foreign-key entry changed graph.json"
+    );
+    assert!(!other.stderr.contains(FIRST_KEY) && !other.stderr.contains(SECOND_KEY));
+    // 환경 키를 쓰면 키 파일을 만들지 않는다.
+    assert!(fs::symlink_metadata(root.join("config")).is_err());
+}
+
+#[test]
+fn missing_key_file_is_created_private_and_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    catalog(root);
+    let cold = run_scan(
+        scan_command(root, "cold.json", Some("cache")),
+        root,
+        "cold.json",
+    );
+    assert_eq!(stats(&cold.stderr), [0, 1, 1, 0], "{}", cold.stderr);
+    let key = key_file(root);
+    assert!(fs::symlink_metadata(&key).unwrap().file_type().is_file());
+    assert_eq!((mode(&key), fs::metadata(&key).unwrap().len()), (0o600, 32));
+    assert_eq!(mode(key.parent().unwrap()), 0o700);
+    let bytes = fs::read(&key).unwrap();
+
+    let warm = run_scan(
+        scan_command(root, "warm.json", Some("cache")),
+        root,
+        "warm.json",
+    );
+    assert_eq!(stats(&warm.stderr), [1, 0, 0, 0], "{}", warm.stderr);
+    assert_eq!(fs::read(&key).unwrap(), bytes, "the key file was replaced");
+    // 공개에 쓴 임시 파일이 남지 않는다.
+    assert_eq!(fs::read_dir(key.parent().unwrap()).unwrap().count(), 1);
+}
+
+#[test]
+fn unsafe_key_files_disable_the_cache_and_are_left_alone() {
+    let readable: fn(&Path) = |key| {
+        fs::write(key, [7u8; 32]).unwrap();
+        fs::set_permissions(key, fs::Permissions::from_mode(0o644)).unwrap();
+    };
+    let linked: fn(&Path) = |key| {
+        let target = key.with_file_name("real.key");
+        fs::write(&target, [7u8; 32]).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, key).unwrap();
+    };
+    let short: fn(&Path) = |key| {
+        fs::write(key, [7u8; 16]).unwrap();
+        fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    for (prepare, reason) in [
+        (readable, "accessible by group or other users"),
+        (linked, "symbolic link"),
+        (short, "fewer than 32 bytes"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        catalog(root);
+        let expected = uncached(root);
+        let key = key_file(root);
+        fs::create_dir_all(key.parent().unwrap()).unwrap();
+        prepare(&key);
+        let before = fs::read(&key).unwrap();
+
+        let scan = run_scan(
+            scan_command(root, "graph.json", Some("cache")),
+            root,
+            "graph.json",
+        );
+        assert!(scan.stderr.contains(reason), "{reason}: {}", scan.stderr);
+        assert_eq!(stats(&scan.stderr), [0, 1, 0, 1], "{}", scan.stderr);
+        assert!(scan.graph == expected, "disabled cache changed graph.json");
+        assert_eq!(
+            fs::read(&key).unwrap(),
+            before,
+            "{reason}: key file changed"
+        );
+        assert_eq!(fs::read_dir(root.join("cache")).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn short_environment_key_or_missing_home_disables_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    catalog(root);
+    let expected = uncached(root);
+    let mut short = scan_command(root, "short.json", Some("cache"));
+    short.env("SCHEMAGRAPH_CACHE_KEY", "PLACEHOLDER-short");
+    let mut homeless = scan_command(root, "homeless.json", Some("cache"));
+    homeless.env_remove("HOME").env_remove("XDG_CONFIG_HOME");
+    for (command, output, reason) in [
+        (short, "short.json", "shorter than 32 bytes"),
+        (homeless, "homeless.json", "SCHEMAGRAPH_CACHE_KEY"),
+    ] {
+        let scan = run_scan(command, root, output);
+        assert!(scan.stderr.contains(reason), "{reason}: {}", scan.stderr);
+        assert_eq!(stats(&scan.stderr), [0, 1, 0, 1], "{}", scan.stderr);
+        assert!(scan.graph == expected, "disabled cache changed graph.json");
+    }
+    assert!(fs::symlink_metadata(root.join("config")).is_err());
+}
+
+#[test]
+fn empty_environment_key_and_relative_config_home_fall_back_to_the_home_key_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    catalog(root);
+    // Actions는 없는 secret을 빈 문자열로 넘긴다. 상대 XDG_CONFIG_HOME은 XDG 규약대로 무시한다.
+    let mut command = scan_command(root, "graph.json", Some("cache"));
+    command
+        .env("SCHEMAGRAPH_CACHE_KEY", "")
+        .env("XDG_CONFIG_HOME", "relative-config")
+        .env("HOME", root.join("home"));
+    let scan = run_scan(command, root, "graph.json");
+    assert_eq!(stats(&scan.stderr), [0, 1, 1, 0], "{}", scan.stderr);
+    let key = root.join("home/.config/schemagraph/cache.key");
+    assert_eq!(mode(&key), 0o600);
+    assert!(fs::symlink_metadata(root.join("relative-config")).is_err());
 }

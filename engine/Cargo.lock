@@ -1199,6 +1199,8 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "getrandom 0.2.17",
+ "hmac",
  "rustix",
  "schemagraph-analysis",
  "schemagraph-core",

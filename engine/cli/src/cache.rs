@@ -2,7 +2,8 @@
 //!
 //! 캐시는 parser 효과만 저장한다. 카탈로그·usage는 매 실행마다 새로 만들고,
 //! SQL 원문은 namespace 계산과 entry 저장 어디에도 복사하지 않는다.
-//! 캐시 디렉터리는 신뢰 입력이다. 신뢰를 세우지 못하면 캐시를 끈다([`trust`]).
+//! 캐시 디렉터리는 신뢰 입력이고, 항목 payload는 사용자별 비밀 키의 HMAC-SHA256
+//! 태그로 인증한다. 신뢰를 세우지 못하면 캐시를 끈다([`trust`]).
 
 mod trust;
 
@@ -12,6 +13,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use hmac::Mac;
 use schemagraph_core::{
     AnalysisState, Diagnostic, Edge, EdgeKind, Evidence, EvidenceLayer, ObjectAnalysis, Origin,
     SourceLocation, VertexId,
@@ -24,9 +26,11 @@ use schemagraph_source::document::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// 3: notes를 정렬하지 않고 parser 순서로 저장한다. 정렬된 채 저장된 2의 항목은
-/// namespace가 달라 다시 쓰지 않는다.
-const CACHE_FORMAT_VERSION: u32 = 3;
+/// 4: payload를 키 없는 SHA-256 `checksum` 대신 사용자별 비밀 키의 HMAC-SHA256 `tag`로
+/// 인증한다. 공개된 재료(실행 파일·문서)만으로 다시 계산한 위조 항목이 hit가 되지 않게
+/// 하기 위해서다. 3 이하의 항목은 namespace가 달라 읽지 않으므로 한 번 miss가 나고 다시 쓴다.
+/// (3: notes를 정렬하지 않고 parser 순서로 저장한다.)
+const CACHE_FORMAT_VERSION: u32 = 4;
 const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const CACHE_SUFFIX: &str = ".json";
@@ -45,8 +49,9 @@ pub(crate) struct DiskBodyCache {
     directory: PathBuf,
     namespace: String,
     scoped_namespace: String,
-    /// false면 신뢰 경계를 세우지 못해 꺼진 캐시다. load는 항상 miss, store는 쓰지 않는다.
-    enabled: bool,
+    /// 항목 태그 키. None이면 신뢰 경계를 세우지 못해 꺼진 캐시다. load는 항상 miss,
+    /// store는 쓰지 않는다.
+    key: Option<trust::CacheKey>,
     stats: CacheStats,
 }
 
@@ -54,13 +59,17 @@ impl DiskBodyCache {
     pub(crate) fn new(directory: &Path, document: &CatalogDocument) -> io::Result<Self> {
         let executable = std::env::current_exe()?;
         let executable_hash = hash_file(&executable)?;
-        Self::new_with_fingerprint(directory, document, &executable_hash)
+        Self::new_with_fingerprint(directory, document, &executable_hash, || {
+            trust::resolve_key(&trust::KeyEnvironment::from_process())
+        })
     }
 
+    /// `key`는 디렉터리를 믿을 수 있을 때만 부른다(키 파일을 만들 수 있다).
     fn new_with_fingerprint(
         directory: &Path,
         document: &CatalogDocument,
         executable_hash: &str,
+        key: impl FnOnce() -> Result<trust::CacheKey, String>,
     ) -> io::Result<Self> {
         let untrusted = trust::prepare_directory(directory)?;
         let namespace = namespace_hash(document, executable_hash)?;
@@ -69,11 +78,16 @@ impl DiskBodyCache {
             directory: directory.to_owned(),
             namespace,
             scoped_namespace,
-            enabled: untrusted.is_none(),
+            key: None,
             stats: CacheStats::default(),
         };
-        if let Some(reason) = untrusted {
-            cache.warning(format!("SQL analysis cache disabled: {reason}"));
+        let key = match untrusted {
+            Some(reason) => Err(reason),
+            None => key(),
+        };
+        match key {
+            Ok(key) => cache.key = Some(key),
+            Err(reason) => cache.warning(format!("SQL analysis cache disabled: {reason}")),
         }
         Ok(cache)
     }
@@ -88,7 +102,7 @@ impl DiskBodyCache {
         body: &str,
         context: Option<&CacheContext>,
     ) -> Option<BodyResult> {
-        if !self.enabled {
+        if self.key.is_none() {
             self.stats.misses += 1;
             return None;
         }
@@ -123,20 +137,22 @@ impl DiskBodyCache {
             self.stats.misses += 1;
             return None;
         }
-        let checksum = match serialized_hash(&entry.payload) {
-            Ok(checksum) => checksum,
-            Err(error) => {
+        match self.authenticate(&entry) {
+            Ok(true) => {}
+            Ok(false) => {
                 self.warning(format!(
-                    "ignoring cache entry {key}: checksum failed: {error}"
+                    "ignoring cache entry with invalid authentication tag {key}; it was forged, corrupted, or written with another cache key"
                 ));
                 self.stats.misses += 1;
                 return None;
             }
-        };
-        if checksum != entry.checksum {
-            self.warning(format!("ignoring cache entry with invalid checksum {key}"));
-            self.stats.misses += 1;
-            return None;
+            Err(error) => {
+                self.warning(format!(
+                    "ignoring cache entry {key}: authentication failed: {error}"
+                ));
+                self.stats.misses += 1;
+                return None;
+            }
         }
         let expected_body_hash = body_hash(body);
         if entry.payload.owner != owner.as_str() || entry.payload.body_hash != expected_body_hash {
@@ -172,7 +188,7 @@ impl DiskBodyCache {
         result: &BodyResult,
         context: Option<&CacheContext>,
     ) {
-        if !self.enabled {
+        if self.key.is_none() {
             return;
         }
         let key = context
@@ -195,16 +211,23 @@ impl DiskBodyCache {
             footprint: context.map(|context| context.fingerprint.clone()),
             result: BodyResultDoc::from_result(result),
         };
-        let checksum = match serialized_hash(&payload) {
-            Ok(checksum) => checksum,
-            Err(error) => {
-                self.warning(format!("cache checksum failed for {key}: {error}"));
+        let tag = match self
+            .key
+            .as_ref()
+            .map(|cache_key| payload_tag(cache_key, &payload))
+        {
+            Some(Ok(tag)) => tag,
+            Some(Err(error)) => {
+                self.warning(format!(
+                    "cache authentication tag failed for {key}: {error}"
+                ));
                 return;
             }
+            None => return,
         };
         let entry = CacheFile {
             format: CACHE_FORMAT_VERSION,
-            checksum,
+            tag,
             payload,
         };
         let bytes = match bounded_json(&entry) {
@@ -259,6 +282,16 @@ impl DiskBodyCache {
         self.stats.warnings += 1;
         eprintln!("schemagraph cache warning: {message}");
     }
+
+    /// payload 태그를 상수 시간으로 확인한다. 꺼진 캐시는 어떤 항목도 믿지 않는다.
+    fn authenticate(&self, entry: &CacheFile) -> io::Result<bool> {
+        let (Some(cache_key), Some(tag)) = (&self.key, decode_hex(&entry.tag)) else {
+            return Ok(false);
+        };
+        Ok(payload_mac(cache_key, &entry.payload)?
+            .verify_slice(&tag)
+            .is_ok())
+    }
 }
 
 impl BodyCache for DiskBodyCache {
@@ -305,7 +338,8 @@ impl BodyCache for DiskBodyCache {
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheFile {
     format: u32,
-    checksum: String,
+    /// payload 직렬화 바이트의 HMAC-SHA256(소문자 hex). 키 없이는 만들 수 없다.
+    tag: String,
     payload: CachePayload,
 }
 
@@ -977,6 +1011,54 @@ impl Write for HashWriter {
     }
 }
 
+/// payload를 serde 압축 직렬화 그대로 HMAC에 흘려 넣는다. 저장과 확인이 같은 구조체를 같은
+/// 방식으로 직렬화하므로 바이트가 같다. 모르는 필드는 역직렬화에서 버려져 태그 재료에도
+/// 들지 않는다.
+fn payload_mac(
+    cache_key: &trust::CacheKey,
+    payload: &CachePayload,
+) -> io::Result<trust::HmacSha256> {
+    let mut writer = MacWriter(cache_key.mac());
+    serde_json::to_writer(&mut writer, payload)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(writer.0)
+}
+
+fn payload_tag(cache_key: &trust::CacheKey, payload: &CachePayload) -> io::Result<String> {
+    Ok(format!(
+        "{:x}",
+        payload_mac(cache_key, payload)?.finalize().into_bytes()
+    ))
+}
+
+/// hex 숫자만 받는다. `u8::from_str_radix`는 `+` 부호를 받아 같은 태그의 다른 표기를 허용한다.
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect()
+}
+
+struct MacWriter(trust::HmacSha256);
+
+impl Write for MacWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn bounded_json<T: Serialize>(value: &T) -> io::Result<Option<Vec<u8>>> {
     let mut writer = LimitedWriter {
         bytes: Vec::new(),
@@ -1103,8 +1185,126 @@ mod tests {
         }
     }
 
+    /// 테스트 전용 가짜 키(32바이트 이상). 실제 비밀값이 아니다.
+    const TEST_KEY: &[u8] = b"PLACEHOLDER-unit-test-cache-key-first";
+
     fn cache(directory: &Path, doc: &CatalogDocument, fingerprint: &str) -> DiskBodyCache {
-        DiskBodyCache::new_with_fingerprint(directory, doc, fingerprint).unwrap()
+        cache_with_key(directory, doc, fingerprint, TEST_KEY)
+    }
+
+    fn cache_with_key(
+        directory: &Path,
+        doc: &CatalogDocument,
+        fingerprint: &str,
+        key: &[u8],
+    ) -> DiskBodyCache {
+        DiskBodyCache::new_with_fingerprint(directory, doc, fingerprint, || {
+            trust::CacheKey::new(key)
+        })
+        .unwrap()
+    }
+
+    fn only_entry(directory: &Path) -> PathBuf {
+        let mut entries = fs::read_dir(directory).unwrap();
+        let entry = entries.next().unwrap().unwrap().path();
+        assert!(entries.next().is_none());
+        entry
+    }
+
+    #[test]
+    fn entry_written_with_another_key_is_a_warning_and_miss() {
+        let directory = tempdir().unwrap();
+        let doc = document("postgres", "orders");
+        let owner = VertexId::object("public", "view");
+        let body = "SELECT id FROM orders";
+        cache(directory.path(), &doc, "exe-a").store(
+            &owner,
+            body,
+            &result(&owner, body, "public.orders"),
+        );
+        let second_key = b"PLACEHOLDER-unit-test-cache-key-second";
+        let mut reader = cache_with_key(directory.path(), &doc, "exe-a", second_key);
+        assert!(reader.load(&owner, body).is_none());
+        assert_eq!(
+            (
+                reader.stats().hits,
+                reader.stats().misses,
+                reader.stats().warnings
+            ),
+            (0, 1, 1)
+        );
+        // 같은 키로는 그대로 hit다.
+        assert!(cache(directory.path(), &doc, "exe-a")
+            .load(&owner, body)
+            .is_some());
+    }
+
+    #[test]
+    fn tampered_payload_or_missing_tag_is_a_warning_and_miss() {
+        let owner = VertexId::object("public", "view");
+        let body = "SELECT id FROM orders";
+        let doc = document("postgres", "orders");
+        let edits: [fn(String) -> String; 3] = [
+            // 태그는 그대로 두고 간선 대상만 바꾼다.
+            |entry| entry.replace("\"to\":\"public.orders\"", "\"to\":\"public.view\""),
+            // 태그 필드를 지운다(형식 4는 태그가 필수다).
+            |entry| {
+                let start = entry.find(",\"tag\":").unwrap();
+                let end = entry.find(",\"payload\":").unwrap();
+                format!("{}{}", &entry[..start], &entry[end..])
+            },
+            // hex가 아닌 태그(부호 붙은 hex 포함)는 비교하지 않고 거절한다.
+            |entry| {
+                let start = entry.find("\"tag\":\"").unwrap() + 7;
+                format!("{}+{}", &entry[..start], &entry[start + 1..])
+            },
+        ];
+        for edit in edits {
+            let directory = tempdir().unwrap();
+            cache(directory.path(), &doc, "exe-a").store(
+                &owner,
+                body,
+                &result(&owner, body, "public.orders"),
+            );
+            let path = only_entry(directory.path());
+            fs::write(&path, edit(fs::read_to_string(&path).unwrap())).unwrap();
+            let mut reader = cache(directory.path(), &doc, "exe-a");
+            assert!(reader.load(&owner, body).is_none());
+            assert_eq!((reader.stats().misses, reader.stats().warnings), (1, 1));
+        }
+    }
+
+    #[test]
+    fn disabled_cache_counts_misses_without_reading_or_writing() {
+        let directory = tempdir().unwrap();
+        let doc = document("postgres", "orders");
+        let owner = VertexId::object("public", "view");
+        let body = "SELECT id FROM orders";
+        let mut disabled =
+            DiskBodyCache::new_with_fingerprint(directory.path(), &doc, "exe-a", || {
+                Err("no cache key in this test".into())
+            })
+            .unwrap();
+        assert_eq!(disabled.stats().warnings, 1);
+        disabled.store(&owner, body, &result(&owner, body, "public.orders"));
+        assert!(disabled.load(&owner, body).is_none());
+        assert_eq!(
+            (
+                disabled.stats().hits,
+                disabled.stats().misses,
+                disabled.stats().writes
+            ),
+            (0, 1, 0)
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn decode_hex_accepts_only_pairs_of_hex_digits() {
+        assert_eq!(decode_hex("00ff7A"), Some(vec![0x00, 0xff, 0x7a]));
+        for invalid in ["0", "+f", "-1", "zz", "0x", " 0", "é0"] {
+            assert_eq!(decode_hex(invalid), None, "{invalid}");
+        }
     }
 
     #[test]

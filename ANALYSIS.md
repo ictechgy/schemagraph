@@ -260,6 +260,27 @@ symbolic links and must be regular files of at most 16 MiB; a symlinked or
 special entry is also reported on stderr, reparsed, and replaced. The cache
 needs Unix ownership checks; on other platforms it is disabled with a warning.
 
+Each entry carries an HMAC-SHA256 tag over its payload, computed with a secret
+key kept outside the cache. An entry rebuilt from public inputs (the release
+binary and the catalog) or written with another key therefore misses: it is
+reported on stderr, reparsed, and overwritten. The key is the value of
+`SCHEMAGRAPH_CACHE_KEY` when that variable is set and not empty; it must be at
+least 32 bytes, for example the output of `openssl rand -hex 32`. Otherwise the
+key is read from `${XDG_CONFIG_HOME:-$HOME/.config}/schemagraph/cache.key`
+(an empty or relative `XDG_CONFIG_HOME` is ignored). When that file does not
+exist, the scan creates it with 32 random bytes and mode `0600`. The key file
+must be a regular file, not a symbolic link, owned by the current user, with no
+group or other permission bits, and at least 32 bytes long. If the key is too
+short, `HOME` is unset, or the key file cannot be created or fails these checks,
+the scan warns and disables the cache. The key is never printed.
+
+CI runners usually start empty, so each run creates a new key file and entries
+restored with `actions/cache` miss and are recomputed. This is the safe
+default. To reuse restored entries, pass a repository secret as
+`SCHEMAGRAPH_CACHE_KEY`. When a secret is unavailable, as for pull requests from
+forks, the expression expands to an empty string, which counts as unset: the
+scan falls back to the key file and recomputes.
+
 Version 0.5.0 DML analysis records destination-column `writes`, source and
 predicate `reads`, and value-only `derives-from` edges for the supported static
 INSERT SELECT, CTAS/SELECT INTO, UPDATE, MERGE, and straight-line temp-table
