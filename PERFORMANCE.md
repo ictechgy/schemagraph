@@ -1,5 +1,230 @@
 # Performance measurements
 
+## Remote PostgreSQL collection (2026-10-20)
+
+Both probes used to ask PostgreSQL for each object's columns, constraints,
+indexes, and triggers separately. The JDBC probe called `getColumns`,
+`getPrimaryKeys`, `getImportedKeys`, and its index catalog query per object.
+Collection runs on one pinned connection, so these statements ran one after
+another and their number grew four times as fast as the table count. Against a
+remote server, collection time grew with the round-trip latency. Both probes now
+read each kind once per schema and split the rows by exact relation name. The
+JDBC probe does this only through pgjdbc, whose `getPrimaryKeys` and
+`getImportedKeys` treat a null table as the whole schema. Other drivers keep
+the per-object calls.
+
+`Scripts/benchmark-probe-postgres.py` produced these measurements on one macOS
+26.7.1 ARM64 host while other jobs ran (load average 5 to 17). It starts a
+private PostgreSQL 16.13 cluster with autovacuum and parallel query turned off,
+so that `pg_stat_database.xact_commit` grows by one for each autocommit
+statement a probe sends, and loads one schema of tables like these:
+
+```sql
+CREATE SCHEMA "bench_000";
+CREATE TABLE "bench_000"."table_0000" (id BIGINT NOT NULL PRIMARY KEY,
+  parent_id BIGINT, column_02 INTEGER, column_03 INTEGER, column_04 INTEGER,
+  column_05 INTEGER, column_06 INTEGER, column_07 INTEGER);
+CREATE INDEX "table_0000_parent" ON "bench_000"."table_0000" (parent_id);
+CREATE TABLE "bench_000"."table_0001" (id BIGINT NOT NULL PRIMARY KEY,
+  parent_id BIGINT, column_02 INTEGER, column_03 INTEGER, column_04 INTEGER,
+  column_05 INTEGER, column_06 INTEGER, column_07 INTEGER,
+  CONSTRAINT "table_0001_fk" FOREIGN KEY (parent_id)
+    REFERENCES "bench_000"."table_0000"(id));
+CREATE INDEX "table_0001_parent" ON "bench_000"."table_0001" (parent_id);
+-- Every later table references the one before it in the same way.
+```
+
+With `--latency-ms 1`, every collection connects through the relay in
+`Scripts/latency-relay.py`. It delays each chunk by 1 ms in each direction,
+which adds about 2 ms per round trip.
+
+The previous Go probe and JAR were built from `835e054`. The previous JAR
+SHA-256 starts `06f479f17b64` and the changed JAR starts `b8f62ecfdfbe`. Go is
+1.27.1, and the JDBC probe ran on OpenJDK 17.0.20 with bundled pgjdbc 42.7.8.
+Each cell is the median of three fresh processes after one warm-up per build,
+with the builds alternating. Statements are the increase of `xact_commit` for
+the benchmark database, read after the probe's session ended.
+
+| Probe | Tables | Format | Before s | After s | Before statements | After statements |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Go | 2,000 | JSON | 23.720 | 0.317 | 8,048 | 52 |
+| Go | 2,000 | NDJSON | 26.035 | 0.303 | 8,048 | 52 |
+| Go | 4,000 | JSON | 47.339 | 0.403 | 16,048 | 52 |
+| Go | 4,000 | NDJSON | 51.498 | 0.373 | 16,048 | 52 |
+| JDBC | 2,000 | JSON | 27.063 | 1.001 | 8,024 | 28 |
+| JDBC | 4,000 | JSON | 55.469 | 1.349 | 16,024 | 28 |
+
+Every pair wrote the same document bytes, and the relay recorded no connection
+errors. Before the change each table added four statements. After it, the count
+was the same at both sizes. Without the relay, 4,000 tables took 1.995 s before
+and 0.322 s after for Go JSON, and 13.168 s before and 1.270 s after for JDBC
+JSON. These direct times depend on host load more than the relay times do. An
+earlier run on the same host at load average 3 to 7 measured them as 1.067 s
+and 0.253 s for Go, and 3.923 s and 1.038 s for JDBC. That run used a scratch
+relay for its relay rows and left parallel query on. Its JDBC count at 4,000
+tables was 30, because PostgreSQL started parallel workers for one schema-wide
+catalog query; this is why the script turns parallel query off.
+
+JDBC `getColumns` takes LIKE patterns for its schema and table arguments. The
+per-object calls therefore also collected the columns of tables or schemas whose
+names matched the pattern: table `a_b` also read `a1b`, `pct%name` also read
+`pctxname`, and schema `my_app` also read `myxapp`. A backslash is the LIKE
+escape character, so table `back\slash` matched `backslash` instead of itself.
+It read the columns of that table, or none when no such table existed, and the
+catalog visibility check then reported an uncollected column. Splitting by exact
+name keeps each table's own columns. Databases without such names produce the
+same documents as before.
+
+These tests check that the number of catalog queries per schema does not depend
+on the table count:
+
+```sh
+(cd probe-go && go test -run TestPostgresQueriesPerSchemaDoNotGrowWithObjectCount .)
+gradle -p probe test --tests schemagraph.probe.PostgresSchemaMetadataTest
+```
+
+The table comes from these commands. Build the previous Go probe and JAR from
+the older commit with `git archive`, as in the Reproduce section at the end of
+this file. The script builds `--new-probe` from `--probe-dir` (default
+`probe-go`).
+
+```sh
+python3 Scripts/test-probe-postgres-benchmark.py
+python3 Scripts/benchmark-probe-postgres.py \
+  --baseline-probe /path/to/previous/schemagraph-probe-go \
+  --new-probe /path/to/new/schemagraph-probe-go \
+  --baseline-jar /path/to/previous/schemagraph-probe-all.jar \
+  --new-jar probe/build/libs/schemagraph-probe-all.jar --java /path/to/java \
+  --engine /path/to/schemagraph --pg-bin /opt/homebrew/opt/postgresql@16/bin \
+  --schemas 1 --tables-per-schema 2000 --columns 8 --indexes --format json \
+  --latency-ms 1 --warmup 1 --repeat 3 --output /path/to/report
+```
+
+For the NDJSON rows, use `--format ndjson` and leave out the JAR options. For
+the larger rows, use `--tables-per-schema 4000`, and for the direct times,
+`--latency-ms 0`. `results.json` keeps every sample with its statement count
+and document SHA-256, a per-build summary, and the relay's connection errors.
+
+## Remote MySQL and MariaDB collection (2026-10-20)
+
+The Go probe used to ask MySQL and MariaDB for each object's primary-key
+positions, columns, constraints, indexes, and triggers separately, and for each
+routine's parameters. go-sql-driver/mysql sends a statement with arguments as a
+prepare and an execute unless `interpolateParams` is set, so each table cost
+about ten round trips on the probe's one pinned connection. The probe now reads
+each kind once per schema and splits the rows by exact table name.
+
+Constraints and their key columns come from two schema-wide queries that the
+probe matches by exact schema, table, and constraint name. Joining the two
+`information_schema` tables on the server made MariaDB 11.4 compare every
+constraint row with every key-column row (a block nested-loop join without an
+index): for 4,000 tables that one query took about 4 s, and its time grew with
+the square of the table count. Read separately, each half took about 0.05 s.
+A table in which two constraints share a name, such as a `UNIQUE` key and a
+foreign key, is the exception. The previous probe merged such constraints into
+one, and the server's join order decided its kind and column order, so the
+probe still reads that table's constraints with the previous per-table join.
+
+Routine parameters are read once per schema as well, except for routine names
+that the server's case- and accent-insensitive comparison could match with
+another name. Those routines are still asked one at a time, so their signatures
+stay byte-for-byte the same as before and the same as the native reader's. When
+a schema has a routine name that is not printable ASCII or that ends with a
+space, every routine in that schema is asked one at a time.
+
+`Scripts/benchmark-probe-mysql.py` produced these measurements on the same
+macOS 26.7.1 ARM64 host while other jobs ran (load average 2 to 7). It starts
+the `mysql:8.4` and `mariadb:11.4` images pinned by digest in
+`Fixtures/accuracy/mysql-environments.json` (MySQL 8.4.11 and MariaDB 11.4.13)
+in Colima 0.10.2 with 2 CPUs and 4 GiB, publishes the port on 127.0.0.1 only,
+and loads one schema of tables like these, with one procedure for every ten
+tables:
+
+```sql
+CREATE TABLE t00000 (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT,
+  c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT,
+  KEY t00000_parent (parent_id));
+CREATE TABLE t00001 (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT,
+  c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT,
+  KEY t00001_parent (parent_id),
+  CONSTRAINT t00001_fk FOREIGN KEY (parent_id) REFERENCES t00000 (id));
+-- Every later table references the one before it in the same way.
+CREATE PROCEDURE p00000(IN a INT, IN b VARCHAR(10)) SELECT a, b;
+```
+
+Both servers run with their default `performance_schema` setting: on for
+MySQL, so a MySQL collection also reads the two `sys` usage views, and off for
+MariaDB. With `--latency-ms 1`, every collection connects through
+`Scripts/latency-relay.py`, which adds about 2 ms per round trip. Statements are
+the increase of the server's `Questions` status variable during one
+collection, with the cost of reading it removed. `Questions` counts executes
+and plain statements but not prepares, which are counted separately from
+`Com_stmt_prepare`.
+
+The previous Go probe was built from `da64c1d`, which still asks per object
+and per routine, and the changed one from `92af86d`. Go is 1.27.1. Each cell is
+the median of three fresh processes after one warm-up per build, with the
+builds alternating.
+
+| Server | Tables | Format | Before s | After s | Before statements | After statements |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| MySQL | 2,000 | JSON | 63.184 | 0.269 | 10,211 | 18 |
+| MySQL | 2,000 | NDJSON | 65.013 | 1.757 | 10,211 | 18 |
+| MySQL | 4,000 | JSON | 153.222 | 0.476 | 20,411 | 18 |
+| MariaDB | 2,000 | JSON | 113.698 | 0.197 | 10,208 | 15 |
+| MariaDB | 2,000 | NDJSON | 118.590 | 0.186 | 10,208 | 15 |
+| MariaDB | 4,000 | JSON | 316.888 | 0.390 | 20,408 | 15 |
+
+Every pair wrote the same document bytes, the relay recorded no connection
+errors, and no other container ran in the Colima VM. Before the change, each
+table added five statements and each routine one. After it, a collection sent
+18 statements, 12 of them prepared, on MySQL and 15, 10 of them prepared, on
+MariaDB at both sizes. Each remaining prepare belongs to one schema-wide query,
+so `interpolateParams` would save at most that many round trips per schema. The
+probe leaves it off, and a URL can still turn it on with
+`?interpolateParams=true`. Without the relay, 4,000 tables took 15.314 s before
+and 0.383 s after on MySQL, and 204.666 s and 0.309 s on MariaDB, whose
+per-table catalog queries cost more on the server itself. An intermediate build
+that still joined the two constraint tables on the server took 1.169 s for
+2,000 and 3.994 s for 4,000 MariaDB tables through the relay.
+
+The MySQL NDJSON row is slower for a reason outside this change. In some MySQL
+containers built from the same image and fixture, the optimizer ran
+`sys.schema_unused_indexes`, the index-usage query that the probe sends once
+per schema both before and after the change, as a nested loop that looks up the
+schema's tables again for every index-usage row, instead of a hash join. That
+one query then took about 1.56 s for 2,000 tables instead of about 0.01 s. In a
+later check, three of five fresh containers chose that plan. In another, two of
+five were as slow, whether the probe connected through the forwarded port or
+ran inside the container. It adds the same time to both builds of a row.
+
+These tests check that the number of catalog queries per schema does not depend
+on the table or routine count, that no catalog query joins `information_schema`
+tables on the server, and that a constraint keeps only its own key columns:
+
+```sh
+(cd probe-go && go test -run 'TestMySQL(QueriesPerSchema|CatalogQueriesDoNotJoin|ConstraintsKeepOnlyTheirOwn)' .)
+```
+
+The table comes from these commands. Build the previous Go probe from the older
+commit with `git archive`, as in the Reproduce section at the end of this file.
+The script needs Docker and pulls the pinned images on first use.
+
+```sh
+python3 Scripts/test-probe-mysql-benchmark.py
+python3 Scripts/benchmark-probe-mysql.py --server mysql \
+  --baseline-probe /path/to/previous/schemagraph-probe-go \
+  --new-probe /path/to/new/schemagraph-probe-go \
+  --engine /path/to/schemagraph --tables 2000 --routines 200 --columns 8 \
+  --format json --latency-ms 1 --warmup 1 --repeat 3 --output /path/to/report
+```
+
+For MariaDB, use `--server mariadb`. For the NDJSON rows, use
+`--format ndjson`. For the larger rows, use `--tables 4000 --routines 400`, and
+for the direct times, `--latency-ms 0`. `results.json` keeps every sample with
+its statement and prepare counts and document SHA-256, a per-build summary, and
+the relay's connection errors.
+
 ## PL/pgSQL routine bodies at scale (2026-10-18)
 
 These release-mode measurements compare the 0.7.1 engine (`a2f0dffc7af4…`,
@@ -76,6 +301,70 @@ startup, driver work, and serialization are included in collection time.
 python3 Scripts/benchmark-probe-sqlite.py --jdbc-jar /path/to/fixed-probe.jar \
   --java /path/to/java --engine /path/to/fixed-schemagraph \
   --objects 2000 10000 --repeat 3 --timeout 600 --output jdbc-scale.json
+```
+
+SQLite keys without per-table driver metadata (2026-10-20). The rows above were
+collected while the JDBC probe asked sqlite-jdbc for `getPrimaryKeys` and
+`getImportedKeys` on every table. The bundled driver scans all of
+`sqlite_schema` inside each call and once more for every foreign key, so
+collection grew with the square of the table count. The probe now reads
+`sqlite_schema` once per collection and builds the same rows from per-table
+PRAGMAs. The previous JAR (`e35a12c27679`, built from `aaba709`) and the changed
+JAR (`06f479f17b64`) ran alternately, two passes each, on one macOS 26.7.1 ARM64
+host while other jobs were running (load average 5 to 7). The runtime is
+OpenJDK 17.0.20 with bundled sqlite-jdbc 3.51.1.0, Python SQLite 3.53.4 creates
+the database file, and engine 0.7.1 (`d970b76b18ed`) checks the outputs outside
+the timer. Each row is the median of six fresh processes. Compare rows within
+this table only; the 2026-09-22 rows above used an older JAR and engine.
+
+| JAR | Tables | Format | Median collection s | Median peak RSS MiB | Maximum peak RSS MiB |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Before | 2,000 | JSON | 1.282 | 206.7 | 213.5 |
+| Before | 2,000 | NDJSON | 1.312 | 205.8 | 209.9 |
+| Before | 10,000 | JSON | 7.577 | 430.6 | 441.8 |
+| Before | 10,000 | NDJSON | 7.171 | 430.1 | 440.1 |
+| Before | 20,000 | JSON | 28.421 | 519.3 | 523.8 |
+| Before | 20,000 | NDJSON | 27.655 | 516.0 | 527.1 |
+| After | 2,000 | JSON | 0.849 | 159.3 | 164.2 |
+| After | 2,000 | NDJSON | 0.790 | 165.3 | 167.5 |
+| After | 10,000 | JSON | 1.317 | 302.0 | 317.8 |
+| After | 10,000 | NDJSON | 1.367 | 335.4 | 336.6 |
+| After | 20,000 | JSON | 2.260 | 364.3 | 374.6 |
+| After | 20,000 | NDJSON | 2.190 | 369.8 | 376.2 |
+
+From 10,000 to 20,000 tables the median grows 3.8 to 3.9 times before and 1.6
+to 1.7 times after. Both JARs wrote the same document bytes at every size and
+format, and every document produced the same graph bytes (20,000 tables:
+80,001 vertices and 80,000 edges).
+
+The DDL above has no foreign keys. A second schema keeps the same two columns
+and adds two references per table, so the previous JAR also scanned the schema
+once per foreign key:
+
+```sql
+CREATE TABLE t000000 (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE t000001 (id INTEGER PRIMARY KEY, value TEXT NOT NULL, prev_id INTEGER,
+  root_id INTEGER REFERENCES t000000,
+  CONSTRAINT fk_000001_prev FOREIGN KEY (prev_id) REFERENCES t000000(id));
+-- Every later table references the table before it and t000000 the same way.
+```
+
+Each cell is the median of three alternating fresh processes after one warm-up
+per JAR. Both JARs wrote the same document bytes at every size.
+
+| Tables | Format | Before median s | After median s |
+| ---: | --- | ---: | ---: |
+| 2,500 | JSON | 3.020 | 1.568 |
+| 2,500 | NDJSON | 2.942 | 1.700 |
+| 5,000 | JSON | 6.941 | 2.618 |
+| 5,000 | NDJSON | 5.813 | 2.471 |
+| 10,000 | JSON | 18.038 | 4.490 |
+| 10,000 | NDJSON | 16.968 | 4.420 |
+
+```sh
+python3 Scripts/benchmark-probe-sqlite.py --jdbc-jar /path/to/fixed-probe.jar \
+  --java /path/to/java --engine /path/to/fixed-schemagraph \
+  --objects 2000 10000 20000 --repeat 3 --timeout 600 --output jdbc-scale.json
 ```
 
 ### Cache: 200 large view definitions

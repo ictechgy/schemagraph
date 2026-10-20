@@ -22,11 +22,13 @@ internal class PreparedCall(val sql: String) {
  * 실제로 돌리고, SQL 실행은 기록만 한 뒤 빈 결과를 돌려준다. [answers]에 있는 SQL은
  * 그 값 한 칸짜리 결과를 돌려준다(세션 상태 조회 흉내). [tables]는 준비된 조회의 원문에
  * 키 문자열이 들어 있으면 그 행들을 열 번호로 읽게 돌려준다(Oracle 사전 조회 흉내).
+ * [metadataOverrides]에 있는 메타데이터 메서드는 위임하지 않고 그 함수가 답한다(다른 드라이버 흉내).
  */
 internal class ScriptedConnection(
     private val metadataSource: Connection,
     private val answers: Map<String, String> = emptyMap(),
     private val tables: Map<String, List<List<Any?>>> = emptyMap(),
+    private val metadataOverrides: Map<String, (DatabaseMetaData, Array<Any?>) -> Any?> = emptyMap(),
 ) {
     /** createStatement 경로로 실행된 SQL 원문. */
     val executed = mutableListOf<String>()
@@ -37,12 +39,17 @@ internal class ScriptedConnection(
     /** getIndexInfo 호출 인자(catalog, schema, table, unique, approximate). */
     val indexInfoCalls = mutableListOf<List<Any?>>()
 
+    /** 메타데이터 메서드 호출 이름 — 대체한 메서드도 센다. */
+    val metadataCalls = mutableListOf<String>()
+
     private var readOnly = false
 
     private val metadata: DatabaseMetaData = metadataSource.metaData.let { real ->
         proxy(DatabaseMetaData::class.java) { method, args ->
+            metadataCalls += method.name
             if (method.name == "getIndexInfo") indexInfoCalls += args.toList()
-            invokeOn(real, method, args)
+            val override = metadataOverrides[method.name]
+            if (override != null) override(real, args) else invokeOn(real, method, args)
         }
     }
 
@@ -113,7 +120,7 @@ internal class ScriptedConnection(
 
 /** Proxy 핸들러가 Object 메서드까지 받으므로 identity 의미로 답해 둔다. */
 @Suppress("UNCHECKED_CAST")
-private fun <T> proxy(type: Class<T>, handler: (Method, Array<Any?>) -> Any?): T =
+internal fun <T> proxy(type: Class<T>, handler: (Method, Array<Any?>) -> Any?): T =
     Proxy.newProxyInstance(ScriptedConnection::class.java.classLoader, arrayOf(type)) { self, method, args ->
         when (method.name) {
             "toString" -> "scripted ${type.simpleName}"
@@ -124,7 +131,7 @@ private fun <T> proxy(type: Class<T>, handler: (Method, Array<Any?>) -> Any?): T
     } as T
 
 /** 위임 대상의 SQLException을 감싸지 않고 그대로 던져야 추출기의 limitation 경로가 같다. */
-private fun invokeOn(target: Any, method: Method, args: Array<Any?>): Any? =
+internal fun invokeOn(target: Any, method: Method, args: Array<Any?>): Any? =
     try {
         method.invoke(target, *args)
     } catch (error: InvocationTargetException) {

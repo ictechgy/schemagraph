@@ -111,6 +111,52 @@ These changes are not yet in a published release.
   range, instead of JSON-RPC error -32602, so agents can correct the value and
   retry. Arguments of the wrong type, unknown arguments, and unknown tools are
   still JSON-RPC errors (-32602).
+- JDBC probe: with pgjdbc, PostgreSQL columns are now split by exact schema
+  and table name. `getColumns` treats both names as LIKE patterns, so a table
+  also picked up the columns of other tables whose names matched its own:
+  `a_b` also read `a1b`, `pct%name` also read `pctxname`, and a table in
+  schema `my_app` also read the same-named table in `myxapp`. A backslash is
+  the LIKE escape character, so `back\slash` read the columns of `backslash`,
+  or none at all, in which case the catalog visibility check reported an
+  uncollected column. Each table now keeps only its own columns. Snapshots
+  collected again from such databases differ from older ones, and `review`
+  against an older snapshot can report those columns as added or removed.
+  Databases without such names produce the same documents as before.
+- The Go probe (PostgreSQL) and the JDBC probe (PostgreSQL through pgjdbc)
+  read columns, keys, and indexes, and the Go probe also triggers, once per
+  schema instead of once per object; see `PERFORMANCE.md`. Successful
+  collections produce the same output, apart from the JDBC column change
+  above. A failed schema-wide catalog query now affects every object in the
+  schema instead of one object. The Go probe leaves that part empty and
+  records its usual limitation once. The JDBC probe records its usual
+  per-object limitation for each object and, for indexes, still falls back to
+  `getIndexInfo`.
+- Go probe: MySQL and MariaDB constraints now list only their own key
+  columns. The probe joined `table_constraints` with `key_column_usage`, and
+  MariaDB compared the names in that join without regard to case or accents.
+  A constraint with a shared name (`PRIMARY`, or `UNIQUE` keys with the same
+  name) therefore also listed the key columns of tables whose names differed
+  only in case or accents, such as `P` and `p` or `resume` and `résumé`, and of
+  same-named tables in a schema whose name differed only in case. The order of
+  those columns also varied between servers. Each constraint now keeps only its
+  own table's key columns, as the native reader already did. MySQL documents
+  are unchanged, and so are MariaDB documents without such names. Snapshots
+  collected again from such databases differ from older ones, and `review`
+  against an older snapshot can report `constraints-changed` for those tables.
+- The Go probe (MySQL and MariaDB) reads primary-key positions, columns,
+  constraints, indexes, triggers, and routine parameters once per schema
+  instead of once per object or routine; see `PERFORMANCE.md`. Routine
+  parameters are still read one routine at a time for names that the server's
+  case- and accent-insensitive comparison could match with another name, and
+  for every routine of a schema with a routine name that is not printable
+  ASCII or that ends with a space. Constraints are still read one table at a
+  time for a table in which two constraints share a name, such as a `UNIQUE`
+  key and a foreign key. Successful collections produce the same output, apart
+  from the constraint change above.
+  A failed schema-wide catalog query now leaves that part empty for every
+  object in the schema and records its usual limitation once. If the
+  schema-wide routine parameter query fails, every routine in the schema
+  records its usual limitation and has no signature.
 
 # schemagraph 0.7.1
 
