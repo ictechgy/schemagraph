@@ -231,12 +231,16 @@ func (h *harvester) mysqlSchemaColumns(schema string) map[string][]ColumnDoc {
 // 같은 이름 제약(PRIMARY, 이름이 같은 UNIQUE)끼리도 짝지었지만, 그런 행은 소유자 검사에서 버리던 것이다. 네이티브
 // reader(engine/source/src/mysql.rs)도 제약마다 키 컬럼을 정확한 테이블·제약 이름으로 물어 같은 결과를 낸다.
 // 키 컬럼을 끝까지 읽지 못하면 일부 컬럼만 가진 제약을 내지 않도록 그 스키마의 제약을 모두 비운다(limitation은 남는다).
+// 이름이 같은 제약 행이 둘 이상인 테이블만 예외로, mysqlSharedNameConstraints가 예전 서버 조인으로 다시 읽는다.
 func (h *harvester) mysqlSchemaConstraints(schema string) map[string][]ConstraintDoc {
 	keys, complete := h.mysqlSchemaKeyColumns(schema)
 	if !complete {
 		return map[string][]ConstraintDoc{}
 	}
 	groups := newRelationGroups[ConstraintDoc]()
+	rowsPerName := map[string]int{}
+	sharedTables := map[string]bool{}
+	shared := []string{}
 	h.mysqlRows("constraints", `
 		SELECT CAST(table_name AS CHAR), CAST(constraint_name AS CHAR), CAST(constraint_type AS CHAR)
 		FROM information_schema.table_constraints
@@ -250,15 +254,71 @@ func (h *harvester) mysqlSchemaConstraints(schema string) map[string][]Constrain
 		if !name.Valid || !kind.Valid {
 			return nil
 		}
+		owner := mysqlKeyColumnOwner(table, name.String)
+		if rowsPerName[owner]++; rowsPerName[owner] > 1 && !sharedTables[table] {
+			sharedTables[table] = true
+			shared = append(shared, table)
+		}
 		constraint := groups.entry(table, name.String, func() ConstraintDoc {
 			return ConstraintDoc{Name: name.String, Kind: mysqlConstraintKind(kind.String), Columns: []string{}}
 		})
-		for _, key := range keys[mysqlKeyColumnOwner(table, name.String)] {
+		for _, key := range keys[owner] {
 			addMySQLKeyColumn(constraint, kind.String, key)
 		}
 		return nil
 	})
-	return groups.lists()
+	constraints := groups.lists()
+	for _, table := range shared {
+		constraints[table] = h.mysqlSharedNameConstraints(schema, table)
+	}
+	return constraints
+}
+
+// mysqlSharedNameConstraints는 이름이 같은 제약 행이 둘 이상인 테이블(같은 이름의 UNIQUE와 FK, MySQL은 UNIQUE와
+// CHECK도)의 제약을 예전처럼 테이블 하나의 서버 조인으로 읽는다. 예전 probe는 이런 제약을 이름으로 하나로 합쳤고,
+// 조인은 그 이름의 키 컬럼 행을 제약 행마다 짝지어 키 순서로 정렬했다. 그래서 합친 제약의 종류(첫 행)와 컬럼 순서는
+// 서버의 동점 순서를 따르고, 따로 읽어 잇는 방식으로는 같게 만들 수 없다(MariaDB 11.4에서는 FK가 UNIQUE가 되어
+// 참조 간선이 사라졌다). 이런 테이블은 드물어 테이블마다 질의를 하나 더 보낸다. 키 컬럼은 정확히 같은 이름의 행만
+// 쓰고(다른 테이블·스키마 행 제외, mysqlSchemaKeyColumns와 같다), 끝까지 읽지 못하면 이 테이블의 제약을 비운다.
+func (h *harvester) mysqlSharedNameConstraints(schema, table string) []ConstraintDoc {
+	groups := newRelationGroups[ConstraintDoc]()
+	complete := h.mysqlRows("constraints", `
+		SELECT CAST(tc.constraint_name AS CHAR), CAST(tc.constraint_type AS CHAR),
+		       CAST(kcu.table_schema AS CHAR), CAST(kcu.table_name AS CHAR), CAST(kcu.constraint_name AS CHAR),
+		       CAST(kcu.column_name AS CHAR), CAST(kcu.referenced_table_schema AS CHAR),
+		       CAST(kcu.referenced_table_name AS CHAR), CAST(kcu.referenced_column_name AS CHAR)
+		FROM information_schema.table_constraints tc
+		LEFT JOIN information_schema.key_column_usage kcu
+		  ON kcu.constraint_schema = tc.constraint_schema
+		 AND kcu.table_schema = tc.table_schema AND kcu.table_name = tc.table_name
+		 AND kcu.constraint_name = tc.constraint_name
+		WHERE tc.table_schema = ? AND tc.table_name = ?
+		  AND tc.constraint_type IN ('PRIMARY KEY','FOREIGN KEY','UNIQUE','CHECK')
+		ORDER BY tc.constraint_name, kcu.ordinal_position`, []any{schema, table}, func(rows *sql.Rows) error {
+		var name, kind, ownerSchema, ownerTable, ownerConstraint sql.NullString
+		var key mysqlKeyColumn
+		if err := rows.Scan(&name, &kind, &ownerSchema, &ownerTable, &ownerConstraint,
+			&key.column, &key.refSchema, &key.refTable, &key.refColumn); err != nil {
+			return err
+		}
+		if !name.Valid || !kind.Valid {
+			return nil
+		}
+		constraint := groups.entry(table, name.String, func() ConstraintDoc {
+			return ConstraintDoc{Name: name.String, Kind: mysqlConstraintKind(kind.String), Columns: []string{}}
+		})
+		// 짝이 없는 행(CHECK)은 키 컬럼 열이 모두 NULL이라 더할 것이 없다.
+		paired := ownerSchema.Valid || ownerTable.Valid || ownerConstraint.Valid
+		if paired && (ownerSchema.String != schema || ownerTable.String != table || ownerConstraint.String != name.String) {
+			return nil
+		}
+		addMySQLKeyColumn(constraint, kind.String, key)
+		return nil
+	})
+	if !complete {
+		return []ConstraintDoc{}
+	}
+	return groups.lists()[table]
 }
 
 // mysqlKeyColumn은 key_column_usage 행 하나의 키 컬럼과 FK 대상이다.

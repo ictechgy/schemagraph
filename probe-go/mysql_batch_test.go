@@ -272,7 +272,8 @@ func TestMySQLSchemaBatchFailureIsReportedOncePerSchema(t *testing.T) {
 }
 
 // 제약 행과 키 컬럼 행은 서버에서 잇지 않는다. MariaDB 11.4는 두 information_schema 표의 JOIN을 인덱스 없는 블록
-// 중첩 반복으로 실행해, 그 질의 하나가 테이블 수의 제곱으로 느려졌다(4,000테이블에서 약 4초).
+// 중첩 반복으로 실행해, 그 질의 하나가 테이블 수의 제곱으로 느려졌다(4,000테이블에서 약 4초). 이름이 같은 제약 행이
+// 둘 이상인 드문 테이블만 테이블 하나짜리 조인으로 다시 읽는다(TestMySQLConstraintsWithSharedNamesKeepTheServerJoinOrder).
 func TestMySQLCatalogQueriesDoNotJoinInformationSchemaTables(t *testing.T) {
 	db, server := newScriptedDB(mysqlTablesReply(3))
 	defer closeScriptedDB(t, db)
