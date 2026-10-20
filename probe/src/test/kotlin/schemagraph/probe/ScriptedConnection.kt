@@ -113,7 +113,7 @@ internal class ScriptedConnection(
 
 /** Proxy 핸들러가 Object 메서드까지 받으므로 identity 의미로 답해 둔다. */
 @Suppress("UNCHECKED_CAST")
-private fun <T> proxy(type: Class<T>, handler: (Method, Array<Any?>) -> Any?): T =
+internal fun <T> proxy(type: Class<T>, handler: (Method, Array<Any?>) -> Any?): T =
     Proxy.newProxyInstance(ScriptedConnection::class.java.classLoader, arrayOf(type)) { self, method, args ->
         when (method.name) {
             "toString" -> "scripted ${type.simpleName}"
@@ -124,7 +124,7 @@ private fun <T> proxy(type: Class<T>, handler: (Method, Array<Any?>) -> Any?): T
     } as T
 
 /** 위임 대상의 SQLException을 감싸지 않고 그대로 던져야 추출기의 limitation 경로가 같다. */
-private fun invokeOn(target: Any, method: Method, args: Array<Any?>): Any? =
+internal fun invokeOn(target: Any, method: Method, args: Array<Any?>): Any? =
     try {
         method.invoke(target, *args)
     } catch (error: InvocationTargetException) {

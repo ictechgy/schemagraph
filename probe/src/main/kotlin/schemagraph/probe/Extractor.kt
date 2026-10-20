@@ -309,66 +309,96 @@ class Extractor(
         emptyList()
     }
 
+    /** SQLite PK·FK를 드라이버 메타데이터 없이 같은 행으로 만드는 경로(SQLiteConstraints.kt).
+     *  sqlite-jdbc는 호출마다 sqlite_schema 전체를 훑어, 테이블마다 부르면 수집이 O(N²)이다. */
+    private val sqliteKeys: SQLiteKeyReader? by lazy {
+        if (dialect == "sqlite" && replicatesSqliteDriver(meta)) SQLiteKeyReader(conn) else null
+    }
+
+    /** 드라이버는 catalog·schema 인자를 PKTABLE_CAT·SCHEM으로 그대로 돌려준다 — 둘 다 없을 때만 옮긴 행이 같다. */
+    private fun sqliteKeysFor(obj: RawObject): SQLiteKeyReader? =
+        sqliteKeys?.takeIf { obj.catalog == null && obj.schemaName == null }
+
     private fun constraintsOf(obj: RawObject): Pair<List<ConstraintDoc>, Map<String, Int>> {
         val out = mutableListOf<ConstraintDoc>()
         val pkPos = mutableMapOf<String, Int>()
         runCatching {
-            meta.getPrimaryKeys(obj.catalog, obj.schemaName, obj.name).use { rs ->
-                val cols = mutableListOf<Pair<Int, String>>()
-                var pkName: String? = null
-                while (rs.next()) {
-                    cols += rs.getInt("KEY_SEQ") to rs.getString("COLUMN_NAME")
-                    pkName = pkName ?: rs.strOrNull("PK_NAME")
-                }
-                if (cols.isNotEmpty()) {
-                    val ordered = cols.sortedBy { it.first }.map { it.second }
-                    ordered.forEachIndexed { i, c -> pkPos[c] = i + 1 }
-                    out += ConstraintDoc(pkName ?: "${obj.name}_pk", "pk", ordered)
-                }
+            val replicated = sqliteKeysFor(obj)?.primaryKeyRows(obj.name)
+            if (replicated != null) addPrimaryKey(obj, replicated, out, pkPos)
+            else meta.getPrimaryKeys(obj.catalog, obj.schemaName, obj.name).use { rs ->
+                addPrimaryKey(obj, readPrimaryKeyRows(rs), out, pkPos)
             }
         }.onFailure { limitations += "${obj.schema}.${obj.name}: getPrimaryKeys 실패 — ${it.message}" }
 
         runCatching {
-            meta.getImportedKeys(obj.catalog, obj.schemaName, obj.name).use { rs ->
-                data class FkRow(
-                    val fkName: String?, val seq: Int, val fkCol: String,
-                    val pkSchema: String?, val pkTable: String, val pkCol: String,
-                )
-                val groups = linkedMapOf<String, MutableList<FkRow>>()
-                var unnamed = 0
-                while (rs.next()) {
-                    val fkName = rs.strOrNull("FK_NAME")?.takeIf { it.isNotBlank() }
-                    val pkTable = rs.getString("PKTABLE_NAME")
-                    // sqlite-jdbc 등은 FK_NAME이 빈 문자열이고 KEY_SEQ도 전부 1이라
-                    // 행만으로는 FK를 구분할 수 없다 — 같은 대상 테이블로 가는
-                    // 컬럼들을 한 FK로 묶는 게 다중 컬럼 FK 복원에도 최선이다.
-                    val gkey = fkName ?: "${obj.name}@$pkTable"
-                    groups.getOrPut(gkey) { mutableListOf() } += FkRow(
-                        fkName = fkName,
-                        seq = rs.getInt("KEY_SEQ"),
-                        fkCol = rs.getString("FKCOLUMN_NAME"),
-                        pkSchema = rs.strOrNull("PKTABLE_SCHEM") ?: rs.strOrNull("PKTABLE_CAT"),
-                        pkTable = pkTable,
-                        pkCol = rs.getString("PKCOLUMN_NAME"),
-                    )
-                }
-                for ((_, rows) in groups) {
-                    val ordered = rows.sortedBy { it.seq }
-                    out += ConstraintDoc(
-                        name = ordered.first().fkName ?: "${obj.name}_fk_${unnamed++}",
-                        kind = "fk",
-                        columns = ordered.map { it.fkCol },
-                        referenced = ReferencedDoc(
-                            schema = ordered.first().pkSchema,
-                            table = ordered.first().pkTable,
-                            columns = ordered.map { it.pkCol },
-                        ),
-                    )
-                }
+            val replicated = sqliteKeysFor(obj)?.importedKeyRows(obj.name)
+            if (replicated != null) addForeignKeys(obj, replicated, out)
+            else meta.getImportedKeys(obj.catalog, obj.schemaName, obj.name).use { rs ->
+                addForeignKeys(obj, readImportedKeyRows(rs), out)
             }
         }.onFailure { limitations += "${obj.schema}.${obj.name}: getImportedKeys 실패 — ${it.message}" }
 
         return out.sortedBy { it.name } to pkPos
+    }
+
+    /** getPrimaryKeys 결과를 읽는다. PK_NAME은 첫 non-null 값만 쓴다. */
+    private fun readPrimaryKeyRows(rs: ResultSet): PrimaryKeyRows {
+        val cols = mutableListOf<Pair<Int, String>>()
+        var pkName: String? = null
+        while (rs.next()) {
+            cols += rs.getInt("KEY_SEQ") to rs.getString("COLUMN_NAME")
+            pkName = pkName ?: rs.strOrNull("PK_NAME")
+        }
+        return PrimaryKeyRows(cols, pkName)
+    }
+
+    /** KEY_SEQ 순서로 PK 하나를 만들고 컬럼별 PK 위치를 [pkPos]에 적는다. 이름이 없으면 `{table}_pk`다. */
+    private fun addPrimaryKey(
+        obj: RawObject, rows: PrimaryKeyRows, out: MutableList<ConstraintDoc>, pkPos: MutableMap<String, Int>,
+    ) {
+        if (rows.columns.isEmpty()) return
+        val ordered = rows.columns.sortedBy { it.first }.map { it.second }
+        ordered.forEachIndexed { i, c -> pkPos[c] = i + 1 }
+        out += ConstraintDoc(rows.name ?: "${obj.name}_pk", "pk", ordered)
+    }
+
+    /** getImportedKeys 결과를 읽는다. 열을 읽는 순서는 이전과 같다. */
+    private fun readImportedKeyRows(rs: ResultSet): List<ImportedKeyRow> = buildList {
+        while (rs.next()) {
+            val fkName = rs.strOrNull("FK_NAME")?.takeIf { it.isNotBlank() }
+            val pkTable = rs.getString("PKTABLE_NAME")
+            add(ImportedKeyRow(
+                name = fkName,
+                keySeq = rs.getInt("KEY_SEQ"),
+                column = rs.getString("FKCOLUMN_NAME"),
+                referencedSchema = rs.strOrNull("PKTABLE_SCHEM") ?: rs.strOrNull("PKTABLE_CAT"),
+                referencedTable = pkTable,
+                referencedColumn = rs.getString("PKCOLUMN_NAME"),
+            ))
+        }
+    }
+
+    /** FK 행을 이름(없으면 대상 테이블)으로 묶어 제약을 만든다. 이름 없는 묶음은 행 순서대로 `{table}_fk_{n}`이다. */
+    private fun addForeignKeys(obj: RawObject, rows: List<ImportedKeyRow>, out: MutableList<ConstraintDoc>) {
+        // sqlite-jdbc 등은 FK_NAME이 빈 문자열이고, 같은 대상으로 가는 단일 컬럼 FK들은 KEY_SEQ도
+        // 같아 행만으로는 FK를 구분할 수 없다 — 같은 대상 테이블로 가는 컬럼들을 한 FK로 묶는 게
+        // 다중 컬럼 FK 복원에도 최선이다.
+        val groups = linkedMapOf<String, MutableList<ImportedKeyRow>>()
+        for (row in rows) groups.getOrPut(row.name ?: "${obj.name}@${row.referencedTable}") { mutableListOf() } += row
+        var unnamed = 0
+        for ((_, group) in groups) {
+            val ordered = group.sortedBy { it.keySeq }
+            out += ConstraintDoc(
+                name = ordered.first().name ?: "${obj.name}_fk_${unnamed++}",
+                kind = "fk",
+                columns = ordered.map { it.column },
+                referenced = ReferencedDoc(
+                    schema = ordered.first().referencedSchema,
+                    table = ordered.first().referencedTable,
+                    columns = ordered.map { it.referencedColumn },
+                ),
+            )
+        }
     }
 
     private fun indexesOf(obj: RawObject): List<IndexDoc> {

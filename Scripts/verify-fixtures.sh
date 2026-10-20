@@ -618,6 +618,47 @@ if nv != pv or ne != pe:
              f"edges diff: {sorted(ne^pe)}")
 EOF
 
+    # 이름 있는 제약 — 세 수집기의 참조 관계가 같아야 한다. 제약 이름은 수집기마다 규칙이
+    # 달라(JDBC는 sqlite-jdbc가 DDL에서 읽은 이름) 제약 정점은 빼고 비교하고, JDBC 이름은
+    # 드라이버 메타데이터 규칙 그대로인지 따로 본다(프로브는 드라이버 대신 같은 행을 만든다).
+    sqlite3 "$tmp/named.db" < "$FIX/named-constraints.sql"
+    "$BIN" scan "sqlite:$tmp/named.db" -o "$tmp/named-native-graph.json"
+    "$JAVABIN" -jar "$JAR" --url "jdbc:sqlite:$tmp/named.db" -o "$tmp/named-jdbc-doc.json"
+    "$BIN" scan --document "$tmp/named-jdbc-doc.json" -o "$tmp/named-jdbc-graph.json"
+    named_graphs=("$tmp/named-native-graph.json" "$tmp/named-jdbc-graph.json")
+    if [ -n "$GO_PROBE" ]; then
+        "$GO_PROBE" --url "sqlite:$tmp/named.db" -o "$tmp/named-go-doc.json"
+        "$BIN" scan --document "$tmp/named-go-doc.json" -o "$tmp/named-go-graph.json"
+        named_graphs+=("$tmp/named-go-graph.json")
+    fi
+    python3 - "${named_graphs[@]}" <<'EOF'
+import json, sys
+def load(path):
+    graph = json.load(open(path))
+    constraints = {v["id"] for v in graph["vertices"] if v["kind"] == "constraint"}
+    vertices = {v["id"] for v in graph["vertices"]} - constraints
+    edges = {(e["kind"], e["from"], e["to"]) for e in graph["edges"]
+             if e["from"] not in constraints and e["to"] not in constraints}
+    return constraints, vertices, edges
+native, jdbc, *rest = [load(path) for path in sys.argv[1:]]
+for label, (_, vertices, edges) in zip(["jdbc", "go"], [jdbc, *rest]):
+    if vertices != native[1] or edges != native[2]:
+        sys.exit(f"probe(SQLite named constraints) {label} 관계 불일치 — verts diff: "
+                 f"{sorted(vertices ^ native[1])} edges diff: {sorted(edges ^ native[2])}")
+want = {("references", "main.invoices.region_code", "main.Regions.Code"),
+        ("references", "main.invoices.region_zone", "main.Regions.Zone"),
+        ("references", "main.invoice_lines.second_reviewer_id", "main.accounts.id")}
+if not want <= native[2]:
+    sys.exit(f"named constraints: 참조 간선 미검출 {sorted(want - native[2])}")
+expected = {"main.accounts.pk_accounts", "main.Regions.pk_Regions", "main.invoices.invoices_pk",
+            "main.invoices.fk_invoices_account", "main.invoices.fk_invoices_approver",
+            "main.invoices.fk_invoices_Region", "main.invoice_lines.invoice_lines_pk",
+            "main.invoice_lines.invoice_lines_fk_0", "main.invoice_lines.invoice_lines_fk_1"}
+if jdbc[0] != expected:
+    sys.exit(f"probe(SQLite named constraints) JDBC 제약 이름이 바뀌었다 — only-actual: "
+             f"{sorted(jdbc[0] - expected)} only-expected: {sorted(expected - jdbc[0])}")
+EOF
+
     # PG parity — pgjdbc가 번들이라 PG가 떠 있으면 같은 DB를 JDBC로도 읽어
     # 네이티브와 같은 판정 간선이 나오는지 확인한다.
     if [ -n "${pg_url:-}" ]; then
