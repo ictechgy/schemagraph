@@ -78,6 +78,70 @@ python3 Scripts/benchmark-probe-sqlite.py --jdbc-jar /path/to/fixed-probe.jar \
   --objects 2000 10000 --repeat 3 --timeout 600 --output jdbc-scale.json
 ```
 
+SQLite keys without per-table driver metadata (2026-10-20). The rows above were
+collected while the JDBC probe asked sqlite-jdbc for `getPrimaryKeys` and
+`getImportedKeys` on every table. The bundled driver scans all of
+`sqlite_schema` inside each call and once more for every foreign key, so
+collection grew with the square of the table count. The probe now reads
+`sqlite_schema` once per collection and builds the same rows from per-table
+PRAGMAs. The previous JAR (`e35a12c27679`, built from `aaba709`) and the changed
+JAR (`06f479f17b64`) ran alternately, two passes each, on one macOS 26.7.1 ARM64
+host while other jobs were running (load average 5 to 7). The runtime is
+OpenJDK 17.0.20 with bundled sqlite-jdbc 3.51.1.0, Python SQLite 3.53.4 creates
+the database file, and engine 0.7.1 (`d970b76b18ed`) checks the outputs outside
+the timer. Each row is the median of six fresh processes. Compare rows within
+this table only; the 2026-09-22 rows above used an older JAR and engine.
+
+| JAR | Tables | Format | Median collection s | Median peak RSS MiB | Maximum peak RSS MiB |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Before | 2,000 | JSON | 1.282 | 206.7 | 213.5 |
+| Before | 2,000 | NDJSON | 1.312 | 205.8 | 209.9 |
+| Before | 10,000 | JSON | 7.577 | 430.6 | 441.8 |
+| Before | 10,000 | NDJSON | 7.171 | 430.1 | 440.1 |
+| Before | 20,000 | JSON | 28.421 | 519.3 | 523.8 |
+| Before | 20,000 | NDJSON | 27.655 | 516.0 | 527.1 |
+| After | 2,000 | JSON | 0.849 | 159.3 | 164.2 |
+| After | 2,000 | NDJSON | 0.790 | 165.3 | 167.5 |
+| After | 10,000 | JSON | 1.317 | 302.0 | 317.8 |
+| After | 10,000 | NDJSON | 1.367 | 335.4 | 336.6 |
+| After | 20,000 | JSON | 2.260 | 364.3 | 374.6 |
+| After | 20,000 | NDJSON | 2.190 | 369.8 | 376.2 |
+
+From 10,000 to 20,000 tables the median grows 3.8 to 3.9 times before and 1.6
+to 1.7 times after. Both JARs wrote the same document bytes at every size and
+format, and every document produced the same graph bytes (20,000 tables:
+80,001 vertices and 80,000 edges).
+
+The DDL above has no foreign keys. A second schema keeps the same two columns
+and adds two references per table, so the previous JAR also scanned the schema
+once per foreign key:
+
+```sql
+CREATE TABLE t000000 (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE t000001 (id INTEGER PRIMARY KEY, value TEXT NOT NULL, prev_id INTEGER,
+  root_id INTEGER REFERENCES t000000,
+  CONSTRAINT fk_000001_prev FOREIGN KEY (prev_id) REFERENCES t000000(id));
+-- Every later table references the table before it and t000000 the same way.
+```
+
+Each cell is the median of three alternating fresh processes after one warm-up
+per JAR. Both JARs wrote the same document bytes at every size.
+
+| Tables | Format | Before median s | After median s |
+| ---: | --- | ---: | ---: |
+| 2,500 | JSON | 3.020 | 1.568 |
+| 2,500 | NDJSON | 2.942 | 1.700 |
+| 5,000 | JSON | 6.941 | 2.618 |
+| 5,000 | NDJSON | 5.813 | 2.471 |
+| 10,000 | JSON | 18.038 | 4.490 |
+| 10,000 | NDJSON | 16.968 | 4.420 |
+
+```sh
+python3 Scripts/benchmark-probe-sqlite.py --jdbc-jar /path/to/fixed-probe.jar \
+  --java /path/to/java --engine /path/to/fixed-schemagraph \
+  --objects 2000 10000 20000 --repeat 3 --timeout 600 --output jdbc-scale.json
+```
+
 ### Cache: 200 large view definitions
 
 This uses the unreleased parser/cache implementation in release-mode binary
