@@ -5,9 +5,11 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 
 SPEC = importlib.util.spec_from_file_location('dml_producers', Path(__file__).with_name('verify-dml-producers.py'))
 PRODUCERS = importlib.util.module_from_spec(SPEC)
@@ -18,7 +20,18 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def replay(engine, baseline, output):
+def cache_environment(config_home):
+    """캐시 키 파일을 결과 디렉터리 밖 임시 디렉터리에 만든다.
+
+    결과 디렉터리는 CI 아티팩트로 올라가므로 키를 그 안에 두지 않는다. 개발자 홈의
+    ~/.config와 환경 키도 쓰지 않는다. cold와 warm이 같은 키 파일을 써야 warm이 hit다.
+    """
+    environment = {name: value for name, value in os.environ.items() if name != 'SCHEMAGRAPH_CACHE_KEY'}
+    environment['XDG_CONFIG_HOME'] = str(config_home)
+    return environment
+
+
+def replay(engine, baseline, output, environment):
     """기대값·첫 실패를 보존하고 수정 후 점수는 새 디렉터리에만 기록한다."""
     corpus = PRODUCERS.load_frozen_corpus()
     original = json.loads((baseline/'result.json').read_text())
@@ -48,7 +61,7 @@ def replay(engine, baseline, output):
                 command = [str(engine), 'scan', '--document', str(document), '-o', str(graph)]
                 if mode != 'uncached':
                     command += ['--cache-dir', str(work/'cache')]
-                scan = subprocess.run(command, capture_output=True, text=True, timeout=120)
+                scan = subprocess.run(command, capture_output=True, text=True, timeout=120, env=environment)
                 (work/(mode+'.stderr')).write_text(scan.stderr)
                 if scan.returncode:
                     raise RuntimeError(f'{key}/{mode} scan failed: '+scan.stderr[-1500:])
@@ -84,7 +97,9 @@ def main():
     parser.add_argument('--baseline', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    return replay(args.engine.resolve(), args.baseline.resolve(), args.output.resolve())
+    with tempfile.TemporaryDirectory(prefix='schemagraph-dml-replay-config-') as config_home:
+        return replay(args.engine.resolve(), args.baseline.resolve(), args.output.resolve(),
+                      cache_environment(Path(config_home)))
 
 
 if __name__ == '__main__':

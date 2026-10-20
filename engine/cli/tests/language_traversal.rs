@@ -209,7 +209,7 @@ fn query는_direction으로_정방향을_고르고_depth를_지킨다() {
 }
 
 #[test]
-fn 찾지_못한_subject는_자리를_지키고_limitation과_종료코드_1로_알린다() {
+fn 찾지_못한_subject는_자리를_지키고_limitation과_종료코드_64로_알린다() {
     let directory = tempfile::tempdir().unwrap();
     let graph = directory.path().join("shop.graph.json");
     shop_graph(&graph);
@@ -218,7 +218,7 @@ fn 찾지_못한_subject는_자리를_지키고_limitation과_종료코드_1로_
         directory.path(),
         &["impact", "orders", "app.products", "missing"],
     );
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.status.code(), Some(64), "{output:?}");
     let document = json_of(&output);
     assert_eq!(document["roots"][0], json!({"id": "orders"}));
     assert_eq!(document["roots"][2], json!({"id": "missing"}));
@@ -422,17 +422,55 @@ fn subject가_하나면_기본_json과_같은_집합이고_max는_각자의_정�
 }
 
 /// subject가 모두 해석되지 않아도 문서를 내고 truncated: true, root-not-found, 종료 코드
-/// 1로 알린다 — "도달 정점 없음"을 완전한 부재로 읽지 않게 한다(SKILL.md 계약).
+/// 64로 알린다 — "도달 정점 없음"을 완전한 부재로 읽지 않게 한다(SKILL.md 계약).
 #[test]
 fn 모든_subject를_찾지_못해도_truncated와_root_not_found를_싣는다() {
     let directory = tempfile::tempdir().unwrap();
     let graph = directory.path().join("shop.graph.json");
     shop_graph(&graph);
     let output = traversal(&graph, directory.path(), &["impact", "missing"]);
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.status.code(), Some(64), "{output:?}");
     let document = json_of(&output);
     assert_eq!(document["roots"], json!([{"id": "missing"}]));
     assert_eq!(document["reached"], json!([]));
     assert_eq!(document["truncated"], true);
     assert_eq!(document["truncationReasons"], json!(["root-not-found"]));
+}
+
+/// root-not-found의 64는 language-traversal 문서에만 쓴다 — isthmus 계열 생산자와 같은
+/// 코드라 isthmus capture가 root-not-found를 기록한 문서와 함께 온 64를 부분 성공으로
+/// 받는다. `query`의 정방향도 같은 경로다. 기본 JSON의 `notFound`는 기존 계약대로 1이다.
+#[test]
+fn root_not_found_64는_language_traversal에만_쓰고_기본_json_notfound는_1이다() {
+    let directory = tempfile::tempdir().unwrap();
+    let graph = directory.path().join("shop.graph.json");
+    shop_graph(&graph);
+    let forward = traversal(
+        &graph,
+        directory.path(),
+        &[
+            "query",
+            "missing",
+            "app.order_report",
+            "--direction",
+            "dependencies",
+        ],
+    );
+    assert_eq!(forward.status.code(), Some(64), "{forward:?}");
+    let document = json_of(&forward);
+    assert_eq!(document["roots"][0], json!({"id": "missing"}));
+    assert_eq!(document["truncationReasons"], json!(["root-not-found"]));
+    assert_eq!(
+        rows(&document),
+        [
+            row("app.orders", 1, "app.order_report", &[1]),
+            row("app.products", 1, "app.order_report", &[1]),
+        ]
+    );
+
+    for command in ["query", "impact"] {
+        let output = run(&graph, &[command, "missing"]);
+        assert_eq!(output.status.code(), Some(1), "{command}: {output:?}");
+        assert_eq!(json_of(&output)["found"], false, "{command}");
+    }
 }

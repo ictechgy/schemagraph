@@ -28,3 +28,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.10.9"
 ctrlc = "3.5.2"
 tempfile = "3"
+# --cache-dir 항목 payload를 사용자별 비밀 키로 인증한다(상수 시간 비교는 verify_slice).
+hmac = "=0.12.1"
+
+[target.'cfg(unix)'.dependencies]
+# --cache-dir 디렉터리·키 파일 소유자를 현재 effective uid와 비교한다.
+rustix = { version = "1.1.5", features = ["process"] }
+# 키 파일이 없을 때 32바이트 난수 키를 만든다.
+getrandom = "=0.2.17"

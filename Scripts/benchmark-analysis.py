@@ -7,6 +7,7 @@ routine 수에 대한 분석 시간 증가율을 함께 잰다.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -88,9 +89,17 @@ def validate_routine_graph(path, functions):
     return {'vertices': len(graph['vertices']), 'edges': len(graph['edges']), 'routines': functions}
 
 
+def cache_environment(work):
+    """캐시 키 파일을 임시 작업 디렉터리에 만들어 개발자 홈의 ~/.config와 환경 키를 쓰지 않는다."""
+    environment = {name: value for name, value in os.environ.items() if name != 'SCHEMAGRAPH_CACHE_KEY'}
+    environment['XDG_CONFIG_HOME'] = str(work/'config')
+    return environment
+
+
 def measure_modes(engine, catalog, expected, repeat, work, bodies):
     """캐시 없음·빈 캐시·재사용 캐시를 반복마다 새 cache로 재고 출력 바이트를 대조한다."""
     measurements = []
+    environment = cache_environment(work)
     # 매 반복은 새 cache에서 시작해 cold와 warm을 실제로 구별한다.
     for index in range(repeat):
         cache = work/f'cache-{index}'
@@ -102,7 +111,7 @@ def measure_modes(engine, catalog, expected, repeat, work, bodies):
             darwin = __import__('sys').platform == 'darwin'
             timed = ['/usr/bin/time','-l',*command] if darwin else ['/usr/bin/time','-v',*command]
             started = time.perf_counter()
-            result = subprocess.run(timed, capture_output=True, text=True, check=True,timeout=180)
+            result = subprocess.run(timed, capture_output=True, text=True, check=True,timeout=180,env=environment)
             seconds = time.perf_counter() - started
             assert hashlib.sha256(output.read_bytes()).hexdigest() == expected, f'{mode}: graph differs'
             pattern = r'(\d+)\s+maximum resident set size' if darwin else r'Maximum resident set size \(kbytes\):\s*(\d+)'

@@ -138,6 +138,22 @@ class ScaleValidationTests(unittest.TestCase):
                 {"jsonrpc": "2.0", "id": 12, "method": "ping"}
             )
 
+    def test_mcp_tool_payload_reads_one_text_content_block(self) -> None:
+        report = {"complete": True, "impacted": []}
+        result = {
+            "content": [{"type": "text", "text": json.dumps(report, separators=(",", ":"))}],
+            "isError": False,
+        }
+        self.assertEqual(MODULE.tool_payload(result), report)
+        for malformed in (
+            dict(result, structuredContent=report),
+            {"content": [], "isError": False},
+            {"content": result["content"] * 2, "isError": False},
+            {"content": [{"type": "text", "text": "not json"}], "isError": False},
+        ):
+            with self.assertRaises(MODULE.BenchmarkError):
+                MODULE.tool_payload(malformed)
+
     def test_impact_facts_reject_wrong_topology(self) -> None:
         expected = MODULE.expected_dense_impact(10, 4)
         value = {

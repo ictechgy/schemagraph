@@ -482,6 +482,27 @@ pub fn not_found_value(
     })
 }
 
+/// 후보를 기존 순서의 앞 `max_candidates`개까지만 싣는 notFound 응답이다.
+///
+/// 말단 이름이 같은 정점이 수천 개인 그래프(예: 모든 테이블의 `id` 컬럼)에서 후보를 전부
+/// 실으면 응답 하나가 그래프 크기만큼 커진다. 잘렸을 때만 전체 후보 수 `candidatesTotal`과
+/// `candidatesTruncated: true`를 더한다 — 값이 없는 선택 필드는 키를 빼는 계약이라, 잘리지
+/// 않은 응답은 [`not_found_value`]와 같다.
+pub fn not_found_value_with_max(
+    name: &str,
+    candidates: &[schemagraph_core::VertexId],
+    limitations: &[String],
+    max_candidates: usize,
+) -> serde_json::Value {
+    let shown = &candidates[..candidates.len().min(max_candidates)];
+    let mut value = not_found_value(name, shown, limitations);
+    if shown.len() < candidates.len() {
+        value["candidatesTotal"] = serde_json::json!(candidates.len());
+        value["candidatesTruncated"] = serde_json::json!(true);
+    }
+    value
+}
+
 /// ImpactReport → JSON Value.
 pub fn impact_to_value(report: &ImpactReport) -> serde_json::Value {
     serde_json::json!({
@@ -614,47 +635,78 @@ pub fn dead_to_value(report: &DeadReport) -> serde_json::Value {
 /// 미수집 정점은 totals로 소비자가 짐작한다. 통계는 since 이후만 유효하므로
 /// "미사용" 판정이 아니라 증거 나열이다.
 pub fn stats_to_value(g: &Graph) -> serde_json::Value {
+    stats_to_value_with_max(g, usize::MAX)
+}
+
+/// `stats` 목록을 기존 순서(정점 id 순)의 앞 `max`개로 자른 보고다.
+///
+/// usage를 수집한 대형 그래프에서 관측 정점 전부를 한 응답에 실으면 응답이 그래프
+/// 크기만큼 커진다. 자를 항목은 아예 만들지 않는다. 잘렸을 때만 `truncated: true`를
+/// 더한다 — `totals.observed`가 이미 전체 관측 수라 총수 키를 따로 두지 않는다. 잘리지
+/// 않은 보고는 [`stats_to_value`]와 같다.
+pub fn stats_to_value_with_max(g: &Graph, max: usize) -> serde_json::Value {
     let stats: Vec<serde_json::Value> = g
         .usages()
-        .map(|(id, u)| {
-            let mut v = serde_json::json!({
-                "id": id.as_str(),
-                "reads": u.reads,
-                "writes": u.writes,
-            });
-            if let Some(vertex) = g.vertex(id) {
-                v["kind"] = serde_json::json!(vertex_kind_str(vertex.kind));
-            }
-            if let Some(since) = &u.since {
-                v["since"] = serde_json::json!(since);
-            }
-            if let Some(scans) = u.scans {
-                v["scans"] = serde_json::json!(scans);
-            }
-            if let Some(ms) = u.total_ms {
-                v["total_ms"] = serde_json::json!(ms);
-            }
-            if let Some(ms) = u.self_ms {
-                v["self_ms"] = serde_json::json!(ms);
-            }
-            v
-        })
+        .take(max)
+        .map(|(id, u)| usage_entry_value(g, id, u))
         .collect();
-    let total = g.vertices().count();
-    serde_json::json!({
+    let observed = g.usages().count();
+    let truncated = stats.len() < observed;
+    let mut value = serde_json::json!({
         "limitations": g.limitations(),
         "stats": stats,
         "totals": {
-            "observed": g.usages().count(),
-            "vertices": total,
+            "observed": observed,
+            "vertices": g.vertices().count(),
         },
-    })
+    });
+    if truncated {
+        value["truncated"] = serde_json::json!(true);
+    }
+    value
+}
+
+/// `stats` 항목 하나 — 수집하지 않은 값(since·scans·실행 시간)은 키를 뺀다.
+fn usage_entry_value(
+    g: &Graph,
+    id: &schemagraph_core::VertexId,
+    u: &schemagraph_core::Usage,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": id.as_str(),
+        "reads": u.reads,
+        "writes": u.writes,
+    });
+    if let Some(vertex) = g.vertex(id) {
+        v["kind"] = serde_json::json!(vertex_kind_str(vertex.kind));
+    }
+    if let Some(since) = &u.since {
+        v["since"] = serde_json::json!(since);
+    }
+    if let Some(scans) = u.scans {
+        v["scans"] = serde_json::json!(scans);
+    }
+    if let Some(ms) = u.total_ms {
+        v["total_ms"] = serde_json::json!(ms);
+    }
+    if let Some(ms) = u.self_ms {
+        v["self_ms"] = serde_json::json!(ms);
+    }
+    v
 }
 
 /// CyclesReport → JSON Value.
 pub fn cycles_to_value(report: &CyclesReport) -> serde_json::Value {
-    serde_json::json!({
-        "cycles": report.cycles.iter().map(|c| {
+    cycles_to_value_with_max(report, usize::MAX)
+}
+
+/// `cycles` 목록을 기존 순서(구성원 id 순)의 앞 `max`개로 자른 보고다.
+///
+/// 잘렸을 때만 `truncated: true`와 전체 순환 수 `total`을 더한다 — 잘리지 않은 보고는
+/// [`cycles_to_value`]와 같다.
+pub fn cycles_to_value_with_max(report: &CyclesReport, max: usize) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "cycles": report.cycles.iter().take(max).map(|c| {
             serde_json::json!({
                 "members": c.members.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
                 "selfLoop": c.self_loop,
@@ -662,7 +714,12 @@ pub fn cycles_to_value(report: &CyclesReport) -> serde_json::Value {
         }).collect::<Vec<_>>(),
         "level": level_str(report.level),
         "limitations": report.limitations,
-    })
+    });
+    if report.cycles.len() > max {
+        value["truncated"] = serde_json::json!(true);
+        value["total"] = serde_json::json!(report.cycles.len());
+    }
+    value
 }
 
 /// GraphDiff → JSON Value. usage는 델타가 아니라서 실리지 않는다 —
@@ -1289,6 +1346,81 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&stats_to_value(&g)).unwrap(),
             serde_json::to_string(&stats_to_value(&g)).unwrap()
+        );
+    }
+
+    #[test]
+    fn stats_상한_변형은_잘렸을_때만_truncated를_더하고_총계는_전체를_센다() {
+        let mut g = sample();
+        for name in ["a", "b"] {
+            g.set_usage(VertexId::object("main", name), Default::default());
+        }
+        let cut = stats_to_value_with_max(&g, 1);
+        let ids: Vec<&str> = cut["stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        // 기존 순서(정점 id 순)의 앞부분을 남긴다.
+        assert_eq!(ids, ["main.a"]);
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["totals"]["observed"], 2);
+        assert_eq!(stats_to_value_with_max(&g, 2), stats_to_value(&g));
+        assert!(stats_to_value(&g).get("truncated").is_none());
+    }
+
+    #[test]
+    fn cycles_상한_변형은_잘렸을_때만_truncated와_total을_더한다() {
+        let report = CyclesReport {
+            cycles: vec![
+                schemagraph_analysis::Cycle {
+                    members: vec![VertexId::object("main", "a"), VertexId::object("main", "b")],
+                    self_loop: false,
+                },
+                schemagraph_analysis::Cycle {
+                    members: vec![VertexId::object("main", "c")],
+                    self_loop: true,
+                },
+            ],
+            level: Level::Object,
+            limitations: vec!["probe limitation".into()],
+        };
+        let cut = cycles_to_value_with_max(&report, 1);
+        assert_eq!(cut["cycles"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            cut["cycles"][0]["members"],
+            serde_json::json!(["main.a", "main.b"])
+        );
+        assert_eq!(
+            (cut["truncated"].clone(), cut["total"].clone()),
+            (true.into(), 2.into())
+        );
+        assert_eq!(cut["limitations"], serde_json::json!(["probe limitation"]));
+        let whole = cycles_to_value(&report);
+        assert_eq!(cycles_to_value_with_max(&report, 2), whole);
+        assert!(whole.get("truncated").is_none() && whole.get("total").is_none());
+    }
+
+    #[test]
+    fn not_found_상한_변형은_잘렸을_때만_후보_총수와_잘림을_싣는다() {
+        let candidates: Vec<VertexId> = ["a", "b", "c"]
+            .iter()
+            .map(|schema| VertexId::object(schema, "id"))
+            .collect();
+        let limitations = vec!["probe limitation".to_owned()];
+        let cut = not_found_value_with_max("id", &candidates, &limitations, 2);
+        assert_eq!(cut["candidates"], serde_json::json!(["a.id", "b.id"]));
+        assert_eq!(cut["candidatesTotal"], 3);
+        assert_eq!(cut["candidatesTruncated"], true);
+        assert_eq!(
+            (cut["found"].clone(), cut["name"].clone()),
+            (false.into(), "id".into())
+        );
+        assert_eq!(cut["limitations"], serde_json::json!(["probe limitation"]));
+        assert_eq!(
+            not_found_value_with_max("id", &candidates, &limitations, 3),
+            not_found_value("id", &candidates, &limitations)
         );
     }
 }

@@ -1,3 +1,117 @@
+# Unreleased
+
+These changes are not yet in a published release.
+
+## Breaking
+
+- MCP tool results carry their JSON report once, as compact JSON with sorted
+  keys in `content[0].text`. `structuredContent` is no longer sent, and the
+  text is no longer pretty-printed. Clients and scripts that read
+  `structuredContent` must parse the text content instead. Apart from the new
+  MCP bounds listed under Changed, the report value is the same as before, and
+  `resources/read` responses are unchanged.
+- `query` and `impact` with `--format language-traversal` now exit 64 instead
+  of 1 when a subject cannot be resolved. The document with the
+  `root-not-found:` limitation is still written. This matches the other isthmus
+  language-traversal producers and the partial-success rule of
+  `isthmus capture`; scripts that accepted exit 1 must accept 64. Usage and
+  engine errors still exit 2, and the default JSON `notFound` still exits 1.
+- In the default `sslmode=prefer` / `ssl-mode=PREFERRED` mode, the native
+  PostgreSQL and MySQL/MariaDB readers now start TLS whenever the server offers
+  it, and a failed handshake ends the scan with exit code 2; the reader does
+  not retry without TLS. Before, the readers never attempted TLS, so such a
+  server was scanned in plaintext and the scan exited 0. A server that
+  supports only TLS 1.1 or older, or only cipher suites that rustls does not
+  implement (such as suites without forward secrecy), now needs an explicit
+  `sslmode=disable` or `ssl-mode=DISABLED`.
+
+## Security
+
+- The native PostgreSQL and MySQL/MariaDB readers are now built with TLS
+  (rustls with the ring provider, TLS 1.2 and 1.3) and trust the Mozilla root
+  certificates built into the binary. Before, the default mode connected
+  without encryption, and `require` and the verify modes failed with "SQLx was
+  built without TLS support". Servers whose TLS handshake fails in the default
+  mode are covered under Breaking.
+- The default stays `sslmode=prefer` / `ssl-mode=PREFERRED`, as in libpq: the
+  reader encrypts when the server offers TLS but does not verify the server
+  certificate, so an active network attacker can still force plaintext or
+  impersonate the server. To require a verified connection, add
+  `sslmode=verify-full` or `ssl-mode=VERIFY_IDENTITY`; for a private CA, also
+  add `sslrootcert` or `ssl-ca`, which is added to the built-in roots.
+- `require`, `verify-ca`, and `verify-full` (`REQUIRED`, `VERIFY_CA`,
+  `VERIFY_IDENTITY`) now work. When the server refuses TLS or the certificate
+  check fails, the scan exits with code 2 instead of falling back to an
+  unencrypted connection. With the current libraries (sqlx 0.8.6, rustls
+  0.23), `verify-ca` and `VERIFY_CA` also require the certificate to name the
+  host. `sslmode=allow` does not attempt TLS.
+- A catalog read over an unencrypted connection to a host that is not a Unix
+  socket or a loopback address (`127.0.0.0/8`, `::1`, `localhost`) records a
+  `connection-not-encrypted:` limitation in the catalog document and the graph.
+  `sslmode=disable`, `sslmode=allow`, and `ssl-mode=DISABLED` always record it
+  for such a host. In the default mode the reader asks the server whether the
+  session uses TLS (`pg_stat_ssl`, `Ssl_cipher`); if the server cannot answer,
+  the limitation says that encryption could not be confirmed. Loopback and
+  Unix-socket scans, including the fixtures, produce the same output as before,
+  and `catalog_complete` is unchanged.
+- New dependencies, pinned by `engine/Cargo.lock`: rustls 0.23.43,
+  rustls-webpki 0.103.14, rustls-pki-types 1.15.1, ring 0.17.14, untrusted
+  0.9.0, and webpki-roots 0.26.11 and 1.0.10. The root certificate data in
+  webpki-roots is licensed under CDLA-Permissive-2.0.
+- `scan --cache-dir` entries are now authenticated with an HMAC-SHA256 tag.
+  Before, an entry was checked only against an unkeyed SHA-256 checksum that
+  anyone with the same release binary and catalog could recompute, so a forged
+  entry in a checked-out tree could hide or invent body dependencies while the
+  analysis still reported `complete`.
+- The cache key is `SCHEMAGRAPH_CACHE_KEY` (at least 32 bytes) when it is set
+  and not empty. Otherwise it is read from
+  `${XDG_CONFIG_HOME:-$HOME/.config}/schemagraph/cache.key`, which is created
+  with 32 random bytes and mode `0600` when missing. A key file that is a
+  symbolic link, is owned by another user, has group or other permission bits,
+  or holds fewer than 32 or more than 4096 bytes is rejected. A short key, an
+  unset `HOME`, or a rejected key file disables the cache with a warning. The
+  key is never printed.
+- Entries with a missing or wrong tag, symbolic-link entries, and FIFOs or other
+  special files are reported on stderr, reparsed, and overwritten. Entries are
+  opened without following symbolic links and without blocking on FIFOs.
+- The cache directory is a trusted input: keep it outside checked-out
+  pull-request code, for example `${XDG_CACHE_HOME:-$HOME/.cache}/schemagraph`
+  or `$RUNNER_TEMP/schemagraph-cache`. A missing directory is created with mode
+  `0700`. A cache directory that is a symbolic link, is owned by another user,
+  or is writable by group or other users disables the cache with a warning.
+  Graph output and exit codes do not change when the cache is disabled.
+
+## Changed
+
+- A native PostgreSQL or MySQL/MariaDB scan of a host that is not a Unix
+  socket or a loopback address now adds a `connection-not-encrypted:`
+  limitation to the catalog document and the graph when the catalog was read
+  over an unencrypted connection or encryption could not be confirmed (details
+  under Security). Loopback and Unix-socket scans, including the fixtures, keep
+  their output.
+- Cache format version 4 makes existing `--cache-dir` entries miss once; the
+  next scan rewrites them. Caches restored from another machine or CI run are
+  reused only when they were written with the same `SCHEMAGRAPH_CACHE_KEY`.
+  Without that secret, each fresh runner creates its own key file and
+  recomputes. Graph output is unchanged.
+- An existing cache directory that is writable by group or other users, such as
+  one created under umask 002 by an earlier version, now disables the cache with
+  a warning until `chmod go-w` is applied to it.
+- On non-Unix builds, which cannot check file ownership or open files without
+  following symbolic links, `--cache-dir` is disabled with a warning.
+- MCP `stats`, `cycles`, and `diagnostics` accept `max` (default 1024, at most
+  10000) and keep the first `max` entries in CLI order. Only a cut list adds
+  `truncated: true`, and `cycles` then also adds the full count as `total`;
+  `stats` `totals` and `diagnostics` `summary` still count every entry. MCP
+  not-found results list at most 64 `candidates` and add `candidatesTotal` and
+  `candidatesTruncated: true` when cut. CLI output is unchanged.
+- On every MCP tool, an integer argument outside its declared range (such as
+  `max` above 10000, `depth` above 64, or a negative value) now returns an
+  `isError: true` tool result whose text is `{"error": "…"}` with the allowed
+  range, instead of JSON-RPC error -32602, so agents can correct the value and
+  retry. Arguments of the wrong type, unknown arguments, and unknown tools are
+  still JSON-RPC errors (-32602).
+
 # schemagraph 0.7.1
 
 This patch protects local inputs and saved snapshots during file exports.

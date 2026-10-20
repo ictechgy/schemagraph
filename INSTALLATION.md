@@ -126,6 +126,13 @@ schemagraph scan "$DATABASE_URL" \
 schemagraph review before.json after.json --strict
 ```
 
+For a remote database, require a verified TLS connection in `DATABASE_URL`,
+for example `postgres://reader@db.example/app?sslmode=verify-full&sslrootcert=/path/ca.pem`
+or `mysql://reader@db.example/app?ssl-mode=VERIFY_IDENTITY&ssl-ca=/path/ca.pem`.
+The default mode does not verify the server, so a network attacker could read
+or alter the catalog that the review compares. See
+[Database support](README.md#database-support) for the TLS modes.
+
 The command reports additions, removals, column and dependency changes, and
 the dependents found in the earlier graph. `--strict` exits with status 1 when
 reviewable changes are present, so a CI system can require an explicit review.

@@ -708,6 +708,33 @@ pub fn read_bounded_file(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>
     read_bounded(path, limit, label)
 }
 
+/// Read a regular file through one no-follow, non-blocking descriptor and keep the I/O error.
+///
+/// `read_bounded_file`과 같은 검사(마지막 경로 성분의 링크 거절, 같은 fd의 fstat으로 정규
+/// 파일 확인, 크기 상한)를 하되 `io::Error`를 그대로 돌려준다. 없는 파일(`NotFound`)을
+/// 오류와 구분해야 하는 호출자(SQL 분석 캐시의 miss)가 쓴다. `O_NONBLOCK`은 FIFO를 열 때
+/// 쓰는 쪽을 기다리며 멈추지 않게 하고 정규 파일 읽기에는 영향이 없다. 같은 fd의
+/// 메타데이터를 함께 돌려주므로 호출자는 경로를 다시 조회하지 않고 연 파일의 소유자·권한을
+/// 확인할 수 있다. 링크는 `ELOOP` 같은 OS 오류, 정규 파일이 아니면 `InvalidInput`, 상한을
+/// 넘으면 `InvalidData`다.
+#[cfg(unix)]
+pub fn read_bounded_regular_file(path: &Path, limit: u64) -> io::Result<(Vec<u8>, fs::Metadata)> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    let file = open(path, flags, Mode::empty())?;
+    read_regular(fs::File::from(file), limit).map_err(|failure| failure.into_io_error(limit))
+}
+
+/// 이 빌드에는 no-follow 파일 디스크립터 API가 없어 정규 파일임을 보장할 수 없다.
+#[cfg(not(unix))]
+pub fn read_bounded_regular_file(_path: &Path, _limit: u64) -> io::Result<(Vec<u8>, fs::Metadata)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no-follow regular file reads require Unix on this build",
+    ))
+}
+
 #[cfg(unix)]
 fn read_bounded(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>, String> {
     use rustix::fs::{open, Mode, OFlags};
@@ -718,7 +745,7 @@ fn read_bounded(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>, String>
         Mode::empty(),
     )
     .map_err(|error| io_error(&format!("securely open {label}"), path, error.into()))?;
-    read_open_fd(&file, limit, label, path)
+    read_open_fd(file, limit, label, path)
 }
 
 #[cfg(not(unix))]
@@ -731,32 +758,69 @@ fn read_bounded(_path: &Path, _limit: u64, _label: &str) -> Result<Vec<u8>, Stri
 
 #[cfg(unix)]
 fn read_open_fd(
-    file: &rustix::fd::OwnedFd,
+    file: rustix::fd::OwnedFd,
     limit: u64,
     label: &str,
     path: &Path,
 ) -> Result<Vec<u8>, String> {
-    use rustix::fs::FileType;
+    let path = path.display();
+    match read_regular(fs::File::from(file), limit) {
+        Ok((bytes, _)) => Ok(bytes),
+        Err(BoundedRead::Inspect(error)) => {
+            Err(format!("could not inspect {label} '{path}': {error}"))
+        }
+        Err(BoundedRead::NotRegular) => Err(format!("{label} is not a regular file: {path}")),
+        Err(BoundedRead::Read(error)) => Err(format!("could not read {label} '{path}': {error}")),
+        Err(BoundedRead::TooLarge) => Err(format!("{label} exceeds {limit} bytes: {path}")),
+    }
+}
 
-    let stat = rustix::fs::fstat(file)
-        .map_err(|error| format!("could not inspect {label} '{}': {error}", path.display()))?;
-    if !FileType::from_raw_mode(stat.st_mode).is_file() {
-        return Err(format!("{label} is not a regular file: {}", path.display()));
+/// 연 파일 하나를 정규 파일로 확인하고 상한까지 읽다 실패한 단계.
+///
+/// 기존 `String` 오류(offline import)와 `io::Error`(캐시) 두 표면이 같은 검사를 공유하도록
+/// 단계만 구분하고 문구는 각 표면에서 만든다.
+#[cfg(unix)]
+enum BoundedRead {
+    Inspect(io::Error),
+    NotRegular,
+    Read(io::Error),
+    TooLarge,
+}
+
+#[cfg(unix)]
+impl BoundedRead {
+    fn into_io_error(self, limit: u64) -> io::Error {
+        match self {
+            Self::Inspect(error) | Self::Read(error) => error,
+            Self::NotRegular => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file (symbolic links, FIFOs, and devices are not read)",
+            ),
+            Self::TooLarge => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("file exceeds {limit} bytes"),
+            ),
+        }
+    }
+}
+
+/// 같은 fd의 fstat으로 정규 파일인지 본 뒤 상한보다 1바이트 더 읽어 넘침을 판정한다.
+#[cfg(unix)]
+fn read_regular(file: fs::File, limit: u64) -> Result<(Vec<u8>, fs::Metadata), BoundedRead> {
+    use std::io::Read;
+
+    let metadata = file.metadata().map_err(BoundedRead::Inspect)?;
+    if !metadata.is_file() {
+        return Err(BoundedRead::NotRegular);
     }
     let mut bytes = Vec::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let count = rustix::io::read(file, &mut buffer)
-            .map_err(|error| format!("could not read {label} '{}': {error}", path.display()))?;
-        if count == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..count]);
-        if bytes.len() as u64 > limit {
-            return Err(format!("{label} exceeds {limit} bytes: {}", path.display()));
-        }
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(BoundedRead::Read)?;
+    if bytes.len() as u64 > limit {
+        return Err(BoundedRead::TooLarge);
     }
-    Ok(bytes)
+    Ok((bytes, metadata))
 }
 
 fn canonical_project_root(path: &Path) -> Result<PathBuf, String> {
@@ -908,7 +972,7 @@ fn secure_read_relative(
             ))
         }
     };
-    read_open_fd(&file, limit, "compiled SQL", Path::new(relative)).map(Some)
+    read_open_fd(file, limit, "compiled SQL", Path::new(relative)).map(Some)
 }
 
 #[cfg(not(unix))]
@@ -1656,5 +1720,41 @@ mod tests {
         assert!(
             import_dbt_manifest(&document(), &manifest, Some(directory.path()), limits()).is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_regular_file_keeps_the_io_error_kind_and_returns_its_metadata() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("entry.json");
+        fs::write(&path, b"{}").unwrap();
+        let (bytes, metadata) = read_bounded_regular_file(&path, 2).unwrap();
+        assert_eq!((bytes.as_slice(), metadata.len()), (&b"{}"[..], 2));
+        // 없는 파일은 호출자가 조용한 miss로 다루도록 NotFound 그대로 돌려준다.
+        let missing = read_bounded_regular_file(&directory.path().join("missing"), 2);
+        assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+        let oversized = read_bounded_regular_file(&path, 1).unwrap_err();
+        assert_eq!(oversized.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_regular_file_rejects_symlinks_and_does_not_block_on_fifos() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target.json");
+        fs::write(&target, b"{}").unwrap();
+        let link = directory.path().join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let linked = read_bounded_regular_file(&link, 1024).unwrap_err();
+        assert_ne!(linked.kind(), io::ErrorKind::NotFound, "{linked}");
+        let fifo = directory.path().join("fifo.json");
+        let created = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(created.success());
+        // 쓰는 쪽이 없는 FIFO를 막힘 없이 열고 정규 파일이 아니라고 거절해야 한다.
+        let special = read_bounded_regular_file(&fifo, 1024).unwrap_err();
+        assert_eq!(special.kind(), io::ErrorKind::InvalidInput, "{special}");
     }
 }

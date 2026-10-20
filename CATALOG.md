@@ -116,7 +116,7 @@ To emit a document from a live scan, use the CLI option that writes the raw
 catalog alongside the graph:
 
 ```sh
-schemagraph scan postgres://db.example/app \
+schemagraph scan 'postgres://db.example/app?sslmode=verify-full&sslrootcert=ca.pem' \
   --emit-document catalog-v2.json --document-version 2
 ```
 

@@ -875,6 +875,25 @@ class McpSession:
         return None
 
 
+def tool_payload(result: dict[str, object]) -> object:
+    """도구 결과의 유일한 본문인 `content[0].text`를 JSON으로 읽는다.
+
+    서버는 보고 JSON을 압축 텍스트 한 벌로만 싣고 `structuredContent`로 다시 싣지 않는다.
+    """
+    if "structuredContent" in result:
+        fail("MCP tool result must carry its JSON once, in text content")
+    content = result.get("content")
+    if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict):
+        fail("MCP tool result must have exactly one content block")
+    text = content[0].get("text")
+    if content[0].get("type") != "text" or not isinstance(text, str):
+        fail("MCP tool content must be one text block")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        fail(f"MCP tool text content was not JSON: {error}")
+
+
 def initialize_mcp(session: McpSession) -> float:
     """initialize 응답을 확인해 이후 측정이 graph load 뒤 시작되게 한다."""
     sent = session.send(
@@ -905,7 +924,7 @@ def mcp_impact_call(
     expected: dict[str, object] | None = None,
     max_results: int = 1,
 ) -> tuple[float, dict[str, object]]:
-    """impact request를 보내고 structuredContent의 complete 사실을 확인한다."""
+    """impact request를 보내고 text content JSON의 complete 사실을 확인한다."""
     sent = session.send(
         {
             "jsonrpc": "2.0",
@@ -928,9 +947,9 @@ def mcp_impact_call(
     result = response.get("result")
     if "error" in response or not isinstance(result, dict) or result.get("isError") is not False:
         fail(f"MCP impact failed: {response}")
-    structured = result.get("structuredContent")
+    structured = tool_payload(result)
     if not isinstance(structured, dict):
-        fail(f"MCP impact omitted structuredContent: {response}")
+        fail(f"MCP impact text content was not a report object: {response}")
     facts = assert_impact(structured, expected=expected)
     return received - sent, facts
 
@@ -1046,7 +1065,7 @@ def mcp_worker_followup_call(
         "error" in response
         or not isinstance(result, dict)
         or result.get("isError") is not True
-        or result.get("structuredContent") != expected
+        or tool_payload(result) != expected
     ):
         fail(f"MCP worker follow-up did not return the expected not-found result: {response}")
     return sent, received, expected

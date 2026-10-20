@@ -237,23 +237,27 @@ fn scan_failure_after_catalog_serialization_preserves_both_previous_outputs() {
     fs::write(root.join("emitted.json"), b"previous catalog").unwrap();
     fs::write(root.join("graph.json"), b"previous graph").unwrap();
     fs::write(root.join("cache-is-file"), b"keep").unwrap();
-    assert_error(
-        run(
-            root,
-            &[
-                "scan",
-                "--document",
-                "catalog.json",
-                "--emit-document",
-                "emitted.json",
-                "-o",
-                "graph.json",
-                "--cache-dir",
-                "cache-is-file",
-            ],
-        ),
-        "analysis cache",
-    );
+    // 캐시 키 파일 위치를 작업 디렉터리 밖 임시 디렉터리로 돌려 개발자 홈을 쓰지 않고,
+    // 아래의 항목 수 확인도 흔들지 않는다.
+    let config = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_schemagraph"))
+        .current_dir(root)
+        .env("XDG_CONFIG_HOME", config.path())
+        .env_remove("SCHEMAGRAPH_CACHE_KEY")
+        .args([
+            "scan",
+            "--document",
+            "catalog.json",
+            "--emit-document",
+            "emitted.json",
+            "-o",
+            "graph.json",
+            "--cache-dir",
+            "cache-is-file",
+        ])
+        .output()
+        .unwrap();
+    assert_error(output, "analysis cache");
     assert_eq!(
         fs::read(root.join("emitted.json")).unwrap(),
         b"previous catalog"

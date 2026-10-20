@@ -34,10 +34,15 @@ fn catalog(root: &Path) {
 }
 
 /// scan을 실행해 graph.json 바이트와 stderr를 돌려준다.
+///
+/// 캐시 키 파일은 작업 디렉터리 안 설정 위치에 만들어 개발자 홈의 `~/.config`와 환경 키를
+/// 쓰지 않는다. cold와 warm이 같은 키 파일을 써야 warm이 hit다.
 fn scan(root: &Path, output: &str, cache: Option<&str>) -> (Vec<u8>, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_schemagraph"));
     command
         .current_dir(root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env_remove("SCHEMAGRAPH_CACHE_KEY")
         .args(["scan", "--document", "catalog.json", "-o", output]);
     if let Some(cache) = cache {
         command.args(["--cache-dir", cache]);

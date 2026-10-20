@@ -80,6 +80,37 @@ and `mysql://…`. MariaDB uses `mysql://`; MySQL X Protocol (`mysqlx://`) is
 unsupported. JDBC URLs go to the probe, whose output the CLI reads with
 `scan --document`.
 
+The native PostgreSQL and MySQL/MariaDB readers use TLS 1.2 or 1.3 (rustls)
+and trust the Mozilla root certificates built into the binary. A URL without
+TLS parameters uses `sslmode=prefer` (PostgreSQL) or `ssl-mode=PREFERRED`
+(MySQL/MariaDB), as libpq does: the reader encrypts when the server offers
+TLS, but it does not verify the server certificate, and an active network
+attacker can force an unencrypted connection. To require a verified
+connection, add `sslmode=verify-full` or `ssl-mode=VERIFY_IDENTITY`. For a
+private CA, such as a managed database provider's CA, also add
+`sslrootcert=/path/ca.pem` or `ssl-ca=/path/ca.pem`; that CA is added to the
+built-in roots. `require` / `REQUIRED` encrypts without verifying the
+certificate. `verify-ca` / `VERIFY_CA` are meant to skip the host name check,
+but with the current TLS libraries (sqlx 0.8.6 with rustls 0.23) they also
+require the certificate to name the host, like the full verify modes. The
+`require` and verify modes fail the scan with exit code 2 instead of falling
+back to an unencrypted connection. `sslmode=allow` does not attempt TLS.
+PostgreSQL URLs also take defaults from libpq variables such as `PGSSLMODE` and
+`PGSSLROOTCERT`. A server limited to TLS 1.1 or older, or to cipher suites
+without forward secrecy, fails the handshake even in the default mode; scan
+it with `sslmode=disable` or `ssl-mode=DISABLED`.
+
+When a catalog is read over an unencrypted connection to a host other than a
+Unix socket or a loopback address (`127.0.0.0/8`, `::1`, or `localhost`), the
+catalog document and graph record a `connection-not-encrypted:` limitation.
+For such a host, `sslmode=disable`, `sslmode=allow`, and `ssl-mode=DISABLED`
+always record it. In the default mode the reader asks the server whether the
+session uses TLS (`pg_stat_ssl`, `Ssl_cipher`); if the server cannot answer,
+the limitation says that encryption could not be confirmed. Behind a
+connection pooler or proxy, that answer describes the pooler's connection to
+the server, so use a verify mode when the connection must be encrypted. The
+limitation does not change `catalog_complete`.
+
 The JDBC baseline collects schemas, tables, columns, keys, indexes, and
 routine metadata exposed by the driver. Body and usage collection depend on
 the database dialect, permissions, and available catalogs. Collection gaps
@@ -120,8 +151,10 @@ read that file by default; use `--graph <path>` to select another snapshot.
 `cycles`, `dead`, `rules`, and `diff` accept `--strict`: the command still
 prints its report but exits with code **1** when it finds cycles,
 candidates, violations, or differences, respectively. `query` and `impact`
-also exit **1** when a name cannot be resolved. Usage and engine errors exit
-**2**. Use `schemagraph <command> --help` for all options.
+also exit **1** when a name cannot be resolved; with `--format
+language-traversal` they still write the document and exit **64**, the code
+the other isthmus producers use for unresolved roots. Usage and engine errors
+exit **2**. Use `schemagraph <command> --help` for all options.
 Version 0.4.2 adds cooperative Ctrl+C and MCP request cancellation;
 see [the cancellation contract](ANALYSIS.md#trace-a-dependency).
 
