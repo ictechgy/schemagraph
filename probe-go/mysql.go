@@ -24,13 +24,7 @@ func (h *harvester) extractMySQL() CatalogDocument {
 
 func (h *harvester) mysqlSchema(schema string) SchemaDoc {
 	objects := h.mysqlObjects(schema)
-	for i := range objects {
-		obj := &objects[i]
-		obj.Columns = h.mysqlColumns(schema, obj.Name)
-		obj.Constraints = h.mysqlConstraints(schema, obj.Name)
-		obj.Indexes = h.mysqlIndexes(schema, obj.Name)
-		obj.Triggers = h.mysqlTriggers(schema, obj.Name)
-	}
+	h.mysqlRelationDetails(schema, objects)
 	h.mysqlObjectUsage(schema, objects)
 	sd := SchemaDoc{Name: schema, Objects: objects, Routines: h.mysqlRoutines(schema)}
 	normalizeSchema(&sd)
@@ -158,34 +152,69 @@ func indexPositions(objects []ObjectDoc) map[string][]indexPosition {
 	return positions
 }
 
-func (h *harvester) mysqlColumns(schema, table string) []ColumnDoc {
-	columns := []ColumnDoc{}
-	pkPositions := map[string]int{}
+// mysqlRelationDetails는 컬럼·PK 위치·제약·인덱스·트리거를 스키마마다 한 번씩 읽어 테이블 이름으로 객체에 나눠 단다.
+// 객체마다 다섯 번씩 물으면 고정 연결 하나에서 직렬 왕복이 객체 수에 비례한다. go-sql-driver/mysql은 interpolateParams가
+// 꺼져 있으면 인자 있는 질의를 prepare와 execute 두 번 왕복으로 보내, 원격 DB에서는 테이블당 약 10왕복이었다.
+// 컬럼·PK 위치·인덱스·트리거를 테이블마다 묻던 table_name = ? 조건은 그 이름의 테이블 행만 돌려줬다
+// (lower_case_table_names=0인 MySQL 8.4와 MariaDB 11.4에서 대소문자·악센트만 다른 T·t, cafe·café로 확인). 그래서 정확한
+// 이름으로 나눈 결과가 테이블마다 묻던 결과와 같다. 제약만 예외다(mysqlSchemaConstraints). 객체가 없는 스키마에는 묻지
+// 않는다 — 예전에도 질의가 없었으니 그 스키마에서 실패 limitation이 새로 생기지 않는다.
+func (h *harvester) mysqlRelationDetails(schema string, objects []ObjectDoc) {
+	if len(objects) == 0 {
+		return
+	}
+	columns := h.mysqlSchemaColumns(schema)
+	constraints := h.mysqlSchemaConstraints(schema)
+	indexes, expressionColumns := h.mysqlSchemaIndexes(schema)
+	triggers := h.mysqlSchemaTriggers(schema)
+	for i := range objects {
+		obj := &objects[i]
+		obj.Columns, obj.Constraints = nonNil(columns[obj.Name]), nonNil(constraints[obj.Name])
+		obj.Indexes, obj.Triggers = nonNil(indexes[obj.Name]), nonNil(triggers[obj.Name])
+		if count := expressionColumns[obj.Name]; count > 0 {
+			h.limitations = append(h.limitations, fmt.Sprintf("%s.%s: omitted %d functional index columns because they have no names", schema, obj.Name, count))
+		}
+	}
+}
+
+// mysqlPrimaryKeyPositions는 테이블마다 PK 컬럼의 PK 안 위치(1부터)를 읽는다.
+func (h *harvester) mysqlPrimaryKeyPositions(schema string) map[string]map[string]int {
+	positions := map[string]map[string]int{}
 	h.mysqlRows("primary key columns", `
-		SELECT CAST(column_name AS CHAR), CAST(ordinal_position AS SIGNED)
+		SELECT CAST(table_name AS CHAR), CAST(column_name AS CHAR), CAST(ordinal_position AS SIGNED)
 		FROM information_schema.key_column_usage
-		WHERE table_schema = ? AND table_name = ? AND constraint_name = 'PRIMARY'
-		ORDER BY ordinal_position`, []any{schema, table}, func(rows *sql.Rows) error {
-		var name string
+		WHERE table_schema = ? AND constraint_name = 'PRIMARY'
+		ORDER BY table_name, ordinal_position`, []any{schema}, func(rows *sql.Rows) error {
+		var table, name string
 		var position int
-		if err := rows.Scan(&name, &position); err != nil {
+		if err := rows.Scan(&table, &name, &position); err != nil {
 			return err
 		}
-		pkPositions[name] = position
+		if positions[table] == nil {
+			positions[table] = map[string]int{}
+		}
+		positions[table][name] = position
 		return nil
 	})
+	return positions
+}
+
+// mysqlSchemaColumns는 스키마의 컬럼을 테이블마다 ordinal_position 순으로 읽어 나누고, PK 컬럼에 PK 안 위치를 단다.
+func (h *harvester) mysqlSchemaColumns(schema string) map[string][]ColumnDoc {
+	pkPositions := h.mysqlPrimaryKeyPositions(schema)
+	columns := map[string][]ColumnDoc{}
 	h.mysqlRows("columns", `
-		SELECT CAST(column_name AS CHAR), CAST(data_type AS CHAR), CAST(is_nullable AS CHAR),
+		SELECT CAST(table_name AS CHAR), CAST(column_name AS CHAR), CAST(data_type AS CHAR), CAST(is_nullable AS CHAR),
 		       CAST(column_default AS CHAR), CAST(ordinal_position AS SIGNED)
 		FROM information_schema.columns
-		WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position`, []any{schema, table}, func(rows *sql.Rows) error {
-		var name, dataType, nullable string
+		WHERE table_schema = ? ORDER BY table_name, ordinal_position`, []any{schema}, func(rows *sql.Rows) error {
+		var table, name, dataType, nullable string
 		var def sql.NullString
 		var ordinal int
-		if err := rows.Scan(&name, &dataType, &nullable, &def, &ordinal); err != nil {
+		if err := rows.Scan(&table, &name, &dataType, &nullable, &def, &ordinal); err != nil {
 			return err
 		}
-		columns = append(columns, ColumnDoc{Name: name, DataType: dataType, Nullable: nullable == "YES", Default: ns(def), Ordinal: ordinal, PkPosition: pkPositions[name]})
+		columns[table] = append(columns[table], ColumnDoc{Name: name, DataType: dataType, Nullable: nullable == "YES", Default: ns(def), Ordinal: ordinal, PkPosition: pkPositions[table][name]})
 		return nil
 	})
 	return columns
@@ -196,19 +225,18 @@ type mysqlConstraintRow struct {
 	refSchema, refTable, refColumn sql.NullString
 }
 
-// mysqlConstraints는 테이블 하나의 PK·FK·UNIQUE·CHECK 제약을 읽는다.
+// mysqlSchemaConstraints는 PK·FK·UNIQUE·CHECK 제약을 스키마마다 한 번 읽어 테이블 이름별로 나눈다. 테이블 안의
+// 행 순서는 테이블마다 읽던 때와 같은 (제약 이름, 키 순서)다.
 //
 // LEFT JOIN은 이름을 서버 콜레이션으로 비교한다. MariaDB 11.4에서는 이 비교가 대소문자·악센트를 무시해, 대소문자·
-// 악센트만 다른 테이블(P와 p, resume과 résumé)과 스키마의 같은 이름 제약(PRIMARY, 이름이 같은 UNIQUE)이 서로의 키
-// 컬럼까지 짝지었다. 그래서 제약에 남의 컬럼이 들어갔고, 그 컬럼들은 ORDER BY에서 동점이라 순서도 서버마다 달랐다.
-// 키 컬럼 행은 스키마·테이블·제약 이름이 정확히 같을 때만 쓴다. 네이티브 reader(engine/source/src/mysql.rs)는 제약마다
-// 키 컬럼을 따로 물어 이미 이렇게 읽고, MySQL 8.4(lower_case_table_names=0)의 조인은 정확한 이름으로 짝지어 결과가
-// 예전과 같다.
-func (h *harvester) mysqlConstraints(schema, table string) []ConstraintDoc {
-	byName := map[string]*ConstraintDoc{}
-	order := []string{}
+// 악센트만 다른 테이블(P와 p, resume과 résumé)이나 스키마의 같은 이름 제약(PRIMARY, 이름이 같은 UNIQUE)이 서로의 키
+// 컬럼까지 짝짓는다. 그런 행은 ORDER BY에서 동점이라 순서도 정해지지 않는다. 그래서 테이블마다 읽던 때처럼 키 컬럼
+// 행은 스키마·테이블·제약 이름이 제약 행과 정확히 같을 때만 쓴다. 네이티브 reader(engine/source/src/mysql.rs)도
+// 제약마다 키 컬럼을 따로 물어 같은 결과를 낸다.
+func (h *harvester) mysqlSchemaConstraints(schema string) map[string][]ConstraintDoc {
+	groups := newRelationGroups[ConstraintDoc]()
 	h.mysqlRows("constraints", `
-		SELECT CAST(tc.constraint_name AS CHAR), CAST(tc.constraint_type AS CHAR),
+		SELECT CAST(tc.table_name AS CHAR), CAST(tc.constraint_name AS CHAR), CAST(tc.constraint_type AS CHAR),
 		       CAST(kcu.table_schema AS CHAR), CAST(kcu.table_name AS CHAR), CAST(kcu.constraint_name AS CHAR),
 		       CAST(kcu.column_name AS CHAR), CAST(kcu.referenced_table_schema AS CHAR),
 		       CAST(kcu.referenced_table_name AS CHAR), CAST(kcu.referenced_column_name AS CHAR)
@@ -217,49 +245,28 @@ func (h *harvester) mysqlConstraints(schema, table string) []ConstraintDoc {
 		  ON kcu.constraint_schema = tc.constraint_schema
 		 AND kcu.table_schema = tc.table_schema AND kcu.table_name = tc.table_name
 		 AND kcu.constraint_name = tc.constraint_name
-		WHERE tc.table_schema = ? AND tc.table_name = ?
+		WHERE tc.table_schema = ?
 		  AND tc.constraint_type IN ('PRIMARY KEY','FOREIGN KEY','UNIQUE','CHECK')
-		ORDER BY tc.constraint_name, kcu.ordinal_position`, []any{schema, table}, func(rows *sql.Rows) error {
+		ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, []any{schema}, func(rows *sql.Rows) error {
+		var table string
 		var owner mysqlKeyOwner
 		var r mysqlConstraintRow
-		if err := rows.Scan(&r.name, &r.kind, &owner.schema, &owner.table, &owner.constraint,
+		if err := rows.Scan(&table, &r.name, &r.kind, &owner.schema, &owner.table, &owner.constraint,
 			&r.column, &r.refSchema, &r.refTable, &r.refColumn); err != nil {
 			return err
 		}
 		if !r.name.Valid || !r.kind.Valid {
 			return nil
 		}
-		constraint := byName[r.name.String]
-		if constraint == nil {
-			constraint = &ConstraintDoc{Name: r.name.String, Kind: mysqlConstraintKind(r.kind.String), Columns: []string{}}
-			byName[r.name.String] = constraint
-			order = append(order, r.name.String)
-		}
-		if !owner.belongsTo(schema, table, r.name.String) {
-			return nil
-		}
-		if r.column.Valid {
-			constraint.Columns = append(constraint.Columns, r.column.String)
-		}
-		if r.kind.String == "FOREIGN KEY" && r.refTable.Valid {
-			if constraint.Referenced == nil {
-				constraint.Referenced = &ReferencedDoc{Table: r.refTable.String, Columns: []string{}}
-				if r.refSchema.Valid {
-					v := r.refSchema.String
-					constraint.Referenced.Schema = &v
-				}
-			}
-			if r.refColumn.Valid {
-				constraint.Referenced.Columns = append(constraint.Referenced.Columns, r.refColumn.String)
-			}
+		constraint := groups.entry(table, r.name.String, func() ConstraintDoc {
+			return ConstraintDoc{Name: r.name.String, Kind: mysqlConstraintKind(r.kind.String), Columns: []string{}}
+		})
+		if owner.belongsTo(schema, table, r.name.String) {
+			addMySQLConstraintRow(constraint, r)
 		}
 		return nil
 	})
-	out := make([]ConstraintDoc, 0, len(order))
-	for _, name := range order {
-		out = append(out, *byName[name])
-	}
-	return out
+	return groups.lists()
 }
 
 // mysqlKeyOwner는 제약 조인이 짝지은 키 컬럼 행의 스키마·테이블·제약 이름이다. 짝이 없는 행(CHECK)은 모두 NULL이다.
@@ -271,6 +278,26 @@ func (k mysqlKeyOwner) belongsTo(schema, table, constraint string) bool {
 		return true
 	}
 	return k.schema.String == schema && k.table.String == table && k.constraint.String == constraint
+}
+
+// addMySQLConstraintRow는 제약 행 하나의 키 컬럼과, FK면 대상 테이블·컬럼을 덧붙인다. CHECK 제약은 키 컬럼 행이 없다.
+func addMySQLConstraintRow(constraint *ConstraintDoc, r mysqlConstraintRow) {
+	if r.column.Valid {
+		constraint.Columns = append(constraint.Columns, r.column.String)
+	}
+	if r.kind.String != "FOREIGN KEY" || !r.refTable.Valid {
+		return
+	}
+	if constraint.Referenced == nil {
+		constraint.Referenced = &ReferencedDoc{Table: r.refTable.String, Columns: []string{}}
+		if r.refSchema.Valid {
+			v := r.refSchema.String
+			constraint.Referenced.Schema = &v
+		}
+	}
+	if r.refColumn.Valid {
+		constraint.Referenced.Columns = append(constraint.Referenced.Columns, r.refColumn.String)
+	}
 }
 
 func mysqlConstraintKind(kind string) string {
@@ -286,57 +313,51 @@ func mysqlConstraintKind(kind string) string {
 	}
 }
 
-func (h *harvester) mysqlIndexes(schema, table string) []IndexDoc {
-	byName := map[string]*IndexDoc{}
-	order := []string{}
-	expressionColumns := 0
+// mysqlSchemaIndexes는 PRIMARY가 아닌 인덱스를 스키마마다 한 번 읽어 테이블 이름별로 나눈다. 테이블 안의 순서는
+// 테이블마다 읽던 때와 같은 (인덱스 이름, 키 순서)다. 이름 없는 키 컬럼(MySQL functional index)은 컬럼에 넣지 않고
+// 정의를 불완전으로 표시하며, 그 수를 테이블마다 돌려준다 — limitation은 객체 목록에 있는 테이블에만 남긴다.
+func (h *harvester) mysqlSchemaIndexes(schema string) (map[string][]IndexDoc, map[string]int) {
+	groups := newRelationGroups[IndexDoc]()
+	expressionColumns := map[string]int{}
 	h.mysqlRows("indexes", `
-		SELECT CAST(index_name AS CHAR), CAST(non_unique AS SIGNED), CAST(column_name AS CHAR)
+		SELECT CAST(table_name AS CHAR), CAST(index_name AS CHAR), CAST(non_unique AS SIGNED), CAST(column_name AS CHAR)
 		FROM information_schema.statistics
-		WHERE table_schema = ? AND table_name = ? AND index_name <> 'PRIMARY'
-		ORDER BY index_name, seq_in_index`, []any{schema, table}, func(rows *sql.Rows) error {
-		var name string
+		WHERE table_schema = ? AND index_name <> 'PRIMARY'
+		ORDER BY table_name, index_name, seq_in_index`, []any{schema}, func(rows *sql.Rows) error {
+		var table, name string
 		var nonUnique int64
 		var column sql.NullString
-		if err := rows.Scan(&name, &nonUnique, &column); err != nil {
+		if err := rows.Scan(&table, &name, &nonUnique, &column); err != nil {
 			return err
 		}
-		idx := byName[name]
-		if idx == nil {
-			idx = &IndexDoc{Name: name, Unique: nonUnique == 0, Columns: []string{}, DefinitionComplete: boolValue(true), HasPredicate: boolValue(false)}
-			byName[name] = idx
-			order = append(order, name)
-		}
+		idx := groups.entry(table, name, func() IndexDoc {
+			return IndexDoc{Name: name, Unique: nonUnique == 0, Columns: []string{}, DefinitionComplete: boolValue(true), HasPredicate: boolValue(false)}
+		})
 		if column.Valid {
 			idx.Columns = append(idx.Columns, column.String)
 		} else {
-			expressionColumns++
+			expressionColumns[table]++
 			idx.DefinitionComplete = boolValue(false)
 		}
 		return nil
 	})
-	if expressionColumns > 0 {
-		h.limitations = append(h.limitations, fmt.Sprintf("%s.%s: omitted %d functional index columns because they have no names", schema, table, expressionColumns))
-	}
-	out := make([]IndexDoc, 0, len(order))
-	for _, name := range order {
-		out = append(out, *byName[name])
-	}
-	return out
+	return groups.lists(), expressionColumns
 }
 
-func (h *harvester) mysqlTriggers(schema, table string) []TriggerDoc {
-	triggers := []TriggerDoc{}
+// mysqlSchemaTriggers는 트리거를 스키마마다 한 번 읽어 대상 테이블 이름별로 나눈다. MySQL 트리거는 대상 테이블과 같은
+// 스키마에만 있으므로 trigger_schema로 고른다(테이블마다 읽던 때와 같은 조건).
+func (h *harvester) mysqlSchemaTriggers(schema string) map[string][]TriggerDoc {
+	triggers := map[string][]TriggerDoc{}
 	h.mysqlRows("triggers", `
-		SELECT CAST(trigger_name AS CHAR), CAST(action_statement AS CHAR)
-		FROM information_schema.triggers WHERE trigger_schema = ? AND event_object_table = ?
-		ORDER BY trigger_name`, []any{schema, table}, func(rows *sql.Rows) error {
-		var name string
+		SELECT CAST(event_object_table AS CHAR), CAST(trigger_name AS CHAR), CAST(action_statement AS CHAR)
+		FROM information_schema.triggers WHERE trigger_schema = ?
+		ORDER BY event_object_table, trigger_name`, []any{schema}, func(rows *sql.Rows) error {
+		var table, name string
 		var body sql.NullString
-		if err := rows.Scan(&name, &body); err != nil {
+		if err := rows.Scan(&table, &name, &body); err != nil {
 			return err
 		}
-		triggers = append(triggers, TriggerDoc{Name: name, Body: ns(body)})
+		triggers[table] = append(triggers[table], TriggerDoc{Name: name, Body: ns(body)})
 		return nil
 	})
 	return triggers
@@ -363,6 +384,13 @@ func (h *harvester) mysqlRoutines(schema string) []RoutineDoc {
 		raw = append(raw, item)
 		return nil
 	})
+	names := []string{}
+	for _, item := range raw {
+		if item.kind.Valid {
+			names = append(names, item.name)
+		}
+	}
+	parameters := h.mysqlRoutineParameters(schema, names)
 	for _, item := range raw {
 		if !item.kind.Valid {
 			h.limitations = append(h.limitations, fmt.Sprintf("%s.%s: ROUTINE_TYPE is NULL; routine kind cannot be determined", schema, item.name))
@@ -371,7 +399,7 @@ func (h *harvester) mysqlRoutines(schema string) []RoutineDoc {
 		if !item.body.Valid {
 			nullBodies++
 		}
-		signature := h.mysqlRoutineSignature(schema, item.name)
+		signature := parameters.signature(h, schema, item.name)
 		name := item.name
 		id := name
 		if signature != nil && *signature != "" {
@@ -394,6 +422,136 @@ func (h *harvester) mysqlRoutines(schema string) []RoutineDoc {
 	return routines
 }
 
+// mysqlParameterBatch는 스키마 routine의 파라미터 형을 한 번 읽은 결과다.
+//
+// routine마다 specific_name = ?로 물으면 서버가 routine 이름 콜레이션(대소문자·악센트 무시)으로 비교해, 이름이
+// 대소문자만 다른 function과 procedure가 서로의 파라미터를 함께 받았다. 이름이 같은 function과 procedure의 행은
+// ordinal_position이 같으면 순서가 정해지지 않는다. 정확한 이름으로 묶으면 이런 이름에서만 결과가 달라질 수 있으므로,
+// 그런 이름은 예전처럼 routine마다 따로 묻는다(mysqlRoutineSignature). 나머지 routine은 묶음에서 찾는다. 네이티브
+// reader도 routine마다 같은 질의를 보내므로, 이렇게 해야 두 생산자의 시그니처가 계속 같다.
+type mysqlParameterBatch struct {
+	// types는 정확한 specific_name마다 ordinal_position 순으로 모은 dtd_identifier다(NULL은 빼고, 예전과 같다).
+	types map[string][]string
+	// separate는 예전처럼 따로 물을 routine 이름이다. everyName이면 모든 routine을 따로 묻는다.
+	separate  map[string]bool
+	everyName bool
+	// failure는 묶음 조회가 실패했을 때 routine마다 남길 예전 limitation의 꼬리다("routine parameters unavailable — …").
+	failure string
+}
+
+// mysqlRoutineParameters는 routine names의 파라미터 형을 스키마마다 한 번 읽는다. routine이 없으면 묻지 않는다 —
+// 예전에도 질의가 없었다.
+func (h *harvester) mysqlRoutineParameters(schema string, names []string) mysqlParameterBatch {
+	batch := mysqlParameterBatch{types: map[string][]string{}}
+	if len(names) == 0 {
+		return batch
+	}
+	rows, err := h.db.Query(`
+		SELECT CAST(specific_name AS CHAR), CAST(dtd_identifier AS CHAR)
+		FROM information_schema.parameters
+		WHERE specific_schema = ? AND ordinal_position > 0
+		ORDER BY specific_name, ordinal_position`, schema)
+	if err != nil {
+		batch.failure = "routine parameters unavailable — " + oneLine(err.Error())
+		return batch
+	}
+	defer rows.Close()
+	specificNames := map[string]bool{}
+	for rows.Next() {
+		var name string
+		var typ sql.NullString
+		if err := rows.Scan(&name, &typ); err != nil {
+			batch.failure = "routine parameter row read failed — " + oneLine(err.Error())
+			return batch
+		}
+		specificNames[name] = true
+		if typ.Valid {
+			batch.types[name] = append(batch.types[name], typ.String)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		batch.failure = "routine parameters unavailable — " + oneLine(err.Error())
+		return batch
+	}
+	batch.separate, batch.everyName = mysqlCollationSensitiveNames(names, specificNames)
+	return batch
+}
+
+// signature는 routine name의 파라미터 형을 쉼표로 이은 시그니처다. 파라미터가 없으면 nil이다. 묶음 조회가 실패했으면
+// 예전에 routine마다 실패했을 때와 같은 limitation을 남긴다.
+func (b mysqlParameterBatch) signature(h *harvester, schema, name string) *string {
+	if b.failure != "" {
+		h.limitations = append(h.limitations, fmt.Sprintf("%s.%s: %s", schema, name, b.failure))
+		return nil
+	}
+	if b.everyName || b.separate[name] {
+		return h.mysqlRoutineSignature(schema, name)
+	}
+	return joinedSignature(b.types[name])
+}
+
+// mysqlCollationSensitiveNames는 정확한 이름으로 묶으면 예전 콜레이션 비교와 결과가 달라질 수 있는 routine 이름을 고른다.
+// 출력 가능한 ASCII 이름끼리의 콜레이션 비교는 대소문자 무시 비교와 같다. 그래서 대소문자 무시로 겹치는 이름이 routine
+// 둘 이상이거나 철자가 둘 이상이면 따로 묻는다. 그 밖의 이름(ASCII가 아니거나 공백으로 끝나는 이름)이 하나라도 있으면
+// 악센트 무시·끝 공백 무시 규칙을 옮길 수 없으므로 모든 routine을 따로 묻는다.
+func mysqlCollationSensitiveNames(routines []string, specificNames map[string]bool) (map[string]bool, bool) {
+	routineCount := map[string]int{}
+	spellings := map[string]map[string]bool{}
+	add := func(name string) bool {
+		if !plainASCIIName(name) {
+			return false
+		}
+		folded := strings.ToLower(name)
+		if spellings[folded] == nil {
+			spellings[folded] = map[string]bool{}
+		}
+		spellings[folded][name] = true
+		return true
+	}
+	for _, name := range routines {
+		if !add(name) {
+			return nil, true
+		}
+		routineCount[strings.ToLower(name)]++
+	}
+	for name := range specificNames {
+		if !add(name) {
+			return nil, true
+		}
+	}
+	separate := map[string]bool{}
+	for _, name := range routines {
+		folded := strings.ToLower(name)
+		if routineCount[folded] > 1 || len(spellings[folded]) > 1 {
+			separate[name] = true
+		}
+	}
+	return separate, false
+}
+
+// plainASCIIName은 이름이 출력 가능한 ASCII(공백~물결표)로만 되어 있고 공백으로 끝나지 않는지 본다.
+func plainASCIIName(name string) bool {
+	if name == "" || name[len(name)-1] == ' ' {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if name[i] < ' ' || name[i] > '~' {
+			return false
+		}
+	}
+	return true
+}
+
+// joinedSignature는 파라미터 형을 쉼표로 잇는다. 형이 하나도 없으면 시그니처가 없다(nil).
+func joinedSignature(types []string) *string {
+	if len(types) == 0 {
+		return nil
+	}
+	signature := strings.Join(types, ",")
+	return &signature
+}
+
+// mysqlRoutineSignature는 routine 하나의 파라미터 형을 따로 묻는다. 비교는 서버 콜레이션을 따른다.
 func (h *harvester) mysqlRoutineSignature(schema, name string) *string {
 	rows, err := h.db.Query(`
 		SELECT CAST(dtd_identifier AS CHAR)
@@ -420,11 +578,7 @@ func (h *harvester) mysqlRoutineSignature(schema, name string) *string {
 		h.limitations = append(h.limitations, fmt.Sprintf("%s.%s: routine parameters unavailable — %s", schema, name, oneLine(err.Error())))
 		return nil
 	}
-	if len(types) == 0 {
-		return nil
-	}
-	signature := strings.Join(types, ",")
-	return &signature
+	return joinedSignature(types)
 }
 
 func (h *harvester) mysqlObjectUsage(schema string, objects []ObjectDoc) {
