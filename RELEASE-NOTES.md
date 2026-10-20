@@ -16,6 +16,14 @@ These changes are not yet in a published release.
   language-traversal producers and the partial-success rule of
   `isthmus capture`; scripts that accepted exit 1 must accept 64. Usage and
   engine errors still exit 2, and the default JSON `notFound` still exits 1.
+- In the default `sslmode=prefer` / `ssl-mode=PREFERRED` mode, the native
+  PostgreSQL and MySQL/MariaDB readers now start TLS whenever the server offers
+  it, and a failed handshake ends the scan with exit code 2; the reader does
+  not retry without TLS. Before, the readers never attempted TLS, so such a
+  server was scanned in plaintext and the scan exited 0. A server that
+  supports only TLS 1.1 or older, or only cipher suites that rustls does not
+  implement (such as suites without forward secrecy), now needs an explicit
+  `sslmode=disable` or `ssl-mode=DISABLED`.
 
 ## Security
 
@@ -23,7 +31,8 @@ These changes are not yet in a published release.
   (rustls with the ring provider, TLS 1.2 and 1.3) and trust the Mozilla root
   certificates built into the binary. Before, the default mode connected
   without encryption, and `require` and the verify modes failed with "SQLx was
-  built without TLS support".
+  built without TLS support". Servers whose TLS handshake fails in the default
+  mode are covered under Breaking.
 - The default stays `sslmode=prefer` / `ssl-mode=PREFERRED`, as in libpq: the
   reader encrypts when the server offers TLS but does not verify the server
   certificate, so an active network attacker can still force plaintext or
@@ -45,10 +54,6 @@ These changes are not yet in a published release.
   the limitation says that encryption could not be confirmed. Loopback and
   Unix-socket scans, including the fixtures, produce the same output as before,
   and `catalog_complete` is unchanged.
-- Once a server accepts TLS, a failed handshake ends the scan even in the
-  default mode; the reader does not retry without TLS. Scan a server that only
-  supports TLS 1.1 or older, or only cipher suites without forward secrecy,
-  with an explicit `sslmode=disable` or `ssl-mode=DISABLED`.
 - New dependencies, pinned by `engine/Cargo.lock`: rustls 0.23.43,
   rustls-webpki 0.103.14, rustls-pki-types 1.15.1, ring 0.17.14, untrusted
   0.9.0, and webpki-roots 0.26.11 and 1.0.10. The root certificate data in
@@ -78,6 +83,12 @@ These changes are not yet in a published release.
 
 ## Changed
 
+- A native PostgreSQL or MySQL/MariaDB scan of a host that is not a Unix
+  socket or a loopback address now adds a `connection-not-encrypted:`
+  limitation to the catalog document and the graph when the catalog was read
+  over an unencrypted connection or encryption could not be confirmed (details
+  under Security). Loopback and Unix-socket scans, including the fixtures, keep
+  their output.
 - Cache format version 4 makes existing `--cache-dir` entries miss once; the
   next scan rewrites them. Caches restored from another machine or CI run are
   reused only when they were written with the same `SCHEMAGRAPH_CACHE_KEY`.
