@@ -13,9 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use schemagraph_analysis::{self as analysis, Resolve};
-#[cfg(test)]
-use schemagraph_core::VertexId;
-use schemagraph_core::{Graph, Level};
+use schemagraph_core::{Graph, Level, VertexId};
 use schemagraph_export as export;
 use serde_json::{json, Map, Value};
 
@@ -27,6 +25,23 @@ const MAX_PATHS: u64 = 1024;
 const MAX_VISITED: u64 = 100_000;
 const MAX_EDGES: u64 = 1_000_000;
 const MAX_OUTSTANDING_JOBS: usize = 16;
+
+/// `stats`·`cycles`·`diagnostics` 목록의 기본 `max`다.
+///
+/// 이 도구들은 그래프 전체를 훑어 관측 정점·순환·분석 기록을 모두 싣던 터라, usage를 수집한
+/// 대형 그래프에서는 응답 한 줄이 그래프 크기만큼 커졌다. 같은 서버의 `dead`·`unused`·
+/// `impact`·`explain` 기본값과 같은 1024로 둔다 — 에이전트가 한 번에 읽을 만한 크기이고,
+/// 더 필요하면 `MAX_RESULTS`까지 올려 다시 묻는다. 잘린 목록에는 `truncated`가 붙는다.
+const DEFAULT_WHOLE_GRAPH_MAX: u64 = 1024;
+
+/// notFound 응답이 싣는 후보 수의 상한이다.
+///
+/// 후보는 같은 말단 이름을 가진 정점 전부라, 모든 테이블에 `id` 컬럼이 있는 그래프(리뷰가 잰
+/// 사례는 후보 5,000개)에서는 응답이 그래프 크기만큼 커진다. 후보 목록은 다시 고를 이름을
+/// 보여 주는 용도라 에이전트가 읽고 고를 수 있는 규모면 충분하다. language-traversal
+/// `roots` 상한과 같은 64로 둔다. 잘리면 `candidatesTotal`·`candidatesTruncated`가 붙으므로
+/// 소비자는 스키마로 한정한 id로 다시 묻는다.
+const MAX_NOT_FOUND_CANDIDATES: usize = 64;
 
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -847,6 +862,7 @@ enum PreparedToolCall {
     },
     Diagnostics {
         name: Option<String>,
+        max: usize,
     },
     Path {
         from: String,
@@ -864,11 +880,14 @@ enum PreparedToolCall {
     },
     Cycles {
         level: Level,
+        max: usize,
     },
     Lint {
         max: usize,
     },
-    Stats,
+    Stats {
+        max: usize,
+    },
     Unused {
         max: usize,
     },
@@ -925,8 +944,9 @@ fn prepare_tool_call(
         }
         "diagnostics" => {
             let name = optional_name(arguments, "name")?;
-            reject_unknown(arguments, &["name"])?;
-            Ok(PreparedToolCall::Diagnostics { name })
+            let max = whole_graph_max(arguments)?;
+            reject_unknown(arguments, &["name", "max"])?;
+            Ok(PreparedToolCall::Diagnostics { name, max })
         }
         "path" => {
             let from = required_name(arguments, "from")?;
@@ -965,8 +985,9 @@ fn prepare_tool_call(
                     format!("unknown level '{label}'; use schema, object, column, or member")
                 })?,
             };
-            reject_unknown(arguments, &["level"])?;
-            Ok(PreparedToolCall::Cycles { level })
+            let max = whole_graph_max(arguments)?;
+            reject_unknown(arguments, &["level", "max"])?;
+            Ok(PreparedToolCall::Cycles { level, max })
         }
         "lint" => {
             let max = bounded_u64(arguments, "max", 256, MAX_RESULTS)? as usize;
@@ -974,8 +995,9 @@ fn prepare_tool_call(
             Ok(PreparedToolCall::Lint { max })
         }
         "stats" => {
-            reject_unknown(arguments, &[])?;
-            Ok(PreparedToolCall::Stats)
+            let max = whole_graph_max(arguments)?;
+            reject_unknown(arguments, &["max"])?;
+            Ok(PreparedToolCall::Stats { max })
         }
         "unused" => {
             let max = bounded_u64(arguments, "max", 1024, MAX_RESULTS)? as usize;
@@ -1032,8 +1054,8 @@ fn call_tool(snapshot: &Snapshot, call: &PreparedToolCall, cancel: &AtomicBool) 
             max_examined_edges,
         } => resolve_impact(graph, name, *max, *max_visited, *max_examined_edges, cancel),
         PreparedToolCall::Explain { name, max } => resolve_explain(graph, name, *max, cancel),
-        PreparedToolCall::Diagnostics { name } => {
-            resolve_diagnostics(graph, name.as_deref(), cancel)
+        PreparedToolCall::Diagnostics { name, max } => {
+            resolve_diagnostics(graph, name.as_deref(), *max, cancel)
         }
         PreparedToolCall::Path { from, to, options } => {
             resolve_path(graph, from, to, *options, cancel)
@@ -1056,13 +1078,15 @@ fn call_tool(snapshot: &Snapshot, call: &PreparedToolCall, cancel: &AtomicBool) 
         PreparedToolCall::Dead { max } => whole_graph(cancel, || {
             export::dead_to_value(&analysis::dead_with_policy(graph, *max, snapshot.retention))
         }),
-        PreparedToolCall::Cycles { level } => whole_graph(cancel, || {
-            export::cycles_to_value(&analysis::cycles(graph, *level))
+        PreparedToolCall::Cycles { level, max } => whole_graph(cancel, || {
+            export::cycles_to_value_with_max(&analysis::cycles(graph, *level), *max)
         }),
         PreparedToolCall::Lint { max } => whole_graph(cancel, || {
             export::lint::to_value(&analysis::schema_lint::lint(graph, *max))
         }),
-        PreparedToolCall::Stats => whole_graph(cancel, || export::stats_to_value(graph)),
+        PreparedToolCall::Stats { max } => {
+            whole_graph(cancel, || export::stats_to_value_with_max(graph, *max))
+        }
         PreparedToolCall::Unused { max } => whole_graph(cancel, || {
             export::unused::to_value(&analysis::unused::unused(graph, *max), graph.limitations())
         }),
@@ -1128,10 +1152,7 @@ fn resolve_query(
                 is_error: false,
             }
         }
-        Resolve::NotFound { candidates } => ToolResult {
-            value: export::not_found_value(name, &candidates, graph.limitations()),
-            is_error: true,
-        },
+        Resolve::NotFound { candidates } => not_found_result(graph, name, &candidates),
     }
 }
 
@@ -1168,10 +1189,7 @@ fn resolve_impact(
                 is_error: false,
             }
         }
-        Resolve::NotFound { candidates } => ToolResult {
-            value: export::not_found_value(name, &candidates, graph.limitations()),
-            is_error: true,
-        },
+        Resolve::NotFound { candidates } => not_found_result(graph, name, &candidates),
     }
 }
 
@@ -1191,31 +1209,34 @@ fn resolve_explain(graph: &Graph, name: &str, max: usize, cancel: &AtomicBool) -
                 is_error: false,
             }
         }
-        Resolve::NotFound { candidates } => ToolResult {
-            value: export::not_found_value(name, &candidates, graph.limitations()),
-            is_error: true,
-        },
+        Resolve::NotFound { candidates } => not_found_result(graph, name, &candidates),
     }
 }
 
-fn resolve_diagnostics(graph: &Graph, name: Option<&str>, cancel: &AtomicBool) -> ToolResult {
+/// 진단 보고 — `objects`만 `max`개로 자르고 `summary`는 전체 기록으로 센다.
+///
+/// 이름을 준 보고는 기록이 하나뿐이라 `max`가 0일 때만 잘린다. 그래도 같은 인자를 같은
+/// 뜻으로 적용한다 — 이름 유무에 따라 `max`를 조용히 무시하지 않는다.
+fn resolve_diagnostics(
+    graph: &Graph,
+    name: Option<&str>,
+    max: usize,
+    cancel: &AtomicBool,
+) -> ToolResult {
     if is_cancelled(cancel) {
         return cancelled_result();
     }
     let result = match name {
         None => ToolResult {
-            value: export::diagnostics::report(graph, None),
+            value: export::diagnostics::report_with_max(graph, None, max),
             is_error: false,
         },
         Some(name) => match analysis::resolve(graph, name) {
             Resolve::Found(id) => ToolResult {
-                value: export::diagnostics::report(graph, Some(&id)),
+                value: export::diagnostics::report_with_max(graph, Some(&id), max),
                 is_error: false,
             },
-            Resolve::NotFound { candidates } => ToolResult {
-                value: export::not_found_value(name, &candidates, graph.limitations()),
-                is_error: true,
-            },
+            Resolve::NotFound { candidates } => not_found_result(graph, name, &candidates),
         },
     };
     if is_cancelled(cancel) {
@@ -1234,21 +1255,11 @@ fn resolve_path(
 ) -> ToolResult {
     let from_id = match analysis::resolve(graph, from) {
         Resolve::Found(id) => id,
-        Resolve::NotFound { candidates } => {
-            return ToolResult {
-                value: export::not_found_value(from, &candidates, graph.limitations()),
-                is_error: true,
-            }
-        }
+        Resolve::NotFound { candidates } => return not_found_result(graph, from, &candidates),
     };
     let to_id = match analysis::resolve(graph, to) {
         Resolve::Found(id) => id,
-        Resolve::NotFound { candidates } => {
-            return ToolResult {
-                value: export::not_found_value(to, &candidates, graph.limitations()),
-                is_error: true,
-            }
-        }
+        Resolve::NotFound { candidates } => return not_found_result(graph, to, &candidates),
     };
     ToolResult {
         value: export::explain::path_value(&analysis::paths::paths(
@@ -1270,6 +1281,21 @@ fn cancelled_result() -> ToolResult {
     ToolResult {
         value: Value::Null,
         is_error: false,
+    }
+}
+
+/// 이름을 해석하지 못한 호출의 notFound 결과 — 후보는 [`MAX_NOT_FOUND_CANDIDATES`]개까지 싣는다.
+///
+/// 모든 도구가 같은 상한을 쓰도록 한 곳에서 만든다. 잘리지 않은 결과는 CLI notFound와 같다.
+fn not_found_result(graph: &Graph, name: &str, candidates: &[VertexId]) -> ToolResult {
+    ToolResult {
+        value: export::not_found_value_with_max(
+            name,
+            candidates,
+            graph.limitations(),
+            MAX_NOT_FOUND_CANDIDATES,
+        ),
+        is_error: true,
     }
 }
 
@@ -1335,6 +1361,11 @@ fn bounded_u64(
         return Err(format!("argument '{key}' exceeds the maximum of {maximum}"));
     }
     Ok(value)
+}
+
+/// `stats`·`cycles`·`diagnostics`의 `max` — 범위를 벗어나면 다른 인자처럼 -32602로 거부한다.
+fn whole_graph_max(arguments: &Map<String, Value>) -> Result<usize, String> {
+    Ok(bounded_u64(arguments, "max", DEFAULT_WHOLE_GRAPH_MAX, MAX_RESULTS)? as usize)
 }
 
 fn optional_bool(arguments: &Map<String, Value>, key: &str, default: bool) -> Result<bool, String> {
@@ -1424,10 +1455,13 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool_definition(
             "diagnostics",
-            "Report graph-wide or object-level SQL analysis coverage and diagnostics.",
+            "Report graph-wide or object-level SQL analysis coverage and diagnostics; `objects` lists at most `max` records and adds `truncated` when cut, while `summary` counts every record.",
             json!({
                 "type":"object",
-                "properties":{"name":{"type":"string","minLength":1,"maxLength":MAX_NAME_BYTES}},
+                "properties": {
+                    "name":{"type":"string","minLength":1,"maxLength":MAX_NAME_BYTES},
+                    "max":{"type":"integer","minimum":0,"maximum":MAX_RESULTS,"default":DEFAULT_WHOLE_GRAPH_MAX}
+                },
                 "additionalProperties":false
             }),
         ),
@@ -1473,10 +1507,13 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool_definition(
             "cycles",
-            "Report dependency cycles and self-loops at a graph level.",
+            "Report dependency cycles and self-loops at a graph level; lists at most `max` cycles and adds `truncated` and `total` when cut.",
             json!({
                 "type":"object",
-                "properties":{"level":{"type":"string","enum":["schema","object","column","member"],"default":"object"}},
+                "properties": {
+                    "level":{"type":"string","enum":["schema","object","column","member"],"default":"object"},
+                    "max":{"type":"integer","minimum":0,"maximum":MAX_RESULTS,"default":DEFAULT_WHOLE_GRAPH_MAX}
+                },
                 "additionalProperties":false
             }),
         ),
@@ -1491,8 +1528,12 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool_definition(
             "stats",
-            "List collected usage counters with their `since` windows and coverage totals.",
-            json!({"type":"object","properties":{},"additionalProperties":false}),
+            "List collected usage counters with their `since` windows and coverage totals; lists at most `max` entries and adds `truncated` when cut, while `totals` counts every entry.",
+            json!({
+                "type":"object",
+                "properties":{"max":{"type":"integer","minimum":0,"maximum":MAX_RESULTS,"default":DEFAULT_WHOLE_GRAPH_MAX}},
+                "additionalProperties":false
+            }),
         ),
         tool_definition(
             "unused",
@@ -1513,7 +1554,9 @@ fn tool_definition(name: &str, description: &str, input_schema: Value) -> Value 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use schemagraph_core::{Edge, EdgeKind, Vertex, VertexKind};
+    use schemagraph_core::{
+        AnalysisState, Edge, EdgeKind, ObjectAnalysis, Usage, Vertex, VertexKind,
+    };
     use std::io::Cursor;
 
     fn fixture() -> Graph {
@@ -1556,9 +1599,14 @@ mod tests {
     }
 
     fn run(input: &str) -> Vec<Value> {
+        run_on(&fixture(), input)
+    }
+
+    /// 주어진 그래프로 stdio 세션 하나를 돌리고 응답을 출력 순서대로 돌려준다.
+    fn run_on(graph: &Graph, input: &str) -> Vec<Value> {
         let mut output = Vec::new();
         serve(
-            &snapshot(&fixture()),
+            &snapshot(graph),
             Cursor::new(input.as_bytes().to_vec()),
             &mut output,
         )
@@ -1619,6 +1667,11 @@ mod tests {
 
     /// 한 번의 세션에서 도구 호출 결과만 요청 id 순으로 모아 돌려준다.
     fn call(tool_calls: &[&str]) -> Vec<Value> {
+        call_on(&fixture(), tool_calls)
+    }
+
+    /// `call`과 같되 주어진 그래프를 적재한 서버에 보낸다.
+    fn call_on(graph: &Graph, tool_calls: &[&str]) -> Vec<Value> {
         let mut input = handshake();
         for (index, params) in tool_calls.iter().enumerate() {
             input.push_str(&format!(
@@ -1627,7 +1680,7 @@ mod tests {
             ));
             input.push('\n');
         }
-        let mut responses = run(&input);
+        let mut responses = run_on(graph, &input);
         responses.remove(0);
         // 인자 오류는 조정 스레드가, 도구 결과는 워커가 쓰므로 도착 순서가 요청 순서와 다를 수 있다.
         responses.sort_by_key(|response| response["id"].as_u64());
@@ -1739,6 +1792,193 @@ mod tests {
             export::unused::to_value(&analysis::unused::unused(&graph, 1024), graph.limitations())
         );
         assert_eq!(responses[4]["error"]["code"], -32602);
+    }
+
+    /// 사용 통계 3개, 순환 2개(두 정점 순환과 자기 루프), 분석 기록 3개를 가진 그래프.
+    ///
+    /// 작은 `max`로 목록을 자르는 경우와 기본 상한에서 CLI export와 같은 경우를 함께 본다.
+    fn bounded_fixture() -> Graph {
+        let mut graph = Graph::new();
+        let states = [
+            AnalysisState::Complete,
+            AnalysisState::Partial,
+            AnalysisState::Unsupported,
+        ];
+        for (index, state) in states.into_iter().enumerate() {
+            let name = format!("t{index}");
+            let id = VertexId::object("app", &name);
+            graph.add_vertex(Vertex {
+                id: id.clone(),
+                kind: VertexKind::Table,
+                name,
+                schema: "app".into(),
+            });
+            let usage = Usage {
+                reads: index as u64,
+                ..Usage::default()
+            };
+            graph.set_usage(id.clone(), usage);
+            let analysis = ObjectAnalysis {
+                state,
+                scope: "body".into(),
+                body_hash: None,
+                diagnostics: vec![],
+                source: None,
+            };
+            graph.set_analysis(id, analysis);
+        }
+        for (from, to) in [("t0", "t1"), ("t1", "t0"), ("t2", "t2")] {
+            graph.add_edge(Edge {
+                from: VertexId::object("app", from),
+                to: VertexId::object("app", to),
+                kind: EdgeKind::References,
+                evidence: vec![],
+            });
+        }
+        graph
+    }
+
+    #[test]
+    fn whole_graph_lists_are_cut_at_max_and_marked_only_when_cut() {
+        let graph = bounded_fixture();
+        let responses = call_on(
+            &graph,
+            &[
+                r#"{"name":"stats","arguments":{"max":2}}"#,
+                r#"{"name":"cycles","arguments":{"max":1}}"#,
+                r#"{"name":"diagnostics","arguments":{"max":2}}"#,
+                r#"{"name":"stats"}"#,
+                r#"{"name":"cycles"}"#,
+                r#"{"name":"diagnostics"}"#,
+            ],
+        );
+        let stats = tool_value(&responses[0]);
+        assert_eq!(stats["stats"].as_array().unwrap().len(), 2);
+        assert_eq!(stats["truncated"], true);
+        assert_eq!(stats["totals"]["observed"], 3);
+        let cycles = tool_value(&responses[1]);
+        assert_eq!(cycles["cycles"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            (&cycles["truncated"], &cycles["total"]),
+            (&json!(true), &json!(2))
+        );
+        let diagnostics = tool_value(&responses[2]);
+        assert_eq!(diagnostics["objects"].as_array().unwrap().len(), 2);
+        assert_eq!(diagnostics["truncated"], true);
+        assert_eq!(
+            diagnostics["summary"],
+            json!({"complete": 1, "partial": 1, "unsupported": 1, "total": 3})
+        );
+        // 기본 상한(1024) 안이면 잘림 키 없이 CLI export와 같은 값이다.
+        assert_eq!(tool_value(&responses[3]), export::stats_to_value(&graph));
+        let whole_cycles = tool_value(&responses[4]);
+        assert_eq!(whole_cycles["cycles"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            whole_cycles,
+            export::cycles_to_value(&analysis::cycles(&graph, Level::Object))
+        );
+        assert_eq!(
+            tool_value(&responses[5]),
+            export::diagnostics::report(&graph, None)
+        );
+    }
+
+    /// 말단 이름이 `id`인 테이블 65개와 `dup`인 테이블 2개를 가진 그래프.
+    fn ambiguous_fixture() -> Graph {
+        let mut graph = Graph::new();
+        let names = (0..65)
+            .map(|index| (format!("s{index:02}"), "id"))
+            .chain([("a".to_owned(), "dup"), ("b".to_owned(), "dup")]);
+        for (schema, name) in names {
+            graph.add_vertex(Vertex {
+                id: VertexId::object(&schema, name),
+                kind: VertexKind::Table,
+                name: name.into(),
+                schema,
+            });
+        }
+        graph
+    }
+
+    #[test]
+    fn not_found_lists_at_most_64_candidates_with_their_total() {
+        let graph = ambiguous_fixture();
+        let responses = call_on(
+            &graph,
+            &[
+                r#"{"name":"query","arguments":{"name":"id"}}"#,
+                r#"{"name":"impact","arguments":{"name":"id"}}"#,
+                r#"{"name":"explain","arguments":{"name":"id"}}"#,
+                r#"{"name":"diagnostics","arguments":{"name":"id"}}"#,
+                r#"{"name":"path","arguments":{"from":"id","to":"a.dup"}}"#,
+                r#"{"name":"path","arguments":{"from":"a.dup","to":"id"}}"#,
+                r#"{"name":"query","arguments":{"name":"dup"}}"#,
+            ],
+        );
+        for response in &responses[..6] {
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            let value = tool_value(response);
+            let candidates = value["candidates"].as_array().unwrap();
+            // 기존 후보 순서(정점 id 순)의 앞 64개를 남긴다.
+            assert_eq!(candidates.len(), 64);
+            assert_eq!(
+                (&candidates[0], &candidates[63]),
+                (&json!("s00.id"), &json!("s63.id"))
+            );
+            assert_eq!(value["candidatesTotal"], 65);
+            assert_eq!(value["candidatesTruncated"], true);
+        }
+        // 상한 안의 notFound는 CLI와 같은 모양이다 — 잘림 키가 없다.
+        let duplicates = [VertexId::object("a", "dup"), VertexId::object("b", "dup")];
+        assert_eq!(
+            tool_value(&responses[6]),
+            export::not_found_value("dup", &duplicates, graph.limitations())
+        );
+    }
+
+    #[test]
+    fn bounded_whole_graph_tools_reject_max_outside_the_declared_range() {
+        let responses = call(&[
+            r#"{"name":"stats","arguments":{"max":10001}}"#,
+            r#"{"name":"cycles","arguments":{"max":-1}}"#,
+            r#"{"name":"diagnostics","arguments":{"max":"10"}}"#,
+            r#"{"name":"diagnostics","arguments":{"name":"orders","max":1.5}}"#,
+            r#"{"name":"stats","arguments":{"max":10000}}"#,
+        ]);
+        for response in &responses[..4] {
+            assert_eq!(response["error"]["code"], -32602, "{response}");
+        }
+        assert!(responses[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds the maximum of 10000"));
+        assert!(responses[1]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must be a non-negative integer"));
+        assert_eq!(
+            tool_value(&responses[4]),
+            export::stats_to_value(&fixture())
+        );
+    }
+
+    #[test]
+    fn bounded_whole_graph_tools_advertise_max() {
+        let input = format!(
+            "{}{}\n",
+            handshake(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#
+        );
+        let responses = run(&input);
+        let tools = responses[1]["result"]["tools"].as_array().unwrap();
+        for name in ["diagnostics", "cycles", "stats"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(
+                tool["inputSchema"]["properties"]["max"],
+                json!({"type": "integer", "minimum": 0, "maximum": 10000, "default": 1024}),
+                "{name}"
+            );
+        }
     }
 
     #[test]

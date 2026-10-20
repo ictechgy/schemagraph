@@ -474,9 +474,20 @@ tools. Configure the MCP client to launch the command above. The tool results
 preserve the CLI analysis contract and explicit result/traversal limits. Each
 result carries its JSON report once, as compact JSON with sorted keys in its
 single text content block (`content[0].text`); there is no `structuredContent`,
-so parse the text. The report is the same JSON value that the CLI command prints
-with the same options (the CLI pretty-prints it). `query` and `impact` return
-their default JSON; `--format language-traversal` is CLI-only.
+so parse the text. Unless an MCP bound below cuts it, the report is the same JSON
+value that the CLI command prints with the same options (the CLI pretty-prints
+it). `query` and `impact` return their default JSON; `--format
+language-traversal` is CLI-only.
+
+MCP bounds lists that the CLI prints in full. `stats`, `cycles`, and
+`diagnostics` accept `max` (default 1024, at most 10000) and keep the first
+`max` usage entries, cycles, or analysis records (`objects`) in CLI order. Only
+a cut result adds `truncated: true`; `cycles` also adds the full count as
+`total`, while `stats` `totals` and `diagnostics` `summary` always count every
+entry. A `notFound` result lists at most 64 `candidates` and, when cut, adds
+`candidatesTotal` and `candidatesTruncated: true`; ask again with a
+schema-qualified id. A `max` outside that range is rejected with JSON-RPC error
+-32602, like every other invalid argument.
 
 Start with `search` when the exact id is unknown. Its default `names` detail
 lists ids only; request `summary` for the candidates you need. The `dead` tool

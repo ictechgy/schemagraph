@@ -106,6 +106,10 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   for preparation/output boundaries and completion races.
 - MCP tool results carry the report JSON once, as compact JSON in
   `content[0].text`; there is no `structuredContent`. Parse the text.
+- MCP `stats`, `cycles`, and `diagnostics` take `max` (default 1024, at most
+  10000) and add `truncated: true` (plus `total` for cycles) only when cut;
+  `totals` and `summary` still count every entry. MCP `notFound` lists at most
+  64 candidates, then `candidatesTotal` and `candidatesTruncated: true`.
 - `dead` — objects nothing inside the database consumes. Consumer-kind
   objects (views, routines, packages) with no caller are the usual
   candidates; each carries its usage evidence when collected.
