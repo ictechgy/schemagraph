@@ -196,11 +196,20 @@ type mysqlConstraintRow struct {
 	refSchema, refTable, refColumn sql.NullString
 }
 
+// mysqlConstraints는 테이블 하나의 PK·FK·UNIQUE·CHECK 제약을 읽는다.
+//
+// LEFT JOIN은 이름을 서버 콜레이션으로 비교한다. MariaDB 11.4에서는 이 비교가 대소문자·악센트를 무시해, 대소문자·
+// 악센트만 다른 테이블(P와 p, resume과 résumé)과 스키마의 같은 이름 제약(PRIMARY, 이름이 같은 UNIQUE)이 서로의 키
+// 컬럼까지 짝지었다. 그래서 제약에 남의 컬럼이 들어갔고, 그 컬럼들은 ORDER BY에서 동점이라 순서도 서버마다 달랐다.
+// 키 컬럼 행은 스키마·테이블·제약 이름이 정확히 같을 때만 쓴다. 네이티브 reader(engine/source/src/mysql.rs)는 제약마다
+// 키 컬럼을 따로 물어 이미 이렇게 읽고, MySQL 8.4(lower_case_table_names=0)의 조인은 정확한 이름으로 짝지어 결과가
+// 예전과 같다.
 func (h *harvester) mysqlConstraints(schema, table string) []ConstraintDoc {
 	byName := map[string]*ConstraintDoc{}
 	order := []string{}
 	h.mysqlRows("constraints", `
 		SELECT CAST(tc.constraint_name AS CHAR), CAST(tc.constraint_type AS CHAR),
+		       CAST(kcu.table_schema AS CHAR), CAST(kcu.table_name AS CHAR), CAST(kcu.constraint_name AS CHAR),
 		       CAST(kcu.column_name AS CHAR), CAST(kcu.referenced_table_schema AS CHAR),
 		       CAST(kcu.referenced_table_name AS CHAR), CAST(kcu.referenced_column_name AS CHAR)
 		FROM information_schema.table_constraints tc
@@ -211,8 +220,10 @@ func (h *harvester) mysqlConstraints(schema, table string) []ConstraintDoc {
 		WHERE tc.table_schema = ? AND tc.table_name = ?
 		  AND tc.constraint_type IN ('PRIMARY KEY','FOREIGN KEY','UNIQUE','CHECK')
 		ORDER BY tc.constraint_name, kcu.ordinal_position`, []any{schema, table}, func(rows *sql.Rows) error {
+		var owner mysqlKeyOwner
 		var r mysqlConstraintRow
-		if err := rows.Scan(&r.name, &r.kind, &r.column, &r.refSchema, &r.refTable, &r.refColumn); err != nil {
+		if err := rows.Scan(&r.name, &r.kind, &owner.schema, &owner.table, &owner.constraint,
+			&r.column, &r.refSchema, &r.refTable, &r.refColumn); err != nil {
 			return err
 		}
 		if !r.name.Valid || !r.kind.Valid {
@@ -223,6 +234,9 @@ func (h *harvester) mysqlConstraints(schema, table string) []ConstraintDoc {
 			constraint = &ConstraintDoc{Name: r.name.String, Kind: mysqlConstraintKind(r.kind.String), Columns: []string{}}
 			byName[r.name.String] = constraint
 			order = append(order, r.name.String)
+		}
+		if !owner.belongsTo(schema, table, r.name.String) {
+			return nil
 		}
 		if r.column.Valid {
 			constraint.Columns = append(constraint.Columns, r.column.String)
@@ -246,6 +260,17 @@ func (h *harvester) mysqlConstraints(schema, table string) []ConstraintDoc {
 		out = append(out, *byName[name])
 	}
 	return out
+}
+
+// mysqlKeyOwner는 제약 조인이 짝지은 키 컬럼 행의 스키마·테이블·제약 이름이다. 짝이 없는 행(CHECK)은 모두 NULL이다.
+type mysqlKeyOwner struct{ schema, table, constraint sql.NullString }
+
+// belongsTo는 키 컬럼 행이 그 제약 자신의 것인지 정확한 이름으로 본다. 짝이 없는 행은 더할 컬럼이 없으므로 그대로 둔다.
+func (k mysqlKeyOwner) belongsTo(schema, table, constraint string) bool {
+	if !k.schema.Valid && !k.table.Valid && !k.constraint.Valid {
+		return true
+	}
+	return k.schema.String == schema && k.table.String == table && k.constraint.String == constraint
 }
 
 func mysqlConstraintKind(kind string) string {
