@@ -78,7 +78,7 @@ class OwnedPostgresAuthentication(unittest.TestCase):
                 if record['tool'] == tool]
 
     def assert_private_cluster(self):
-        """initdb는 host trust 없이 0600 비밀번호 파일을 받고 socket은 비공개 디렉터리여야 한다."""
+        """initdb는 host trust 없이 0600 비밀번호 파일을 받고 socket은 끄거나 비공개 디렉터리에 둬야 한다."""
         [initdb] = self.records('initdb')
         args = initdb['args']
         self.assertIn('--auth-host=scram-sha-256', args)
@@ -91,8 +91,11 @@ class OwnedPostgresAuthentication(unittest.TestCase):
         password = initdb['pwfile']['content'].strip()
         self.assertGreaterEqual(len(password), 32)
         [start] = [record for record in self.records('pg_ctl') if 'start' in record['args']]
-        self.assertNotEqual(Path(start['socket_dir']).resolve(), Path('/tmp').resolve())
-        self.assertEqual(start['socket']['mode'], 0o700, start['socket_dir'])
+        # -k가 없으면 기본 socket 디렉터리(/tmp)를 쓴다. 빈 -k('')는 Unix socket을 아예 열지 않는다.
+        self.assertIn('socket_dir', start, start['args'])
+        if start['socket_dir']:
+            self.assertNotEqual(Path(start['socket_dir']).resolve(), Path('/tmp').resolve())
+            self.assertEqual(start['socket']['mode'], 0o700, start['socket_dir'])
         return password, start['args'][start['args'].index('-o') + 1].split()[1]
 
     def assert_password_file(self, record, password, port):
@@ -156,12 +159,21 @@ class OwnedPostgresAuthentication(unittest.TestCase):
 
     def test_probe_benchmark_cluster(self):
         benchmark = load('benchmark-probe-postgres')
-        started = benchmark.start_postgres(self.bin, self.root, self.root)
+        started = benchmark.start_postgres(self.bin, self.root)
         self.addCleanup(benchmark.stop_postgres, self.bin, started[0])
         password, port = self.assert_private_cluster()
-        _cluster, reserved, _user, environment = started
+        _cluster, reserved, _user, returned_password, environment = started
         self.assertEqual(str(reserved), port)
+        self.assertEqual(returned_password, password)
         self.assert_client_environment(environment, password, port)
+        # 측정 DB를 만드는 psql도 loopback TCP로 붙으므로 같은 비밀번호 파일만 받아야 한다.
+        self.assert_tcp_psql_has_password(password, port)
+        # --latency-ms의 relay 포트는 그 포트 줄만 더하고, 다른 포트에는 비밀번호를 주지 않는다.
+        relay_port = int(port) + 1
+        benchmark.allow_relay_port(environment['PGPASSFILE'], relay_port, password)
+        passfile = Path(environment['PGPASSFILE'])
+        self.assertEqual(passfile.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(passfile.read_text(), f'*:{port}:*:*:{password}\n*:{relay_port}:*:*:{password}\n')
 
     def test_fixture_sweep_cluster(self):
         start = 'if [ -z "$pg_url" ] && [ -n "$PGBIN" ] && [ -x "$PGBIN/initdb" ]; then\n'

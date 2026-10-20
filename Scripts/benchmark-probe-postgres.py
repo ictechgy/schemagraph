@@ -225,8 +225,8 @@ def start_postgres(pg_bin: Path, report: Path) -> tuple[Path, int, str, str, dic
     env = {key: value for key, value in os.environ.items() if key != "PGPASSWORD"}
     try:
         initial = private_file(cluster / "initdb-password", password + "\n")
-        # 포트는 비워 둔다: --latency-ms면 probe는 서버가 아니라 relay 포트로 붙는다.
-        env["PGPASSFILE"] = str(private_file(cluster / "pgpass", f"127.0.0.1:*:*:*:{password}\n"))
+        # 비밀번호는 이 cluster 포트에만 준다. --latency-ms의 relay 포트 줄은 relay가 열린 뒤 allow_relay_port가 더한다.
+        env["PGPASSFILE"] = str(private_file(cluster / "pgpass", f"*:{port}:*:*:{password}\n"))
         checked([str(pg_bin / "initdb"), "-D", str(cluster / "data"), "--auth-local=trust",
                  "--auth-host=scram-sha-256", f"--pwfile={initial}", "--no-instructions"])
         settings = f"-p {port} -k '' -c listen_addresses=127.0.0.1 -c autovacuum=off -c max_parallel_workers_per_gather=0"
@@ -237,6 +237,16 @@ def start_postgres(pg_bin: Path, report: Path) -> tuple[Path, int, str, str, dic
     except Exception:
         stop_postgres(pg_bin, cluster)
         raise
+
+
+def allow_relay_port(passfile: str, relay_port: int, password: str) -> None:
+    """지연 relay 포트로 붙는 Go probe도 PGPASSFILE에서 비밀번호를 찾게 그 포트 줄을 더한다.
+
+    포트를 *로 두면 같은 호스트의 다른 포트에서 받는 서버에도 이 비밀번호를 내주므로, 실제로 붙는 포트만
+    하나씩 연다. 0600으로 만든 파일에 이어 쓰므로 권한은 그대로다.
+    """
+    with open(passfile, "a", encoding="utf-8") as stream:
+        stream.write(f"*:{relay_port}:*:*:{password}\n")
 
 
 def psql_command(pg_bin: Path, port: int, user: str, database: str, *args: str) -> list[str]:
@@ -371,6 +381,8 @@ def measure_producers(context: dict, producers: list[dict], args: argparse.Names
     relay = RELAY.LatencyRelay(context["port"], args.latency_ms) if args.latency_ms > 0 else None
     with relay if relay is not None else contextlib.nullcontext():
         probe_port = relay.port if relay is not None else context["port"]
+        if relay is not None:
+            allow_relay_port(context["env"]["PGPASSFILE"], relay.port, context["password"])
         for warmup in range(args.warmup):
             results += [run_once(context, producer, probe_port, f"warmup{warmup}", True) for producer in producers]
         for run in range(args.repeat):
@@ -417,7 +429,8 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             constraints=expected_shape[1],
         )
         context = {
-            "report": report, "pg_bin": pg_bin, "port": port, "user": user, "env": env, "engine": engine,
+            "report": report, "pg_bin": pg_bin, "port": port, "user": user, "password": password, "env": env,
+            "engine": engine,
             "java": args.java.resolve() if args.java is not None else None, "format": args.format,
             # Go probe는 빈 public 스키마도 싣고, JDBC probe는 객체·routine이 없는 스키마를 싣지 않는다.
             "expected": {"go": expected, "jdbc": {**expected, "schemas": args.schemas}}, "references": {},
