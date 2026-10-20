@@ -2019,7 +2019,9 @@ mod tests {
     }
 
     /// 숫자 인자는 도구와 무관하게 같은 검사기를 지나 같은 채널(isError)로 거부된다. 새
-    /// `max`만 isError로 내면 같은 서버의 `dead`·`unused` `max`와 채널이 갈린다.
+    /// `max`만 isError로 내면 같은 서버의 `dead`·`unused` `max`와 채널이 갈린다. 숫자 인자
+    /// 키(`max`·`depth`·`maxVisited`·`maxExaminedEdges`·`maxPaths`·`maxEdges`)마다 사례를 두어
+    /// 한 키만 다른 검사 경로(-32602 등)로 새도 이 테스트가 잡게 한다.
     #[test]
     fn out_of_range_numbers_are_tool_errors_for_every_tool() {
         let cases = [
@@ -2037,6 +2039,16 @@ mod tests {
                 r#"{"name":"impact","arguments":{"name":"orders","maxVisited":100001}}"#,
                 "maxVisited",
                 100_000,
+            ),
+            (
+                r#"{"name":"query","arguments":{"name":"orders","maxExaminedEdges":1000001}}"#,
+                "maxExaminedEdges",
+                1_000_000,
+            ),
+            (
+                r#"{"name":"impact","arguments":{"name":"orders","maxExaminedEdges":-1}}"#,
+                "maxExaminedEdges",
+                1_000_000,
             ),
             (
                 r#"{"name":"explain","arguments":{"name":"orders","max":10001}}"#,
