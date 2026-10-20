@@ -58,9 +58,13 @@ tables took 1.067 s before and 0.253 s after for Go JSON, and 3.923 s before and
 
 JDBC `getColumns` takes LIKE patterns for its schema and table arguments. The
 per-object calls therefore also collected the columns of tables or schemas whose
-names matched the pattern: table `a_b` also read `a1b`, and schema `my_app` also
-read `myxapp`. Splitting by exact name drops those columns. Databases without
-such names produce the same documents as before.
+names matched the pattern: table `a_b` also read `a1b`, `pct%name` also read
+`pctxname`, and schema `my_app` also read `myxapp`. A backslash is the LIKE
+escape character, so table `back\slash` matched `backslash` instead of itself.
+It read the columns of that table, or none when no such table existed, and the
+catalog visibility check then reported an uncollected column. Splitting by exact
+name keeps each table's own columns. Databases without such names produce the
+same documents as before.
 
 These tests check that the number of catalog queries per schema does not depend
 on the table count:

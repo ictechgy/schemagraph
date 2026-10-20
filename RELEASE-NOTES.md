@@ -1,3 +1,30 @@
+# Unreleased
+
+These changes are not yet in a published release.
+
+## Changed
+
+- JDBC probe: with pgjdbc, PostgreSQL columns are now split by exact schema
+  and table name. `getColumns` treats both names as LIKE patterns, so a table
+  also picked up the columns of other tables whose names matched its own:
+  `a_b` also read `a1b`, `pct%name` also read `pctxname`, and a table in
+  schema `my_app` also read the same-named table in `myxapp`. A backslash is
+  the LIKE escape character, so `back\slash` read the columns of `backslash`,
+  or none at all, in which case the catalog visibility check reported an
+  uncollected column. Each table now keeps only its own columns. Snapshots
+  collected again from such databases differ from older ones, and `review`
+  against an older snapshot can report those columns as added or removed.
+  Databases without such names produce the same documents as before.
+- The Go probe (PostgreSQL) and the JDBC probe (PostgreSQL through pgjdbc)
+  read columns, keys, and indexes, and the Go probe also triggers, once per
+  schema instead of once per object; see `PERFORMANCE.md`. Successful
+  collections produce the same output, apart from the JDBC column change
+  above. A failed schema-wide catalog query now affects every object in the
+  schema instead of one object. The Go probe leaves that part empty and
+  records its usual limitation once. The JDBC probe records its usual
+  per-object limitation for each object and, for indexes, still falls back to
+  `getIndexInfo`.
+
 # schemagraph 0.7.1
 
 This patch protects local inputs and saved snapshots during file exports.
