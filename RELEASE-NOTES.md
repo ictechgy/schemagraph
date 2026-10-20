@@ -38,6 +38,41 @@ These changes are not yet in a published release.
   rustls-webpki 0.103.14, rustls-pki-types 1.15.1, ring 0.17.14, untrusted
   0.9.0, and webpki-roots 0.26.11 and 1.0.10. The root certificate data in
   webpki-roots is licensed under CDLA-Permissive-2.0.
+- `scan --cache-dir` entries are now authenticated with an HMAC-SHA256 tag.
+  Before, an entry was checked only against an unkeyed SHA-256 checksum that
+  anyone with the same release binary and catalog could recompute, so a forged
+  entry in a checked-out tree could hide or invent body dependencies while the
+  analysis still reported `complete`.
+- The cache key is `SCHEMAGRAPH_CACHE_KEY` (at least 32 bytes) when it is set
+  and not empty. Otherwise it is read from
+  `${XDG_CONFIG_HOME:-$HOME/.config}/schemagraph/cache.key`, which is created
+  with 32 random bytes and mode `0600` when missing. A key file that is a
+  symbolic link, is owned by another user, has group or other permission bits,
+  or holds fewer than 32 bytes is rejected. A short key, an unset `HOME`, or a
+  rejected key file disables the cache with a warning. The key is never
+  printed.
+- Entries with a missing or wrong tag, symbolic-link entries, and FIFOs or other
+  special files are reported on stderr, reparsed, and overwritten. Entries are
+  opened without following symbolic links and without blocking on FIFOs.
+- The cache directory is a trusted input: keep it outside checked-out
+  pull-request code, for example `${XDG_CACHE_HOME:-$HOME/.cache}/schemagraph`
+  or `$RUNNER_TEMP/schemagraph-cache`. A missing directory is created with mode
+  `0700`. A cache directory that is a symbolic link, is owned by another user,
+  or is writable by group or other users disables the cache with a warning.
+  Graph output and exit codes do not change when the cache is disabled.
+
+## Changed
+
+- Cache format version 4 makes existing `--cache-dir` entries miss once; the
+  next scan rewrites them. Caches restored from another machine or CI run are
+  reused only when they were written with the same `SCHEMAGRAPH_CACHE_KEY`.
+  Without that secret, each fresh runner creates its own key file and
+  recomputes. Graph output is unchanged.
+- An existing cache directory that is writable by group or other users, such as
+  one created under umask 002 by an earlier version, now disables the cache with
+  a warning until `chmod go-w` is applied to it.
+- On non-Unix builds, which cannot check file ownership or open files without
+  following symbolic links, `--cache-dir` is disabled with a warning.
 
 # schemagraph 0.7.1
 
