@@ -512,6 +512,24 @@ class McpReader:
         return responses
 
 
+def tool_payload(result: dict[str, Any]) -> Any:
+    """도구 결과의 유일한 본문인 `content[0].text`를 JSON으로 읽는다.
+
+    서버는 보고 JSON을 압축 텍스트 한 벌로만 싣고 `structuredContent`로 다시 싣지 않는다.
+    """
+    if "structuredContent" in result:
+        fail(f"MCP tool result must carry its JSON once, in text content: {result}")
+    content = result.get("content")
+    if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict):
+        fail(f"MCP tool result must have exactly one content block: {result}")
+    if content[0].get("type") != "text" or not isinstance(content[0].get("text"), str):
+        fail(f"MCP tool content must be one text block: {result}")
+    try:
+        return json.loads(content[0]["text"])
+    except json.JSONDecodeError as error:
+        fail(f"MCP tool text content was not JSON ({error}): {result}")
+
+
 def send_json(process: subprocess.Popen[bytes], message: dict[str, Any]) -> None:
     """한 JSON-RPC line을 flush해 stdin open 상태로 전달한다."""
     assert process.stdin is not None
@@ -615,9 +633,9 @@ def check_mcp(engine: Path, work: Path) -> None:
         query_result = responses[id_key(3)]["result"]
         if not isinstance(query_result, dict) or query_result.get("isError") is not False:
             fail(f"MCP query returned a tool error after cancellation: {responses[id_key(3)]}")
-        structured = query_result.get("structuredContent")
+        structured = tool_payload(query_result)
         if not isinstance(structured, dict):
-            fail(f"MCP query omitted structuredContent after cancellation: {responses[id_key(3)]}")
+            fail(f"MCP query text content was not a report object after cancellation: {responses[id_key(3)]}")
         subject = structured.get("subject")
         if not isinstance(subject, dict) or subject.get("id") != ROOT:
             fail(f"MCP follow-up query returned the wrong subject: {structured}")

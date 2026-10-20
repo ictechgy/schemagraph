@@ -5,7 +5,9 @@
 //! pg 카탈로그를 따로 팔 이유가 없다. "스키마"는 곧 데이터베이스이고,
 //! URL에 데이터베이스가 있으면 그것만, 없으면 시스템 스키마를 뺀 전부를 읽는다.
 
-use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlPool, MySqlPoolOptions};
+use sqlx::mysql::{
+    MySqlConnectOptions, MySqlConnection, MySqlPool, MySqlPoolOptions, MySqlSslMode,
+};
 use sqlx::Row;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
@@ -13,7 +15,12 @@ use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
 use crate::document::*;
+use crate::transport::{is_local_endpoint, TlsPolicy, Transport, TransportCheck};
 use crate::SourceError;
+
+/// 평문 원격 연결 limitation의 해결 방향. 공개 CA가 아닌 관리형 DB는 CA 파일이 필요하다.
+const TLS_REMEDY: &str = "use ssl-mode=VERIFY_IDENTITY (with ssl-ca=<CA file> for a private CA) \
+                          to require a verified TLS connection";
 
 /// 읽기 전용 세션을 고정하지 못했을 때의 한계. Go 프로브와 같은 문구로 시작해 수집기와
 /// 무관하게 같은 사실로 읽힌다. 네이티브 reader는 그 뒤 괄호 안에 원인을 덧붙인다.
@@ -34,6 +41,8 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
 
     // URL에 데이터베이스가 있으면 그것만 — 없으면 사용자 스키마 전부.
     let scope_db = options.get_database().map(|d| d.to_owned());
+    let transport = transport_check(&options);
+    let connection_transport = transport.clone();
 
     // after_connect는 연결마다 돈다 — 어느 연결이든 고정에 실패하면 문서 전체의 한계다.
     // 원인은 처음 실패한 연결의 것을 남긴다.
@@ -42,11 +51,16 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
     let pool = MySqlPoolOptions::new()
         .after_connect(move |conn, _| {
             let first_cause = Arc::clone(&first_cause);
+            let transport = connection_transport.clone();
             Box::pin(async move {
                 // 둘 다 실패해도 스캔은 계속하되(reader는 카탈로그 SELECT만 보낸다)
                 // 세션이 쓰기 가능이라는 사실과 그 원인은 limitation으로 남긴다.
                 if let Some(cause) = pin_read_only_session(conn).await {
                     first_cause.get_or_init(|| cause);
+                }
+                // 전송 확인도 같은 이유로 오류를 돌려주지 않고 limitation으로 남긴다.
+                if transport.needs_server_check() {
+                    transport.record(observe_transport(conn).await);
                 }
                 Ok(())
             })
@@ -78,7 +92,50 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         catalog_complete,
     });
     record_read_only_failure(&mut doc, read_only_cause.get().map(String::as_str));
+    transport.record_limitation(&mut doc, TLS_REMEDY);
     Ok(doc)
+}
+
+/// URL의 ssl-mode를 전송 판정의 세 갈래로 접는다.
+fn tls_policy(mode: MySqlSslMode) -> TlsPolicy {
+    match mode {
+        MySqlSslMode::Disabled => TlsPolicy::Never,
+        MySqlSslMode::Preferred => TlsPolicy::Prefer,
+        MySqlSslMode::Required | MySqlSslMode::VerifyCa | MySqlSslMode::VerifyIdentity => {
+            TlsPolicy::Required
+        }
+    }
+}
+
+/// 접속 옵션으로 전송 판정을 준비한다. sqlx는 socket 인자가 있으면 Unix 소켓으로 붙는다.
+fn transport_check(options: &MySqlConnectOptions) -> TransportCheck {
+    let uses_socket = options.get_socket().is_some();
+    TransportCheck::new(
+        is_local_endpoint(options.get_host(), uses_socket),
+        tls_policy(options.get_ssl_mode()),
+    )
+}
+
+/// 서버가 본 이 세션의 TLS 암호 모음을 묻는다. 빈 값이면 평문이다. `SHOW STATUS`는
+/// prepared statement로 허용되는 문장(MySQL 문서의 목록) 밖일 수 있어 텍스트
+/// 프로토콜(`&str` 실행)로 보낸다. 커넥션 풀러나 프록시 뒤라면 이 답은 풀러와 서버 사이
+/// 연결을 말한다.
+async fn observe_transport(conn: &mut MySqlConnection) -> Transport {
+    let row =
+        sqlx::Executor::fetch_optional(&mut *conn, "SHOW SESSION STATUS LIKE 'Ssl_cipher'").await;
+    // 둘째 열(Value)에 BINARY 플래그가 붙으면 sqlx가 String 디코드를 거절하므로 바이트로 읽는다.
+    let cipher = row.and_then(|row| row.map(|row| row.try_get::<Vec<u8>, _>(1)).transpose());
+    transport_from_cipher(cipher)
+}
+
+/// Ssl_cipher 답을 전송 상태로 바꾼다. 행이 없거나 질의가 실패하면 암호화를 주장하지 않는다.
+fn transport_from_cipher(answer: Result<Option<Vec<u8>>, sqlx::Error>) -> Transport {
+    match answer {
+        Ok(Some(cipher)) if !cipher.is_empty() => Transport::Encrypted,
+        Ok(Some(_)) => Transport::Plaintext,
+        Ok(None) => Transport::Unconfirmed("Ssl_cipher status is unavailable".into()),
+        Err(error) => Transport::Unconfirmed(format!("Ssl_cipher status query failed: {error}")),
+    }
 }
 
 /// 읽기 전용 세션을 고정한다. 처음 성공한 문장에서 멈추고, 모두 거절되면 원인을 돌려준다.
@@ -702,5 +759,82 @@ mod tests {
             assert_eq!(doc.context, collected.context);
             assert_eq!(doc.schemas, collected.schemas);
         }
+    }
+
+    /// URL의 ssl-mode를 판정의 세 갈래로 접는다. 값은 대소문자를 가리지 않는다(sqlx).
+    #[test]
+    fn ssl_modes_map_to_tls_policies() {
+        for (mode, policy) in [
+            ("DISABLED", TlsPolicy::Never),
+            ("PREFERRED", TlsPolicy::Prefer),
+            ("REQUIRED", TlsPolicy::Required),
+            ("VERIFY_CA", TlsPolicy::Required),
+            ("verify_identity", TlsPolicy::Required),
+        ] {
+            let url = format!("mysql://u@db.example/app?ssl-mode={mode}");
+            let options = MySqlConnectOptions::from_str(&url).unwrap();
+            assert_eq!(tls_policy(options.get_ssl_mode()), policy, "{mode}");
+        }
+    }
+
+    /// 서버 확인은 네트워크를 지나는 PREFERRED(기본) 연결에서만 한다. socket 인자는 Unix 소켓이다.
+    #[test]
+    fn only_remote_preferred_connections_ask_the_server() {
+        for (url, asks_server) in [
+            ("mysql://u@127.0.0.1/app", false),
+            ("mysql://u@localhost/app", false),
+            ("mysql://u@[::1]/app", false),
+            ("mysql://u@db.example/app?socket=/tmp/mysql.sock", false),
+            ("mysql://u@db.example/app", true),
+            ("mysql://u@db.example/app?ssl-mode=DISABLED", false),
+            ("mysql://u@db.example/app?ssl-mode=REQUIRED", false),
+        ] {
+            let options = MySqlConnectOptions::from_str(url).unwrap();
+            assert_eq!(
+                transport_check(&options).needs_server_check(),
+                asks_server,
+                "{url}"
+            );
+        }
+    }
+
+    /// Ssl_cipher 답을 연결의 전송 상태로 바꾼다. 빈 값은 평문이고, 행이 없거나 질의가 실패하면
+    /// 암호화를 주장하지 않고 원인을 남긴다.
+    #[test]
+    fn ssl_cipher_answers_become_transport_observations() {
+        let cipher = b"TLS_AES_256_GCM_SHA384".to_vec();
+        assert_eq!(
+            transport_from_cipher(Ok(Some(cipher))),
+            Transport::Encrypted
+        );
+        assert_eq!(
+            transport_from_cipher(Ok(Some(Vec::new()))),
+            Transport::Plaintext
+        );
+        assert!(matches!(
+            transport_from_cipher(Ok(None)),
+            Transport::Unconfirmed(cause) if cause.contains("Ssl_cipher")
+        ));
+        assert!(matches!(
+            transport_from_cipher(Err(sqlx::Error::PoolTimedOut)),
+            Transport::Unconfirmed(cause) if cause.contains("Ssl_cipher")
+        ));
+    }
+
+    /// 원격 평문 연결의 limitation은 MySQL URL 인자로 해결 방향을 말하고, 읽기 전용 고정 실패보다
+    /// 앞에 선다(접속 단계 순서).
+    #[test]
+    fn remote_plaintext_limitation_precedes_the_read_only_failure() {
+        let mut doc = collected_document(true);
+        record_read_only_failure(&mut doc, Some("denied"));
+        TransportCheck::new(false, TlsPolicy::Never).record_limitation(&mut doc, TLS_REMEDY);
+        assert_eq!(
+            doc.limitations[0],
+            "connection-not-encrypted: the catalog was read over an unencrypted connection; \
+             use ssl-mode=VERIFY_IDENTITY (with ssl-ca=<CA file> for a private CA) to require \
+             a verified TLS connection"
+        );
+        assert!(doc.limitations[1].starts_with(READ_ONLY_UNAVAILABLE));
+        assert_eq!(doc.context, collected_document(true).context);
     }
 }

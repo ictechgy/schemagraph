@@ -96,7 +96,8 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   subjects in its `roots` and `depth`/`via` measured from them; a subject
   reached only from itself is not listed. `--max` caps the combined `reached`
   list, nearest first. An unresolved subject stays in `roots` without `symbol`,
-  adds a `root-not-found:` limitation (and `truncated: true`), and exits 1;
+  adds a `root-not-found:` limitation (and `truncated: true`), and exits 64
+  after the document is written (default JSON `notFound` still exits 1);
   identify which subject failed from the missing `symbol`, not from `truncated`. Compare `graphRevision` (SHA-256 of graph.json) before trusting a
   saved document against the current graph.
 - Version 0.4.2 and later support Ctrl+C for `query`, `impact`, `path`, and
@@ -104,6 +105,12 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   in `truncationReasons`; partial results never establish absence. MCP clients
   cancel by request ID; cancelled calls may have no response. See ANALYSIS.md
   for preparation/output boundaries and completion races.
+- MCP tool results carry the report JSON once, as compact JSON in
+  `content[0].text`; there is no `structuredContent`. Parse the text.
+- MCP `stats`, `cycles`, and `diagnostics` take `max` (default 1024, at most
+  10000) and add `truncated: true` (plus `total` for cycles) only when cut;
+  `totals` and `summary` still count every entry. MCP `notFound` lists at most
+  64 candidates, then `candidatesTotal` and `candidatesTruncated: true`.
 - `dead` — objects nothing inside the database consumes. Consumer-kind
   objects (views, routines, packages) with no caller are the usual
   candidates; each carries its usage evidence when collected.

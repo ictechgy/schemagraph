@@ -220,7 +220,8 @@ these rules does not change an existing strict gate.
 
 ```sh
 schemagraph scan --document catalog.json --sql-dir ./queries --query-schema main \
-  --cache-dir .schemagraph-cache --emit-document with-queries.json -o graph.json
+  --cache-dir "${XDG_CACHE_HOME:-$HOME/.cache}/schemagraph" \
+  --emit-document with-queries.json -o graph.json
 ```
 
 SQL files become `query` vertices named from their relative paths. The collector
@@ -238,10 +239,49 @@ dependencies invalidate them. Executable, dialect, and collection context are
 also part of compatibility. Bodies without a trustworthy resolution footprint
 use a conservative whole-catalog namespace. Corrupt or oversized
 entries are reported on stderr and reparsed. Cache counts also go to stderr so
-graph JSON stays machine-readable. Cache files are disposable build artifacts.
+graph JSON stays machine-readable. Cache files can be deleted at any time; the
+next scan recomputes them.
 The full catalog and graph are still rebuilt and held in memory. This caches
 SQL analysis; it is not a persistent incremental graph engine. Version
 v0.4.3 uses whole-catalog structural invalidation for all entries.
+
+The cache directory is a trusted input: a hit restores the stored analysis
+without parsing the SQL again. Point `--cache-dir` at a private directory that
+only the current user can write and that is outside any checked-out code. Never
+use a path inside a pull-request checkout; in CI, use
+`--cache-dir "$RUNNER_TEMP/schemagraph-cache"`. A missing directory is created
+with mode `0700`. If the directory is a symbolic link, is owned by another user,
+or is writable by group or other users, the scan prints a warning, disables the
+cache, and analyzes every body as if no cache had been given; graph output and
+the exit code do not change. Run `chmod go-w` on a directory that was created
+group-writable. Only the last path component is checked, so a parent such as
+macOS `/tmp` may be a symbolic link. Trailing `/` and `.` components are removed
+first, so `link/` and `link/.` are checked as the link `link` itself. Entries
+are opened without following symbolic links and must be regular files of at
+most 16 MiB; a symlinked or special entry is also reported on stderr, reparsed,
+and replaced. The cache needs Unix ownership checks; on other platforms it is
+disabled with a warning.
+
+Each entry carries an HMAC-SHA256 tag over its payload, computed with a secret
+key kept outside the cache. An entry rebuilt from public inputs (the release
+binary and the catalog) or written with another key therefore misses: it is
+reported on stderr, reparsed, and overwritten. The key is the value of
+`SCHEMAGRAPH_CACHE_KEY` when that variable is set and not empty; it must be at
+least 32 bytes, for example the output of `openssl rand -hex 32`. Otherwise the
+key is read from `${XDG_CONFIG_HOME:-$HOME/.config}/schemagraph/cache.key`
+(an empty or relative `XDG_CONFIG_HOME` is ignored). When that file does not
+exist, the scan creates it with 32 random bytes and mode `0600`. The key file
+must be a regular file, not a symbolic link, owned by the current user, with no
+group or other permission bits, and 32 to 4096 bytes long. If the key is too
+short, `HOME` is unset, or the key file cannot be created or fails these checks,
+the scan warns and disables the cache. The key is never printed.
+
+CI runners usually start empty, so each run creates a new key file and entries
+restored with `actions/cache` miss and are recomputed. This is the safe
+default. To reuse restored entries, pass a repository secret as
+`SCHEMAGRAPH_CACHE_KEY`. When a secret is unavailable, as for pull requests from
+forks, the expression expands to an empty string, which counts as unset: the
+scan falls back to the key file and recomputes.
 
 Version 0.5.0 DML analysis records destination-column `writes`, source and
 predicate `reads`, and value-only `derives-from` edges for the supported static
@@ -408,10 +448,14 @@ rejected without `--format language-traversal`. MCP tools keep the default JSON.
   `symbol`, adds a `root-not-found:` limitation naming the index and any
   candidates, and adds `root-not-found` to `truncationReasons` (so `truncated`
   is true). The other roots are still traversed and the document is written,
-  but the command exits **1**, as with `notFound`. `truncated` alone does not
-  say which root failed: use a root entry without `symbol`, or the
-  `root-not-found: roots[i]` limitation, as the precise per-root signal. Results
-  for the resolved roots are complete unless another reason is also listed.
+  but the command exits **64**: the code the other isthmus language-traversal
+  producers use, which `isthmus capture` accepts as a partial success when the
+  document records `root-not-found`. Usage errors still exit 2, so 64 always
+  comes with a written document; the default JSON `notFound` still exits 1.
+  `truncated` alone does not say which root failed: use a root entry without
+  `symbol`, or the `root-not-found: roots[i]` limitation, as the precise
+  per-root signal. Results for the resolved roots are complete unless another
+  reason is also listed.
 - `truncated` is true when any `truncationReasons` exist (`result-limit`,
   `visited-limit`, `edge-limit`, `cancelled`, `root-not-found`);
   `truncationReasons` is omitted when empty. After a budget stop or
@@ -433,9 +477,28 @@ metadata; share it with the same audience as the graph snapshot.
 `path`, `diagnostics`, `search`, `dead`, `cycles`, `lint`, `stats`, and `unused`. It loads
 one graph at startup and exposes no database connection or arbitrary file-reading
 tools. Configure the MCP client to launch the command above. The tool results
-preserve the CLI analysis contract and explicit result/traversal limits; each
-tool returns the same JSON as the CLI command with the same options. `query` and
-`impact` return their default JSON; `--format language-traversal` is CLI-only.
+preserve the CLI analysis contract and explicit result/traversal limits. Each
+result carries its JSON report once, as compact JSON with sorted keys in its
+single text content block (`content[0].text`); there is no `structuredContent`,
+so parse the text. Unless an MCP bound below cuts it, the report is the same JSON
+value that the CLI command prints with the same options (the CLI pretty-prints
+it). `query` and `impact` return their default JSON; `--format
+language-traversal` is CLI-only.
+
+MCP bounds lists that the CLI prints in full. `stats`, `cycles`, and
+`diagnostics` accept `max` (default 1024, at most 10000) and keep the first
+`max` usage entries, cycles, or analysis records (`objects`) in CLI order. Only
+a cut result adds `truncated: true`; `cycles` also adds the full count as
+`total`, while `stats` `totals` and `diagnostics` `summary` always count every
+entry. A `notFound` result lists at most 64 `candidates` and, when cut, adds
+`candidatesTotal` and `candidatesTruncated: true`; ask again with a
+schema-qualified id.
+
+Numeric arguments are never clamped. On every tool, an integer outside its
+declared range, such as `max` above 10000 or a negative `depth`, returns an
+`isError: true` result whose text is `{"error": "…"}` with the allowed range,
+so the agent can retry with a valid value. Arguments of the wrong type, unknown
+arguments, unknown tools, and malformed requests are JSON-RPC errors (-32602).
 
 Start with `search` when the exact id is unknown. Its default `names` detail
 lists ids only; request `summary` for the candidates you need. The `dead` tool

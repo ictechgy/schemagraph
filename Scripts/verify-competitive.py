@@ -7,6 +7,7 @@ import argparse
 from collections import Counter
 import copy
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -71,10 +72,10 @@ def run(engine: Path, *arguments: object, expected: int = 0) -> str:
     return result.stdout
 
 
-def run_capture(engine: Path, *arguments: object, expected: int = 0, input_text: str = "", cwd: Path | None = None) -> tuple[str, str]:
+def run_capture(engine: Path, *arguments: object, expected: int = 0, input_text: str = "", cwd: Path | None = None, env: dict[str, str] | None = None) -> tuple[str, str]:
     """실행 결과의 stdout/stderr를 함께 돌려준다 — cache 통계와 경고를 검사할 때 쓴다."""
     command = [str(engine), *(str(argument) for argument in arguments)]
-    result = subprocess.run(command, input=input_text, capture_output=True, text=True, check=False, cwd=cwd)
+    result = subprocess.run(command, input=input_text, capture_output=True, text=True, check=False, cwd=cwd, env=env)
     if result.returncode != expected:
         detail = (result.stderr or result.stdout).strip()
         fail(f"{command[1]} exited {result.returncode}, expected {expected}: {detail}")
@@ -495,11 +496,19 @@ def check_sql_files(engine: Path, database: Path, work: Path) -> None:
         fail(f"external SQL queries did not become query vertices: {query_vertices}")
 
 
+def cache_environment(work: Path) -> dict[str, str]:
+    """캐시 키 파일을 작업 디렉터리에 만들어 개발자 홈의 ~/.config와 환경 키를 쓰지 않는다."""
+    environment = {name: value for name, value in os.environ.items() if name != "SCHEMAGRAPH_CACHE_KEY"}
+    environment["XDG_CONFIG_HOME"] = str(work / "config")
+    return environment
+
+
 def check_cache(engine: Path, database: Path, work: Path) -> None:
     """cold/warm, per-body, schema namespace, and corruption cache behavior를 확인한다."""
     document = work / "cache-document.json"
     baseline = work / "cache-baseline.graph.json"
     cache_dir = work / "cache"
+    environment = cache_environment(work)
     scan(engine, database, baseline, document)
     _, cold_stderr = run_capture(
         engine,
@@ -510,6 +519,7 @@ def check_cache(engine: Path, database: Path, work: Path) -> None:
         cache_dir,
         "-o",
         work / "cache-cold.graph.json",
+        env=environment,
     )
     _, warm_stderr = run_capture(
         engine,
@@ -520,11 +530,17 @@ def check_cache(engine: Path, database: Path, work: Path) -> None:
         cache_dir,
         "-o",
         work / "cache-warm.graph.json",
+        env=environment,
     )
     if not read_json(baseline) == read_json(work / "cache-cold.graph.json") == read_json(work / "cache-warm.graph.json"):
         fail("uncached, cold and warm cache graph JSON differed")
     if "hits=" not in warm_stderr or "writes=" not in cold_stderr:
         fail(f"cache statistics were not reported: cold={cold_stderr!r}, warm={warm_stderr!r}")
+    if "hits=0 " in warm_stderr:
+        fail(f"warm cache with the same key reused no body: {warm_stderr!r}")
+    key_file = work / "config" / "schemagraph" / "cache.key"
+    if not key_file.is_file() or key_file.stat().st_mode & 0o077:
+        fail(f"cache key file was not created owner-only under XDG_CONFIG_HOME: {key_file}")
 
     changed = copy.deepcopy(read_json(document))
     views = [obj for schema in changed["schemas"] for obj in schema["objects"] if obj["name"] in {"correlated_view", "derived_view"}]
@@ -542,6 +558,7 @@ def check_cache(engine: Path, database: Path, work: Path) -> None:
         cache_dir,
         "-o",
         work / "cache-one-body.graph.json",
+        env=environment,
     )
     if "hits=0" in changed_stderr:
         fail(f"changing one body invalidated every body: {changed_stderr}")
@@ -568,6 +585,7 @@ def check_cache(engine: Path, database: Path, work: Path) -> None:
         cache_dir,
         "-o",
         work / "cache-schema.graph.json",
+        env=environment,
     )
     if "hits=0" in schema_stderr:
         fail(f"unrelated relation invalidated every body: {schema_stderr}")
@@ -582,7 +600,7 @@ def check_cache(engine: Path, database: Path, work: Path) -> None:
     referenced_path = work / 'cache-reference-changed.json'
     referenced_path.write_text(json.dumps(referenced), encoding='utf-8')
     _, referenced_stderr = run_capture(engine, 'scan', '--document', referenced_path, '--cache-dir', cache_dir,
-                                      '-o', work/'cache-reference.graph.json')
+                                      '-o', work/'cache-reference.graph.json', env=environment)
     run_capture(engine, 'scan', '--document', referenced_path, '-o', work/'cache-reference-uncached.graph.json')
     if 'misses=0' in referenced_stderr:
         fail('a changed referenced relation unexpectedly reused every body')
@@ -603,6 +621,7 @@ def check_cache(engine: Path, database: Path, work: Path) -> None:
         cache_dir,
         "-o",
         work / "cache-corrupt.graph.json",
+        env=environment,
     )
     if "warning" not in corruption_stderr.lower():
         fail(f"corrupt cache entry did not produce a stderr warning: {corruption_stderr}")
@@ -653,6 +672,25 @@ def tool(tool_name: str, /, **arguments: object) -> dict:
     return {"method": "tools/call", "params": {"name": tool_name, "arguments": arguments}}
 
 
+def tool_payload(response: dict) -> object:
+    """도구 결과의 유일한 본문인 `content[0].text`를 JSON으로 읽는다.
+
+    서버는 보고 JSON을 압축 텍스트 한 벌로만 싣고 `structuredContent`로 다시 싣지 않는다.
+    """
+    result = response.get("result")
+    if not isinstance(result, dict) or "structuredContent" in result:
+        fail(f"MCP tool result must carry its JSON once, in text content: {response}")
+    content = result.get("content")
+    if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict):
+        fail(f"MCP tool result must have exactly one content block: {response}")
+    if content[0].get("type") != "text" or not isinstance(content[0].get("text"), str):
+        fail(f"MCP tool content must be one text block: {response}")
+    try:
+        return json.loads(content[0]["text"])
+    except json.JSONDecodeError as error:
+        fail(f"MCP tool text content was not JSON ({error}): {response}")
+
+
 def check_mcp_parity(engine: Path, graph_path: Path) -> None:
     """MCP 도구 결과가 같은 그래프에 대한 CLI JSON과 일치하는지 확인한다."""
     cli = {
@@ -680,7 +718,7 @@ def check_mcp_parity(engine: Path, graph_path: Path) -> None:
         {"method": "tools/list"},
     ])
     for key, response in zip(cli, responses):
-        if response.get("result", {}).get("structuredContent") != expected[key]:
+        if tool_payload(response) != expected[key]:
             fail(f"MCP {key} report differed from CLI: {response}")
     if not expected["search-names"]["matches"] or not expected["search-summary"]["truncated"]:
         fail(f"search fixture did not exercise matches and truncation: {expected['search-names']} {expected['search-summary']}")
@@ -698,7 +736,7 @@ def check_mcp_retention(engine: Path, graph_path: Path, unretained: dict) -> Non
     root = unretained["candidates"][0]["id"]
     retained_cli = json.loads(run(engine, "dead", "--graph", graph_path, "--retain", root))
     response = mcp_session(engine, graph_path, [tool("dead")], "--retain", root)[0]
-    if response.get("result", {}).get("structuredContent") != retained_cli:
+    if tool_payload(response) != retained_cli:
         fail(f"MCP dead with serve --retain differed from CLI: {response}")
     if retained_cli == unretained:
         fail(f"retention root did not change the dead report: {retained_cli}")
@@ -710,7 +748,7 @@ def check_mcp_retention(engine: Path, graph_path: Path, unretained: dict) -> Non
         f'retain = ["{root}"]\n[[suppress]]\npattern = "*"\nreason = "x"\nuntil = "2099-01-01"\n', encoding="utf-8")
     run(engine, "dead", "--graph", graph_path, "--config", workdir / "schemagraph.toml", expected=2)
     response = mcp_session(engine, graph_path, [tool("dead")], cwd=workdir)[0]
-    if response.get("result", {}).get("structuredContent") != unretained:
+    if tool_payload(response) != unretained:
         fail(f"serve read schemagraph.toml from its working directory: {response}")
 
 

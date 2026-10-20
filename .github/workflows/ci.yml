@@ -296,6 +296,15 @@ jobs:
           python3 Scripts/verify-bridge-facts.py --engine engine/target/debug/schemagraph \
             --output "$RUNNER_TEMP/bridge-facts.json"
 
+      - name: Verify native PostgreSQL, MySQL, and MariaDB TLS modes against real servers
+        env:
+          PGBIN: /usr/lib/postgresql/16/bin
+        run: |
+          # MySQL·MariaDB는 정확도 단계와 같은 고정 이미지로 TLS 서버와 TLS를 끈 서버를 띄운다.
+          python3 Scripts/verify-native-tls.py --engine engine/target/debug/schemagraph \
+            --mysql-environments Fixtures/accuracy/mysql-environments.json \
+            --output "$RUNNER_TEMP/native-tls.json"
+
       - name: Verify every database fixture
         env:
           SG_MYSQL_JAR: ${{ runner.temp }}/mysql-connector-j.jar
@@ -323,6 +332,7 @@ jobs:
             ${{ runner.temp }}/mysql-accuracy.json
             ${{ runner.temp }}/scope-*.json
             ${{ runner.temp }}/imports-check.json
+            ${{ runner.temp }}/native-tls.json
           if-no-files-found: ignore
           retention-days: 7
 

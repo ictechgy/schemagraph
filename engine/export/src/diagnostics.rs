@@ -84,23 +84,28 @@ pub fn analysis_docs(graph: &Graph) -> Vec<AnalysisDoc> {
     graph
         .analysis()
         .iter()
-        .map(|(id, a)| AnalysisDoc {
-            body_hash: a.body_hash.clone(),
-            diagnostics: a
-                .diagnostics
-                .iter()
-                .map(|d| DiagnosticDoc {
-                    code: d.code.clone(),
-                    location: d.location.as_ref().map(Into::into),
-                    message: d.message.clone(),
-                })
-                .collect(),
-            id: id.as_str().to_owned(),
-            scope: a.scope.clone(),
-            source: a.source.clone(),
-            state: state_str(a.state).into(),
-        })
+        .map(|(id, a)| analysis_doc(id, a))
         .collect()
+}
+
+/// 분석 기록 하나의 전송 표현 — `analysis_docs`와 진단 보고가 같은 변환을 쓴다.
+fn analysis_doc(id: &VertexId, a: &ObjectAnalysis) -> AnalysisDoc {
+    AnalysisDoc {
+        body_hash: a.body_hash.clone(),
+        diagnostics: a
+            .diagnostics
+            .iter()
+            .map(|d| DiagnosticDoc {
+                code: d.code.clone(),
+                location: d.location.as_ref().map(Into::into),
+                message: d.message.clone(),
+            })
+            .collect(),
+        id: id.as_str().to_owned(),
+        scope: a.scope.clone(),
+        source: a.source.clone(),
+        state: state_str(a.state).into(),
+    }
 }
 
 /// 간선과 근거의 정렬된 키를 그대로 사용해 같은 스냅샷을 재현한다.
@@ -170,12 +175,33 @@ pub(crate) fn restore(graph: &mut Graph, analyses: &[AnalysisDoc], origins: &[Or
 
 /// 분석 기록이 없는 구버전 스냅샷을 완전 분석으로 오인하지 않도록 요약한다.
 pub fn report(graph: &Graph, subject: Option<&VertexId>) -> serde_json::Value {
-    let records: Vec<_> = analysis_docs(graph)
-        .into_iter()
-        .filter(|r| subject.is_none_or(|id| id.as_str() == r.id))
+    report_with_max(graph, subject, usize::MAX)
+}
+
+/// `objects`를 기존 순서(정점 id 순)의 앞 `max`개로 자른 진단 보고다.
+///
+/// 분석 기록이 많은 그래프에서 전체 진단을 한 응답에 실으면 응답이 기록 수만큼 커진다.
+/// `state`와 `summary`는 자르기 전 전체 기록으로 센다 — 잘린 목록만 보고 분석 범위를
+/// 오독하지 않게 한다. 잘렸을 때만 `truncated: true`를 더하고, 잘리지 않은 보고는
+/// [`report`]와 같다.
+pub fn report_with_max(graph: &Graph, subject: Option<&VertexId>, max: usize) -> serde_json::Value {
+    let records: Vec<(&VertexId, &ObjectAnalysis)> = graph
+        .analysis()
+        .iter()
+        .filter(|(id, _)| subject.is_none_or(|wanted| wanted.as_str() == id.as_str()))
         .collect();
-    let count = |state: &str| records.iter().filter(|a| a.state == state).count();
-    serde_json::json!({"state":if records.is_empty(){"unavailable"}else{"available"},"summary":{"complete":count("complete"),"partial":count("partial"),"unsupported":count("unsupported"),"total":records.len()},"objects":records,"limitations":graph.limitations()})
+    let count = |state: AnalysisState| records.iter().filter(|(_, a)| a.state == state).count();
+    let objects: Vec<AnalysisDoc> = records
+        .iter()
+        .take(max)
+        .map(|(id, a)| analysis_doc(id, a))
+        .collect();
+    let truncated = objects.len() < records.len();
+    let mut value = serde_json::json!({"state":if records.is_empty(){"unavailable"}else{"available"},"summary":{"complete":count(AnalysisState::Complete),"partial":count(AnalysisState::Partial),"unsupported":count(AnalysisState::Unsupported),"total":records.len()},"objects":objects,"limitations":graph.limitations()});
+    if truncated {
+        value["truncated"] = serde_json::json!(true);
+    }
+    value
 }
 
 #[cfg(test)]
@@ -246,6 +272,70 @@ mod tests {
         let restored = crate::graph_from_doc(&doc);
         assert_eq!(graph.analysis(), restored.analysis());
         assert_eq!(graph.origins(), restored.origins());
+    }
+
+    /// 세 분석 상태를 하나씩 가진 그래프 — 상한 변형이 요약을 전체 기준으로 두는지 본다.
+    fn three_analysis_states() -> Graph {
+        let mut graph = Graph::new();
+        let states = [
+            ("a", AnalysisState::Complete),
+            ("b", AnalysisState::Partial),
+            ("c", AnalysisState::Unsupported),
+        ];
+        for (name, state) in states {
+            let id = VertexId::object("s", name);
+            graph.add_vertex(Vertex {
+                id: id.clone(),
+                kind: VertexKind::View,
+                name: name.into(),
+                schema: "s".into(),
+            });
+            graph.set_analysis(
+                id,
+                ObjectAnalysis {
+                    state,
+                    scope: "column-dependencies-and-lineage".into(),
+                    body_hash: None,
+                    diagnostics: vec![],
+                    source: None,
+                },
+            );
+        }
+        graph
+    }
+
+    #[test]
+    fn bounded_report_cuts_objects_but_summarizes_every_record() {
+        let graph = three_analysis_states();
+        let cut = report_with_max(&graph, None, 2);
+        let ids: Vec<&str> = cut["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| object["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["s.a", "s.b"]);
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(
+            cut["summary"],
+            serde_json::json!({"complete": 1, "partial": 1, "unsupported": 1, "total": 3})
+        );
+        assert_eq!(cut["state"], "available");
+        let whole = report(&graph, None);
+        assert_eq!(report_with_max(&graph, None, 3), whole);
+        assert!(whole.get("truncated").is_none());
+        // 대상 하나를 고른 보고도 같은 상한을 따른다 — 기록 1개를 0개로 자르면 잘렸다고 쓴다.
+        let subject = VertexId::object("s", "b");
+        let none = report_with_max(&graph, Some(&subject), 0);
+        assert_eq!(none["objects"], serde_json::json!([]));
+        assert_eq!(
+            (none["truncated"].clone(), none["summary"]["total"].clone()),
+            (true.into(), 1.into())
+        );
+        assert_eq!(
+            report_with_max(&graph, Some(&subject), 1),
+            report(&graph, Some(&subject))
+        );
     }
 
     #[test]
