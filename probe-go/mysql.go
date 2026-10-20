@@ -721,7 +721,8 @@ func (h *harvester) mysqlObjectUsage(schema string, objects []ObjectDoc) {
 
 // mysqlRows는 metadata query 실패를 빈 성공으로 숨기지 않고 limitation으로
 // 기록한다. 개별 테이블의 선택적 metadata는 그 테이블만 비워 진행한다.
-// 끝까지 읽었으면 true다. 다른 질의와 맞춰야 하는 호출(mysqlSchemaKeyColumns)만 이 값을 본다.
+// 끝까지 읽었으면 true다. 일부만 읽은 키 컬럼으로 제약을 내지 않아야 하는 호출(mysqlSchemaKeyColumns,
+// mysqlSharedNameConstraints)만 이 값을 본다.
 func (h *harvester) mysqlRows(label, query string, args []any, scan func(*sql.Rows) error) bool {
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
