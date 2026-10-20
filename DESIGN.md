@@ -314,7 +314,8 @@ sqlparser-rs는 `parser` 안에서만 쓴다. 엔진은 DB를 직접 만지지 �
   payload는 cache 밖 사용자별 비밀 키의 HMAC-SHA256 `tag`로 인증한다(형식 4).
   키는 `SCHEMAGRAPH_CACHE_KEY`(32바이트 이상)가 우선이고, 없으면
   `${XDG_CONFIG_HOME:-$HOME/.config}/schemagraph/cache.key`다(없으면 32바이트
-  난수로 0600 생성, 링크·다른 소유자·group/other 권한·짧은 파일은 거절). 공개
+  난수로 0600 생성, 링크·다른 소유자·group/other 권한·32바이트 미만이거나
+  4096바이트 초과인 파일은 거절). 공개
   재료(실행 파일·문서)만으로 다시 계산한 항목과 다른 키의 항목은 miss다. 키를
   얻지 못하면 경고하고 cache를 끈다.
   `merge`는 각 document의 명시적 `context.source_id`를 `source::id` namespace로

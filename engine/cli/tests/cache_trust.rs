@@ -456,10 +456,19 @@ fn unsafe_key_files_disable_the_cache_and_are_left_alone() {
         fs::write(key, [7u8; 16]).unwrap();
         fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
     };
+    // 상한(4096바이트)을 넘는 정규 파일은 링크·특수 파일이 아니라 길이 문제로 안내한다.
+    let oversized: fn(&Path) = |key| {
+        fs::write(key, [7u8; 5000]).unwrap();
+        fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
+    };
     for (prepare, reason) in [
         (readable, "accessible by group or other users"),
         (linked, "symbolic link"),
         (short, "fewer than 32 bytes"),
+        (
+            oversized,
+            "holds more than 4096 bytes; use a key of 32 to 4096 bytes",
+        ),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

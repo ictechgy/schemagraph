@@ -137,7 +137,8 @@ const UNSUPPORTED_PLATFORM: &str =
 const MIN_KEY_BYTES: usize = 32;
 
 /// 키 파일 읽기 상한. 만드는 키는 32바이트다. 사용자가 직접 둔 더 긴 키도 받되, 실수로
-/// 가리킨 큰 파일을 메모리로 읽지 않는다.
+/// 가리킨 큰 파일을 메모리로 읽지 않는다. 넘으면 이 상한을 담은 경고로 캐시를 끈다
+/// (ANALYSIS.md에 32~4096바이트로 적혀 있다).
 #[cfg(unix)]
 const MAX_KEY_FILE_BYTES: u64 = 4096;
 
@@ -248,17 +249,30 @@ fn read_key_file(path: &Path) -> Result<Option<CacheKey>, String> {
     let (bytes, metadata) = match read {
         Ok(read) => read,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "cannot use cache key file '{}'; it must be a regular file, not a symbolic link: {error}",
-                path.display()
-            ))
-        }
+        Err(error) => return Err(unreadable_key_file(path, &error)),
     };
     match key_file_problem(metadata.uid(), metadata.mode(), bytes.len(), current_uid()) {
         Some(problem) => Err(format!("cache key file '{}' {problem}", path.display())),
         None => CacheKey::new(&bytes).map(Some),
     }
+}
+
+/// 키 파일을 열거나 읽지 못한 이유를 해결 방향과 함께 만든다.
+///
+/// 상한 초과는 `read_bounded_regular_file`이 `InvalidData`로 알린다. 링크·특수 파일과는
+/// 해결 방향(키를 줄이거나 파일을 지운다)이 달라 따로 안내한다. 링크·특수 파일이라고 하면
+/// 사용자가 직접 둔 긴 키가 왜 거절되는지 알 수 없다.
+#[cfg(unix)]
+fn unreadable_key_file(path: &Path, error: &io::Error) -> String {
+    let path = path.display();
+    if error.kind() == io::ErrorKind::InvalidData {
+        return format!(
+            "cache key file '{path}' holds more than {MAX_KEY_FILE_BYTES} bytes; use a key of {MIN_KEY_BYTES} to {MAX_KEY_FILE_BYTES} bytes, or remove the file so that a new key is created"
+        );
+    }
+    format!(
+        "cannot use cache key file '{path}'; it must be a regular file, not a symbolic link: {error}"
+    )
 }
 
 /// 같은 fd에서 본 키 파일이 현재 사용자 전용이고 충분히 긴지 판정한다. 순수 함수로 두어

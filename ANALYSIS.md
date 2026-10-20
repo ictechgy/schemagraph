@@ -272,7 +272,7 @@ key is read from `${XDG_CONFIG_HOME:-$HOME/.config}/schemagraph/cache.key`
 (an empty or relative `XDG_CONFIG_HOME` is ignored). When that file does not
 exist, the scan creates it with 32 random bytes and mode `0600`. The key file
 must be a regular file, not a symbolic link, owned by the current user, with no
-group or other permission bits, and at least 32 bytes long. If the key is too
+group or other permission bits, and 32 to 4096 bytes long. If the key is too
 short, `HOME` is unset, or the key file cannot be created or fails these checks,
 the scan warns and disables the cache. The key is never printed.
 

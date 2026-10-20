@@ -63,9 +63,9 @@ These changes are not yet in a published release.
   `${XDG_CONFIG_HOME:-$HOME/.config}/schemagraph/cache.key`, which is created
   with 32 random bytes and mode `0600` when missing. A key file that is a
   symbolic link, is owned by another user, has group or other permission bits,
-  or holds fewer than 32 bytes is rejected. A short key, an unset `HOME`, or a
-  rejected key file disables the cache with a warning. The key is never
-  printed.
+  or holds fewer than 32 or more than 4096 bytes is rejected. A short key, an
+  unset `HOME`, or a rejected key file disables the cache with a warning. The
+  key is never printed.
 - Entries with a missing or wrong tag, symbolic-link entries, and FIFOs or other
   special files are reported on stderr, reparsed, and overwritten. Entries are
   opened without following symbolic links and without blocking on FIFOs.
