@@ -14,13 +14,18 @@
 - require와 기본 prefer는 TLS로 성공하고, disable은 hostssl 서버가 거절한다(종료 2).
 - TLS를 끈 서버에서 require는 종료 2이고, 기본 prefer는 평문으로 성공한다.
 - 루프백 평문 연결에는 `connection-not-encrypted:` limitation이 없다.
-- 네트워크 호스트로 분류되는 연결은 서버가 본 전송 상태를 따른다. TLS 서버에서는 기본
-  prefer가 pg_stat_ssl로 TLS를 확인해 limitation이 없고, TLS를 끈 서버에서는 평문 관측
-  limitation이 남는다. 확인 질의가 실패했을 때의 문구("could not be confirmed")와 구분한다.
+- 네트워크 호스트로 분류되는 연결은 reader가 직접 한 TLS 협상 결과를 따른다. 기본 prefer는
+  TLS를 요구해 먼저 붙고, 서버가 TLS를 거절했을 때만 평문으로 다시 붙어 그 사실("the server
+  did not accept TLS")을 limitation에 남긴다. TLS 서버에서는 limitation이 없고, TLS를 끈
+  서버에서는 거절 limitation이 남는다. disable은 모드 문구("the catalog was read over an
+  unencrypted connection")를 남기므로 두 문구를 가른다.
+- 공격 재현: 클라이언트 쪽 TLS만 거절하고 서버와는 TLS로 붙는 중간자를 TLS 서버 앞에 둔다.
+  서버가 보는 세션은 TLS라 서버의 자기 보고(pg_stat_ssl)는 암호화됐다고 답하지만, reader의
+  연결은 평문이다. 기본 prefer가 거절 limitation을 남겨야 한다.
   호스트는 `0.0.0.0`을 쓴다. reader는 루프백 주소가 아니라서 네트워크로 보지만, Linux·macOS
   커널은 0.0.0.0으로 가는 접속을 자기 호스트로 보내 루프백 리스너에 닿는다. 그래서 클러스터를
-  외부에 열지 않고도 원격 판정(서버 확인 질의 포함)을 탄다. `127.1` 같은 축약 표기는 rustls가
-  서버 이름으로 받지 않아 TLS 서버에는 쓸 수 없다.
+  외부에 열지 않고도 원격 판정(TLS를 요구한 첫 접속 포함)을 탄다. `127.1` 같은 축약 표기는
+  rustls가 서버 이름으로 받지 않아 TLS 서버에는 쓸 수 없다.
 
 사용자 PG 설정이 결과를 바꾸지 않도록 PG로 시작하는 환경 변수(PGSSLMODE 등)를 지운
 환경으로 돌린다. 비밀번호는 0600 PGPASSFILE로만 넘겨 URL·argv에 싣지 않는다.
@@ -28,11 +33,9 @@
 `--mysql-environments`(정확도 하네스와 같은 고정 이미지 목록)를 주면 MySQL·MariaDB도
 Docker로 검증한다. 엔진마다 기본 설정(자체 서명 인증서로 TLS를 켠다) 서버와 TLS를 끈
 서버를 루프백 포트로 띄운다. 네트워크 호스트(`0.0.0.0`)의 기본 PREFERRED 연결은 MySQL
-reader가 `SHOW SESSION STATUS LIKE 'Ssl_cipher'`로 서버에 물어 판정하는 유일한 경로다.
-TLS 서버에서는 limitation이 없어야 하고, TLS를 끈 서버에서는 평문 관측 limitation이 남아야
-한다. 텍스트 프로토콜 실행이나 BINARY 열 디코드가 sqlx 갱신 등으로 어긋나면 "could not be
-confirmed" 문구가 대신 붙어 실패한다. 루프백 fixture(`127.0.0.1`)만으로는 이 경로를 타지
-않는다.
+reader가 REQUIRED로 먼저 붙어 보는 경로다. TLS 서버에서는 limitation이 없어야 하고, TLS를
+끈 서버에서는 거절 limitation이 남아야 한다. 루프백 fixture(`127.0.0.1`)만으로는 이 경로를
+타지 않는다.
 """
 
 import argparse
@@ -41,26 +44,38 @@ import json
 import os
 from pathlib import Path
 import secrets
+import select
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[1]
 
 # 평문 원격 연결을 알리는 limitation 접두사다(엔진 계약).
 LIMITATION_PREFIX = 'connection-not-encrypted:'
-# 서버가 평문이라고 답했을 때의 문구다. 확인 질의 실패("could not be confirmed")와 가른다.
-OBSERVED_PLAINTEXT = 'read over an unencrypted connection'
+# 모드가 TLS를 시도하지 않은 평문 연결(disable·DISABLED)의 문구다.
+PLAINTEXT_BY_MODE = f'{LIMITATION_PREFIX} the catalog was read over an unencrypted connection;'
+# 기본 prefer에서 서버가 TLS를 거절해 평문으로 다시 붙은 연결의 문구다.
+PLAINTEXT_AFTER_REFUSAL = (f'{LIMITATION_PREFIX} the server did not accept TLS, so the catalog '
+                           'was read over an unencrypted connection;')
 # reader가 네트워크 호스트로 분류하지만 커널이 자기 호스트로 보내는 주소다.
 NETWORK_HOST = '0.0.0.0'
 # 연결마다 확인하는 테이블이다. 그래프에 이 정점이 있으면 카탈로그를 실제로 읽은 것이다.
 PROBE_TABLE = 'public.tls_probe'
-# 사례별 전송 limitation 기대값: 없음, 또는 서버가 답한 평문 관측 하나.
+# 사례별 전송 limitation 기대값: 없음, 모드로 끈 평문 하나, 또는 서버가 거절한 평문 하나.
 EXPECT_NONE = 'none'
 EXPECT_PLAINTEXT = 'plaintext'
+EXPECT_REFUSED = 'refused'
+EXPECTED_LIMITATION = {EXPECT_PLAINTEXT: PLAINTEXT_BY_MODE, EXPECT_REFUSED: PLAINTEXT_AFTER_REFUSAL}
+# PostgreSQL SSLRequest(길이 8, 요청 코드 80877103)다. 중간자 재현이 TLS 요청을 알아본다.
+PG_SSL_REQUEST = bytes([0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F])
+# 중간자 중계가 한쪽을 기다리는 상한(초). scan 하나보다 넉넉하다.
+RELAY_IDLE_SECONDS = 60
 
 # MySQL·MariaDB 사례가 쓸 데이터베이스다. Scripts/wait-mysql-ready.py가 이 이름으로 최종
 # 서버의 TCP 준비를 확인한다(fixture 하네스와 같은 절차).
@@ -231,11 +246,14 @@ def transport_limitations(graph):
 
 
 def check_transport(label, found, expected):
-    """전송 limitation이 기대와 같은지 본다. 평문 관측은 확인 실패 문구와 구분한다."""
-    if expected == EXPECT_NONE and found:
-        raise AssertionError(f'{label}: expected no transport limitation, got {found}')
-    if expected == EXPECT_PLAINTEXT and (len(found) != 1 or OBSERVED_PLAINTEXT not in found[0]):
-        raise AssertionError(f'{label}: expected one observed-plaintext limitation, got {found}')
+    """전송 limitation이 기대와 같은지 본다. 모드로 끈 평문과 서버가 거절한 평문을 문구로 가른다."""
+    if expected == EXPECT_NONE:
+        if found:
+            raise AssertionError(f'{label}: expected no transport limitation, got {found}')
+        return
+    prefix = EXPECTED_LIMITATION[expected]
+    if len(found) != 1 or not found[0].startswith(prefix):
+        raise AssertionError(f'{label}: expected one limitation starting with {prefix!r}, got {found}')
 
 
 def check_success(label, graph, expected, hidden, probe=PROBE_TABLE):
@@ -292,27 +310,195 @@ def tls_cluster_cases(port, certificates):
 
 
 def plain_cluster_cases(port):
-    """TLS를 끈 서버의 사례. 루프백은 limitation이 없고, 네트워크 호스트는 평문 관측이 남는다."""
+    """TLS를 끈 서버의 사례. 루프백은 limitation이 없다. 네트워크 호스트는 기본 prefer면 거절
+    limitation이, disable이면 모드 limitation이 남는다."""
     return [
         ('require-without-server-tls', scan_url('127.0.0.1', port, {'sslmode': 'require'}), 2,
          'server does not support TLS', None),
         ('default-prefer-loopback', scan_url('127.0.0.1', port, {}), 0, None, EXPECT_NONE),
         ('default-prefer-localhost', scan_url('localhost', port, {}), 0, None, EXPECT_NONE),
         ('disable-loopback', scan_url('127.0.0.1', port, {'sslmode': 'disable'}), 0, None, EXPECT_NONE),
-        ('default-prefer-network-host', scan_url(NETWORK_HOST, port, {}), 0, None, EXPECT_PLAINTEXT),
+        ('default-prefer-network-host', scan_url(NETWORK_HOST, port, {}), 0, None, EXPECT_REFUSED),
         ('disable-network-host', scan_url(NETWORK_HOST, port, {'sslmode': 'disable'}), 0, None, EXPECT_PLAINTEXT),
     ]
 
 
+def recv_exact(sock, size):
+    """`size`바이트를 받는다. 상대가 먼저 닫으면 그때까지 받은 바이트를 돌려준다."""
+    data = b''
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+class UpstreamTls:
+    """중간자와 서버 사이의 TLS 구간. 서버 인증서는 시험 CA와 인증서 이름(localhost)으로 검증한다.
+
+    MemoryBIO로 한 스레드가 읽기와 쓰기를 번갈아 하므로 SSL 객체를 두 스레드가 함께 쓰지 않는다.
+    """
+
+    def __init__(self, sock, cafile):
+        context = ssl.create_default_context(cafile=str(cafile))
+        self.sock = sock
+        self.incoming, self.outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        self.tls = context.wrap_bio(self.incoming, self.outgoing, server_hostname='localhost')
+        self.handshake()
+
+    def flush(self):
+        """TLS가 보낼 바이트를 서버로 보낸다."""
+        data = self.outgoing.read()
+        if data:
+            self.sock.sendall(data)
+
+    def handshake(self):
+        """서버와 TLS 핸드셰이크를 끝낸다."""
+        while True:
+            try:
+                self.tls.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                self.flush()
+                data = self.sock.recv(65536)
+                if not data:
+                    raise RuntimeError('the server closed the connection during the TLS handshake')
+                self.incoming.write(data)
+        self.flush()
+
+    def send(self, data):
+        """평문을 암호화해 서버로 보낸다."""
+        self.tls.write(data)
+        self.flush()
+
+    def receive(self, data):
+        """서버가 보낸 TLS 바이트를 넣고 풀린 평문을 돌려준다. 레코드가 덜 왔으면 빈 바이트다."""
+        self.incoming.write(data)
+        plain = []
+        while True:
+            try:
+                chunk = self.tls.read(65536)
+            except ssl.SSLWantReadError:
+                break
+            if not chunk:
+                break  # 서버가 TLS를 닫았다(close_notify). 이어지는 소켓 EOF가 중계를 끝낸다.
+            plain.append(chunk)
+        self.flush()
+        return b''.join(plain)
+
+
+def relay(client, upstream):
+    """클라이언트 평문과 서버 TLS 사이에서 바이트를 옮긴다. 어느 쪽이든 닫으면 끝낸다."""
+    while True:
+        readable, _, _ = select.select([client, upstream.sock], [], [], RELAY_IDLE_SECONDS)
+        if not readable:
+            raise RuntimeError(f'the relay was idle for {RELAY_IDLE_SECONDS} seconds')
+        for source in readable:
+            data = source.recv(65536)
+            if not data:
+                return
+            if source is client:
+                upstream.send(data)
+            else:
+                client.sendall(upstream.receive(data))
+
+
+class DowngradeProxy:
+    """클라이언트 쪽 TLS만 거절하고 서버와는 TLS로 붙는 중간자(공격 재현).
+
+    클라이언트의 SSLRequest에 `N`으로 답해 클라이언트 구간을 평문으로 만들고, 서버에는 자기가
+    SSLRequest를 보내 TLS로 붙어 바이트를 옮긴다. 서버가 보는 세션은 TLS라 pg_stat_ssl은
+    ssl = true를 답한다. 그 답으로 판정하는 reader는 클라이언트 평문 구간의 limitation을 잃는다.
+    """
+
+    def __init__(self, upstream_port, cafile):
+        self.upstream_port = upstream_port
+        self.cafile = cafile
+        self.listener = socket.create_server(('127.0.0.1', 0))
+        self.port = self.listener.getsockname()[1]
+        self.errors = []
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.listener.close()
+        self.thread.join(timeout=10)
+
+    def serve(self):
+        """접속마다 중계 스레드를 띄운다. __exit__가 리스너를 닫으면 accept가 OSError로 끝난다."""
+        while True:
+            try:
+                client, _ = self.listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.handle, args=(client,), daemon=True).start()
+
+    def handle(self, client):
+        """중계 하나를 돌린다. 실패 원인은 모아 두었다가 사례 판정에서 드러낸다."""
+        try:
+            with client:
+                client.settimeout(RELAY_IDLE_SECONDS)
+                self.downgrade(client)
+        except Exception as error:  # 스레드 밖으로 원인을 옮긴다(사례 판정이 실패로 낸다).
+            self.errors.append(f'{type(error).__name__}: {error}')
+
+    def downgrade(self, client):
+        """클라이언트의 TLS 요청을 거절하고, 평문으로 이어지는 접속만 서버의 TLS 세션에 잇는다."""
+        first = recv_exact(client, len(PG_SSL_REQUEST))
+        if first == PG_SSL_REQUEST:
+            client.sendall(b'N')
+            # TLS를 요구한 접속은 여기서 닫히고, 서버 자기 보고에 기대는 prefer는 같은 접속으로
+            # 평문 StartupMessage를 잇는다.
+            first = recv_exact(client, len(PG_SSL_REQUEST))
+        if len(first) < len(PG_SSL_REQUEST):
+            return
+        with socket.create_connection(('127.0.0.1', self.upstream_port), timeout=RELAY_IDLE_SECONDS) as sock:
+            sock.sendall(PG_SSL_REQUEST)
+            if recv_exact(sock, 1) != b'S':
+                raise RuntimeError('the server refused TLS to the proxy')
+            upstream = UpstreamTls(sock, self.cafile)
+            upstream.send(first)
+            try:
+                relay(client, upstream)
+            except (ConnectionResetError, BrokenPipeError):
+                return  # scan이 끝나며 접속을 끊었다. 정상 종료와 같다.
+
+
+def check_downgrade_proxy(args, work, env, port, cafile, hidden):
+    """TLS 서버 앞에 클라이언트 쪽 TLS만 거절하는 중간자를 두고 기본 prefer로 scan한다.
+
+    서버는 TLS 세션을 보지만 reader의 연결은 평문이다. reader가 직접 한 TLS 협상으로 판정하면
+    거절 limitation이 남고, 서버의 자기 보고(pg_stat_ssl)로 판정하면 limitation이 사라져 실패한다.
+    """
+    with DowngradeProxy(port, cafile) as proxy:
+        case = ('downgrade-proxy-network-host', scan_url(NETWORK_HOST, proxy.port, {}), 0, None,
+                EXPECT_REFUSED)
+        concealed = {**hidden, 'limitation': [*hidden['limitation'], f':{proxy.port}']}
+        try:
+            result = check_case(args.engine, work, env, case, concealed)
+        except AssertionError as error:
+            raise AssertionError(f'{error}; relay errors: {proxy.errors}') from error
+    if proxy.errors:
+        raise AssertionError(f'downgrade-proxy-network-host: relay failed: {proxy.errors}')
+    return result
+
+
 def run_cluster(args, work, name, tls, password, cases_for):
-    """클러스터 하나를 띄워 사례를 모두 돌리고 멈춘다."""
+    """클러스터 하나를 띄워 사례를 모두 돌리고 멈춘다. TLS 클러스터에서는 중간자 사례도 돌린다."""
     env = args.environment
     data, port = start_cluster(args.postgres_bin, work, name, tls, password, env)
     try:
         create_probe_table(args.postgres_bin, port, env)
         # 비밀번호는 오류에도 limitation에도, 호스트·포트는 limitation에 실리면 안 된다.
         hidden = {'stderr': [password], 'limitation': [password, NETWORK_HOST, f':{port}']}
-        return [check_case(args.engine, work, env, case, hidden) for case in cases_for(port)]
+        results = [check_case(args.engine, work, env, case, hidden) for case in cases_for(port)]
+        if tls:
+            results.append(check_downgrade_proxy(args, work, env, port, tls['ca'], hidden))
+        return results
     finally:
         stop_cluster(args.postgres_bin, data, env)
 
@@ -384,8 +570,8 @@ def mysql_url(host, port, parameters):
 
 
 def mysql_tls_cases(port):
-    """TLS를 켠 서버의 사례. 네트워크 호스트의 기본 PREFERRED는 Ssl_cipher로 TLS를 확인해
-    limitation이 없다. DISABLED는 모드로 평문을 알아 서버에 묻지 않고 남긴다."""
+    """TLS를 켠 서버의 사례. 네트워크 호스트의 기본 PREFERRED는 REQUIRED로 먼저 붙어 TLS로
+    읽으므로 limitation이 없다. DISABLED는 모드 limitation을 남긴다."""
     return [
         ('preferred-network-host', mysql_url(NETWORK_HOST, port, {}), 0, None, EXPECT_NONE),
         ('required-network-host', mysql_url(NETWORK_HOST, port, {'ssl-mode': 'REQUIRED'}), 0, None, EXPECT_NONE),
@@ -396,9 +582,10 @@ def mysql_tls_cases(port):
 
 
 def mysql_plain_cases(port):
-    """TLS를 끈 서버의 사례. 네트워크 호스트의 기본 PREFERRED는 빈 Ssl_cipher를 평문으로 읽는다."""
+    """TLS를 끈 서버의 사례. 네트워크 호스트의 기본 PREFERRED는 서버가 TLS를 거절해 평문으로
+    다시 붙으므로 거절 limitation을 남긴다."""
     return [
-        ('preferred-network-host', mysql_url(NETWORK_HOST, port, {}), 0, None, EXPECT_PLAINTEXT),
+        ('preferred-network-host', mysql_url(NETWORK_HOST, port, {}), 0, None, EXPECT_REFUSED),
         ('required-without-server-tls', mysql_url('127.0.0.1', port, {'ssl-mode': 'REQUIRED'}), 2,
          'server does not support TLS', None),
         ('preferred-loopback', mysql_url('127.0.0.1', port, {}), 0, None, EXPECT_NONE),

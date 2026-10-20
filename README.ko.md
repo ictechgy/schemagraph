@@ -95,11 +95,15 @@ Unix 소켓이나 루프백 주소(`127.0.0.0/8`, `::1`, `localhost`)가 아닌 
 암호화하지 않은 연결로 카탈로그를 읽으면, catalog document와 그래프에
 `connection-not-encrypted:` limitation이 남습니다. 이런 호스트에서는
 `sslmode=disable`, `sslmode=allow`, `ssl-mode=DISABLED`가 항상 이 limitation을
-남깁니다. 기본 모드에서는 reader가 세션의 TLS 사용 여부를 서버에
-묻습니다(`pg_stat_ssl`, `Ssl_cipher`). 서버가 답하지 못하면 암호화를 확인하지
-못했다고 limitation에 적습니다. 커넥션 풀러나 프록시 뒤에서는 이 답이 풀러와
-서버 사이 연결을 말하므로, 암호화가 반드시 필요하면 verify 모드를 씁니다. 이
-limitation은 `catalog_complete`를 바꾸지 않습니다.
+남깁니다. 기본 모드에서는 reader가 이런 호스트에 먼저 `sslmode=require`·
+`ssl-mode=REQUIRED`처럼 접속하고, 서버가 TLS를 거절했을 때만 TLS 없이 다시
+접속합니다. 이때 limitation은 서버가 TLS를 받지 않았다고 적습니다. TLS
+핸드셰이크가 실패하면 그대로 종료 코드 2로 끝납니다. reader는 서버가 알려 주는
+세션 정보가 아니라 자기가 직접 한 TLS 협상 결과로 판정하므로, reader 쪽 TLS만
+거절하는 프록시가 이 limitation을 숨길 수 없습니다. 이 limitation은 reader 자신의
+연결을 말하며, 커넥션 풀러나 프록시가 DB로 잇는 연결은 다루지 않습니다. 암호화가
+반드시 필요하면 verify 모드를 씁니다. 이 limitation은 `catalog_complete`를 바꾸지
+않습니다.
 
 JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·컬럼·키·인덱스·루틴
 메타데이터입니다. 본문과 사용 통계의 수집 범위는 DB 방언, 권한, 사용 가능한

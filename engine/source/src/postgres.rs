@@ -4,12 +4,12 @@
 //! 몸체·routine 언어가 빠진다) pg_catalog를 주로 쓴다. 세션은 읽기 전용으로
 //! 고정한다 — 스캐너가 DB를 바꾸는 일은 없어야 한다(sqlite의 mode=ro와 같은 의도).
 
-use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgSslMode};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::Row;
 use std::str::FromStr;
 
 use crate::document::*;
-use crate::transport::{is_local_endpoint, TlsPolicy, Transport, TransportCheck};
+use crate::transport::{is_local_endpoint, ConnectMode, TlsPolicy, Transport, TransportCheck};
 use crate::SourceError;
 
 /// 평문 원격 연결 limitation의 해결 방향. 공개 CA가 아닌 관리형 DB는 CA 파일이 필요하다.
@@ -28,29 +28,7 @@ pub async fn read_with_dependencies(
 ) -> Result<CatalogDocument, SourceError> {
     let options = PgConnectOptions::from_str(url)
         .map_err(|e| SourceError::Connect(format!("postgres URL 해석 실패: {e}")))?;
-    let transport = transport_check(&options);
-    let connection_transport = transport.clone();
-    let pool = PgPoolOptions::new()
-        .after_connect(move |conn, _| {
-            let transport = connection_transport.clone();
-            Box::pin(async move {
-                // 읽기 전용 세션 고정 — sqlite reader의 read_only(true)와 같은 의도.
-                sqlx::Executor::execute(
-                    &mut *conn,
-                    "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
-                )
-                .await?;
-                // 서버가 렌더링하는 뷰 이름을 한정해 수집 세션의 search_path 영향을 없앤다.
-                sqlx::Executor::execute(&mut *conn, "SET search_path = pg_catalog").await?;
-                // 전송 확인은 실패해도 오류로 돌려주지 않는다. after_connect가 오류를 내면 풀이
-                // 시간 상한까지 접속을 되풀이하므로, 확인하지 못한 사실은 limitation으로 남긴다.
-                if transport.needs_server_check() {
-                    transport.record(observe_transport(conn).await);
-                }
-                Ok(())
-            })
-        })
-        .connect_with(options)
+    let (pool, transport) = connect(&options)
         .await
         .map_err(|e| SourceError::Connect(format!("postgres 접속 실패: {e}")))?;
 
@@ -123,25 +101,40 @@ fn transport_check(options: &PgConnectOptions) -> TransportCheck {
     )
 }
 
-/// 서버가 본 이 세션의 TLS 여부를 묻는다(pg_stat_ssl, PostgreSQL 9.5+). 커넥션 풀러나
-/// 프록시 뒤라면 서버가 본 상대는 풀러라, 이 답은 풀러와 서버 사이 연결을 말한다.
-async fn observe_transport(conn: &mut PgConnection) -> Transport {
-    let answer = sqlx::query_scalar::<_, bool>(
-        "SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid = pg_catalog.pg_backend_pid()",
-    )
-    .fetch_optional(conn)
-    .await;
-    transport_from_answer(answer)
+/// 풀을 열고 카탈로그를 읽을 연결의 전송을 함께 돌려준다. 네트워크를 지나는 prefer 연결은
+/// require로 먼저 열고, 서버가 TLS를 거절했을 때만 disable로 다시 연다(TransportCheck::open).
+async fn connect(options: &PgConnectOptions) -> Result<(PgPool, Transport), sqlx::Error> {
+    transport_check(options)
+        .open(|mode| pool_options().connect_with(options_for(options, mode)))
+        .await
 }
 
-/// pg_stat_ssl 답을 전송 상태로 바꾼다. 행이 없거나 질의가 실패하면 암호화를 주장하지 않는다.
-fn transport_from_answer(answer: Result<Option<bool>, sqlx::Error>) -> Transport {
-    match answer {
-        Ok(Some(true)) => Transport::Encrypted,
-        Ok(Some(false)) => Transport::Plaintext,
-        Ok(None) => Transport::Unconfirmed("pg_stat_ssl has no row for this session".into()),
-        Err(error) => Transport::Unconfirmed(format!("pg_stat_ssl query failed: {error}")),
+/// 여는 방식을 sslmode로 옮긴다. require는 prefer처럼 인증서를 검증하지 않으므로, 서버가
+/// TLS를 받는 한 sqlx 자체 prefer와 같은 연결이다. sslmode 말고는 URL 그대로다.
+fn options_for(options: &PgConnectOptions, mode: ConnectMode) -> PgConnectOptions {
+    let options = options.clone();
+    match mode {
+        ConnectMode::AsGiven => options,
+        ConnectMode::RequireTls => options.ssl_mode(PgSslMode::Require),
+        ConnectMode::Plaintext => options.ssl_mode(PgSslMode::Disable),
     }
+}
+
+/// 연결마다 수집 세션을 고정하는 풀 설정.
+fn pool_options() -> PgPoolOptions {
+    PgPoolOptions::new().after_connect(|conn, _| {
+        Box::pin(async move {
+            // 읽기 전용 세션 고정 — sqlite reader의 read_only(true)와 같은 의도.
+            sqlx::Executor::execute(
+                &mut *conn,
+                "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+            )
+            .await?;
+            // 서버가 렌더링하는 뷰 이름을 한정해 수집 세션의 search_path 영향을 없앤다.
+            sqlx::Executor::execute(&mut *conn, "SET search_path = pg_catalog").await?;
+            Ok(())
+        })
+    })
 }
 
 async fn read_dependencies(
@@ -836,12 +829,12 @@ mod tests {
         }
     }
 
-    /// 서버 확인은 네트워크를 지나는 prefer 연결에서만 한다. Unix 소켓은 `/`로 시작하는
-    /// 호스트(퍼센트 인코딩한 URL 호스트나 host 인자)로 고르는 sqlx 규칙을 따르고,
+    /// TLS를 요구해 먼저 여는 것은 네트워크를 지나는 prefer 연결뿐이다. Unix 소켓은 `/`로
+    /// 시작하는 호스트(퍼센트 인코딩한 URL 호스트나 host 인자)로 고르는 sqlx 규칙을 따르고,
     /// hostaddr는 실제 접속 주소라 호스트 이름보다 앞선다.
     #[test]
-    fn only_remote_prefer_connections_ask_the_server() {
-        for (url, asks_server) in [
+    fn only_remote_prefer_connections_negotiate_tls() {
+        for (url, negotiates) in [
             ("postgres://u@127.0.0.1/app?sslmode=prefer", false),
             ("postgres://u@[::1]/app?sslmode=prefer", false),
             ("postgres://u@localhost/app?sslmode=prefer", false),
@@ -863,49 +856,63 @@ mod tests {
         ] {
             let options = PgConnectOptions::from_str(url).unwrap();
             assert_eq!(
-                transport_check(&options).needs_server_check(),
-                asks_server,
+                transport_check(&options).negotiates_tls(),
+                negotiates,
                 "{url}"
             );
         }
     }
 
-    /// pg_stat_ssl 답을 연결의 전송 상태로 바꾼다. 행이 없거나 질의가 실패하면 암호화를
-    /// 주장하지 않고 원인을 남긴다.
+    /// 여는 방식은 sslmode만 바꾸고 접속 대상과 다른 인자는 URL 그대로 둔다. PgSslMode에는
+    /// 비교 연산이 없어 Debug 표기로 본다.
     #[test]
-    fn pg_stat_ssl_answers_become_transport_observations() {
-        assert_eq!(transport_from_answer(Ok(Some(true))), Transport::Encrypted);
-        assert_eq!(transport_from_answer(Ok(Some(false))), Transport::Plaintext);
-        assert!(matches!(
-            transport_from_answer(Ok(None)),
-            Transport::Unconfirmed(cause) if cause.contains("pg_stat_ssl")
-        ));
-        assert!(matches!(
-            transport_from_answer(Err(sqlx::Error::PoolTimedOut)),
-            Transport::Unconfirmed(cause) if cause.contains("pg_stat_ssl")
-        ));
+    fn connect_modes_change_only_the_ssl_mode() {
+        let url = "postgres://u@db.example:6543/app?sslmode=prefer&sslrootcert=/etc/ca.pem";
+        let options = PgConnectOptions::from_str(url).unwrap();
+        for (mode, ssl_mode) in [
+            (ConnectMode::AsGiven, "Prefer"),
+            (ConnectMode::RequireTls, "Require"),
+            (ConnectMode::Plaintext, "Disable"),
+        ] {
+            let opened = options_for(&options, mode);
+            assert_eq!(format!("{:?}", opened.get_ssl_mode()), ssl_mode, "{mode:?}");
+            assert_eq!(opened.get_host(), "db.example");
+            assert_eq!(opened.get_port(), 6543);
+            assert_eq!(opened.get_database(), Some("app"));
+        }
     }
 
-    /// 원격 평문 연결의 limitation은 PostgreSQL URL 인자로 해결 방향을 말한다.
+    /// 원격 평문 연결의 limitation은 PostgreSQL URL 인자로 해결 방향을 말한다. 모드로 끈
+    /// 평문과 서버가 TLS를 거절한 평문은 원인 문구로 갈린다.
     #[test]
     fn remote_plaintext_limitation_names_the_postgres_remedy() {
-        let check = TransportCheck::new(false, TlsPolicy::Never);
-        let mut doc = CatalogDocument {
-            context: None,
-            dependencies: vec![],
-            version: DOCUMENT_VERSION,
-            dialect: "postgres".into(),
-            reader: "native-sqlx".into(),
-            schemas: vec![],
-            limitations: vec![],
+        let limitation = |transport: Transport| {
+            let mut doc = CatalogDocument {
+                context: None,
+                dependencies: vec![],
+                version: DOCUMENT_VERSION,
+                dialect: "postgres".into(),
+                reader: "native-sqlx".into(),
+                schemas: vec![],
+                limitations: vec![],
+            };
+            transport.record_limitation(&mut doc, TLS_REMEDY);
+            doc.limitations
         };
-        check.record_limitation(&mut doc, TLS_REMEDY);
         assert_eq!(
-            doc.limitations,
+            limitation(Transport::Plaintext),
             [
                 "connection-not-encrypted: the catalog was read over an unencrypted connection; \
               use sslmode=verify-full (with sslrootcert=<CA file> for a private CA) to require \
               a verified TLS connection"
+            ]
+        );
+        assert_eq!(
+            limitation(Transport::TlsRefused),
+            [
+                "connection-not-encrypted: the server did not accept TLS, so the catalog was read \
+              over an unencrypted connection; use sslmode=verify-full (with sslrootcert=<CA \
+              file> for a private CA) to require a verified TLS connection"
             ]
         );
     }

@@ -5,13 +5,17 @@
 //!
 //! PostgreSQL·MySQL URL은 가짜 서버로 접속의 첫 메시지를 본다. 기본 접속이 TLS를 먼저
 //! 청하는지, `sslmode=disable`·`ssl-mode=DISABLED`가 그 요청을 끄는지, TLS를 요구한 접속이
-//! 서버가 거절하면 종료 2로 끝나는지를 서버 없이 고정한다.
+//! 서버가 거절하면 종료 2로 끝나는지를 서버 없이 고정한다. 네트워크 호스트의 기본 접속은
+//! 접속 순서까지 본다. TLS를 요구해 먼저 붙고, 서버가 TLS를 거절했을 때만 새 평문 접속으로
+//! 다시 붙으며, 핸드셰이크가 실패하면 다시 붙지 않는다.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -148,6 +152,13 @@ const MYSQL_SSL_REQUEST_LEN: usize = 32;
 /// 가짜 서버가 접속과 첫 메시지를 기다리는 상한. 클라이언트가 오지 않아도 테스트가 멈추지 않는다.
 const FAKE_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// reader가 네트워크를 지나는 접속으로 분류하는 주소. 루프백 주소가 아니지만 Linux·macOS
+/// 커널은 0.0.0.0으로 가는 접속을 자기 호스트로 보내므로, 루프백 가짜 서버로 원격 경로를 탄다.
+const NETWORK_HOST: &str = "0.0.0.0";
+
+/// 가짜 서버가 접속 하나와 나누는 교환. 클라이언트가 보낸 바이트를 돌려준다.
+type Exchange = Box<dyn FnOnce(&mut TcpStream) -> Vec<u8> + Send>;
+
 /// libpq 환경 변수(`PGSSLMODE` 등)를 지우고 scan한다.
 ///
 /// sqlx는 이 변수로 기본 sslmode·호스트를 바꾼다. 개발자 환경과 무관하게 URL만으로
@@ -181,6 +192,68 @@ where
             .unwrap_or_default()
     });
     (port, server)
+}
+
+/// 루프백에 가짜 서버를 띄워 들어오는 접속마다 `exchanges`를 차례로 돌린다. 교환이 바닥난
+/// 뒤의 접속은 첫 8바이트만 받는다. scan이 끝났다고 `finished`가 켜진 뒤 대기열이 비면 멈추고,
+/// 접속마다 받은 바이트를 순서대로 돌려준다. 접속 수로 reader가 다시 붙었는지를 판정한다.
+fn fake_server_sessions(
+    exchanges: Vec<Exchange>,
+    finished: Arc<AtomicBool>,
+) -> (u16, JoinHandle<Vec<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let server = thread::spawn(move || {
+        let mut exchanges = exchanges.into_iter();
+        let mut sessions = Vec::new();
+        let deadline = Instant::now() + FAKE_SERVER_TIMEOUT;
+        while let Some(mut stream) = next_session(&listener, &finished, deadline) {
+            let exchange = exchanges.next().unwrap_or_else(|| Box::new(first_message));
+            sessions.push(exchange(&mut stream));
+        }
+        sessions
+    });
+    (port, server)
+}
+
+/// 다음 접속을 받는다. `finished`를 accept보다 먼저 읽으므로, scan이 끝난 뒤에 본 빈
+/// 대기열이면 더 올 접속이 없다(None). 상한이 지나도 None이다.
+fn next_session(
+    listener: &TcpListener,
+    finished: &AtomicBool,
+    deadline: Instant,
+) -> Option<TcpStream> {
+    loop {
+        let done = finished.load(Ordering::SeqCst) || Instant::now() >= deadline;
+        match listener.accept() {
+            Ok((stream, _)) => return Some(blocking_with_timeout(stream)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if done {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("fake server could not accept a connection: {error}"),
+        }
+    }
+}
+
+/// 예상하지 않은 접속의 교환. 무엇을 보냈는지 실패 메시지에 보이도록 첫 8바이트를 받는다.
+fn first_message(stream: &mut TcpStream) -> Vec<u8> {
+    read_up_to(stream, PG_SSL_REQUEST.len())
+}
+
+/// 가짜 서버 앞에서 scan을 돌리고, scan이 끝난 뒤 서버가 접속마다 받은 바이트를 모은다.
+fn scan_against(
+    exchanges: Vec<Exchange>,
+    scan: impl FnOnce(u16) -> Output,
+) -> (Output, Vec<Vec<u8>>) {
+    let finished = Arc::new(AtomicBool::new(false));
+    let (port, server) = fake_server_sessions(exchanges, Arc::clone(&finished));
+    let output = scan(port);
+    finished.store(true, Ordering::SeqCst);
+    (output, server.join().unwrap())
 }
 
 /// 상한 안에 들어온 접속 하나를 받는다. 클라이언트가 오지 않으면 None이다.
@@ -239,17 +312,43 @@ fn postgres_exchange(reply: Option<u8>) -> impl FnOnce(&mut TcpStream) -> Vec<u8
     }
 }
 
-/// HandshakeV10을 보내고 클라이언트의 첫 패킷(4바이트 머리와 페이로드)을 읽는다.
+/// CLIENT_SSL을 광고하는 HandshakeV10을 보내고 클라이언트의 첫 패킷을 읽는다.
 fn mysql_exchange(stream: &mut TcpStream) -> Vec<u8> {
-    stream
-        .write_all(&mysql_packet(0, MYSQL_HANDSHAKE_V10))
-        .expect("send HandshakeV10");
-    let mut packet = read_up_to(stream, 4);
-    if let [low, middle, high, _] = packet[..] {
-        let length = u32::from_le_bytes([low, middle, high, 0]) as usize;
-        packet.extend(read_up_to(stream, length.min(4096)));
+    mysql_exchange_with(MYSQL_HANDSHAKE_V10.to_vec())(stream)
+}
+
+/// HandshakeV10 `handshake`를 보내고 클라이언트의 첫 패킷(4바이트 머리와 페이로드)을 읽는다.
+/// 클라이언트가 답하지 않고 접속을 닫으면 빈 바이트다.
+fn mysql_exchange_with(handshake: Vec<u8>) -> impl FnOnce(&mut TcpStream) -> Vec<u8> + Send {
+    move |stream| {
+        stream
+            .write_all(&mysql_packet(0, &handshake))
+            .expect("send HandshakeV10");
+        let mut packet = read_up_to(stream, 4);
+        if let [low, middle, high, _] = packet[..] {
+            let length = u32::from_le_bytes([low, middle, high, 0]) as usize;
+            packet.extend(read_up_to(stream, length.min(4096)));
+        }
+        packet
     }
-    packet
+}
+
+/// CLIENT_SSL을 광고하지 않는 HandshakeV10. TLS를 끈 서버나, 그 비트를 지운 중간자가 보내는
+/// 모양이다. 프로토콜 버전 1바이트, NUL로 끝나는 서버 버전, 접속 id 4바이트, 인증 자료 8바이트,
+/// 채움 1바이트 뒤에 능력 비트 하위 2바이트(리틀 엔디언)가 온다.
+fn mysql_handshake_without_tls() -> Vec<u8> {
+    let mut handshake = MYSQL_HANDSHAKE_V10.to_vec();
+    let version_end = 1 + handshake[1..].iter().position(|&byte| byte == 0).unwrap();
+    let at = version_end + 1 + 4 + 8 + 1;
+    let lower = u16::from_le_bytes([handshake[at], handshake[at + 1]]);
+    assert_ne!(
+        u32::from(lower) & MYSQL_CLIENT_SSL,
+        0,
+        "the sample must offer TLS"
+    );
+    let without_tls = lower & !(MYSQL_CLIENT_SSL as u16);
+    handshake[at..at + 2].copy_from_slice(&without_tls.to_le_bytes());
+    handshake
 }
 
 /// MySQL 패킷 머리(3바이트 길이와 1바이트 순번)를 페이로드 앞에 붙인다.
@@ -330,6 +429,74 @@ fn mysql_ssl_mode_disabled_answers_without_tls() {
     let output = scan(dir.path(), &url);
     let packet = server.join().unwrap();
     assert_eq!(mysql_client_capabilities(&packet) & MYSQL_CLIENT_SSL, 0);
+    let after_fixed_fields = &packet[4 + MYSQL_SSL_REQUEST_LEN..];
+    assert!(after_fixed_fields.starts_with(b"reader\0"), "{packet:?}");
+    assert_redacted_error(&output, "database scan failed", &["FAKEPW8"]);
+}
+
+/// 네트워크 호스트의 기본 PostgreSQL URL은 TLS를 요구해 먼저 붙는다. 서버가 거절하면(`N`) 그
+/// 접속에 아무것도 더 보내지 않고 닫은 뒤, TLS를 청하지 않는 새 접속(StartupMessage)으로 다시
+/// 붙는다. 거절한 접속에서 평문으로 이어 가지 않으므로, 이후 연결이 평문이라는 사실을 서버에
+/// 묻지 않고 reader가 안다(서버의 답은 평문 구간에서 위조될 수 있다).
+#[test]
+fn remote_default_postgres_url_reconnects_without_tls_after_the_server_refuses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let refuse: Exchange = Box::new(|stream| {
+        let mut received = postgres_exchange(Some(b'N'))(stream);
+        // 거절 뒤 같은 접속으로 보낸 바이트가 있으면 함께 남긴다 — 있으면 안 된다.
+        received.extend(read_up_to(stream, PG_SSL_REQUEST.len()));
+        received
+    });
+    let exchanges = vec![refuse, Box::new(postgres_exchange(None)) as Exchange];
+    let (output, sessions) = scan_against(exchanges, |port| {
+        let url = format!("postgres://reader:FAKEPW7@{NETWORK_HOST}:{port}/app");
+        scan_without_libpq_env(dir.path(), &url)
+    });
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    assert_eq!(sessions[0], PG_SSL_REQUEST, "{sessions:?}");
+    assert_eq!(sessions[1].len(), 8, "{sessions:?}");
+    assert_eq!(sessions[1][4..], PG_PROTOCOL_3_0, "{sessions:?}");
+    assert_redacted_error(&output, "database scan failed", &["FAKEPW7"]);
+}
+
+/// 서버가 TLS를 받겠다고 한 뒤(`S`) 핸드셰이크가 실패하면 평문으로 다시 붙지 않고 종료 2로
+/// 끝난다. 평문 재접속은 서버가 TLS를 거절했을 때뿐이다(sqlx 자체 prefer와 같다).
+#[test]
+fn remote_default_postgres_url_does_not_retry_without_tls_after_a_failed_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let exchanges = vec![Box::new(postgres_exchange(Some(b'S'))) as Exchange];
+    let (output, sessions) = scan_against(exchanges, |port| {
+        let url = format!("postgres://reader:FAKEPW7@{NETWORK_HOST}:{port}/app");
+        scan_without_libpq_env(dir.path(), &url)
+    });
+    assert_eq!(sessions, [PG_SSL_REQUEST.to_vec()]);
+    assert_redacted_error(&output, "database scan failed", &["FAKEPW7"]);
+}
+
+/// 네트워크 호스트의 기본 MySQL URL도 TLS를 요구해 먼저 붙는다. 서버가 CLIENT_SSL을 광고하지
+/// 않으면 인증 응답 없이 그 접속을 닫고, CLIENT_SSL을 끈 새 접속으로 다시 붙어 평문으로 인증한다.
+#[test]
+fn remote_default_mysql_url_reconnects_without_tls_when_the_server_lacks_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = mysql_handshake_without_tls();
+    let exchanges: Vec<Exchange> = vec![
+        Box::new(mysql_exchange_with(handshake.clone())),
+        Box::new(mysql_exchange_with(handshake)),
+    ];
+    let (output, sessions) = scan_against(exchanges, |port| {
+        scan(
+            dir.path(),
+            &format!("mysql://reader:FAKEPW8@{NETWORK_HOST}:{port}/app"),
+        )
+    });
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    assert!(
+        sessions[0].is_empty(),
+        "answered without TLS: {:?}",
+        sessions[0]
+    );
+    let packet = &sessions[1];
+    assert_eq!(mysql_client_capabilities(packet) & MYSQL_CLIENT_SSL, 0);
     let after_fixed_fields = &packet[4 + MYSQL_SSL_REQUEST_LEN..];
     assert!(after_fixed_fields.starts_with(b"reader\0"), "{packet:?}");
     assert_redacted_error(&output, "database scan failed", &["FAKEPW8"]);
