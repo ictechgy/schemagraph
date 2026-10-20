@@ -120,6 +120,10 @@ probe matches by exact schema, table, and constraint name. Joining the two
 constraint row with every key-column row (a block nested-loop join without an
 index): for 4,000 tables that one query took about 4 s, and its time grew with
 the square of the table count. Read separately, each half took about 0.05 s.
+A table in which two constraints share a name, such as a `UNIQUE` key and a
+foreign key, is the exception. The previous probe merged such constraints into
+one, and the server's join order decided its kind and column order, so the
+probe still reads that table's constraints with the previous per-table join.
 
 Routine parameters are read once per schema as well, except for routine names
 that the server's case- and accent-insensitive comparison could match with

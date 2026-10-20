@@ -42,8 +42,10 @@ These changes are not yet in a published release.
   parameters are still read one routine at a time for names that the server's
   case- and accent-insensitive comparison could match with another name, and
   for every routine of a schema with a routine name that is not printable
-  ASCII or that ends with a space. Successful collections produce the same
-  output, apart from the constraint change above.
+  ASCII or that ends with a space. Constraints are still read one table at a
+  time for a table in which two constraints share a name, such as a `UNIQUE`
+  key and a foreign key. Successful collections produce the same output, apart
+  from the constraint change above.
   A failed schema-wide catalog query now leaves that part empty for every
   object in the schema and records its usual limitation once. If the
   schema-wide routine parameter query fails, every routine in the schema
