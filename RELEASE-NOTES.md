@@ -2,6 +2,21 @@
 
 These changes are not yet in a published release.
 
+## Breaking
+
+- MCP tool results carry their JSON report once, as compact JSON with sorted
+  keys in `content[0].text`. `structuredContent` is no longer sent, and the
+  text is no longer pretty-printed. Clients and scripts that read
+  `structuredContent` must parse the text content instead. Apart from the new
+  MCP bounds listed under Changed, the report value is the same as before, and
+  `resources/read` responses are unchanged.
+- `query` and `impact` with `--format language-traversal` now exit 64 instead
+  of 1 when a subject cannot be resolved. The document with the
+  `root-not-found:` limitation is still written. This matches the other isthmus
+  language-traversal producers and the partial-success rule of
+  `isthmus capture`; scripts that accepted exit 1 must accept 64. Usage and
+  engine errors still exit 2, and the default JSON `notFound` still exits 1.
+
 ## Security
 
 - The native PostgreSQL and MySQL/MariaDB readers are now built with TLS
@@ -73,6 +88,13 @@ These changes are not yet in a published release.
   a warning until `chmod go-w` is applied to it.
 - On non-Unix builds, which cannot check file ownership or open files without
   following symbolic links, `--cache-dir` is disabled with a warning.
+- MCP `stats`, `cycles`, and `diagnostics` accept `max` (default 1024, at most
+  10000) and keep the first `max` entries in CLI order. Only a cut list adds
+  `truncated: true`, and `cycles` then also adds the full count as `total`;
+  `stats` `totals` and `diagnostics` `summary` still count every entry. MCP
+  not-found results list at most 64 `candidates` and add `candidatesTotal` and
+  `candidatesTruncated: true` when cut. A `max` outside that range is rejected
+  with JSON-RPC error -32602. CLI output is unchanged.
 
 # schemagraph 0.7.1
 
