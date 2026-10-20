@@ -177,10 +177,11 @@ func (h *harvester) mysqlRelationDetails(schema string, objects []ObjectDoc) {
 	}
 }
 
-// mysqlPrimaryKeyPositions는 테이블마다 PK 컬럼의 PK 안 위치(1부터)를 읽는다.
+// mysqlPrimaryKeyPositions는 테이블마다 PK 컬럼의 PK 안 위치(1부터)를 읽는다. 끝까지 읽지 못하면 모든 위치를 비운다
+// (일부 테이블에만 위치가 남지 않게).
 func (h *harvester) mysqlPrimaryKeyPositions(schema string) map[string]map[string]int {
 	positions := map[string]map[string]int{}
-	h.mysqlRows("primary key columns", `
+	complete := h.mysqlRows("primary key columns", `
 		SELECT CAST(table_name AS CHAR), CAST(column_name AS CHAR), CAST(ordinal_position AS SIGNED)
 		FROM information_schema.key_column_usage
 		WHERE table_schema = ? AND constraint_name = 'PRIMARY'
@@ -196,14 +197,18 @@ func (h *harvester) mysqlPrimaryKeyPositions(schema string) map[string]map[strin
 		positions[table][name] = position
 		return nil
 	})
+	if !complete {
+		return map[string]map[string]int{}
+	}
 	return positions
 }
 
 // mysqlSchemaColumns는 스키마의 컬럼을 테이블마다 ordinal_position 순으로 읽어 나누고, PK 컬럼에 PK 안 위치를 단다.
+// 컬럼을 끝까지 읽지 못하면 모든 테이블의 컬럼을 비운다(일부 컬럼만 남지 않게).
 func (h *harvester) mysqlSchemaColumns(schema string) map[string][]ColumnDoc {
 	pkPositions := h.mysqlPrimaryKeyPositions(schema)
 	columns := map[string][]ColumnDoc{}
-	h.mysqlRows("columns", `
+	complete := h.mysqlRows("columns", `
 		SELECT CAST(table_name AS CHAR), CAST(column_name AS CHAR), CAST(data_type AS CHAR), CAST(is_nullable AS CHAR),
 		       CAST(column_default AS CHAR), CAST(ordinal_position AS SIGNED)
 		FROM information_schema.columns
@@ -217,6 +222,9 @@ func (h *harvester) mysqlSchemaColumns(schema string) map[string][]ColumnDoc {
 		columns[table] = append(columns[table], ColumnDoc{Name: name, DataType: dataType, Nullable: nullable == "YES", Default: ns(def), Ordinal: ordinal, PkPosition: pkPositions[table][name]})
 		return nil
 	})
+	if !complete {
+		return map[string][]ColumnDoc{}
+	}
 	return columns
 }
 
@@ -230,8 +238,9 @@ func (h *harvester) mysqlSchemaColumns(schema string) map[string][]ColumnDoc {
 // 한 제약 안의 키 순서는 ordinal_position으로 정해진다. 서버 조인은 MariaDB에서 대소문자·악센트만 다른 테이블·스키마의
 // 같은 이름 제약(PRIMARY, 이름이 같은 UNIQUE)끼리도 짝지었지만, 그런 행은 소유자 검사에서 버리던 것이다. 네이티브
 // reader(engine/source/src/mysql.rs)도 제약마다 키 컬럼을 정확한 테이블·제약 이름으로 물어 같은 결과를 낸다.
-// 키 컬럼을 끝까지 읽지 못하면 일부 컬럼만 가진 제약을 내지 않도록 그 스키마의 제약을 모두 비운다(limitation은 남는다).
-// 이름이 같은 제약 행이 둘 이상인 테이블만 예외로, mysqlSharedNameConstraints가 예전 서버 조인으로 다시 읽는다.
+// 키 컬럼이나 제약 행을 끝까지 읽지 못하면 일부 컬럼만 가진 제약이나 일부 제약만 내지 않도록 그 스키마의 제약을 모두
+// 비운다(limitation은 남는다). 이름이 같은 제약 행이 둘 이상인 테이블만 예외로, mysqlSharedNameConstraints가 예전
+// 서버 조인으로 다시 읽는다.
 func (h *harvester) mysqlSchemaConstraints(schema string) map[string][]ConstraintDoc {
 	keys, complete := h.mysqlSchemaKeyColumns(schema)
 	if !complete {
@@ -241,7 +250,7 @@ func (h *harvester) mysqlSchemaConstraints(schema string) map[string][]Constrain
 	rowsPerName := map[string]int{}
 	sharedTables := map[string]bool{}
 	shared := []string{}
-	h.mysqlRows("constraints", `
+	complete = h.mysqlRows("constraints", `
 		SELECT CAST(table_name AS CHAR), CAST(constraint_name AS CHAR), CAST(constraint_type AS CHAR)
 		FROM information_schema.table_constraints
 		WHERE table_schema = ? AND constraint_type IN ('PRIMARY KEY','FOREIGN KEY','UNIQUE','CHECK')
@@ -267,6 +276,9 @@ func (h *harvester) mysqlSchemaConstraints(schema string) map[string][]Constrain
 		}
 		return nil
 	})
+	if !complete {
+		return map[string][]ConstraintDoc{}
+	}
 	constraints := groups.lists()
 	for _, table := range shared {
 		constraints[table] = h.mysqlSharedNameConstraints(schema, table)
@@ -393,10 +405,11 @@ func mysqlConstraintKind(kind string) string {
 // mysqlSchemaIndexes는 PRIMARY가 아닌 인덱스를 스키마마다 한 번 읽어 테이블 이름별로 나눈다. 테이블 안의 순서는
 // 테이블마다 읽던 때와 같은 (인덱스 이름, 키 순서)다. 이름 없는 키 컬럼(MySQL functional index)은 컬럼에 넣지 않고
 // 정의를 불완전으로 표시하며, 그 수를 테이블마다 돌려준다 — limitation은 객체 목록에 있는 테이블에만 남긴다.
+// 끝까지 읽지 못하면 모든 테이블의 인덱스와 그 수를 비운다(일부 인덱스·키 컬럼만 남지 않게).
 func (h *harvester) mysqlSchemaIndexes(schema string) (map[string][]IndexDoc, map[string]int) {
 	groups := newRelationGroups[IndexDoc]()
 	expressionColumns := map[string]int{}
-	h.mysqlRows("indexes", `
+	complete := h.mysqlRows("indexes", `
 		SELECT CAST(table_name AS CHAR), CAST(index_name AS CHAR), CAST(non_unique AS SIGNED), CAST(column_name AS CHAR)
 		FROM information_schema.statistics
 		WHERE table_schema = ? AND index_name <> 'PRIMARY'
@@ -418,14 +431,17 @@ func (h *harvester) mysqlSchemaIndexes(schema string) (map[string][]IndexDoc, ma
 		}
 		return nil
 	})
+	if !complete {
+		return map[string][]IndexDoc{}, map[string]int{}
+	}
 	return groups.lists(), expressionColumns
 }
 
 // mysqlSchemaTriggers는 트리거를 스키마마다 한 번 읽어 대상 테이블 이름별로 나눈다. MySQL 트리거는 대상 테이블과 같은
-// 스키마에만 있으므로 trigger_schema로 고른다(테이블마다 읽던 때와 같은 조건).
+// 스키마에만 있으므로 trigger_schema로 고른다(테이블마다 읽던 때와 같은 조건). 끝까지 읽지 못하면 모든 트리거를 비운다.
 func (h *harvester) mysqlSchemaTriggers(schema string) map[string][]TriggerDoc {
 	triggers := map[string][]TriggerDoc{}
-	h.mysqlRows("triggers", `
+	complete := h.mysqlRows("triggers", `
 		SELECT CAST(event_object_table AS CHAR), CAST(trigger_name AS CHAR), CAST(action_statement AS CHAR)
 		FROM information_schema.triggers WHERE trigger_schema = ?
 		ORDER BY event_object_table, trigger_name`, []any{schema}, func(rows *sql.Rows) error {
@@ -437,6 +453,9 @@ func (h *harvester) mysqlSchemaTriggers(schema string) map[string][]TriggerDoc {
 		triggers[table] = append(triggers[table], TriggerDoc{Name: name, Body: ns(body)})
 		return nil
 	})
+	if !complete {
+		return map[string][]TriggerDoc{}
+	}
 	return triggers
 }
 
@@ -720,9 +739,9 @@ func (h *harvester) mysqlObjectUsage(schema string, objects []ObjectDoc) {
 }
 
 // mysqlRows는 metadata query 실패를 빈 성공으로 숨기지 않고 limitation으로
-// 기록한다. 개별 테이블의 선택적 metadata는 그 테이블만 비워 진행한다.
-// 끝까지 읽었으면 true다. 일부만 읽은 키 컬럼으로 제약을 내지 않아야 하는 호출(mysqlSchemaKeyColumns,
-// mysqlSharedNameConstraints)만 이 값을 본다.
+// 기록한다. 끝까지 읽었으면 true다. 스키마 단위 세부 조회(컬럼·PK 위치·제약·키 컬럼·인덱스·트리거)는 false면
+// 그때까지 읽은 행도 버리고 그 부분을 스키마의 모든 객체에서 비운다 — 커서가 도중에 끊기면 어느 객체까지
+// 채워지는지가 실패 시점에 따라 달라지기 때문이다. 객체 목록·뷰 본문·routine 같은 나머지 호출은 이 값을 보지 않는다.
 func (h *harvester) mysqlRows(label, query string, args []any, scan func(*sql.Rows) error) bool {
 	rows, err := h.db.Query(query, args...)
 	if err != nil {

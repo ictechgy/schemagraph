@@ -242,6 +242,14 @@ func TestMySQLSchemaBatchFailureIsReportedOncePerSchema(t *testing.T) {
 			}
 			return reply
 		}},
+		// 제약 행 커서가 끝에서 실패하면 그때까지 만든 제약도 내지 않는다(일부 제약만 남지 않게).
+		{name: "constraint cursor", reply: func(query string, args []driver.NamedValue) scriptedReply {
+			reply := mysqlCatalogReply(query, args)
+			if strings.Contains(query, "FROM information_schema.table_constraints") {
+				reply.rowsErr = failure
+			}
+			return reply
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -265,6 +273,64 @@ func TestMySQLSchemaBatchFailureIsReportedOncePerSchema(t *testing.T) {
 				}
 			}
 			if columns := mysqlObjectsByName(objects)["orders"].Columns; len(columns) != 3 {
+				t.Fatalf("other batch queries must still fill the schema: %#v", columns)
+			}
+		})
+	}
+}
+
+// 스키마 단위 세부 조회의 커서가 도중에 실패하면(rows.Err) 그때까지 읽은 행도 쓰지 않고 그 부분을 스키마의 모든
+// 객체에서 비운다. 남기면 어느 객체·컬럼·인덱스까지 채워지는지가 실패 시점에 따라 달라진다. limitation은 예전 문구로
+// 한 번 남고 미완전으로 표시된다. 제약은 TestMySQLSchemaBatchFailureIsReportedOncePerSchema가 본다.
+func TestMySQLSchemaBatchCursorFailureLeavesThatPartEmpty(t *testing.T) {
+	failure := fmt.Errorf("injected cursor failure")
+	tests := []struct {
+		label string
+		match func(string) bool
+		empty func(ObjectDoc) bool
+	}{
+		{label: "columns", match: func(query string) bool { return strings.Contains(query, "FROM information_schema.columns") },
+			empty: func(object ObjectDoc) bool { return len(object.Columns) == 0 }},
+		{label: "primary key columns", match: func(query string) bool {
+			return strings.Contains(query, "FROM information_schema.key_column_usage") && strings.Contains(query, "'PRIMARY'")
+		}, empty: func(object ObjectDoc) bool {
+			return !slices.ContainsFunc(object.Columns, func(column ColumnDoc) bool { return column.PkPosition != 0 })
+		}},
+		{label: "indexes", match: func(query string) bool { return strings.Contains(query, "FROM information_schema.statistics") },
+			empty: func(object ObjectDoc) bool { return len(object.Indexes) == 0 }},
+		{label: "triggers", match: func(query string) bool { return strings.Contains(query, "FROM information_schema.triggers") },
+			empty: func(object ObjectDoc) bool { return len(object.Triggers) == 0 }},
+	}
+	for _, test := range tests {
+		t.Run(test.label, func(t *testing.T) {
+			db, _ := newScriptedDB(func(query string, args []driver.NamedValue) scriptedReply {
+				reply := mysqlCatalogReply(query, args)
+				if test.match(query) {
+					reply.rowsErr = failure
+				}
+				return reply
+			})
+			defer closeScriptedDB(t, db)
+			h := &harvester{db: db, dialect: "mysql", schemaFilter: map[string]bool{"app": true}}
+			objects := h.mysqlObjects("app")
+			h.mysqlRelationDetails("app", objects)
+			failures := 0
+			for _, limitation := range h.limitations {
+				if limitation == test.label+" unavailable — injected cursor failure" {
+					failures++
+				} else if test.label == "indexes" && strings.Contains(limitation, "functional index") {
+					t.Fatalf("a failed index read must not report functional index columns: %q", h.limitations)
+				}
+			}
+			if failures != 1 || !h.catalogIncomplete {
+				t.Fatalf("%s failure must be reported once and mark the catalog incomplete: %q", test.label, h.limitations)
+			}
+			for _, object := range objects {
+				if !test.empty(object) {
+					t.Fatalf("%s: %s kept rows read before the cursor failed: %#v", object.Name, test.label, object)
+				}
+			}
+			if columns := mysqlObjectsByName(objects)["orders"].Columns; test.label != "columns" && len(columns) != 3 {
 				t.Fatalf("other batch queries must still fill the schema: %#v", columns)
 			}
 		})
