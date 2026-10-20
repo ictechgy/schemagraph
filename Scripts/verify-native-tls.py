@@ -76,6 +76,12 @@ EXPECTED_LIMITATION = {EXPECT_PLAINTEXT: PLAINTEXT_BY_MODE, EXPECT_REFUSED: PLAI
 PG_SSL_REQUEST = bytes([0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F])
 # 중간자 중계가 한쪽을 기다리는 상한(초). scan 하나보다 넉넉하다.
 RELAY_IDLE_SECONDS = 60
+# 중간자 리스너가 멈춤 요청을 확인하는 accept 대기 간격(초). Linux는 다른 스레드가 리스닝
+# 소켓을 닫아도 막힌 accept를 깨우지 않으므로(macOS는 ECONNABORTED로 깨운다), 닫아서 끝내지
+# 않고 이 간격마다 요청을 본다.
+ACCEPT_POLL_SECONDS = 0.2
+# 멈춤 요청 뒤 리스너 스레드를 기다리는 상한(초). accept 대기 간격보다 넉넉하다. 넘기면 실패로 낸다.
+PROXY_STOP_SECONDS = 10
 
 # MySQL·MariaDB 사례가 쓸 데이터베이스다. Scripts/wait-mysql-ready.py가 이 이름으로 최종
 # 서버의 TCP 준비를 확인한다(fixture 하네스와 같은 절차).
@@ -416,8 +422,11 @@ class DowngradeProxy:
         self.upstream_port = upstream_port
         self.cafile = cafile
         self.listener = socket.create_server(('127.0.0.1', 0))
+        # accept가 이 간격마다 돌아와 serve가 멈춤 요청을 본다. 받은 접속은 blocking으로 온다.
+        self.listener.settimeout(ACCEPT_POLL_SECONDS)
         self.port = self.listener.getsockname()[1]
         self.errors = []
+        self.stopping = threading.Event()
         self.thread = threading.Thread(target=self.serve, daemon=True)
 
     def __enter__(self):
@@ -425,15 +434,26 @@ class DowngradeProxy:
         return self
 
     def __exit__(self, *exc_info):
+        """멈춤을 요청하고, serve가 accept에서 나와 끝난 뒤에 리스너를 닫아 포트를 바로 놓는다.
+
+        리스너를 먼저 닫아 accept를 끝내지 않는다. Linux에서는 막힌 accept가 깨지 않아 join이 상한을
+        다 기다리고, 그 accept가 소켓을 붙잡아 프로세스가 끝날 때까지 포트가 LISTEN으로 남는다.
+        """
+        self.stopping.set()
+        self.thread.join(timeout=PROXY_STOP_SECONDS)
+        if self.thread.is_alive():
+            self.errors.append(f'the proxy listener did not stop within {PROXY_STOP_SECONDS} seconds')
         self.listener.close()
-        self.thread.join(timeout=10)
 
     def serve(self):
-        """접속마다 중계 스레드를 띄운다. __exit__가 리스너를 닫으면 accept가 OSError로 끝난다."""
-        while True:
+        """접속마다 중계 스레드를 띄운다. __exit__가 멈춤을 요청하면 다음 accept 대기 뒤에 끝난다."""
+        while not self.stopping.is_set():
             try:
                 client, _ = self.listener.accept()
-            except OSError:
+            except socket.timeout:  # Python 3.9에서는 TimeoutError의 별칭이 아니라 이 이름으로 받는다.
+                continue
+            except OSError as error:  # 리스너는 serve가 끝난 뒤에 닫히므로 실제 실패다(사례 판정이 낸다).
+                self.errors.append(f'accept failed: {type(error).__name__}: {error}')
                 return
             threading.Thread(target=self.handle, args=(client,), daemon=True).start()
 
