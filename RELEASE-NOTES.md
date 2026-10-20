@@ -49,11 +49,15 @@ These changes are not yet in a published release.
   socket or a loopback address (`127.0.0.0/8`, `::1`, `localhost`) records a
   `connection-not-encrypted:` limitation in the catalog document and the graph.
   `sslmode=disable`, `sslmode=allow`, and `ssl-mode=DISABLED` always record it
-  for such a host. In the default mode the reader asks the server whether the
-  session uses TLS (`pg_stat_ssl`, `Ssl_cipher`); if the server cannot answer,
-  the limitation says that encryption could not be confirmed. Loopback and
-  Unix-socket scans, including the fixtures, produce the same output as before,
-  and `catalog_complete` is unchanged.
+  for such a host. In the default mode the reader first connects to such a
+  host as `sslmode=require` / `ssl-mode=REQUIRED` does and reconnects without
+  TLS only when the server refuses TLS; the limitation then says that the
+  server did not accept TLS. The reader decides from its own TLS negotiation,
+  not from the server's report of the session, so a proxy that refuses TLS
+  toward the reader cannot hide the limitation. The limitation describes the
+  reader's own connection, not the onward connection from a pooler or proxy
+  to the database. Loopback and Unix-socket scans, including the fixtures,
+  produce the same output as before, and `catalog_complete` is unchanged.
 - New dependencies, pinned by `engine/Cargo.lock`: rustls 0.23.43,
   rustls-webpki 0.103.14, rustls-pki-types 1.15.1, ring 0.17.14, untrusted
   0.9.0, and webpki-roots 0.26.11 and 1.0.10. The root certificate data in
@@ -86,9 +90,8 @@ These changes are not yet in a published release.
 - A native PostgreSQL or MySQL/MariaDB scan of a host that is not a Unix
   socket or a loopback address now adds a `connection-not-encrypted:`
   limitation to the catalog document and the graph when the catalog was read
-  over an unencrypted connection or encryption could not be confirmed (details
-  under Security). Loopback and Unix-socket scans, including the fixtures, keep
-  their output.
+  over an unencrypted connection (details under Security). Loopback and
+  Unix-socket scans, including the fixtures, keep their output.
 - Cache format version 4 makes existing `--cache-dir` entries miss once; the
   next scan rewrites them. Caches restored from another machine or CI run are
   reused only when they were written with the same `SCHEMAGRAPH_CACHE_KEY`.

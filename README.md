@@ -104,12 +104,16 @@ When a catalog is read over an unencrypted connection to a host other than a
 Unix socket or a loopback address (`127.0.0.0/8`, `::1`, or `localhost`), the
 catalog document and graph record a `connection-not-encrypted:` limitation.
 For such a host, `sslmode=disable`, `sslmode=allow`, and `ssl-mode=DISABLED`
-always record it. In the default mode the reader asks the server whether the
-session uses TLS (`pg_stat_ssl`, `Ssl_cipher`); if the server cannot answer,
-the limitation says that encryption could not be confirmed. Behind a
-connection pooler or proxy, that answer describes the pooler's connection to
-the server, so use a verify mode when the connection must be encrypted. The
-limitation does not change `catalog_complete`.
+always record it. In the default mode the reader first connects to such a
+host as `sslmode=require` / `ssl-mode=REQUIRED` does, and reconnects without
+TLS only when the server refuses TLS; the limitation then says that the server
+did not accept TLS. A failed TLS handshake still ends the scan with exit code
+2. The reader decides from its own TLS negotiation, not from the server's
+report of the session, so a proxy that refuses TLS toward the reader cannot
+hide the limitation. The limitation describes the reader's own connection,
+not a pooler's or proxy's onward connection to the database; use a verify
+mode when the connection must be encrypted. The limitation does not change
+`catalog_complete`.
 
 The JDBC baseline collects schemas, tables, columns, keys, indexes, and
 routine metadata exposed by the driver. Body and usage collection depend on
