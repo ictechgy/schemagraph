@@ -13,48 +13,57 @@ JDBC probe does this only through pgjdbc, whose `getPrimaryKeys` and
 `getImportedKeys` treat a null table as the whole schema. Other drivers keep
 the per-object calls.
 
-A local PostgreSQL 16.13 cluster served these measurements on one macOS 26.7.1
-ARM64 host while other jobs ran (load average 3 to 7). A scratch asyncio TCP
-relay in front of the server delayed every chunk by 1 ms in each direction,
-which adds about 2 ms per round trip. The relay is not part of the repository.
-Each database holds one schema:
+`Scripts/benchmark-probe-postgres.py` produced these measurements on one macOS
+26.7.1 ARM64 host while other jobs ran (load average 5 to 17). It starts a
+private PostgreSQL 16.13 cluster with autovacuum and parallel query turned off,
+so that `pg_stat_database.xact_commit` grows by one for each autocommit
+statement a probe sends, and loads one schema of tables like these:
 
 ```sql
-CREATE SCHEMA app;
-CREATE TABLE app.t00000 (id bigint PRIMARY KEY, parent_id bigint,
-  c2 integer, c3 integer, c4 integer, c5 integer, c6 integer, c7 integer);
-CREATE INDEX t00000_parent ON app.t00000 (parent_id);
-CREATE TABLE app.t00001 (id bigint PRIMARY KEY,
-  parent_id bigint REFERENCES app.t00000 (id),
-  c2 integer, c3 integer, c4 integer, c5 integer, c6 integer, c7 integer);
-CREATE INDEX t00001_parent ON app.t00001 (parent_id);
+CREATE SCHEMA "bench_000";
+CREATE TABLE "bench_000"."table_0000" (id BIGINT NOT NULL PRIMARY KEY,
+  parent_id BIGINT, column_02 INTEGER, column_03 INTEGER, column_04 INTEGER,
+  column_05 INTEGER, column_06 INTEGER, column_07 INTEGER);
+CREATE INDEX "table_0000_parent" ON "bench_000"."table_0000" (parent_id);
+CREATE TABLE "bench_000"."table_0001" (id BIGINT NOT NULL PRIMARY KEY,
+  parent_id BIGINT, column_02 INTEGER, column_03 INTEGER, column_04 INTEGER,
+  column_05 INTEGER, column_06 INTEGER, column_07 INTEGER,
+  CONSTRAINT "table_0001_fk" FOREIGN KEY (parent_id)
+    REFERENCES "bench_000"."table_0000"(id));
+CREATE INDEX "table_0001_parent" ON "bench_000"."table_0001" (parent_id);
 -- Every later table references the one before it in the same way.
 ```
+
+With `--latency-ms 1`, every collection connects through the relay in
+`Scripts/latency-relay.py`. It delays each chunk by 1 ms in each direction,
+which adds about 2 ms per round trip.
 
 The previous Go probe and JAR were built from `835e054`. The previous JAR
 SHA-256 starts `06f479f17b64` and the changed JAR starts `b8f62ecfdfbe`. Go is
 1.27.1, and the JDBC probe ran on OpenJDK 17.0.20 with bundled pgjdbc 42.7.8.
 Each cell is the median of three fresh processes after one warm-up per build,
-with the two builds alternating. Statements are the increase of
-`pg_stat_database.xact_commit` for the database, read after the probe's backend
-exited. Every probe statement runs in autocommit, and autovacuum was off.
+with the builds alternating. Statements are the increase of `xact_commit` for
+the benchmark database, read after the probe's session ended.
 
 | Probe | Tables | Format | Before s | After s | Before statements | After statements |
 | --- | ---: | --- | ---: | ---: | ---: | ---: |
-| Go | 2,000 | JSON | 22.706 | 0.282 | 8,048 | 52 |
-| Go | 2,000 | NDJSON | 23.570 | 0.270 | 8,048 | 52 |
-| Go | 4,000 | JSON | 46.103 | 0.416 | 16,048 | 52 |
-| Go | 4,000 | NDJSON | 45.228 | 0.373 | 16,048 | 52 |
-| JDBC | 2,000 | JSON | 25.552 | 0.907 | 8,024 | 28 |
-| JDBC | 4,000 | JSON | 48.392 | 1.139 | 16,024 | 30 |
+| Go | 2,000 | JSON | 23.720 | 0.317 | 8,048 | 52 |
+| Go | 2,000 | NDJSON | 26.035 | 0.303 | 8,048 | 52 |
+| Go | 4,000 | JSON | 47.339 | 0.403 | 16,048 | 52 |
+| Go | 4,000 | NDJSON | 51.498 | 0.373 | 16,048 | 52 |
+| JDBC | 2,000 | JSON | 27.063 | 1.001 | 8,024 | 28 |
+| JDBC | 4,000 | JSON | 55.469 | 1.349 | 16,024 | 28 |
 
-Every pair wrote the same document bytes. Before the change each table added
-four statements. After it, the server logged the same 27 JDBC statements at both
-sizes. The two extra commits at 4,000 tables come from the parallel workers that
-PostgreSQL started for one schema-wide catalog query; with
-`max_parallel_workers_per_gather = 0` the count is 28. Without the relay, 4,000
-tables took 1.067 s before and 0.253 s after for Go JSON, and 3.923 s before and
-1.038 s after for JDBC JSON.
+Every pair wrote the same document bytes, and the relay recorded no connection
+errors. Before the change each table added four statements. After it, the count
+was the same at both sizes. Without the relay, 4,000 tables took 1.995 s before
+and 0.322 s after for Go JSON, and 13.168 s before and 1.270 s after for JDBC
+JSON. These direct times depend on host load more than the relay times do. An
+earlier run on the same host at load average 3 to 7 measured them as 1.067 s
+and 0.253 s for Go, and 3.923 s and 1.038 s for JDBC. That run used a scratch
+relay for its relay rows and left parallel query on. Its JDBC count at 4,000
+tables was 30, because PostgreSQL started parallel workers for one schema-wide
+catalog query; this is why the script turns parallel query off.
 
 JDBC `getColumns` takes LIKE patterns for its schema and table arguments. The
 per-object calls therefore also collected the columns of tables or schemas whose
@@ -73,6 +82,28 @@ on the table count:
 (cd probe-go && go test -run TestPostgresQueriesPerSchemaDoNotGrowWithObjectCount .)
 gradle -p probe test --tests schemagraph.probe.PostgresSchemaMetadataTest
 ```
+
+The table comes from these commands. Build the previous Go probe and JAR from
+the older commit with `git archive`, as in the Reproduce section at the end of
+this file. The script builds `--new-probe` from `--probe-dir` (default
+`probe-go`).
+
+```sh
+python3 Scripts/test-probe-postgres-benchmark.py
+python3 Scripts/benchmark-probe-postgres.py \
+  --baseline-probe /path/to/previous/schemagraph-probe-go \
+  --new-probe /path/to/new/schemagraph-probe-go \
+  --baseline-jar /path/to/previous/schemagraph-probe-all.jar \
+  --new-jar probe/build/libs/schemagraph-probe-all.jar --java /path/to/java \
+  --engine /path/to/schemagraph --pg-bin /opt/homebrew/opt/postgresql@16/bin \
+  --schemas 1 --tables-per-schema 2000 --columns 8 --indexes --format json \
+  --latency-ms 1 --warmup 1 --repeat 3 --output /path/to/report
+```
+
+For the NDJSON rows, use `--format ndjson` and leave out the JAR options. For
+the larger rows, use `--tables-per-schema 4000`, and for the direct times,
+`--latency-ms 0`. `results.json` keeps every sample with its statement count
+and document SHA-256, a per-build summary, and the relay's connection errors.
 
 ## PL/pgSQL routine bodies at scale (2026-10-18)
 
