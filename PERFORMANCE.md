@@ -1,5 +1,75 @@
 # Performance measurements
 
+## Remote PostgreSQL collection (2026-10-20)
+
+Both probes used to ask PostgreSQL for each object's columns, constraints,
+indexes, and triggers separately. The JDBC probe called `getColumns`,
+`getPrimaryKeys`, `getImportedKeys`, and its index catalog query per object.
+Collection runs on one pinned connection, so these statements ran one after
+another and their number grew four times as fast as the table count. Against a
+remote server, collection time grew with the round-trip latency. Both probes now
+read each kind once per schema and split the rows by exact relation name. The
+JDBC probe does this only through pgjdbc, whose `getPrimaryKeys` and
+`getImportedKeys` treat a null table as the whole schema. Other drivers keep
+the per-object calls.
+
+A local PostgreSQL 16.13 cluster served these measurements on one macOS 26.7.1
+ARM64 host while other jobs ran (load average 3 to 7). A scratch asyncio TCP
+relay in front of the server delayed every chunk by 1 ms in each direction,
+which adds about 2 ms per round trip. The relay is not part of the repository.
+Each database holds one schema:
+
+```sql
+CREATE SCHEMA app;
+CREATE TABLE app.t00000 (id bigint PRIMARY KEY, parent_id bigint,
+  c2 integer, c3 integer, c4 integer, c5 integer, c6 integer, c7 integer);
+CREATE INDEX t00000_parent ON app.t00000 (parent_id);
+CREATE TABLE app.t00001 (id bigint PRIMARY KEY,
+  parent_id bigint REFERENCES app.t00000 (id),
+  c2 integer, c3 integer, c4 integer, c5 integer, c6 integer, c7 integer);
+CREATE INDEX t00001_parent ON app.t00001 (parent_id);
+-- Every later table references the one before it in the same way.
+```
+
+The previous Go probe and JAR were built from `835e054`. The previous JAR
+SHA-256 starts `06f479f17b64` and the changed JAR starts `b8f62ecfdfbe`. Go is
+1.27.1, and the JDBC probe ran on OpenJDK 17.0.20 with bundled pgjdbc 42.7.8.
+Each cell is the median of three fresh processes after one warm-up per build,
+with the two builds alternating. Statements are the increase of
+`pg_stat_database.xact_commit` for the database, read after the probe's backend
+exited. Every probe statement runs in autocommit, and autovacuum was off.
+
+| Probe | Tables | Format | Before s | After s | Before statements | After statements |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Go | 2,000 | JSON | 22.706 | 0.282 | 8,048 | 52 |
+| Go | 2,000 | NDJSON | 23.570 | 0.270 | 8,048 | 52 |
+| Go | 4,000 | JSON | 46.103 | 0.416 | 16,048 | 52 |
+| Go | 4,000 | NDJSON | 45.228 | 0.373 | 16,048 | 52 |
+| JDBC | 2,000 | JSON | 25.552 | 0.907 | 8,024 | 28 |
+| JDBC | 4,000 | JSON | 48.392 | 1.139 | 16,024 | 30 |
+
+Every pair wrote the same document bytes. Before the change each table added
+four statements. After it, the server logged the same 27 JDBC statements at both
+sizes. The two extra commits at 4,000 tables come from the parallel workers that
+PostgreSQL started for one schema-wide catalog query; with
+`max_parallel_workers_per_gather = 0` the count is 28. Without the relay, 4,000
+tables took 1.067 s before and 0.253 s after for Go JSON, and 3.923 s before and
+1.038 s after for JDBC JSON.
+
+JDBC `getColumns` takes LIKE patterns for its schema and table arguments. The
+per-object calls therefore also collected the columns of tables or schemas whose
+names matched the pattern: table `a_b` also read `a1b`, and schema `my_app` also
+read `myxapp`. Splitting by exact name drops those columns. Databases without
+such names produce the same documents as before.
+
+These tests check that the number of catalog queries per schema does not depend
+on the table count:
+
+```sh
+(cd probe-go && go test -run TestPostgresQueriesPerSchemaDoNotGrowWithObjectCount .)
+gradle -p probe test --tests schemagraph.probe.PostgresSchemaMetadataTest
+```
+
 ## PL/pgSQL routine bodies at scale (2026-10-18)
 
 These release-mode measurements compare the 0.7.1 engine (`a2f0dffc7af4…`,
