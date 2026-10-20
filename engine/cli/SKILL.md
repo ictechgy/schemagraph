@@ -96,7 +96,8 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   subjects in its `roots` and `depth`/`via` measured from them; a subject
   reached only from itself is not listed. `--max` caps the combined `reached`
   list, nearest first. An unresolved subject stays in `roots` without `symbol`,
-  adds a `root-not-found:` limitation (and `truncated: true`), and exits 1;
+  adds a `root-not-found:` limitation (and `truncated: true`), and exits 64
+  after the document is written (default JSON `notFound` still exits 1);
   identify which subject failed from the missing `symbol`, not from `truncated`. Compare `graphRevision` (SHA-256 of graph.json) before trusting a
   saved document against the current graph.
 - Version 0.4.2 and later support Ctrl+C for `query`, `impact`, `path`, and

@@ -140,8 +140,10 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 
 `cycles`, `dead`, `rules`, `diff`는 `--strict`를 지원합니다. 보고서를 출력하면서
 각각 순환·후보·규칙 위반·차이를 발견하면 종료 코드 **1**을 반환합니다.
-`query`와 `impact`도 이름을 해석하지 못하면 **1**을 반환합니다. 사용법·엔진
-오류는 **2**입니다. 전체 옵션은 `schemagraph <command> --help`로 확인합니다.
+`query`와 `impact`도 이름을 해석하지 못하면 **1**을 반환합니다.
+`--format language-traversal`에서는 문서를 출력한 뒤, 다른 isthmus 생산자가 못 찾은
+root에 쓰는 **64**를 반환합니다. 사용법·엔진 오류는 **2**입니다. 전체 옵션은
+`schemagraph <command> --help`로 확인합니다.
 v0.4.2의 Ctrl+C·MCP 요청 취소 동작은 영어 정본인
 [취소 계약](ANALYSIS.md#trace-a-dependency)을 참고하세요.
 

@@ -151,8 +151,10 @@ read that file by default; use `--graph <path>` to select another snapshot.
 `cycles`, `dead`, `rules`, and `diff` accept `--strict`: the command still
 prints its report but exits with code **1** when it finds cycles,
 candidates, violations, or differences, respectively. `query` and `impact`
-also exit **1** when a name cannot be resolved. Usage and engine errors exit
-**2**. Use `schemagraph <command> --help` for all options.
+also exit **1** when a name cannot be resolved; with `--format
+language-traversal` they still write the document and exit **64**, the code
+the other isthmus producers use for unresolved roots. Usage and engine errors
+exit **2**. Use `schemagraph <command> --help` for all options.
 Version 0.4.2 adds cooperative Ctrl+C and MCP request cancellation;
 see [the cancellation contract](ANALYSIS.md#trace-a-dependency).
 

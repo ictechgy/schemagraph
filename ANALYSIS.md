@@ -446,10 +446,14 @@ rejected without `--format language-traversal`. MCP tools keep the default JSON.
   `symbol`, adds a `root-not-found:` limitation naming the index and any
   candidates, and adds `root-not-found` to `truncationReasons` (so `truncated`
   is true). The other roots are still traversed and the document is written,
-  but the command exits **1**, as with `notFound`. `truncated` alone does not
-  say which root failed: use a root entry without `symbol`, or the
-  `root-not-found: roots[i]` limitation, as the precise per-root signal. Results
-  for the resolved roots are complete unless another reason is also listed.
+  but the command exits **64**: the code the other isthmus language-traversal
+  producers use, which `isthmus capture` accepts as a partial success when the
+  document records `root-not-found`. Usage errors still exit 2, so 64 always
+  comes with a written document; the default JSON `notFound` still exits 1.
+  `truncated` alone does not say which root failed: use a root entry without
+  `symbol`, or the `root-not-found: roots[i]` limitation, as the precise
+  per-root signal. Results for the resolved roots are complete unless another
+  reason is also listed.
 - `truncated` is true when any `truncationReasons` exist (`result-limit`,
   `visited-limit`, `edge-limit`, `cancelled`, `root-not-found`);
   `truncationReasons` is omitted when empty. After a budget stop or

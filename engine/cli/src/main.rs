@@ -4,6 +4,8 @@
 //! - 0: 성공 (또는 보고할 것이 없음)
 //! - 1: 질의가 발견을 보고함(--strict 시) 또는 대상을 못 찾음(notFound)
 //! - 2: 사용법·엔진 오류 (잘못된 URL, 파일 없음, 파싱 불가)
+//! - 64: `--format language-traversal`에서 해석하지 못한 subject가 있음 — notFound의 1
+//!   대신 isthmus 계열 값을 쓰고, 문서는 출력된다
 //! - 130: Ctrl+C로 질의·경로·검토 작업을 취소함
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -1525,10 +1527,22 @@ struct TraversalRequest<'a> {
     budget: analysis::budget::Budget,
 }
 
+/// language-traversal 문서에 해석하지 못한 subject가 있을 때의 종료 코드.
+///
+/// isthmus 계열의 다른 순회 생산자(rustograph·tsograph·cartograph 등)는 모르는 root가
+/// 섞이면 나머지 root로 순회한 문서를 쓰고 64로 끝난다. isthmus capture는 기본 설정에서
+/// root-not-found를 기록한 순회 문서와 함께 온 64만 부분 성공으로 받고, 1은 단계 실패로
+/// 본다. 그래서 이 형식에서만 기본 JSON notFound의 1 대신 계열 값을 쓴다. 사용법 오류는
+/// 이 저장소 계약대로 2로 둔다 — 계열에서는 문서 없는 사용법 오류도 64지만, 여기서 64는
+/// 언제나 출력된 문서와 함께 온다(취소는 130이 덮는다).
+const ROOT_NOT_FOUND_EXIT_CODE: i32 = 64;
+
 /// 여러 subject를 한 번의 다중 루트 탐색으로 돌려 language-traversal 문서를 출력한다.
 ///
 /// 해석하지 못한 subject가 있어도 문서를 낸다 — 그 루트는 `symbol` 없이 자리를 지키고
-/// limitation과 `root-not-found`로 보고된다. 종료 코드는 기존 notFound 계약처럼 1이다.
+/// limitation과 `root-not-found`로 보고된다. 그때는 문서를 출력한 뒤 64
+/// ([`ROOT_NOT_FOUND_EXIT_CODE`])를 돌려준다. 기본 JSON notFound의 1과 다른 이유는 상수
+/// 주석에 있다.
 fn language_traversal(request: &TraversalRequest, options: &ReportArgs) -> Result<i32> {
     let cancel = cancellation::install()?;
     let project = canonical_project(options.project.as_deref().unwrap_or(Path::new(".")))?;
@@ -1560,7 +1574,7 @@ fn language_traversal(request: &TraversalRequest, options: &ReportArgs) -> Resul
     let value = export::language_traversal::to_value(&header, &roots, &report, &limitations);
     println!("{}", export::to_pretty_json(&value)?);
     Ok(if roots.iter().any(|root| root.resolved.is_none()) {
-        1
+        ROOT_NOT_FOUND_EXIT_CODE
     } else {
         0
     })
