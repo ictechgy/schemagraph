@@ -152,12 +152,12 @@ func indexPositions(objects []ObjectDoc) map[string][]indexPosition {
 	return positions
 }
 
-// mysqlRelationDetails는 컬럼·PK 위치·제약·인덱스·트리거를 스키마마다 한 번씩 읽어 테이블 이름으로 객체에 나눠 단다.
-// 객체마다 다섯 번씩 물으면 고정 연결 하나에서 직렬 왕복이 객체 수에 비례한다. go-sql-driver/mysql은 interpolateParams가
+// mysqlRelationDetails는 컬럼·PK 위치·제약·키 컬럼·인덱스·트리거를 스키마마다 한 번씩 읽어 테이블 이름으로 객체에
+// 나눠 단다. 객체마다 다섯 번씩 물으면 고정 연결 하나에서 직렬 왕복이 객체 수에 비례한다. go-sql-driver/mysql은 interpolateParams가
 // 꺼져 있으면 인자 있는 질의를 prepare와 execute 두 번 왕복으로 보내, 원격 DB에서는 테이블당 약 10왕복이었다.
 // 컬럼·PK 위치·인덱스·트리거를 테이블마다 묻던 table_name = ? 조건은 그 이름의 테이블 행만 돌려줬다
 // (lower_case_table_names=0인 MySQL 8.4와 MariaDB 11.4에서 대소문자·악센트만 다른 T·t, cafe·café로 확인). 그래서 정확한
-// 이름으로 나눈 결과가 테이블마다 묻던 결과와 같다. 제약만 예외다(mysqlSchemaConstraints). 객체가 없는 스키마에는 묻지
+// 이름으로 나눈 결과가 테이블마다 묻던 결과와 같다. 제약은 mysqlSchemaConstraints를 본다. 객체가 없는 스키마에는 묻지
 // 않는다 — 예전에도 질의가 없었으니 그 스키마에서 실패 limitation이 새로 생기지 않는다.
 func (h *harvester) mysqlRelationDetails(schema string, objects []ObjectDoc) {
 	if len(objects) == 0 {
@@ -220,83 +220,100 @@ func (h *harvester) mysqlSchemaColumns(schema string) map[string][]ColumnDoc {
 	return columns
 }
 
-type mysqlConstraintRow struct {
-	name, kind, column             sql.NullString
-	refSchema, refTable, refColumn sql.NullString
-}
-
 // mysqlSchemaConstraints는 PK·FK·UNIQUE·CHECK 제약을 스키마마다 한 번 읽어 테이블 이름별로 나눈다. 테이블 안의
-// 행 순서는 테이블마다 읽던 때와 같은 (제약 이름, 키 순서)다.
+// 순서는 테이블마다 읽던 때와 같은 (제약 이름, 키 순서)다.
 //
-// LEFT JOIN은 이름을 서버 콜레이션으로 비교한다. MariaDB 11.4에서는 이 비교가 대소문자·악센트를 무시해, 대소문자·
-// 악센트만 다른 테이블(P와 p, resume과 résumé)이나 스키마의 같은 이름 제약(PRIMARY, 이름이 같은 UNIQUE)이 서로의 키
-// 컬럼까지 짝짓는다. 그런 행은 ORDER BY에서 동점이라 순서도 정해지지 않는다. 그래서 테이블마다 읽던 때처럼 키 컬럼
-// 행은 스키마·테이블·제약 이름이 제약 행과 정확히 같을 때만 쓴다. 네이티브 reader(engine/source/src/mysql.rs)도
-// 제약마다 키 컬럼을 따로 물어 같은 결과를 낸다.
+// 제약 행(table_constraints)과 키 컬럼 행(key_column_usage)은 따로 읽어, 스키마·테이블·제약 이름이 정확히 같은 것끼리
+// 여기서 잇는다. 서버에서 LEFT JOIN으로 이으면 MariaDB 11.4는 두 information_schema 표를 인덱스 없이 블록 중첩
+// 반복(BNL)으로 이어, 4,000테이블 스키마에서 약 8,000행끼리 6,400만 번 비교하는 데 4초쯤 걸렸고 테이블 수의 제곱으로
+// 늘었다. 결과는 서버 조인에 키 컬럼 소유자 검사를 더하던 앞 방식과 같다. 정확히 같은 이름은 콜레이션 비교로도 같고,
+// 한 제약 안의 키 순서는 ordinal_position으로 정해진다. 서버 조인은 MariaDB에서 대소문자·악센트만 다른 테이블·스키마의
+// 같은 이름 제약(PRIMARY, 이름이 같은 UNIQUE)끼리도 짝지었지만, 그런 행은 소유자 검사에서 버리던 것이다. 네이티브
+// reader(engine/source/src/mysql.rs)도 제약마다 키 컬럼을 정확한 테이블·제약 이름으로 물어 같은 결과를 낸다.
+// 키 컬럼을 끝까지 읽지 못하면 일부 컬럼만 가진 제약을 내지 않도록 그 스키마의 제약을 모두 비운다(limitation은 남는다).
 func (h *harvester) mysqlSchemaConstraints(schema string) map[string][]ConstraintDoc {
+	keys, complete := h.mysqlSchemaKeyColumns(schema)
+	if !complete {
+		return map[string][]ConstraintDoc{}
+	}
 	groups := newRelationGroups[ConstraintDoc]()
 	h.mysqlRows("constraints", `
-		SELECT CAST(tc.table_name AS CHAR), CAST(tc.constraint_name AS CHAR), CAST(tc.constraint_type AS CHAR),
-		       CAST(kcu.table_schema AS CHAR), CAST(kcu.table_name AS CHAR), CAST(kcu.constraint_name AS CHAR),
-		       CAST(kcu.column_name AS CHAR), CAST(kcu.referenced_table_schema AS CHAR),
-		       CAST(kcu.referenced_table_name AS CHAR), CAST(kcu.referenced_column_name AS CHAR)
-		FROM information_schema.table_constraints tc
-		LEFT JOIN information_schema.key_column_usage kcu
-		  ON kcu.constraint_schema = tc.constraint_schema
-		 AND kcu.table_schema = tc.table_schema AND kcu.table_name = tc.table_name
-		 AND kcu.constraint_name = tc.constraint_name
-		WHERE tc.table_schema = ?
-		  AND tc.constraint_type IN ('PRIMARY KEY','FOREIGN KEY','UNIQUE','CHECK')
-		ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, []any{schema}, func(rows *sql.Rows) error {
+		SELECT CAST(table_name AS CHAR), CAST(constraint_name AS CHAR), CAST(constraint_type AS CHAR)
+		FROM information_schema.table_constraints
+		WHERE table_schema = ? AND constraint_type IN ('PRIMARY KEY','FOREIGN KEY','UNIQUE','CHECK')
+		ORDER BY table_name, constraint_name`, []any{schema}, func(rows *sql.Rows) error {
 		var table string
-		var owner mysqlKeyOwner
-		var r mysqlConstraintRow
-		if err := rows.Scan(&table, &r.name, &r.kind, &owner.schema, &owner.table, &owner.constraint,
-			&r.column, &r.refSchema, &r.refTable, &r.refColumn); err != nil {
+		var name, kind sql.NullString
+		if err := rows.Scan(&table, &name, &kind); err != nil {
 			return err
 		}
-		if !r.name.Valid || !r.kind.Valid {
+		if !name.Valid || !kind.Valid {
 			return nil
 		}
-		constraint := groups.entry(table, r.name.String, func() ConstraintDoc {
-			return ConstraintDoc{Name: r.name.String, Kind: mysqlConstraintKind(r.kind.String), Columns: []string{}}
+		constraint := groups.entry(table, name.String, func() ConstraintDoc {
+			return ConstraintDoc{Name: name.String, Kind: mysqlConstraintKind(kind.String), Columns: []string{}}
 		})
-		if owner.belongsTo(schema, table, r.name.String) {
-			addMySQLConstraintRow(constraint, r)
+		for _, key := range keys[mysqlKeyColumnOwner(table, name.String)] {
+			addMySQLKeyColumn(constraint, kind.String, key)
 		}
 		return nil
 	})
 	return groups.lists()
 }
 
-// mysqlKeyOwner는 제약 조인이 짝지은 키 컬럼 행의 스키마·테이블·제약 이름이다. 짝이 없는 행(CHECK)은 모두 NULL이다.
-type mysqlKeyOwner struct{ schema, table, constraint sql.NullString }
-
-// belongsTo는 키 컬럼 행이 그 제약 자신의 것인지 정확한 이름으로 본다. 짝이 없는 행은 더할 컬럼이 없으므로 그대로 둔다.
-func (k mysqlKeyOwner) belongsTo(schema, table, constraint string) bool {
-	if !k.schema.Valid && !k.table.Valid && !k.constraint.Valid {
-		return true
-	}
-	return k.schema.String == schema && k.table.String == table && k.constraint.String == constraint
+// mysqlKeyColumn은 key_column_usage 행 하나의 키 컬럼과 FK 대상이다.
+type mysqlKeyColumn struct {
+	column, refSchema, refTable, refColumn sql.NullString
 }
 
-// addMySQLConstraintRow는 제약 행 하나의 키 컬럼과, FK면 대상 테이블·컬럼을 덧붙인다. CHECK 제약은 키 컬럼 행이 없다.
-func addMySQLConstraintRow(constraint *ConstraintDoc, r mysqlConstraintRow) {
-	if r.column.Valid {
-		constraint.Columns = append(constraint.Columns, r.column.String)
+// mysqlKeyColumnOwner는 키 컬럼 행을 제약에 잇는 키("테이블\x00제약")다. MySQL 식별자에는 NUL이 없어 두 이름의
+// 경계가 섞이지 않는다(indexPositions와 같은 규칙).
+func mysqlKeyColumnOwner(table, constraint string) string {
+	return table + "\x00" + constraint
+}
+
+// mysqlSchemaKeyColumns는 스키마의 키 컬럼 행을 (테이블, 제약)마다 ordinal_position 순으로 모은다. 스키마 이름이
+// 정확히 같은 행만 쓴다. MariaDB는 information_schema 이름을 대소문자 무시로 비교하므로 대소문자만 다른 스키마의 행이
+// 섞여 올 수 있다. 끝까지 읽었는지도 돌려준다.
+func (h *harvester) mysqlSchemaKeyColumns(schema string) (map[string][]mysqlKeyColumn, bool) {
+	keys := map[string][]mysqlKeyColumn{}
+	complete := h.mysqlRows("constraints", `
+		SELECT CAST(table_schema AS CHAR), CAST(table_name AS CHAR), CAST(constraint_name AS CHAR),
+		       CAST(column_name AS CHAR), CAST(referenced_table_schema AS CHAR),
+		       CAST(referenced_table_name AS CHAR), CAST(referenced_column_name AS CHAR)
+		FROM information_schema.key_column_usage
+		WHERE table_schema = ?
+		ORDER BY table_name, constraint_name, ordinal_position`, []any{schema}, func(rows *sql.Rows) error {
+		var owner, table, constraint string
+		var key mysqlKeyColumn
+		if err := rows.Scan(&owner, &table, &constraint, &key.column, &key.refSchema, &key.refTable, &key.refColumn); err != nil {
+			return err
+		}
+		if owner == schema {
+			keys[mysqlKeyColumnOwner(table, constraint)] = append(keys[mysqlKeyColumnOwner(table, constraint)], key)
+		}
+		return nil
+	})
+	return keys, complete
+}
+
+// addMySQLKeyColumn은 제약에 키 컬럼 하나와, FK면 대상 테이블·컬럼을 덧붙인다. CHECK 제약은 키 컬럼 행이 없다.
+func addMySQLKeyColumn(constraint *ConstraintDoc, kind string, key mysqlKeyColumn) {
+	if key.column.Valid {
+		constraint.Columns = append(constraint.Columns, key.column.String)
 	}
-	if r.kind.String != "FOREIGN KEY" || !r.refTable.Valid {
+	if kind != "FOREIGN KEY" || !key.refTable.Valid {
 		return
 	}
 	if constraint.Referenced == nil {
-		constraint.Referenced = &ReferencedDoc{Table: r.refTable.String, Columns: []string{}}
-		if r.refSchema.Valid {
-			v := r.refSchema.String
+		constraint.Referenced = &ReferencedDoc{Table: key.refTable.String, Columns: []string{}}
+		if key.refSchema.Valid {
+			v := key.refSchema.String
 			constraint.Referenced.Schema = &v
 		}
 	}
-	if r.refColumn.Valid {
-		constraint.Referenced.Columns = append(constraint.Referenced.Columns, r.refColumn.String)
+	if key.refColumn.Valid {
+		constraint.Referenced.Columns = append(constraint.Referenced.Columns, key.refColumn.String)
 	}
 }
 
@@ -644,23 +661,26 @@ func (h *harvester) mysqlObjectUsage(schema string, objects []ObjectDoc) {
 
 // mysqlRows는 metadata query 실패를 빈 성공으로 숨기지 않고 limitation으로
 // 기록한다. 개별 테이블의 선택적 metadata는 그 테이블만 비워 진행한다.
-func (h *harvester) mysqlRows(label, query string, args []any, scan func(*sql.Rows) error) {
+// 끝까지 읽었으면 true다. 다른 질의와 맞춰야 하는 호출(mysqlSchemaKeyColumns)만 이 값을 본다.
+func (h *harvester) mysqlRows(label, query string, args []any, scan func(*sql.Rows) error) bool {
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("%s unavailable — %s", label, oneLine(err.Error())))
-		return
+		return false
 	}
 	defer rows.Close()
 	for rows.Next() {
 		if err := scan(rows); err != nil {
 			h.catalogIncomplete = true
 			h.limitations = append(h.limitations, fmt.Sprintf("%s row read failed — %s", label, oneLine(err.Error())))
-			return
+			return false
 		}
 	}
 	if err := rows.Err(); err != nil {
 		h.catalogIncomplete = true
 		h.limitations = append(h.limitations, fmt.Sprintf("%s unavailable — %s", label, oneLine(err.Error())))
+		return false
 	}
+	return true
 }

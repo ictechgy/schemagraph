@@ -7,18 +7,27 @@ import (
 	"testing"
 )
 
-// mariadbCollationJoin은 제약 조인이 이름을 대소문자 무시로 비교하는 MariaDB다. P와 p는 대소문자만 다른 테이블이고,
-// 대소문자만 다른 스키마 APP에도 P가 있다. 세 테이블의 PRIMARY 키 컬럼이 P·p의 PRIMARY 모두와 짝지어진다. 제약을
-// 테이블마다 묻는 질의(인자 둘: 스키마, 테이블)와 스키마 단위로 묻는 질의(인자 하나, 맨 앞 열이 제약 테이블)에 모두
-// 답해, 수집 방식과 관계없이 같은 서버 응답을 흉내 낸다.
+// mariadbCollationJoin은 information_schema 이름을 대소문자 무시로 비교하는 MariaDB다. P와 p는 대소문자만 다른
+// 테이블이고, 대소문자만 다른 스키마 APP에도 P가 있다. 제약 조인을 쓰면 세 테이블의 PRIMARY 키 컬럼이 P·p의 PRIMARY
+// 모두와 짝지어진다. 제약을 테이블마다 조인으로 묻는 질의(인자 둘: 스키마, 테이블), 스키마 단위로 조인하는 질의(인자
+// 하나, 맨 앞 열이 제약 테이블), 제약 행과 키 컬럼 행을 따로 묻는 질의(키 컬럼에 APP의 행도 섞여 온다)에 모두 답해,
+// 수집 방식과 관계없이 같은 서버를 흉내 낸다.
 func mariadbCollationJoin(query string, args []driver.NamedValue) scriptedReply {
+	keys := [][3]string{{"app", "P", "a"}, {"app", "p", "b"}, {"APP", "P", "c"}}
 	switch {
 	case strings.Contains(query, "information_schema.schemata"):
 		return scriptedRows([]driver.Value{"app"})
 	case strings.Contains(query, "FROM information_schema.tables"):
 		return scriptedRows([]driver.Value{"P", "BASE TABLE"}, []driver.Value{"p", "BASE TABLE"})
+	case !strings.Contains(query, "LEFT JOIN") && strings.Contains(query, "FROM information_schema.table_constraints"):
+		return scriptedRows([]driver.Value{"P", "PRIMARY", "PRIMARY KEY"}, []driver.Value{"p", "PRIMARY", "PRIMARY KEY"})
+	case strings.Contains(query, "FROM information_schema.key_column_usage") && !strings.Contains(query, "'PRIMARY'"):
+		var rows [][]driver.Value
+		for _, key := range keys {
+			rows = append(rows, []driver.Value{key[0], key[1], "PRIMARY", key[2], nil, nil, nil})
+		}
+		return scriptedRows(rows...)
 	case strings.Contains(query, "FROM information_schema.table_constraints"):
-		keys := [][3]string{{"app", "P", "a"}, {"app", "p", "b"}, {"APP", "P", "c"}}
 		var rows [][]driver.Value
 		for _, table := range []string{"P", "p"} {
 			if len(args) == 2 && args[1].Value != table {

@@ -72,9 +72,9 @@ func TestMySQLQueriesPerSchemaDoNotGrowWithObjectCount(t *testing.T) {
 	}
 }
 
-// mysqlCatalogReply는 스키마 단위 조회 다섯이 여러 테이블의 행을 섞어 돌려주는 MySQL이다. Orders와 orders는 대소문자만
-// 다른 별개 테이블이고(lower_case_table_names=0), ghost는 객체 목록에 없는 테이블이다. 제약 조인은 MariaDB처럼 이름을
-// 대소문자 무시로 비교해, 두 테이블의 PRIMARY가 서로의 키 컬럼과, 스키마 APP의 orders 키 컬럼과도 짝지어진다.
+// mysqlCatalogReply는 스키마 단위 조회가 여러 테이블의 행을 섞어 돌려주는 MySQL이다. Orders와 orders는 대소문자만
+// 다른 별개 테이블이고(lower_case_table_names=0), ghost는 객체 목록에 없는 테이블이다. 키 컬럼 조회에는 MariaDB처럼
+// 대소문자만 다른 스키마 APP의 행과 대소문자만 다른 제약 이름의 행이 섞여 온다.
 func mysqlCatalogReply(query string, _ []driver.NamedValue) scriptedReply {
 	switch {
 	case strings.Contains(query, "information_schema.schemata"):
@@ -94,21 +94,29 @@ func mysqlCatalogReply(query string, _ []driver.NamedValue) scriptedReply {
 			[]driver.Value{"orders", "region", "varchar", "NO", "'eu'", int64(2)},
 			[]driver.Value{"orders", "customer_id", "bigint", "YES", nil, int64(3)},
 		)
-	case strings.Contains(query, "FROM information_schema.table_constraints"):
-		// 제약 테이블·이름·종류, 키 컬럼 행의 스키마·테이블·제약 이름, 키 컬럼, FK 대상 스키마·테이블·컬럼 순이다.
+	case strings.Contains(query, "FROM information_schema.key_column_usage"):
+		// 키 컬럼 행의 스키마·테이블·제약 이름, 키 컬럼, FK 대상 스키마·테이블·컬럼 순이다(table_name, constraint_name,
+		// ordinal_position 순이며, 대소문자 무시 정렬이라 Orders와 orders의 행이 번갈아 온다).
 		return scriptedRows(
-			[]driver.Value{"Orders", "PRIMARY", "PRIMARY KEY", "app", "Orders", "PRIMARY", "ID", nil, nil, nil},
-			[]driver.Value{"Orders", "PRIMARY", "PRIMARY KEY", "app", "orders", "PRIMARY", "region", nil, nil, nil},
-			[]driver.Value{"orders", "PRIMARY", "PRIMARY KEY", "app", "Orders", "PRIMARY", "ID", nil, nil, nil},
-			[]driver.Value{"orders", "PRIMARY", "PRIMARY KEY", "app", "orders", "PRIMARY", "region", nil, nil, nil},
-			[]driver.Value{"orders", "PRIMARY", "PRIMARY KEY", "APP", "orders", "PRIMARY", "zone", nil, nil, nil},
-			[]driver.Value{"orders", "PRIMARY", "PRIMARY KEY", "app", "orders", "PRIMARY", "id", nil, nil, nil},
-			[]driver.Value{"ghost", "PRIMARY", "PRIMARY KEY", "app", "ghost", "PRIMARY", "id", nil, nil, nil},
-			[]driver.Value{"orders", "orders_check", "CHECK", nil, nil, nil, nil, nil, nil, nil},
-			[]driver.Value{"orders", "orders_pair_fk", "FOREIGN KEY", "app", "orders", "orders_pair_fk", "region", "app", "Orders", "ID"},
-			[]driver.Value{"orders", "orders_pair_fk", "FOREIGN KEY", "app", "orders", "ORDERS_PAIR_FK", "zone", "app", "Orders", "ZONE"},
-			[]driver.Value{"orders", "orders_pair_fk", "FOREIGN KEY", "app", "orders", "orders_pair_fk", "customer_id", "app", "Orders", "CUSTOMER"},
-			[]driver.Value{"orders", nil, "UNIQUE", "app", "orders", nil, "id", nil, nil, nil},
+			[]driver.Value{"app", "ghost", "PRIMARY", "id", nil, nil, nil},
+			[]driver.Value{"app", "Orders", "PRIMARY", "ID", nil, nil, nil},
+			[]driver.Value{"app", "orders", "PRIMARY", "region", nil, nil, nil},
+			[]driver.Value{"APP", "orders", "PRIMARY", "zone", nil, nil, nil},
+			[]driver.Value{"app", "orders", "PRIMARY", "id", nil, nil, nil},
+			[]driver.Value{"app", "orders", "orders_pair_fk", "region", "app", "Orders", "ID"},
+			[]driver.Value{"app", "orders", "ORDERS_PAIR_FK", "zone", "app", "Orders", "ZONE"},
+			[]driver.Value{"app", "orders", "orders_pair_fk", "customer_id", "app", "Orders", "CUSTOMER"},
+			[]driver.Value{"app", "orders", "orders_uq", "id", nil, nil, nil},
+		)
+	case strings.Contains(query, "FROM information_schema.table_constraints"):
+		// 제약 테이블·이름·종류 순이다. 이름이 NULL인 행은 버린다.
+		return scriptedRows(
+			[]driver.Value{"ghost", "PRIMARY", "PRIMARY KEY"},
+			[]driver.Value{"Orders", "PRIMARY", "PRIMARY KEY"},
+			[]driver.Value{"orders", "PRIMARY", "PRIMARY KEY"},
+			[]driver.Value{"orders", "orders_check", "CHECK"},
+			[]driver.Value{"orders", "orders_pair_fk", "FOREIGN KEY"},
+			[]driver.Value{"orders", nil, "UNIQUE"},
 		)
 	case strings.Contains(query, "FROM information_schema.statistics"):
 		return scriptedRows(
@@ -201,35 +209,79 @@ func TestMySQLSchemaRowsAreSplitByExactTableName(t *testing.T) {
 	}
 }
 
+// isMySQLKeyColumnQuery는 제약의 키 컬럼을 읽는 질의인지 본다(PK 위치 질의도 key_column_usage를 읽는다).
+func isMySQLKeyColumnQuery(query string) bool {
+	return strings.Contains(query, "FROM information_schema.key_column_usage") && !strings.Contains(query, "'PRIMARY'")
+}
+
 // 스키마 단위 조회 하나가 실패하면 limitation은 테이블마다가 아니라 스키마에 한 번 남고 미완전으로 표시된다. 문구는
-// 테이블마다 읽던 때와 같다(그때도 테이블 이름 없이 남아 문서에서 하나로 합쳐졌다).
+// 테이블마다 읽던 때와 같다(그때도 테이블 이름 없이 남아 문서에서 하나로 합쳐졌다). 제약은 제약 행과 키 컬럼 행을
+// 따로 읽는데, 어느 쪽이 실패해도 문구는 하나("constraints …")이고, 키 컬럼 일부만 가진 제약은 내지 않는다.
 func TestMySQLSchemaBatchFailureIsReportedOncePerSchema(t *testing.T) {
-	db, _ := newScriptedDB(func(query string, args []driver.NamedValue) scriptedReply {
-		if strings.Contains(query, "FROM information_schema.table_constraints") {
-			return scriptedReply{err: fmt.Errorf("injected constraint failure")}
-		}
-		return mysqlCatalogReply(query, args)
-	})
+	failure := fmt.Errorf("injected constraint failure")
+	tests := []struct {
+		name  string
+		reply func(string, []driver.NamedValue) scriptedReply
+	}{
+		{name: "constraint rows", reply: func(query string, args []driver.NamedValue) scriptedReply {
+			if strings.Contains(query, "FROM information_schema.table_constraints") {
+				return scriptedReply{err: failure}
+			}
+			return mysqlCatalogReply(query, args)
+		}},
+		{name: "key column rows", reply: func(query string, args []driver.NamedValue) scriptedReply {
+			if isMySQLKeyColumnQuery(query) {
+				return scriptedReply{err: failure}
+			}
+			return mysqlCatalogReply(query, args)
+		}},
+		{name: "key column cursor", reply: func(query string, args []driver.NamedValue) scriptedReply {
+			reply := mysqlCatalogReply(query, args)
+			if isMySQLKeyColumnQuery(query) {
+				reply.rowsErr = failure
+			}
+			return reply
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, _ := newScriptedDB(test.reply)
+			defer closeScriptedDB(t, db)
+			h := &harvester{db: db, dialect: "mysql", schemaFilter: map[string]bool{"app": true}}
+			objects := h.mysqlObjects("app")
+			h.mysqlRelationDetails("app", objects)
+			failures := 0
+			for _, limitation := range h.limitations {
+				if limitation == "constraints unavailable — injected constraint failure" {
+					failures++
+				}
+			}
+			if failures != 1 || !h.catalogIncomplete {
+				t.Fatalf("constraint failure must be reported once and mark the catalog incomplete: %q", h.limitations)
+			}
+			for _, object := range objects {
+				if object.Constraints == nil || len(object.Constraints) != 0 {
+					t.Fatalf("%s: constraints = %#v, want an empty slice", object.Name, object.Constraints)
+				}
+			}
+			if columns := mysqlObjectsByName(objects)["orders"].Columns; len(columns) != 3 {
+				t.Fatalf("other batch queries must still fill the schema: %#v", columns)
+			}
+		})
+	}
+}
+
+// 제약 행과 키 컬럼 행은 서버에서 잇지 않는다. MariaDB 11.4는 두 information_schema 표의 JOIN을 인덱스 없는 블록
+// 중첩 반복으로 실행해, 그 질의 하나가 테이블 수의 제곱으로 느려졌다(4,000테이블에서 약 4초).
+func TestMySQLCatalogQueriesDoNotJoinInformationSchemaTables(t *testing.T) {
+	db, server := newScriptedDB(mysqlTablesReply(3))
 	defer closeScriptedDB(t, db)
 	h := &harvester{db: db, dialect: "mysql", schemaFilter: map[string]bool{"app": true}}
-	objects := h.mysqlObjects("app")
-	h.mysqlRelationDetails("app", objects)
-	failures := 0
-	for _, limitation := range h.limitations {
-		if limitation == "constraints unavailable — injected constraint failure" {
-			failures++
+	h.extract()
+	for _, call := range server.recorded() {
+		if strings.Count(call.query, "information_schema.") > 1 {
+			t.Fatalf("a catalog query joins information_schema tables on the server:\n%s", call.query)
 		}
-	}
-	if failures != 1 || !h.catalogIncomplete {
-		t.Fatalf("constraint failure must be reported once and mark the catalog incomplete: %q", h.limitations)
-	}
-	for _, object := range objects {
-		if object.Constraints == nil || len(object.Constraints) != 0 {
-			t.Fatalf("%s: constraints = %#v, want an empty slice", object.Name, object.Constraints)
-		}
-	}
-	if columns := mysqlObjectsByName(objects)["orders"].Columns; len(columns) != 3 {
-		t.Fatalf("other batch queries must still fill the schema: %#v", columns)
 	}
 }
 
