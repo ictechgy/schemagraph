@@ -75,7 +75,8 @@ impl DiskBodyCache {
         let namespace = namespace_hash(document, executable_hash)?;
         let scoped_namespace = scoped_namespace_hash(document, executable_hash)?;
         let mut cache = Self {
-            directory: directory.to_owned(),
+            // 신뢰 검사가 본 경로(끝 `/`·`.`를 지운 경로) 아래에 항목을 둔다.
+            directory: trust::normalized_directory(directory),
             namespace,
             scoped_namespace,
             key: None,

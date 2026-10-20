@@ -9,7 +9,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -56,17 +56,31 @@ impl KeyEnvironment {
     }
 }
 
+/// `--cache-dir` 경로를 성분 단위로 다시 모은다. 끝의 `/`, `.` 성분, 겹친 `/`가 빠진다.
+///
+/// POSIX는 `link/`·`link/.`처럼 끝이 `/`나 `.`인 경로를 마지막 성분의 링크까지 따라가
+/// 해석한다. 그대로 검사하면 `lstat`이 링크 대신 대상 디렉터리를 보고, macOS의 `mkdir`은
+/// 끊어진 링크의 대상 디렉터리까지 만든다. 셸 탭 완성이 끝 `/`를 붙이므로 흔한 표기다. 다시
+/// 모으면 마지막 성분이 사용자가 이름 붙인 항목 자체가 되어 링크 검사가 그 항목을 본다. 앞의
+/// `.`와 `..`는 지우면 경로 뜻이 바뀌므로 `Path::components`가 그대로 둔다.
+pub(super) fn normalized_directory(directory: &Path) -> PathBuf {
+    directory.components().collect()
+}
+
 /// 캐시 디렉터리를 준비하고, 신뢰할 수 없으면 캐시를 끄는 이유(영어 문장)를 돌려준다.
 ///
-/// 디렉터리가 없으면 0700으로 만든다. umask는 권한 비트를 빼기만 하므로 기본값(0777)으로
-/// 만들면 umask 002(사용자 개인 그룹) 환경에서 group 쓰기가 생겨 스스로 캐시를 끄게 된다.
-/// 링크는 마지막 경로 성분만 본다. macOS의 `/tmp`·`/var`(그리고 `$TMPDIR`)는 상위 성분이
-/// 링크라서 상위까지 거절하면 모든 임시 경로가 막힌다. 끊어진 링크도 따라가 만들지 않는다.
-/// 만들기 자체의 I/O 실패(권한 거부, 같은 이름의 파일)는 기존처럼 오류(종료 2)로 둔다.
+/// 검사는 [`normalized_directory`]로 끝 `/`·`.`를 지운 경로에 한다. 호출자도 같은 경로 아래에
+/// 항목을 둔다. 디렉터리가 없으면 0700으로 만든다. umask는 권한 비트를 빼기만 하므로
+/// 기본값(0777)으로 만들면 umask 002(사용자 개인 그룹) 환경에서 group 쓰기가 생겨 스스로
+/// 캐시를 끄게 된다. 링크는 마지막 경로 성분만 본다. macOS의 `/tmp`·`/var`(그리고 `$TMPDIR`)는
+/// 상위 성분이 링크라서 상위까지 거절하면 모든 임시 경로가 막힌다. 끊어진 링크도 따라가
+/// 만들지 않는다. 만들기 자체의 I/O 실패(권한 거부, 같은 이름의 파일)는 기존처럼 오류(종료
+/// 2)로 둔다.
 #[cfg(unix)]
 pub(super) fn prepare_directory(directory: &Path) -> io::Result<Option<String>> {
     use std::os::unix::fs::MetadataExt;
 
+    let directory = &normalized_directory(directory);
     if is_symlink(directory)? {
         return Ok(Some(untrusted_directory(directory, SYMLINK_DIRECTORY)));
     }
@@ -341,6 +355,28 @@ mod tests {
         for mode in [0o40770, 0o40707, 0o41777] {
             let shared = directory_problem(false, 501, mode, 501).unwrap();
             assert!(shared.contains("writable by group or other"), "{mode:o}");
+        }
+    }
+
+    /// 끝 `/`·`.`와 겹친 `/`만 지운다. 앞의 `.`·`..`와 절대 경로 뿌리는 그대로다.
+    #[test]
+    fn normalized_directory_drops_trailing_separators_and_dot_components() {
+        for (given, expected) in [
+            ("linked/", "linked"),
+            ("linked/.", "linked"),
+            ("linked//", "linked"),
+            ("linked/./", "linked"),
+            ("a/./b/", "a/b"),
+            ("./cache/", "./cache"),
+            ("../cache/.", "../cache"),
+            ("/tmp/cache/", "/tmp/cache"),
+            ("linked", "linked"),
+        ] {
+            assert_eq!(
+                normalized_directory(Path::new(given)),
+                Path::new(expected),
+                "{given}"
+            );
         }
     }
 

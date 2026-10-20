@@ -255,10 +255,12 @@ or is writable by group or other users, the scan prints a warning, disables the
 cache, and analyzes every body as if no cache had been given; graph output and
 the exit code do not change. Run `chmod go-w` on a directory that was created
 group-writable. Only the last path component is checked, so a parent such as
-macOS `/tmp` may be a symbolic link. Entries are opened without following
-symbolic links and must be regular files of at most 16 MiB; a symlinked or
-special entry is also reported on stderr, reparsed, and replaced. The cache
-needs Unix ownership checks; on other platforms it is disabled with a warning.
+macOS `/tmp` may be a symbolic link. Trailing `/` and `.` components are removed
+first, so `link/` and `link/.` are checked as the link `link` itself. Entries
+are opened without following symbolic links and must be regular files of at
+most 16 MiB; a symlinked or special entry is also reported on stderr, reparsed,
+and replaced. The cache needs Unix ownership checks; on other platforms it is
+disabled with a warning.
 
 Each entry carries an HMAC-SHA256 tag over its payload, computed with a secret
 key kept outside the cache. An entry rebuilt from public inputs (the release

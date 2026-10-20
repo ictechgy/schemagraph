@@ -150,18 +150,47 @@ fn symlinked_cache_directory_disables_the_cache() {
     symlink(root.join("real"), root.join("linked")).unwrap();
     // 끊어진 링크도 따라가 대상 디렉터리를 만들지 않고 같은 이유로 끈다.
     symlink(root.join("missing"), root.join("dangling")).unwrap();
-    for cache in ["linked", "dangling"] {
+    // POSIX는 끝이 `/`나 `/.`인 경로의 마지막 링크를 따라간다(셸 탭 완성이 `/`를 붙인다).
+    // 그런 표기도 링크 자체로 보고 거절해야 한다. macOS의 `mkdir("dangling/")`은 대상을 만든다.
+    for cache in [
+        "linked",
+        "linked/",
+        "linked/.",
+        "linked//",
+        "dangling",
+        "dangling/",
+        "dangling/.",
+    ] {
         let scan = run_scan(
             scan_command(root, "graph.json", Some(cache)),
             root,
             "graph.json",
         );
-        assert!(scan.stderr.contains("symbolic link"), "{}", scan.stderr);
-        assert_eq!(stats(&scan.stderr), [0, 1, 0, 1], "{}", scan.stderr);
-        assert!(scan.graph == expected, "disabled cache changed graph.json");
+        assert!(
+            scan.stderr.contains("symbolic link"),
+            "{cache}: {}",
+            scan.stderr
+        );
+        assert_eq!(
+            stats(&scan.stderr),
+            [0, 1, 0, 1],
+            "{cache}: {}",
+            scan.stderr
+        );
+        assert!(
+            scan.graph == expected,
+            "{cache}: disabled cache changed graph.json"
+        );
+        assert_eq!(
+            fs::read_dir(root.join("real")).unwrap().count(),
+            0,
+            "{cache}"
+        );
+        assert!(
+            fs::symlink_metadata(root.join("missing")).is_err(),
+            "{cache}"
+        );
     }
-    assert_eq!(fs::read_dir(root.join("real")).unwrap().count(), 0);
-    assert!(fs::symlink_metadata(root.join("missing")).is_err());
 }
 
 #[test]
