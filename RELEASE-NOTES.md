@@ -1,4 +1,4 @@
-# Unreleased
+# 0.8.0 release preparation
 
 These changes are not yet in a published release.
 

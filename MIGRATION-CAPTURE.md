@@ -11,6 +11,10 @@ python3 Scripts/capture-migration.py --engine /path/to/schemagraph \
   --project /path/to/application --output /path/to/new-capture
 ```
 
+The helper and this guide are included in the native release archive. Crate-only
+installations can use the helper from the matching source tag. Python 3 with
+SQLite support is required.
+
 The output parent must exist. All SQL files are read once and hashed before
 execution (16 MiB per file); an SQLite authorizer blocks ATTACH/DETACH, including
 VACUUM INTO, and extensions remain disabled. A 30-second SQL budget and

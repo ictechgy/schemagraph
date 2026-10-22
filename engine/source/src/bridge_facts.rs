@@ -14,6 +14,7 @@
 use schemagraph_core::VertexId;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use crate::document::{CatalogDocument, ObjectDoc};
 
@@ -111,6 +112,16 @@ fn relation_contract(object: &ObjectDoc) -> Value {
 
 /// 교환 계약의 입력 상한을 지키며 빠진 근거는 명시한다. 한계가 빈 성공으로 바뀌지 않는다.
 fn bounded_contract(mut fields: Vec<Value>) -> Value {
+    let mut identities = BTreeMap::new();
+    for field in &fields {
+        *identities
+            .entry((
+                field["in"].as_str().unwrap_or_default().to_owned(),
+                field["path"].as_str().unwrap_or_default().to_owned(),
+            ))
+            .or_insert(0usize) += 1;
+    }
+    let ambiguous = identities.values().filter(|count| **count > 1).count();
     fields.sort_by_key(|field| {
         (
             field["in"].as_str().unwrap_or_default().to_owned(),
@@ -119,22 +130,32 @@ fn bounded_contract(mut fields: Vec<Value>) -> Value {
     });
     let original = fields.len();
     fields.retain(|field| {
-        ["path", "type"].iter().all(|key| {
-            field[key].as_str().is_some_and(|text| {
-                !text.is_empty()
-                    && text.encode_utf16().count() <= 1024
-                    && !text.chars().any(char::is_control)
+        identities.get(&(
+            field["in"].as_str().unwrap_or_default().to_owned(),
+            field["path"].as_str().unwrap_or_default().to_owned(),
+        )) == Some(&1)
+            && ["path", "type"].iter().all(|key| {
+                field[key].as_str().is_some_and(|text| {
+                    !text.is_empty()
+                        && text.encode_utf16().count() <= 1024
+                        && !text.chars().any(char::is_control)
+                })
             })
-        })
     });
     fields.truncate(512);
     let mut limitations = vec!["Catalog field evidence only; defaults, CHECK expressions, runtime values and application compatibility are not assessed.".to_owned()];
+    if ambiguous > 0 {
+        limitations.push(format!(
+            "contract-field-ambiguity: {ambiguous} duplicate field identities omitted"
+        ));
+    }
     if fields.len() < original {
         limitations.push(format!(
-            "contract-field-limit: {} fields omitted by the 512-field/string budget",
+            "contract-field-limit: {} fields omitted by ambiguity or the 512-field/string budget",
             original - fields.len()
         ));
     }
+
     json!({"version": 1, "fields": fields, "limitations": limitations})
 }
 
@@ -175,6 +196,30 @@ mod tests {
     use super::*;
     use crate::document::{CollectionContext, ColumnDoc, IndexDoc, ObjectDoc, SchemaDoc};
     use schemagraph_core::VertexKind;
+
+    #[test]
+    fn contract_omits_ambiguous_columns_constraints_and_oversized_utf16() {
+        let contract = bounded_contract(vec![
+            json!({"in":"column","path":"email","type":"text"}),
+            json!({"in":"column","path":"email","type":"integer"}),
+            json!({"in":"constraint","path":"unique_email","type":"hash-a"}),
+            json!({"in":"constraint","path":"unique_email","type":"hash-b"}),
+            json!({"in":"column","path":"😀".repeat(513),"type":"text"}),
+            json!({"in":"column","path":"valid","type":"text"}),
+        ]);
+        assert_eq!(
+            contract["fields"],
+            json!([{"in":"column","path":"valid","type":"text"}])
+        );
+        assert!(contract["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item
+                .as_str()
+                .unwrap()
+                .contains("2 duplicate field identities omitted")));
+    }
 
     fn catalog() -> CatalogDocument {
         CatalogDocument {
