@@ -96,6 +96,7 @@ jobs:
         run: |
           cargo build --manifest-path engine/Cargo.toml --workspace --locked
           cargo test --manifest-path engine/Cargo.toml --workspace --locked
+          python3 Scripts/test-capture-migration.py --engine engine/target/debug/schemagraph
 
       - name: Verify JSON contracts and competitive CLI behavior
         run: |

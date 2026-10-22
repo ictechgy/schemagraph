@@ -13,8 +13,9 @@
 
 use schemagraph_core::VertexId;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
-use crate::document::CatalogDocument;
+use crate::document::{CatalogDocument, ObjectDoc};
 
 /// 카탈로그가 관계로 취급하는 객체 종류다 — sequence·type·synonym 같은
 /// 비관계 객체는 SQL 관계 조인 키와 다른 의미라 선언하지 않는다.
@@ -43,14 +44,16 @@ pub fn bridge_facts_document(
                 escape_channel_segment(&object.name)
             );
             let qualified = VertexId::object(&schema.name, &object.name);
-            facts.push(declaration_fact(&channel, None, qualified.as_str()));
+            let mut relation = declaration_fact(&channel, None, qualified.as_str());
+            relation["dataContract"] = relation_contract(object);
+            facts.push(relation);
             for column in &object.columns {
                 let member = VertexId::member(&schema.name, &object.name, &column.name);
-                facts.push(declaration_fact(
-                    &channel,
-                    Some(&column.name),
-                    member.as_str(),
-                ));
+                let mut fact = declaration_fact(&channel, Some(&column.name), member.as_str());
+                fact["dataContract"] =
+                    bounded_contract(vec![json!({"in": "column", "path": column.name,
+                    "type": column.data_type, "nullable": column.nullable})]);
+                facts.push(fact);
             }
         }
     }
@@ -90,6 +93,49 @@ pub fn bridge_facts_document(
         "facts": facts,
         "limitations": limitations,
     })
+}
+
+/// 컬럼 선언과 제약의 구조 해시를 전달한다. CHECK 본문·런타임 의미는 카탈로그가 주지 않아 추측하지 않는다.
+fn relation_contract(object: &ObjectDoc) -> Value {
+    let mut fields: Vec<Value> = object.columns.iter().map(|column| json!({
+        "in": "column", "path": column.name, "type": column.data_type, "nullable": column.nullable,
+    })).collect();
+    for constraint in &object.constraints {
+        // 이름 변경과 구조 변경을 구분하려고 이름은 키, 나머지 구조는 해시로 보존한다.
+        let structure = json!({"kind": constraint.kind, "columns": constraint.columns, "referenced": constraint.referenced});
+        let digest = Sha256::digest(serde_json::to_vec(&structure).expect("JSON values serialize"));
+        fields.push(json!({"in": "constraint", "path": constraint.name, "type": format!("sha256:{digest:x}")}));
+    }
+    bounded_contract(fields)
+}
+
+/// 교환 계약의 입력 상한을 지키며 빠진 근거는 명시한다. 한계가 빈 성공으로 바뀌지 않는다.
+fn bounded_contract(mut fields: Vec<Value>) -> Value {
+    fields.sort_by_key(|field| {
+        (
+            field["in"].as_str().unwrap_or_default().to_owned(),
+            field["path"].as_str().unwrap_or_default().to_owned(),
+        )
+    });
+    let original = fields.len();
+    fields.retain(|field| {
+        ["path", "type"].iter().all(|key| {
+            field[key].as_str().is_some_and(|text| {
+                !text.is_empty()
+                    && text.chars().count() <= 1024
+                    && !text.chars().any(char::is_control)
+            })
+        })
+    });
+    fields.truncate(512);
+    let mut limitations = vec!["Catalog field evidence only; defaults, CHECK expressions, runtime values and application compatibility are not assessed.".to_owned()];
+    if fields.len() < original {
+        limitations.push(format!(
+            "contract-field-limit: {} fields omitted by the 512-field/string budget",
+            original - fields.len()
+        ));
+    }
+    json!({"version": 1, "fields": fields, "limitations": limitations})
 }
 
 /// relation-decl 사실 하나를 만든다. `method`가 있으면 컬럼 선언이다.
@@ -208,6 +254,10 @@ mod tests {
         assert_eq!(facts[2]["channel"], "public.users");
         assert_eq!(facts[2]["method"], "id");
         assert_eq!(facts[2]["symbol"]["qualifiedName"], "public.users.id");
+        assert_eq!(
+            facts[2]["dataContract"]["fields"],
+            json!([{"in":"column", "path":"id", "type":"bigint", "nullable":false}])
+        );
         for fact in facts {
             assert_eq!(fact["kind"], "relation-decl");
             assert_eq!(fact["dynamic"], false);
@@ -222,6 +272,52 @@ mod tests {
         }
         // 완전한 카탈로그에는 catalog-coverage limitation이 없다.
         assert_eq!(value["limitations"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn same_name_type_nullability_and_constraint_changes_remain_observable() {
+        use crate::document::ConstraintDoc;
+        let before = catalog();
+        let mut after = before.clone();
+        let object = &mut after.schemas[0].objects[0];
+        object.columns[0].data_type = "text".into();
+        object.columns[0].nullable = true;
+        object.constraints.push(ConstraintDoc {
+            name: "id_unique".into(),
+            kind: "unique".into(),
+            columns: vec!["id".into()],
+            referenced: None,
+        });
+        let old = bridge_facts_document(&before, "/repo", "test", "2026-10-22T00:00:00Z");
+        let new = bridge_facts_document(&after, "/repo", "test", "2026-10-22T00:00:00Z");
+        assert_eq!(old["facts"][1]["symbol"], new["facts"][1]["symbol"]);
+        assert_ne!(
+            old["facts"][1]["dataContract"],
+            new["facts"][1]["dataContract"]
+        );
+        assert_eq!(
+            new["facts"][2]["dataContract"]["fields"][0]["nullable"],
+            true
+        );
+        assert_eq!(
+            new["facts"][1]["dataContract"]["fields"][1]["in"],
+            "constraint"
+        );
+    }
+
+    #[test]
+    fn contract_budget_is_explicit_and_deterministic() {
+        let fields = (0..600)
+            .rev()
+            .map(|i| json!({"in":"column", "path":format!("c{i:03}"), "type":"text"}))
+            .collect();
+        let contract = bounded_contract(fields);
+        assert_eq!(contract["fields"].as_array().unwrap().len(), 512);
+        assert!(contract["limitations"][1]
+            .as_str()
+            .unwrap()
+            .contains("88 fields omitted"));
+        assert_eq!(contract["fields"][0]["path"], "c000");
     }
 
     /// usr는 조인 키라서 같은 카탈로그 그래프의 실제 정점이어야 한다. 컬럼과 같은

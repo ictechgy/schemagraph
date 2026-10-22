@@ -111,6 +111,10 @@ id가 다른 kind에 점유됐으면 나중 정점은 `name@kind`로 분리된�
 
 ## 명령
 
+SQLite migration의 재현 가능한 before/after 준비는 [MIGRATION-CAPTURE.md](MIGRATION-CAPTURE.md)를 따른다.
+`facts`의 선택적 `dataContract`는 컬럼 타입/nullability·제약 구조를 보존한다. 그래프 간선을 추가하거나
+실제 앱 호환성을 보장하지 않으며, 미수집 의미와 출력 상한은 함께 전달한다.
+
 ```
 schemagraph scan <jdbc-url> [-o graph.json]   # 카탈로그+몸체 파싱 → 그래프 산출물
 schemagraph scan <jdbc-url> --sql-dir queries --query-schema app  # 외부 SQL query root 추가
