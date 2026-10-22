@@ -1,5 +1,8 @@
 # schemagraph
 
+SQLite SQL migration의 재현 가능한 전후 카탈로그 준비와 앱 계약 연결은
+[격리 migration capture](MIGRATION-CAPTURE.md)를 참고하세요.
+
 <img src="icon.png" alt="schemagraph의 올빼미 마스코트" width="112" height="112" align="right">
 
 이 문서는 한국어 참고 번역입니다. README의 정본은 [영어 원문](README.md)이며,

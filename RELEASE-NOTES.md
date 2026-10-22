@@ -1,6 +1,13 @@
-# Unreleased
+# 0.8.0 release preparation
 
 These changes are not yet in a published release.
+
+- `Scripts/capture-migration.py` replays SQLite migration SQL only in a new isolated
+  database and captures comparable before/after catalogs, graphs, bridge facts and
+  review with input/output hashes and preparation costs. See [migration capture](MIGRATION-CAPTURE.md).
+- `facts` preserves additive bounded column type/nullability and constraint
+  structural evidence for Isthmus contract comparison. Runtime/data compatibility
+  and uncollected defaults/CHECK bodies remain explicitly unassessed.
 
 ## Breaking
 
