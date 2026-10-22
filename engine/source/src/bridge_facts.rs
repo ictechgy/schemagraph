@@ -122,7 +122,7 @@ fn bounded_contract(mut fields: Vec<Value>) -> Value {
         ["path", "type"].iter().all(|key| {
             field[key].as_str().is_some_and(|text| {
                 !text.is_empty()
-                    && text.chars().count() <= 1024
+                    && text.encode_utf16().count() <= 1024
                     && !text.chars().any(char::is_control)
             })
         })

@@ -15,10 +15,12 @@ The output parent must exist. All SQL files are read once and hashed before
 execution (16 MiB per file); an SQLite authorizer blocks ATTACH/DETACH, including
 VACUUM INTO, and extensions remain disabled. A 30-second SQL budget and
 120-second analyzer-command timeout bound preparation. Failures preserve partial
-artifacts for diagnosis and never emit a successful capture receipt. The helper
+artifacts for diagnosis and never emit a capture receipt without a structured review. The helper
 creates one local DB and reuses its path to keep catalog source identity stable.
-Review uses `--strict --require-complete`; code 1 remains recorded as a review or
-coverage finding. Preparation, capture/migration and review costs are separate.
+Review uses `--strict --require-complete`; code 1 means review findings and code 2
+means incomplete or unverified analysis. Both retain the full review and receipt,
+and the helper exits with the same code. A receipt is not an analysis pass.
+Preparation, capture/migration and review costs are separate.
 
 `capture.json` identifies exact SQL and output bytes. It is not a claim about a
 production DB, data-dependent migration safety, locks, or other SQL dialects.

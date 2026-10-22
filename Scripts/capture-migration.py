@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 import time
 
 MAX_SQL_BYTES = 16 * 1024 * 1024
@@ -72,12 +73,17 @@ def capture(engine, base_schema, migrations, output, project):
         run_engine(engine, ['facts', '--document', output / f'{side}.catalog.json', '--project', project,
                             '-o', output / f'{side}.facts.json'])
     reviewed = time.monotonic()
-    review = run_engine(engine, ['review', output / 'before.catalog.json', output / 'after.catalog.json', '--strict', '--require-complete'], (0, 1))
+    review = run_engine(engine, ['review', output / 'before.catalog.json', output / 'after.catalog.json', '--strict', '--require-complete'], (0, 1, 2))
+    # Exit 2 may carry a valid incomplete review. Preserve its evidence and exit
+    # status; command/input failures without a review must still fail capture.
+    review_document = json.loads(review.stdout)
+    if not isinstance(review_document, dict) or review_document.get('kind') != 'review' or not isinstance(review_document.get('complete'), bool):
+        raise ValueError('Analyzer did not return a structured review')
     (output / 'review.json').write_text(review.stdout, encoding='utf-8')
     receipt = {'format': 'schemagraph-migration-capture', 'version': 1, 'dialect': 'sqlite',
                'inputs': [{'role': 'base-schema' if i == 0 else 'migration', 'sha256': digest} for i, (_, digest) in enumerate(sources)],
                'outputs': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(output.glob('*.json'))},
-               'reviewExitCode': review.returncode, 'complete': False,
+               'reviewExitCode': review.returncode, 'reviewComplete': review_document['complete'], 'complete': False,
                'seconds': {'basePreparation': prepared - start, 'captureAndMigration': reviewed - prepared,
                            'review': time.monotonic() - reviewed, 'total': time.monotonic() - start},
                'limitations': ['Isolated SQLite replay only; other DB dialects, production data and deployment locks are not assessed.',
@@ -96,7 +102,8 @@ def main():
     args = parser.parse_args()
     receipt = capture(args.engine, args.base_schema, args.migration, args.output, args.project)
     print(json.dumps(receipt, sort_keys=True))
+    return receipt['reviewExitCode']
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
