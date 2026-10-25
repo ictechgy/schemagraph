@@ -28,11 +28,17 @@ dependency records.
 
 ## Quick start
 
-Install the CLI with Rust and Cargo:
+Install the latest published CLI with Rust and Cargo:
 
 ```sh
-cargo install schemagraph-cli --version 0.7.1 --locked
+cargo install schemagraph-cli --locked
+schemagraph --version
 ```
+
+Cargo and GitHub binaries are published separately. For the 0.8.1 migration
+helper, use the matching binary archive or source tag described in
+[the installation guide](INSTALLATION.md); check channel availability before
+pinning a crate version.
 
 ### Build from source
 
