@@ -1,9 +1,9 @@
 # Installing schemagraph
 
-For the published [v0.7.1 binary release](https://github.com/ictechgy/schemagraph/releases/tag/v0.7.1),
-replace `VERSION` below with `0.7.1` (published and verified on 2026-10-13 UTC).
-Use a version listed on the [release page](https://github.com/ictechgy/schemagraph/releases)
-with the matching artifacts and `SHA256SUMS`.
+The release target is `0.8.1`. Replace `VERSION` below only with a version listed
+on the [release page](https://github.com/ictechgy/schemagraph/releases) with matching
+artifacts and `SHA256SUMS`; a source version alone does not establish publication.
+GitHub binaries, Cargo crates, and Maven packages are published separately.
 
 Version 0.5.0 includes [a consumer GitHub Action](REVIEW-ACTION.md)
 and [a reproducible Docker build](SUPPORT-MATRIX.md#runtime-and-distribution).

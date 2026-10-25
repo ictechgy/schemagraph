@@ -27,14 +27,23 @@ def read_sql(path):
     return data.decode('utf-8-sig'), hashlib.sha256(data).hexdigest()
 
 
+def _migration_authorizer(action, _argument1, argument2, *_):
+    """확장 API 유무와 무관하게 외부 DB 및 SQL 확장 호출을 준비 단계에서 막는다."""
+    if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH):
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_FUNCTION and (argument2 or '').casefold() == 'load_extension':
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
 def apply_sql(database, sql):
     """SQLite itself executes the migration; authorizer prevents external DB access."""
     deadline = time.monotonic() + 30
     with closing(sqlite3.connect(database)) as connection:
-        connection.enable_load_extension(False)
-        connection.set_authorizer(lambda action, *_: sqlite3.SQLITE_DENY
-                                  if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH)
-                                  else sqlite3.SQLITE_OK)
+        # 새 연결은 확장 로딩이 꺼져 있고, 일부 Python 빌드는 선택적 API 자체가 없다.
+        if hasattr(connection, 'enable_load_extension'):
+            connection.enable_load_extension(False)
+        connection.set_authorizer(_migration_authorizer)
         connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
         connection.execute('PRAGMA foreign_keys = ON')
         connection.executescript(sql)

@@ -23,11 +23,16 @@ JSON을 출력하며, Mermaid·Graphviz DOT와 오프라인 HTML 탐색기도 �
 
 ## 빠른 시작
 
-Rust와 Cargo로 CLI를 설치합니다.
+Rust와 Cargo로 레지스트리에 공개된 최신 CLI를 설치합니다.
 
 ```sh
-cargo install schemagraph-cli --version 0.7.1 --locked
+cargo install schemagraph-cli --locked
+schemagraph --version
 ```
+
+Cargo와 GitHub 바이너리는 별도로 게시됩니다. 0.8.1 migration helper는
+[설치 안내](INSTALLATION.md)의 같은 버전 바이너리 archive나 source tag를
+사용하고, crate 버전을 고정할 때는 해당 채널의 공개 여부를 먼저 확인하세요.
 
 ### 소스에서 빌드
 

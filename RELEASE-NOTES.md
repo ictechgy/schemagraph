@@ -1,6 +1,18 @@
-# 0.8.0 release preparation
+# schemagraph 0.8.1
 
-These changes are not yet in a published release.
+- The packaged SQLite migration helper works when Python was built without the
+  optional `enable_load_extension` API, including the stock Apple Python build.
+  A fresh connection keeps extension loading off; SQL `load_extension` is always
+  rejected by the authorizer. A present disable API still runs and any error
+  propagates before SQL execution.
+- ATTACH, DETACH, VACUUM INTO and extension-loading guards remain in place;
+  ordinary PRAGMAs and schema DDL still work. Catalog, graph, facts and review
+  bodies retain their contracts; producer version metadata advances to 0.8.1.
+- Cargo workspace, JDBC probe and manual Maven publication defaults move to
+  0.8.1. Publication and public installation are checked per channel; source
+  versions do not imply registry availability.
+
+# schemagraph 0.8.0
 
 - `Scripts/capture-migration.py` replays SQLite migration SQL only in a new isolated
   database and captures comparable before/after catalogs, graphs, bridge facts and

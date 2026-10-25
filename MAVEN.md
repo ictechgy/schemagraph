@@ -1,22 +1,25 @@
 # Maven publication
 
+The examples target release 0.8.1. Source version alignment does not establish
+publication: select a version visible in Central or Pages metadata before resolving it.
+
 The JDBC probe publication coordinates are
-`io.github.ictechgy:schemagraph-probe:0.7.1`. The regular Maven artifact is a
+`io.github.ictechgy:schemagraph-probe:0.8.1`. The regular Maven artifact is a
 thin Kotlin/JVM jar. Its POM carries Kotlin, Jackson, and bundled JDBC driver
 runtime dependencies. The optional `all` classifier remains the executable
 fat jar used by the fixture runner:
 
 ```text
-schemagraph-probe-0.7.1.jar       thin library/application jar
-schemagraph-probe-0.7.1-all.jar  executable jar with bundled drivers
-schemagraph-probe-0.7.1-sources.jar
-schemagraph-probe-0.7.1-javadoc.jar
+schemagraph-probe-0.8.1.jar       thin library/application jar
+schemagraph-probe-0.8.1-all.jar  executable jar with bundled drivers
+schemagraph-probe-0.8.1-sources.jar
+schemagraph-probe-0.8.1-javadoc.jar
 ```
 
 ## Install from Maven Central
 
 Use Maven Central to resolve
-[`io.github.ictechgy:schemagraph-probe:0.7.1`](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.7.1).
+[`io.github.ictechgy:schemagraph-probe:0.8.1`](https://central.sonatype.com/artifact/io.github.ictechgy/schemagraph-probe/0.8.1).
 No project-specific repository URL or publishing credentials are needed:
 
 ```kotlin
@@ -25,7 +28,7 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.ictechgy:schemagraph-probe:0.7.1")
+    implementation("io.github.ictechgy:schemagraph-probe:0.8.1")
 }
 ```
 
@@ -48,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.ictechgy:schemagraph-probe:0.7.1")
+    implementation("io.github.ictechgy:schemagraph-probe:0.8.1")
 }
 ```
 
@@ -65,13 +68,13 @@ The Pages workflow requires the repository's Pages source to use GitHub Actions
 and the standard `github-pages` environment. No Central account, signing key,
 or publishing token is needed for this anonymous repository.
 
-The build defaults to version `0.7.1` and group `io.github.ictechgy`. Override
+The build defaults to version `0.8.1` and group `io.github.ictechgy`. Override
 those values without editing the build:
 
 ```sh
 gradle -p probe \
   -PprobeGroup=io.github.ictechgy \
-  -PprobeVersion=0.7.1 \
+  -PprobeVersion=0.8.1 \
   shadowJar
 ```
 
@@ -176,7 +179,7 @@ With the signing key supplied securely, create the Central bundle. This command
 does not contact Central:
 
 ```sh
-Scripts/publish-probe-maven.sh --output probe/build/central-bundle-0.7.1.zip
+Scripts/publish-probe-maven.sh --output probe/build/central-bundle-0.8.1.zip
 ```
 
 The script verifies `.asc`, `.md5`, and `.sha1` sidecars for every JAR and POM,
@@ -213,17 +216,17 @@ An already `PUBLISHED` deployment is treated as an idempotent readback.
 The upload is user-managed and stops after validation. Use `--publish` only
 after reviewing the Central validation result; the helper then waits for and
 reads back `PUBLISHED`. Before publishing, verify the namespace, token
-permissions, public signing key, and that `0.7.1` has not already been released.
+permissions, public signing key, and that `0.8.1` has not already been released.
 Central releases are immutable.
 
 Alternatively, run the manual workflow from `main` after the four secrets are
 configured:
 
 ```sh
-gh workflow run publish-central.yml --ref main -f version=0.7.1 -f publish=true
+gh workflow run publish-central.yml --ref main -f version=0.8.1 -f publish=true
 ```
 
-It builds the probe from the existing `v0.7.1` tag, compares all five unsigned
+It builds the probe from the existing `v0.8.1` tag, compares all five unsigned
 payloads byte-for-byte with the public Pages repository, then uploads the signed
 bundle. Publication proceeds only after Central reports `VALIDATED`, and the
 workflow waits for `PUBLISHED`. With `publish=false` (the default), it stops
