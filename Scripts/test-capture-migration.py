@@ -8,11 +8,21 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location('capture', Path(__file__).with_name('capture-migration.py'))
 CAPTURE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CAPTURE)
 ENGINE = None
+
+
+class WithoutExtensionAPI(sqlite3.Connection):
+    """선택적으로 빌드되는 확장 API가 없는 실제 SQLite 연결을 대조한다."""
+
+    def __getattribute__(self, name):
+        if name == 'enable_load_extension':
+            raise AttributeError(name)
+        return super().__getattribute__(name)
 
 
 class CaptureTests(unittest.TestCase):
@@ -34,6 +44,78 @@ class CaptureTests(unittest.TestCase):
                 with self.assertRaises(sqlite3.DatabaseError):
                     CAPTURE.apply_sql(database, sql)
                 self.assertFalse(outside.exists())
+
+    def test_missing_extension_api_preserves_real_ddl_and_local_pragma(self):
+        original_connect = sqlite3.connect
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / 'fixture.sqlite'
+            def connect(*args, **kwargs):
+                return original_connect(*args, factory=WithoutExtensionAPI, **kwargs)
+            with patch.object(CAPTURE.sqlite3, 'connect', side_effect=connect):
+                CAPTURE.apply_sql(database, 'PRAGMA user_version = 7; CREATE TABLE people(id INTEGER PRIMARY KEY, email TEXT NOT NULL);')
+                CAPTURE.apply_sql(database, 'ALTER TABLE people RENAME COLUMN email TO address;')
+            with closing(original_connect(database)) as connection:
+                self.assertEqual(connection.execute('PRAGMA user_version').fetchone(), (7,))
+                self.assertEqual([row[1] for row in connection.execute('PRAGMA table_info(people)')], ['id', 'address'])
+
+    def test_sql_extension_and_external_database_guards_with_optional_api(self):
+        original_connect = sqlite3.connect
+        modes = [WithoutExtensionAPI]
+        if hasattr(sqlite3.Connection, 'enable_load_extension'):
+            modes.append(sqlite3.Connection)
+        with tempfile.TemporaryDirectory() as folder:
+            database, outside = Path(folder) / 'fixture.sqlite', Path(folder) / 'outside.sqlite'
+            calls = []
+            for factory in modes:
+                def connect(*args, **kwargs):
+                    connection = original_connect(*args, factory=factory, **kwargs)
+                    # 실제 라이브러리 로딩 대신 무해한 함수로 준비 단계의 거부를 확인한다.
+                    connection.create_function('load_extension', 1, lambda value: calls.append(value))
+                    return connection
+                with patch.object(CAPTURE.sqlite3, 'connect', side_effect=connect):
+                    for sql in ["SELECT load_extension('not-loaded');", "SELECT LOAD_EXTENSION('not-loaded');",
+                                "SELECT \"load_extension\"('not-loaded');", f"ATTACH DATABASE '{outside.as_posix()}' AS extra;",
+                                'DETACH DATABASE main;', f"VACUUM INTO '{outside.as_posix()}';"]:
+                        with self.subTest(api=factory.__name__, sql=sql), self.assertRaises(sqlite3.DatabaseError):
+                            CAPTURE.apply_sql(database, sql)
+                self.assertEqual(calls, [])
+                self.assertFalse(outside.exists())
+
+    def test_present_extension_api_disable_failure_stops_before_sql(self):
+        calls = []
+        class DisableFails(sqlite3.Connection):
+            def enable_load_extension(self, enabled):
+                calls.append(enabled)
+                raise sqlite3.OperationalError('extension disable failed')
+        original_connect = sqlite3.connect
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / 'fixture.sqlite'
+            def connect(*args, **kwargs):
+                return original_connect(*args, factory=DisableFails, **kwargs)
+            with patch.object(CAPTURE.sqlite3, 'connect', side_effect=connect):
+                with self.assertRaisesRegex(sqlite3.OperationalError, 'extension disable failed'):
+                    CAPTURE.apply_sql(database, 'CREATE TABLE must_not_execute(id INTEGER);')
+            self.assertEqual(calls, [False])
+            with closing(original_connect(database)) as connection:
+                self.assertEqual(connection.execute('SELECT name FROM sqlite_schema').fetchall(), [])
+
+    @unittest.skipUnless(hasattr(sqlite3.Connection, 'enable_load_extension'), 'SQLite build omits optional extension API')
+    def test_present_extension_api_is_disabled_before_replay(self):
+        calls = []
+        class DisableRecords(sqlite3.Connection):
+            def enable_load_extension(self, enabled):
+                calls.append(enabled)
+                return super().enable_load_extension(enabled)
+        original_connect = sqlite3.connect
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / 'fixture.sqlite'
+            def connect(*args, **kwargs):
+                return original_connect(*args, factory=DisableRecords, **kwargs)
+            with patch.object(CAPTURE.sqlite3, 'connect', side_effect=connect):
+                CAPTURE.apply_sql(database, 'CREATE TABLE normal_replay(id INTEGER);')
+            self.assertEqual(calls, [False])
+            with closing(original_connect(database)) as connection:
+                self.assertEqual(connection.execute('SELECT name FROM sqlite_schema WHERE type = ?;', ('table',)).fetchall(), [('normal_replay',)])
 
     def test_real_engine_catalog_before_after_and_contract_export(self):
         if ENGINE is None:

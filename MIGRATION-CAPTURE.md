@@ -15,6 +15,14 @@ The helper and this guide are included in the native release archive. Crate-only
 installations can use the helper from the matching source tag. Python 3 with
 SQLite support is required.
 
+The optional `enable_load_extension` Python API may be absent, including in
+Apple-provided SQLite builds. New SQLite connections start with extension loading
+disabled; the helper also disables it through that API when present and always
+rejects SQL `load_extension` calls through its authorizer. Errors from an available
+disable API remain fatal. Normal DDL and local PRAGMA statements retain their
+existing behavior. See the [Python sqlite3 build notes](https://docs.python.org/3/library/sqlite3.html#sqlite3.Connection.enable_load_extension)
+and [SQLite extension-loading contract](https://www.sqlite.org/c3ref/enable_load_extension.html).
+
 The output parent must exist. All SQL files are read once and hashed before
 execution (16 MiB per file); an SQLite authorizer blocks ATTACH/DETACH, including
 VACUUM INTO, and extensions remain disabled. A 30-second SQL budget and
