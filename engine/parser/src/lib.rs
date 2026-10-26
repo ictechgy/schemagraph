@@ -28,6 +28,7 @@ pub use cache::{BodyCache, BodyResult, CacheContext};
 mod scope;
 #[cfg(test)]
 mod scope_tests;
+mod sqlite;
 
 /// document의 몸체들을 파싱해 그래프에 간선을 보강한다.
 ///
@@ -178,6 +179,7 @@ pub fn enrich_with_cache(
                         dialect.as_deref(),
                         body,
                         doc.dialect == "sqlserver" || doc.dialect == "mssql",
+                        doc.dialect == "sqlite",
                     ),
                 };
                 match parsed_body {
@@ -820,6 +822,7 @@ fn parse_trigger_body(
     dialect: Option<&dyn Dialect>,
     body: &str,
     sqlserver_trigger: bool,
+    sqlite_trigger: bool,
 ) -> Result<ParsedTrigger, String> {
     let default = GenericDialect {};
     let dialect = dialect.unwrap_or(&default);
@@ -857,7 +860,7 @@ fn parse_trigger_body(
                 );
             }
             for stmt in stmts {
-                collect_trigger_stmt(stmt, &mut parsed, sqlserver_trigger);
+                collect_trigger_stmt(stmt, &mut parsed, sqlserver_trigger, sqlite_trigger);
             }
             invalidate_temp_state_if_unsafe(&mut parsed, body, 0);
             Ok(parsed)
@@ -889,7 +892,7 @@ fn parse_routine_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<Parse
     let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
     let transformed =
         inner.as_ref().len() != body.len() || !std::ptr::eq(inner.as_ref().as_ptr(), body.as_ptr());
-    let mut parsed = parse_trigger_body(dialect, &inner, false)?;
+    let mut parsed = parse_trigger_body(dialect, &inner, false, false)?;
     parsed
         .scalar_symbols
         .extend(routine_parameter_symbols(body));
@@ -1066,9 +1069,9 @@ fn parse_informix_trigger_body(
         .unwrap_or(body);
     if let Some(alias) = informix_new_alias(body) {
         let normalized = replace_trigger_alias(inner, &alias);
-        return parse_trigger_body(dialect, &normalized, false);
+        return parse_trigger_body(dialect, &normalized, false, false);
     }
-    parse_trigger_body(dialect, inner, false)
+    parse_trigger_body(dialect, inner, false, false)
 }
 
 fn informix_new_alias(body: &str) -> Option<String> {
@@ -1126,7 +1129,7 @@ fn parse_db2_trigger_body(
     body: &str,
 ) -> Result<ParsedTrigger, String> {
     let inner = strip_catalog_trigger_header("db2", body).unwrap_or(body);
-    parse_trigger_body(dialect, inner, false)
+    parse_trigger_body(dialect, inner, false, false)
 }
 
 fn strip_catalog_trigger_header<'a>(dialect: &str, body: &'a str) -> Option<&'a str> {
@@ -1578,7 +1581,7 @@ fn parse_procedural_body(
         match parse_limits::parse_sql(dialect, stmt) {
             Ok(list) => {
                 for s in list {
-                    collect_trigger_stmt(s, &mut parsed, false);
+                    collect_trigger_stmt(s, &mut parsed, false, false);
                 }
             }
             // 추출기가 SQL이 아닌 조각을 문장으로 오인한 경우 — 하나의
@@ -3037,19 +3040,29 @@ fn is_query_text(s: &str) -> bool {
 /// 컬럼 DML은 복제하지 않고 옮겨 보관하고, 절차형 블록(IF/WHILE/CASE)은 안쪽 문장을
 /// 꺼내 같은 규칙으로 모은다. 컬럼 DML에는 안쪽 문장이 없으므로 처음 나온 순서가
 /// 참조로 훑던 때와 같다.
-fn collect_trigger_stmt(stmt: Statement, parsed: &mut ParsedTrigger, sqlserver_trigger: bool) {
-    collect_trigger_facts(&stmt, parsed, sqlserver_trigger);
+fn collect_trigger_stmt(
+    stmt: Statement,
+    parsed: &mut ParsedTrigger,
+    sqlserver_trigger: bool,
+    sqlite_trigger: bool,
+) {
+    collect_trigger_facts(&stmt, parsed, sqlserver_trigger, sqlite_trigger);
     if is_column_dml_statement(&stmt) {
         parsed.retain_dml_statement(stmt);
         return;
     }
     for nested in into_nested_statements(stmt) {
-        collect_trigger_stmt(nested, parsed, sqlserver_trigger);
+        collect_trigger_stmt(nested, parsed, sqlserver_trigger, sqlite_trigger);
     }
 }
 
 /// 문장 하나의 관계·식·호출 참조를 모은다. 안쪽 문장은 호출자가 따로 넘긴다.
-fn collect_trigger_facts(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver_trigger: bool) {
+fn collect_trigger_facts(
+    stmt: &Statement,
+    parsed: &mut ParsedTrigger,
+    sqlserver_trigger: bool,
+    sqlite_trigger: bool,
+) {
     if let Statement::CreateTable(create) = stmt {
         let local = create.temporary
             || create
@@ -3167,6 +3180,11 @@ fn collect_trigger_facts(stmt: &Statement, parsed: &mut ParsedTrigger, sqlserver
             // 몸체 안의 함수 호출 — 내장 함수는 routine이 아니라 걸러야
             // count() 같은 호출이 "카탈로그에 없음" 노이즈를 만들지 않는다.
             Expr::Function(f) => {
+                // SQLite RAISE는 trigger 전용 구문이다. visitor는 계속 내려가므로
+                // 오류 메시지의 서브쿼리·사용자 함수·NEW/OLD 읽기는 그대로 남는다.
+                if sqlite_trigger && sqlite::raise_action(f).is_some() {
+                    return ControlFlow::<()>::Continue(());
+                }
                 let t = object_name_parts(&f.name);
                 let quoted_name = f
                     .name

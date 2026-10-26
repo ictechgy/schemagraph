@@ -210,6 +210,7 @@ struct Binder<'a, 'd> {
     depth: usize,
     window_expansions: usize,
     scalar_symbols: BTreeSet<String>,
+    sqlite_trigger: bool,
     pseudo_relations: BTreeMap<String, Relation>,
     /// 문장열 안에서만 유효한 CTAS/temp 기호. 그래프 정점은 만들지 않고 생성
     /// 질의에서 물려받은 실제 source 컬럼 id만 보관한다.
@@ -1891,6 +1892,7 @@ impl Binder<'_, '_> {
             queries: 0,
             expression_depth: 0,
             pseudo_access_roots: 0,
+            skip_raise_action: false,
             sources: Sources::new(),
         };
         let _ = node.visit(&mut visitor);
@@ -1927,6 +1929,10 @@ pub(crate) fn apply_dml_column_effects(
             depth: 0,
             window_expansions: 0,
             scalar_symbols: options.scalar_symbols.clone(),
+            sqlite_trigger: catalog.dialect == "sqlite"
+                && graph
+                    .vertex(owner)
+                    .is_some_and(|vertex| vertex.kind == VertexKind::Trigger),
             pseudo_relations: BTreeMap::new(),
             local_relations: BTreeMap::new(),
         },
@@ -2989,6 +2995,7 @@ struct ExprVisitor<'a, 'b, 'c, 'd> {
     queries: usize,
     expression_depth: usize,
     pseudo_access_roots: usize,
+    skip_raise_action: bool,
     sources: Sources,
 }
 
@@ -3015,6 +3022,11 @@ impl Visitor for ExprVisitor<'_, '_, '_, '_> {
         }
         let root_expression = self.expression_depth == 0;
         self.expression_depth += 1;
+        // raise_action은 수식자 없는 첫 Identifier 인자만 허용한다. 바로 다음
+        // Expr인 이 키워드만 건너뛰며 이후 메시지 식은 정상적으로 방문한다.
+        if std::mem::take(&mut self.skip_raise_action) {
+            return ControlFlow::Continue(());
+        }
         if let Some((pseudo, field)) = pseudo_field_access(expr) {
             self.pseudo_access_roots += 1;
             let ids = [Ident::new(pseudo), field.clone()];
@@ -3026,7 +3038,11 @@ impl Visitor for ExprVisitor<'_, '_, '_, '_> {
             return ControlFlow::Continue(());
         }
         if let Expr::Function(function) = expr {
-            self.binder.call(&function.name, location(expr));
+            if self.binder.sqlite_trigger && super::sqlite::raise_action(function).is_some() {
+                self.skip_raise_action = true;
+            } else {
+                self.binder.call(&function.name, location(expr));
+            }
             if let Some(over) = &function.over {
                 let sources = match over {
                     WindowType::NamedWindow(reference) => self.binder.named_window_sources(
@@ -3166,6 +3182,7 @@ pub(crate) fn enrich_view(
         depth: 0,
         window_expansions: 0,
         scalar_symbols: BTreeSet::new(),
+        sqlite_trigger: false,
         pseudo_relations: BTreeMap::new(),
         local_relations: BTreeMap::new(),
     };
