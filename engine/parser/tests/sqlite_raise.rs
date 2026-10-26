@@ -102,8 +102,9 @@ fn sqlite_raise_message_subqueries_remain_read_dependencies() {
     assert_eq!(
         state(&graph),
         AnalysisState::Complete,
-        "{:?}",
-        graph.limitations()
+        "limitations: {:?}; analysis: {:?}",
+        graph.limitations(),
+        graph.analysis()
     );
     assert!(has_edge(&graph, "s.customers", EdgeKind::Reads));
     assert!(has_edge(&graph, "s.orders.customer_id", EdgeKind::Reads));
@@ -154,22 +155,44 @@ fn sqlite_raise_inside_dml_keeps_message_sources_and_skips_the_action_keyword() 
     let graph = analyze(
         "sqlite",
         "INSERT INTO customers (id, name) SELECT NEW.customer_id, \
-         RAISE(ABORT, (SELECT name FROM customers WHERE id = NEW.customer_id))",
+         RAISE(ABORT, (SELECT id FROM orders WHERE id = NEW.id))",
         json!([]),
     );
     assert_eq!(
         state(&graph),
         AnalysisState::Complete,
-        "{:?}",
-        graph.limitations()
+        "limitations: {:?}; analysis: {:?}",
+        graph.limitations(),
+        graph.analysis()
     );
     assert!(has_edge(&graph, "s.customers", EdgeKind::Writes));
-    assert!(has_edge(&graph, "s.customers.name", EdgeKind::Reads));
+    assert!(has_edge(&graph, "s.orders.id", EdgeKind::Reads));
     assert!(has_edge(&graph, "s.orders.customer_id", EdgeKind::Reads));
     assert!(!graph
         .edges()
         .iter()
         .any(|edge| edge.kind == EdgeKind::Calls));
+}
+
+#[test]
+fn sqlite_raise_does_not_hide_temporal_self_lineage_limitations() {
+    let graph = analyze(
+        "sqlite",
+        "INSERT INTO customers (id, name) SELECT NEW.customer_id, \
+         RAISE(ABORT, (SELECT name FROM customers WHERE id = NEW.customer_id))",
+        json!([]),
+    );
+    assert_eq!(state(&graph), AnalysisState::Partial);
+    assert!(graph.analysis()[&VertexId::from_raw("s.orders.guard")]
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "SG_TEMPORAL_SELF_LINEAGE"));
+    assert!(!graph
+        .limitations()
+        .iter()
+        .any(|note| note.contains("s.RAISE")));
+    assert!(has_edge(&graph, "s.customers", EdgeKind::Writes));
+    assert!(has_edge(&graph, "s.customers.name", EdgeKind::Reads));
 }
 
 #[test]
