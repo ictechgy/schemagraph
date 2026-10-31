@@ -81,6 +81,24 @@ fn has_dependency_to(graph: &Graph, from: &str, to: &str) -> bool {
 }
 
 #[test]
+fn review_recursive_forward_cte_alias_is_not_a_physical_relation() {
+    for (sql, physical_later) in [
+        ("WITH RECURSIVE first_cte AS (SELECT id FROM later_cte), later_cte AS (SELECT id FROM audit) SELECT id FROM first_cte", false),
+        ("WITH first_cte AS (SELECT id FROM later_cte), later_cte AS (SELECT id FROM audit) SELECT id FROM first_cte", true),
+    ] {
+        let graph = analyze("postgres", vec![table("later_cte", &["id"]), table("audit", &["id"])], vec![function("read_ctes", None, sql)]);
+        assert_eq!(has_edge(&graph, "s.read_ctes", "s.later_cte", EdgeKind::Reads), physical_later);
+        assert!(has_edge(&graph, "s.read_ctes", "s.audit", EdgeKind::Reads));
+    }
+    let graph = analyze("postgres", vec![table("audit", &["id"])], vec![function("read_ctes", None,
+        "WITH RECURSIVE first_cte AS (SELECT id FROM later_cte), later_cte AS (SELECT id FROM audit) SELECT id FROM first_cte")]);
+    assert!(!graph
+        .limitations()
+        .iter()
+        .any(|note| note.contains("later_cte")));
+}
+
+#[test]
 fn feedback_default_expression_keeps_its_function_dependency() {
     let mut orders = table("orders", &["id", "literal"]);
     orders["columns"][0]["default"] = json!("S.Next_Id()");

@@ -90,11 +90,16 @@ pub(super) fn collect_reads(
                 .remove(&(query as *const Query as usize))
                 .unwrap_or_else(|| self.ctes.last().cloned().unwrap_or_default());
             if let Some(with) = &query.with {
+                // RECURSIVE는 뒤 형제 CTE 참조도 허용한다. 비재귀는 이전 별칭만 보인다.
+                if with.recursive {
+                    visible.extend(
+                        with.cte_tables
+                            .iter()
+                            .map(|cte| cte.alias.name.value.clone()),
+                    );
+                }
                 for cte in &with.cte_tables {
                     let name = cte.alias.name.value.clone();
-                    if with.recursive {
-                        visible.insert(name.clone());
-                    }
                     self.definitions
                         .insert(cte.query.as_ref() as *const Query as usize, visible.clone());
                     visible.insert(name);
