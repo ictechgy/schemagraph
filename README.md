@@ -1,5 +1,7 @@
 # schemagraph
 
+Verified on 2026-11-01: GitHub [v0.8.1](https://github.com/ictechgy/schemagraph/releases/tag/v0.8.1) and crates.io `schemagraph-cli` **0.7.0** are separate channels. To use the 0.8.1 behavior described here, select a verified GitHub artifact or build that tag with `--locked`; `cargo install schemagraph-cli` currently selects 0.7.0. See [installation](INSTALLATION.md).
+
 <img src="icon.png" alt="schemagraph's owl mascot" width="112" height="112" align="right">
 
 English is the canonical version of this README. [한국어 참고 번역](README.ko.md)
@@ -64,6 +66,18 @@ schemagraph query main.orders --graph "$sg_demo_dir/shop.graph.json"
 schemagraph impact main.customers --graph "$sg_demo_dir/shop.graph.json"
 schemagraph graph --graph "$sg_demo_dir/shop.graph.json" --format mermaid
 ```
+If `sqlite3` is unavailable, create the same database with Python 3 instead:
+
+```sh
+python3 - "$sg_demo_dir/shop.db" <<'PYTHON'
+from pathlib import Path
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as database:
+    database.executescript(Path('Fixtures/sqlite/basic.sql').read_text())
+PYTHON
+```
+
 
 The fixture includes a foreign-key chain, a view, a trigger, and dependency
 cycles. `query main.orders` shows its dependency on `main.customers`;

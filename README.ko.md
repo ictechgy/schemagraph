@@ -1,5 +1,7 @@
 # schemagraph
 
+2026-11-01 확인: GitHub [v0.8.1](https://github.com/ictechgy/schemagraph/releases/tag/v0.8.1)과 crates.io `schemagraph-cli` **0.7.0**은 별도 배포 채널이다. 여기 설명된 0.8.1 동작은 검증된 GitHub 산출물이나 해당 태그의 `--locked` 소스 빌드를 사용한다. `cargo install schemagraph-cli`의 현재 발행본은 0.7.0이다. [설치 안내](INSTALLATION.md).
+
 SQLite SQL migration의 재현 가능한 전후 카탈로그 준비와 앱 계약 연결은
 [격리 migration capture](MIGRATION-CAPTURE.md)를 참고하세요.
 
@@ -58,6 +60,18 @@ schemagraph query main.orders --graph "$sg_demo_dir/shop.graph.json"
 schemagraph impact main.customers --graph "$sg_demo_dir/shop.graph.json"
 schemagraph graph --graph "$sg_demo_dir/shop.graph.json" --format mermaid
 ```
+`sqlite3` 실행 파일이 없으면 Python 3 표준 라이브러리로 같은 DB를 만든다:
+
+```sh
+python3 - "$sg_demo_dir/shop.db" <<'PYTHON'
+from pathlib import Path
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as database:
+    database.executescript(Path('Fixtures/sqlite/basic.sql').read_text())
+PYTHON
+```
+
 
 fixture에는 외래 키 체인, 뷰, 트리거, 의존성 순환이 포함되어 있습니다.
 `query main.orders`는 `main.customers`에 대한 의존성을 보여주고,
