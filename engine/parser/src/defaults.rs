@@ -74,6 +74,15 @@ pub(super) fn enrich(
                     } else {
                         schema.name.clone()
                     };
+                    // pg_catalog 내장 시퀀스 함수는 사용자 routine 카탈로그에 없다.
+                    // 정규화한 식별자로만 대조해 따옴표 대소문자와 사용자 스키마를 보존한다.
+                    let sequence_builtin =
+                        matches!(document.dialect.as_str(), "postgres" | "postgresql")
+                            && (parts.len() == 1 || target_schema == "pg_catalog")
+                            && matches!(
+                                name.as_str(),
+                                "nextval" | "currval" | "setval" | "lastval"
+                            );
                     match resolve_routine(graph, &target_schema, &name, catalog.lookup(ci)) {
                         RoutineHit::One(target) if graph.vertex(&target).is_some_and(|vertex| vertex.kind == VertexKind::Function) => {
                             graph.add_edge(Edge {
@@ -83,6 +92,7 @@ pub(super) fn enrich(
                             });
                         }
                         RoutineHit::Ambiguous(count) => notes.push(format!("column {owner} DEFAULT: {target_schema}.{name} has {count} overloads; dependency unresolved")),
+                        RoutineHit::None if sequence_builtin => {},
                         RoutineHit::None if parts.len() == 1 && parts[0].quote_style.is_none() && is_builtin_function(&name) => {},
                         _ => notes.push(format!("column {owner} DEFAULT: function {target_schema}.{name} unavailable in catalog; dependency unresolved")),
                     }

@@ -124,6 +124,71 @@ fn feedback_default_expression_keeps_its_function_dependency() {
 }
 
 #[test]
+fn review_postgres_sequence_builtins_are_not_missing_user_functions() {
+    for dialect in ["postgres", "postgresql"] {
+        for expression in [
+            "nextval('s.order_seq'::regclass)",
+            "PG_CATALOG.NEXTVAL('s.order_seq'::regclass)",
+            "\"pg_catalog\".\"nextval\"('s.order_seq'::regclass)",
+            "currval('s.order_seq'::regclass)",
+            "setval('s.order_seq'::regclass, 42)",
+            "pg_catalog.setval('s.order_seq'::regclass, 42, false)",
+            "lastval()",
+        ] {
+            let mut orders = table("orders", &["id"]);
+            orders["columns"][0]["default"] = json!(expression);
+            let graph = analyze(dialect, vec![orders], vec![]);
+            assert!(
+                !graph
+                    .limitations()
+                    .iter()
+                    .any(|note| note.contains("DEFAULT")),
+                "{dialect}: {expression}: {:?}",
+                graph.limitations()
+            );
+        }
+    }
+}
+
+#[test]
+fn review_sequence_builtin_names_keep_user_functions_and_unknown_names() {
+    for expression in ["nextval()", "s.nextval()"] {
+        let mut orders = table("orders", &["id"]);
+        orders["columns"][0]["default"] = json!(expression);
+        let graph = analyze(
+            "postgres",
+            vec![orders],
+            vec![function("nextval", None, "SELECT 1")],
+        );
+        assert!(has_edge(
+            &graph,
+            "s.orders.id",
+            "s.nextval",
+            EdgeKind::DependsOn
+        ));
+    }
+    for (dialect, expression) in [
+        ("postgres", "s.nextval()"),
+        ("postgres", "\"PG_CATALOG\".nextval()"),
+        ("postgres", "\"NextVal\"()"),
+        ("postgres", "pg_catalog.not_a_builtin()"),
+        ("sqlite", "nextval()"),
+    ] {
+        let mut orders = table("orders", &["id"]);
+        orders["columns"][0]["default"] = json!(expression);
+        let graph = analyze(dialect, vec![orders], vec![]);
+        assert!(
+            graph
+                .limitations()
+                .iter()
+                .any(|note| note.contains("DEFAULT") && note.contains("unavailable")),
+            "{dialect}: {expression}: {:?}",
+            graph.limitations()
+        );
+    }
+}
+
+#[test]
 fn feedback_default_expression_does_not_guess_overloads_or_accept_trailing_sql() {
     let mut orders = table("orders", &["ambiguous", "invalid"]);
     orders["columns"][0]["default"] = json!("next_id()");
