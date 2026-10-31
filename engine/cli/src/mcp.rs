@@ -89,7 +89,6 @@ pub(crate) fn serve<R: BufRead + Send + 'static, W: Write + Send>(
                     .is_err()
             {
                 // 조정자가 이미 종료했다면 더 전달할 연결이 없다.
-                return;
             }
         })?;
 
@@ -106,7 +105,6 @@ pub(crate) fn serve<R: BufRead + Send + 'static, W: Write + Send>(
                 .unwrap_or_else(|_| Err(io::Error::other("MCP analysis worker panicked")));
                 if events_tx.send(Event::WorkerFinished(result)).is_err() {
                     // 입력/출력 실패로 조정자가 먼저 끝나면 완료 알림도 폐기한다.
-                    return;
                 }
             })?;
         let mut result = coordinate(&events_rx, jobs_tx, &registry, &writer, &resources);
@@ -124,10 +122,8 @@ pub(crate) fn serve<R: BufRead + Send + 'static, W: Write + Send>(
         result
     });
     stop_input.store(true, Ordering::Release);
-    if result.is_ok() || input.is_finished() {
-        if input.join().is_err() {
-            return Err(io::Error::other("MCP input reader panicked"));
-        }
+    if (result.is_ok() || input.is_finished()) && input.join().is_err() {
+        return Err(io::Error::other("MCP input reader panicked"));
     }
     // 치명적 I/O 오류 때 stdin read 자체는 깨울 수 없다. reader가 모든 입력
     // 상태를 소유하므로 안전하게 분리하며 CLI의 즉시 프로세스 종료가 이를 정리한다.
@@ -298,20 +294,15 @@ fn worker_loop_with<W: Write + Send>(
     while let Ok(job) = jobs.recv() {
         if !job.token.load(Ordering::Acquire) {
             let result = evaluate(snapshot, &job.call, &job.token);
-            let suppress = match finish_job(&registry, &job.id, &job.token) {
-                Ok(suppress) => suppress,
-                Err(error) => return Err(error),
-            };
+            let suppress = finish_job(&registry, &job.id, &job.token)?;
             if !suppress {
-                if let Err(error) = write_shared(
+                write_shared(
                     &writer,
                     &success_response(job.id, tool_result(&result.value, result.is_error)),
-                ) {
-                    return Err(error);
-                }
+                )?;
             }
-        } else if let Err(error) = finish_job(&registry, &job.id, &job.token) {
-            return Err(error);
+        } else {
+            finish_job(&registry, &job.id, &job.token)?;
         }
     }
     Ok(())

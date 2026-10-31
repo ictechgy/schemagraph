@@ -297,8 +297,8 @@ pub fn diff_documents(old: &CatalogDocument, new: &CatalogDocument) -> DocumentD
         match old_objects.get(id) {
             Some(oo) => {
                 let change = object_change(id, oo, no);
-                if change.is_some() {
-                    objects.changed.push(change.unwrap());
+                if let Some(change) = change {
+                    objects.changed.push(change);
                 }
             }
             None => objects.added.push(IdKind {

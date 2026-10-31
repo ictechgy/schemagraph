@@ -812,6 +812,10 @@ async fn run(cli: Cli) -> Result<i32> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "scan 명령의 검증된 CLI 옵션들을 수집 경계로 전달한다"
+)]
 async fn scan(
     url: Option<&str>,
     document: Option<&std::path::Path>,

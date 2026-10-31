@@ -372,6 +372,10 @@ pub fn fingerprint(
 }
 
 /// 변경 전체를 평가한다. `report`는 출력 상한이 적용된 뒤에도 전체 안전성 상태를 보존한다.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "전후 문서와 정책·기준선의 검증 경계를 명시한다"
+)]
 pub fn evaluate(
     changes: &[Change],
     details: &BTreeMap<Change, Value>,
@@ -691,7 +695,7 @@ mod tests {
         };
         let details = BTreeMap::new();
         assert!(evaluate(
-            &[change.clone()],
+            std::slice::from_ref(&change),
             &details,
             &before,
             &after,

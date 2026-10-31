@@ -59,6 +59,10 @@ struct Changes<'a> {
 }
 
 impl Changes<'_> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "변경 기록의 선택적 상세 필드를 한 지점에서 직렬화한다"
+    )]
     fn add_detailed(
         &mut self,
         id: &str,

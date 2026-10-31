@@ -883,7 +883,7 @@ fn structural_document(document: &CatalogDocument) -> StructuralDocument<'_> {
     let mut schemas: Vec<_> = document.schemas.iter().map(structural_schema).collect();
     schemas.sort_by(|left, right| left.name.cmp(right.name));
     let mut dependencies: Vec<_> = document.dependencies.iter().collect();
-    dependencies.sort_by(|left, right| left.cmp(right));
+    dependencies.sort();
     StructuralDocument {
         version: document.version,
         dialect: &document.dialect,
@@ -1083,10 +1083,7 @@ impl Write for LimitedWriter {
         let remaining = self.limit.saturating_sub(self.bytes.len());
         if bytes.len() > remaining {
             self.bytes.extend_from_slice(&bytes[..remaining]);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "cache entry size limit",
-            ));
+            return Err(io::Error::other("cache entry size limit"));
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())

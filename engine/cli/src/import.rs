@@ -13,6 +13,10 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 /// catalog에 offline 입력을 붙이고 document/report 두 산출물을 기록한다.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "명령 경계의 독립된 입력·출력·제한 옵션을 그대로 전달한다"
+)]
 pub(crate) fn run(
     catalog: &Path,
     input: &Path,
@@ -89,8 +93,8 @@ fn validate_input(path: &Path, label: &str, limit: u64) -> Result<PathBuf> {
     if metadata.len() > limit {
         bail!("{label} exceeds {limit} bytes: {}", path.display());
     }
-    Ok(fs::canonicalize(path)
-        .with_context(|| format!("could not canonicalize {label} {}", path.display()))?)
+    fs::canonicalize(path)
+        .with_context(|| format!("could not canonicalize {label} {}", path.display()))
 }
 
 fn same_file(left: &Path, right: &Path) -> Result<bool> {

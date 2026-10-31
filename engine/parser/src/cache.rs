@@ -316,6 +316,125 @@ fn take_restore_visits() -> usize {
     RESTORE_VISITS.with(|count| count.replace(0))
 }
 
+pub(crate) fn capture(
+    graph: &Graph,
+    owner: &VertexId,
+    outcome: BodyOutcome<'_>,
+) -> Option<BodyResult> {
+    let analysis = graph.analysis().get(owner)?.clone();
+    let body_hash = analysis.body_hash.as_deref()?;
+    let mut owners = vec![owner.clone()];
+    owners.extend(
+        graph
+            .outgoing(owner)
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Contains)
+            .filter_map(|e| graph.vertex(&e.to))
+            .filter(|v| v.kind == VertexKind::Column)
+            .map(|v| v.id.clone()),
+    );
+    let mut edges = Vec::new();
+    let mut origins = Vec::new();
+    for id in owners {
+        for edge in graph.outgoing(&id) {
+            let evidence: Vec<_> = edge
+                .evidence
+                .iter()
+                .filter(|v| v.layer == EvidenceLayer::BodyParse)
+                .cloned()
+                .collect();
+            if evidence.is_empty() {
+                continue;
+            }
+            let key = (edge.from.clone(), edge.to.clone(), edge.kind);
+            if let Some(values) = graph.origins().get(&key) {
+                origins.extend(
+                    values
+                        .iter()
+                        .filter(|origin| origin.body_hash == body_hash)
+                        .cloned()
+                        .map(|origin| (key.clone(), origin)),
+                );
+            }
+            edges.push(Edge {
+                evidence,
+                ..edge.clone()
+            });
+        }
+    }
+    // DML 값 계보는 대상 컬럼에서 시작해 routine/view의 소유 간선에 포함되지
+    // 않는다. origin의 생산 소유자를 함께 확인해 같은 SQL을 쓰는 두 routine의
+    // 캐시 결과가 섞이지 않게 한다. 후보는 DML 분석이 이 owner에 기록한 키만 본다
+    // — 몸체마다 그래프의 모든 origin을 훑으면 저장 비용이 몸체 수의 제곱이 된다.
+    // 키를 정렬 순서로 돌므로 모으는 순서는 전체 origin을 훑을 때와 같다.
+    let mut captured: BTreeSet<OriginKey> = edges.iter().map(edge_key).collect();
+    let owner_prefix = format!("dml-owner:{}:", owner.as_str());
+    let evidence_prefix = format!("{} ", owner.as_str());
+    for key in &outcome.dml_origins {
+        #[cfg(test)]
+        CAPTURED_KEYS.with(|count| count.set(count.get() + 1));
+        let Some(values) = graph.origins().get(key) else {
+            continue;
+        };
+        let owned_values: Vec<_> = values
+            .iter()
+            .filter(|origin| {
+                origin.body_hash == body_hash && origin.role.starts_with(&owner_prefix)
+            })
+            .cloned()
+            .collect();
+        if owned_values.is_empty() {
+            continue;
+        }
+        // 이미 모은 간선은 그래프에 있는 owner 간선이라 다시 찾지 않는다.
+        if !captured.contains(key) {
+            let Some(edge) = graph
+                .outgoing(&key.0)
+                .iter()
+                .find(|edge| edge.to == key.1 && edge.kind == key.2)
+            else {
+                continue;
+            };
+            let evidence: Vec<_> = edge
+                .evidence
+                .iter()
+                .filter(|evidence| {
+                    evidence.layer == EvidenceLayer::BodyParse
+                        && evidence.detail.starts_with(&evidence_prefix)
+                })
+                .cloned()
+                .collect();
+            if evidence.is_empty() {
+                continue;
+            }
+            captured.insert(key.clone());
+            edges.push(Edge {
+                evidence,
+                ..edge.clone()
+            });
+        }
+        origins.extend(owned_values.into_iter().map(|origin| (key.clone(), origin)));
+    }
+    // 모은 origin은 모두 이 몸체의 해시다. 간선마다 origin 목록을 훑지 않고 키로 확인한다.
+    let origin_keys: BTreeSet<&OriginKey> = origins.iter().map(|(key, _)| key).collect();
+    if captured.iter().any(|key| !origin_keys.contains(key)) {
+        return None;
+    }
+    Some(BodyResult {
+        owner: owner.clone(),
+        edges,
+        origins,
+        analysis,
+        notes: outcome.notes.to_vec(),
+        enriched: outcome.enriched,
+    })
+}
+
+/// 간선을 origin과 같은 (from, to, kind) 키로 나타낸다.
+fn edge_key(edge: &Edge) -> OriginKey {
+    (edge.from.clone(), edge.to.clone(), edge.kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,123 +1279,4 @@ mod tests {
             enriched,
         })
     }
-}
-
-pub(crate) fn capture(
-    graph: &Graph,
-    owner: &VertexId,
-    outcome: BodyOutcome<'_>,
-) -> Option<BodyResult> {
-    let analysis = graph.analysis().get(owner)?.clone();
-    let body_hash = analysis.body_hash.as_deref()?;
-    let mut owners = vec![owner.clone()];
-    owners.extend(
-        graph
-            .outgoing(owner)
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Contains)
-            .filter_map(|e| graph.vertex(&e.to))
-            .filter(|v| v.kind == VertexKind::Column)
-            .map(|v| v.id.clone()),
-    );
-    let mut edges = Vec::new();
-    let mut origins = Vec::new();
-    for id in owners {
-        for edge in graph.outgoing(&id) {
-            let evidence: Vec<_> = edge
-                .evidence
-                .iter()
-                .filter(|v| v.layer == EvidenceLayer::BodyParse)
-                .cloned()
-                .collect();
-            if evidence.is_empty() {
-                continue;
-            }
-            let key = (edge.from.clone(), edge.to.clone(), edge.kind);
-            if let Some(values) = graph.origins().get(&key) {
-                origins.extend(
-                    values
-                        .iter()
-                        .filter(|origin| origin.body_hash == body_hash)
-                        .cloned()
-                        .map(|origin| (key.clone(), origin)),
-                );
-            }
-            edges.push(Edge {
-                evidence,
-                ..edge.clone()
-            });
-        }
-    }
-    // DML 값 계보는 대상 컬럼에서 시작해 routine/view의 소유 간선에 포함되지
-    // 않는다. origin의 생산 소유자를 함께 확인해 같은 SQL을 쓰는 두 routine의
-    // 캐시 결과가 섞이지 않게 한다. 후보는 DML 분석이 이 owner에 기록한 키만 본다
-    // — 몸체마다 그래프의 모든 origin을 훑으면 저장 비용이 몸체 수의 제곱이 된다.
-    // 키를 정렬 순서로 돌므로 모으는 순서는 전체 origin을 훑을 때와 같다.
-    let mut captured: BTreeSet<OriginKey> = edges.iter().map(edge_key).collect();
-    let owner_prefix = format!("dml-owner:{}:", owner.as_str());
-    let evidence_prefix = format!("{} ", owner.as_str());
-    for key in &outcome.dml_origins {
-        #[cfg(test)]
-        CAPTURED_KEYS.with(|count| count.set(count.get() + 1));
-        let Some(values) = graph.origins().get(key) else {
-            continue;
-        };
-        let owned_values: Vec<_> = values
-            .iter()
-            .filter(|origin| {
-                origin.body_hash == body_hash && origin.role.starts_with(&owner_prefix)
-            })
-            .cloned()
-            .collect();
-        if owned_values.is_empty() {
-            continue;
-        }
-        // 이미 모은 간선은 그래프에 있는 owner 간선이라 다시 찾지 않는다.
-        if !captured.contains(key) {
-            let Some(edge) = graph
-                .outgoing(&key.0)
-                .iter()
-                .find(|edge| edge.to == key.1 && edge.kind == key.2)
-            else {
-                continue;
-            };
-            let evidence: Vec<_> = edge
-                .evidence
-                .iter()
-                .filter(|evidence| {
-                    evidence.layer == EvidenceLayer::BodyParse
-                        && evidence.detail.starts_with(&evidence_prefix)
-                })
-                .cloned()
-                .collect();
-            if evidence.is_empty() {
-                continue;
-            }
-            captured.insert(key.clone());
-            edges.push(Edge {
-                evidence,
-                ..edge.clone()
-            });
-        }
-        origins.extend(owned_values.into_iter().map(|origin| (key.clone(), origin)));
-    }
-    // 모은 origin은 모두 이 몸체의 해시다. 간선마다 origin 목록을 훑지 않고 키로 확인한다.
-    let origin_keys: BTreeSet<&OriginKey> = origins.iter().map(|(key, _)| key).collect();
-    if captured.iter().any(|key| !origin_keys.contains(key)) {
-        return None;
-    }
-    Some(BodyResult {
-        owner: owner.clone(),
-        edges,
-        origins,
-        analysis,
-        notes: outcome.notes.to_vec(),
-        enriched: outcome.enriched,
-    })
-}
-
-/// 간선을 origin과 같은 (from, to, kind) 키로 나타낸다.
-fn edge_key(edge: &Edge) -> OriginKey {
-    (edge.from.clone(), edge.to.clone(), edge.kind)
 }
