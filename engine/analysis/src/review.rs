@@ -96,6 +96,10 @@ pub fn review_with_budget(
 }
 
 /// 변경별 영향 탐색을 취소 토큰과 예산에 맞춰 수행한다.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "이미 공개된 취소 API의 호출 호환성을 보존한다"
+)]
 pub fn review_with_cancellation(
     before: &Graph,
     after: &Graph,

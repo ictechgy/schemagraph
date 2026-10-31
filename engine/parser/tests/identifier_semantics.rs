@@ -80,6 +80,87 @@ fn has_dependency_to(graph: &Graph, from: &str, to: &str) -> bool {
         .any(|edge| edge.to.as_str() == to && edge.kind.is_dependency())
 }
 
+#[test]
+fn feedback_default_expression_keeps_its_function_dependency() {
+    let mut orders = table("orders", &["id", "literal"]);
+    orders["columns"][0]["default"] = json!("S.Next_Id()");
+    orders["columns"][1]["default"] = json!("0");
+    let graph = analyze(
+        "postgres",
+        vec![orders],
+        vec![function("next_id", None, "SELECT 1")],
+    );
+    assert!(has_edge(
+        &graph,
+        "s.orders.id",
+        "s.next_id",
+        EdgeKind::DependsOn
+    ));
+    assert!(!has_dependency_to(&graph, "s.orders.literal", "s.next_id"));
+    assert!(!has_edge(
+        &graph,
+        "s.orders.id",
+        "s.next_id",
+        EdgeKind::Calls
+    ));
+}
+
+#[test]
+fn feedback_default_expression_does_not_guess_overloads_or_accept_trailing_sql() {
+    let mut orders = table("orders", &["ambiguous", "invalid"]);
+    orders["columns"][0]["default"] = json!("next_id()");
+    orders["columns"][1]["default"] = json!("next_id(); SELECT 1");
+    let graph = analyze(
+        "postgres",
+        vec![orders],
+        vec![
+            function("next_id", Some("integer"), "SELECT 1"),
+            function("next_id", Some("text"), "SELECT 1"),
+        ],
+    );
+    assert!(!graph
+        .edges()
+        .iter()
+        .any(|edge| edge.kind == EdgeKind::DependsOn));
+    assert!(graph
+        .limitations()
+        .iter()
+        .any(|note| note.contains("DEFAULT") && note.contains("overload")));
+    assert!(graph
+        .limitations()
+        .iter()
+        .any(|note| note.contains("DEFAULT") && note.contains("parse failed")));
+}
+
+#[test]
+fn feedback_cte_scope_keeps_physical_reads_and_outer_reads_of_written_relations() {
+    let graph = analyze(
+        "postgres",
+        vec![table("audit", &["id"])],
+        vec![
+            function(
+                "same_name",
+                None,
+                "WITH audit AS (SELECT id FROM audit) SELECT * FROM audit",
+            ),
+            function(
+                "outer_read",
+                None,
+                "WITH gone AS (DELETE FROM audit RETURNING id) SELECT id FROM audit",
+            ),
+        ],
+    );
+    assert!(has_edge(&graph, "s.same_name", "s.audit", EdgeKind::Reads));
+    assert!(has_edge(&graph, "s.outer_read", "s.audit", EdgeKind::Reads));
+    assert!(has_edge(
+        &graph,
+        "s.outer_read",
+        "s.audit",
+        EdgeKind::Writes
+    ));
+    assert!(!graph.limitations().iter().any(|note| note.contains("gone")));
+}
+
 fn state(graph: &Graph, id: &str) -> AnalysisState {
     graph
         .analysis()
@@ -99,6 +180,57 @@ fn diagnostics(graph: &Graph, id: &str) -> Vec<String> {
         .iter()
         .map(|diagnostic| diagnostic.code.clone())
         .collect()
+}
+
+#[test]
+fn feedback_postgres_body_folds_only_unquoted_relation_names() {
+    let graph = analyze(
+        "postgres",
+        vec![table("orders", &["id"]), table("audit", &["id"])],
+        vec![
+            function("read_orders", None, "SELECT count(*) FROM S.Orders"),
+            function("archive", None, "INSERT INTO Audit SELECT id FROM ORDERS"),
+            function("quoted", None, "SELECT count(*) FROM \"Orders\""),
+        ],
+    );
+    assert!(has_edge(
+        &graph,
+        "s.read_orders",
+        "s.orders",
+        EdgeKind::Reads
+    ));
+    assert!(has_edge(&graph, "s.archive", "s.orders", EdgeKind::Reads));
+    assert!(has_edge(&graph, "s.archive", "s.audit", EdgeKind::Writes));
+    assert!(!has_edge(&graph, "s.quoted", "s.orders", EdgeKind::Reads));
+}
+
+#[test]
+fn feedback_truncate_is_a_write_without_an_invented_read() {
+    let graph = analyze(
+        "postgres",
+        vec![table("audit", &["id"]), table("orders", &["id"])],
+        vec![function("cleanup", None, "TRUNCATE audit, orders")],
+    );
+    for target in ["s.audit", "s.orders"] {
+        assert!(has_edge(&graph, "s.cleanup", target, EdgeKind::Writes));
+        assert!(!has_edge(&graph, "s.cleanup", target, EdgeKind::Reads));
+    }
+}
+
+#[test]
+fn feedback_data_modifying_cte_keeps_write_and_hides_only_its_alias() {
+    let graph = analyze(
+        "postgres",
+        vec![table("audit", &["id"])],
+        vec![function(
+            "cleanup",
+            None,
+            "WITH x AS (DELETE FROM audit RETURNING id) SELECT count(*) FROM x",
+        )],
+    );
+    assert!(has_edge(&graph, "s.cleanup", "s.audit", EdgeKind::Writes));
+    assert!(!has_edge(&graph, "s.cleanup", "s.audit", EdgeKind::Reads));
+    assert!(!graph.limitations().iter().any(|text| text.contains("s.x")));
 }
 
 #[test]

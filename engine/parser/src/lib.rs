@@ -12,17 +12,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId, VertexKind};
-use schemagraph_source::document::{CatalogDocument, ObjectDoc};
+use schemagraph_source::document::{CatalogDocument, ObjectDoc, RoutineDoc};
 use sqlparser::ast::{
-    visit_expressions, visit_relations, Expr, ObjectName, Statement, TableFactor, TableObject,
+    visit_expressions, visit_statements, Expr, ObjectName, Statement, TableFactor, TableObject,
     TableWithJoins, UpdateTableFromKind,
 };
 use sqlparser::dialect::{
     Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
 };
 
+mod body_relations;
 mod cache;
 mod constant_sql;
+mod defaults;
 mod parse_limits;
 pub use cache::{BodyCache, BodyResult, CacheContext};
 mod scope;
@@ -64,6 +66,9 @@ pub fn enrich_with_cache(
     let mut enriched = 0usize;
     let mut unavailable = 0usize;
     let mut notes: Vec<String> = Vec::new();
+
+    // 컬럼 기본값은 routine/view 몸체 캐시의 소유가 아니다. 현재 카탈로그에서 매번 읽는다.
+    defaults::enrich(g, doc, &catalog_index, dialect.as_deref(), ci, &mut notes);
 
     for schema in &doc.schemas {
         for obj in &schema.objects {
@@ -186,15 +191,18 @@ pub fn enrich_with_cache(
                     Ok(mut parsed) => {
                         apply_trigger(
                             g,
-                            &catalog_index,
-                            &schema.name,
+                            BodyContext {
+                                catalog: &catalog_index,
+                                schema: &schema.name,
+                                ci,
+                                body_hash: scope::body_hash(body),
+                                sqlserver_trigger: doc.dialect == "sqlserver"
+                                    || doc.dialect == "mssql",
+                            },
                             &obj.name,
                             &trigger_id,
                             &mut parsed,
                             &mut notes,
-                            ci,
-                            scope::body_hash(body),
-                            doc.dialect == "sqlserver" || doc.dialect == "mssql",
                         );
                         if parsed.partial {
                             state = schemagraph_core::AnalysisState::Partial;
@@ -239,28 +247,14 @@ pub fn enrich_with_cache(
                 _ => (VertexKind::Function, "function"),
             };
             // 패키지 멤버는 schema.pkg.member 정점 — schema 직속이 아니다.
-            let owner = match &routine.member_of {
-                Some(pkg) => resolve_routine_vertex(
-                    g,
-                    &schema.name,
-                    Some(pkg),
-                    &routine.name,
-                    routine.signature.as_deref(),
-                    kind,
-                    suffix,
-                    catalog_index.lookup(ci),
-                ),
-                None => resolve_routine_vertex(
-                    g,
-                    &schema.name,
-                    None,
-                    &routine.name,
-                    routine.signature.as_deref(),
-                    kind,
-                    suffix,
-                    catalog_index.lookup(ci),
-                ),
-            };
+            let owner = resolve_routine_vertex(
+                g,
+                &schema.name,
+                routine,
+                kind,
+                suffix,
+                catalog_index.lookup(ci),
+            );
             let Some(owner) = owner else {
                 notes.push(format!(
                     "routine {}.{}: 정점을 못 찾음 — 몸체 간선 생략",
@@ -344,13 +338,16 @@ pub fn enrich_with_cache(
                     let (mut parsed, unextracted) = parse_catalog_routine_body(&doc.dialect, body);
                     let partial = apply_routine(
                         g,
-                        &catalog_index,
-                        &schema.name,
+                        BodyContext {
+                            catalog: &catalog_index,
+                            schema: &schema.name,
+                            ci,
+                            body_hash: scope::body_hash(body),
+                            sqlserver_trigger: false,
+                        },
                         &owner,
                         &mut parsed,
                         &mut notes,
-                        ci,
-                        scope::body_hash(body),
                     );
                     if partial {
                         state = schemagraph_core::AnalysisState::Partial;
@@ -380,13 +377,16 @@ pub fn enrich_with_cache(
                         Ok(mut parsed) => {
                             let partial = apply_routine(
                                 g,
-                                &catalog_index,
-                                &schema.name,
+                                BodyContext {
+                                    catalog: &catalog_index,
+                                    schema: &schema.name,
+                                    ci,
+                                    body_hash: scope::body_hash(body),
+                                    sqlserver_trigger: false,
+                                },
                                 &owner,
                                 &mut parsed,
                                 &mut notes,
-                                ci,
-                                scope::body_hash(body),
                             );
                             if partial {
                                 state = schemagraph_core::AnalysisState::Partial;
@@ -409,13 +409,16 @@ pub fn enrich_with_cache(
                                 if parsed.has_edges() {
                                     let partial = apply_routine(
                                         g,
-                                        &catalog_index,
-                                        &schema.name,
+                                        BodyContext {
+                                            catalog: &catalog_index,
+                                            schema: &schema.name,
+                                            ci,
+                                            body_hash: scope::body_hash(body),
+                                            sqlserver_trigger: false,
+                                        },
                                         &owner,
                                         &mut parsed,
                                         &mut notes,
-                                        ci,
-                                        scope::body_hash(body),
                                     );
                                     if partial {
                                         state = schemagraph_core::AnalysisState::Partial;
@@ -447,13 +450,16 @@ pub fn enrich_with_cache(
                         );
                         let partial = apply_routine(
                             g,
-                            &catalog_index,
-                            &schema.name,
+                            BodyContext {
+                                catalog: &catalog_index,
+                                schema: &schema.name,
+                                ci,
+                                body_hash: scope::body_hash(body),
+                                sqlserver_trigger: false,
+                            },
                             &owner,
                             &mut parsed,
                             &mut notes,
-                            ci,
-                            scope::body_hash(body),
                         );
                         if partial {
                             state = schemagraph_core::AnalysisState::Partial;
@@ -514,9 +520,7 @@ pub fn enrich_with_cache(
             if let Some(id) = resolve_routine_vertex(
                 g,
                 &schema.name,
-                routine.member_of.as_deref(),
-                &routine.name,
-                routine.signature.as_deref(),
+                routine,
                 VertexKind::Query,
                 "query",
                 catalog_index.lookup(false),
@@ -859,7 +863,10 @@ fn parse_trigger_body(
                     "procedural variables or dynamic SQL require statement extraction".to_owned(),
                 );
             }
-            for stmt in stmts {
+            for mut stmt in stmts {
+                if dialect.is::<PostgreSqlDialect>() {
+                    body_relations::normalize_postgres(&mut stmt);
+                }
                 collect_trigger_stmt(stmt, &mut parsed, sqlserver_trigger, sqlite_trigger);
             }
             invalidate_temp_state_if_unsafe(&mut parsed, body, 0);
@@ -969,7 +976,7 @@ fn strip_catalog_routine_header<'a>(dialect: &str, body: &'a str) -> Option<&'a 
     strip_informix_routine_body(after_routine)
 }
 
-fn strip_db2_routine_body<'a>(tail: &'a str) -> Option<&'a str> {
+fn strip_db2_routine_body(tail: &str) -> Option<&str> {
     let markers = [
         "BEGIN", "RETURN", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CALL", "VALUES",
     ];
@@ -984,7 +991,7 @@ fn strip_db2_routine_body<'a>(tail: &'a str) -> Option<&'a str> {
     Some(body)
 }
 
-fn strip_informix_routine_body<'a>(tail: &'a str) -> Option<&'a str> {
+fn strip_informix_routine_body(tail: &str) -> Option<&str> {
     if let Some(returning) = find_all_keywords(tail, "RETURNING").first().copied() {
         let after_returning = &tail[returning + "RETURNING".len()..];
         let end = find_top_level_semicolon(after_returning)?;
@@ -1580,7 +1587,10 @@ fn parse_procedural_body(
     for stmt in &stmts {
         match parse_limits::parse_sql(dialect, stmt) {
             Ok(list) => {
-                for s in list {
+                for mut s in list {
+                    if dialect.is::<PostgreSqlDialect>() {
+                        body_relations::normalize_postgres(&mut s);
+                    }
                     collect_trigger_stmt(s, &mut parsed, false, false);
                 }
             }
@@ -1802,9 +1812,9 @@ fn extract_procedural_statements(
                     // 문장 머리가 오면 선언 섹션은 끝났다 — T-SQL은 DECLARE가
                     // BEGIN..END 안의 문장이라 뒤따르는 UPDATE 등이 선언으로
                     // 오인되지 않게 실제 SQL 문장을 우선 본다.
-                    if is_statement_head(&word) {
+                    if is_statement_head(word) {
                         in_declare = false;
-                        record_variable_writes(rest, &word, state);
+                        record_variable_writes(rest, word, state);
                         // SELECT .. INTO <변수>·RETURNING .. INTO <변수>는
                         // 변수 귀속 절 — 벗기지 않으면 변수가 테이블로 오인된다.
                         let stmt = match word.to_ascii_uppercase().as_str() {
@@ -2422,7 +2432,7 @@ fn push_dynamic_sql(
         *unextracted += 1;
         return;
     };
-    if !remaining.is_empty() && !(allow_bindings && dynamic_binding_head(remaining).is_some()) {
+    if !(remaining.is_empty() || allow_bindings && dynamic_binding_head(remaining).is_some()) {
         *unextracted += 1;
         return;
     }
@@ -3115,7 +3125,6 @@ fn collect_trigger_facts(
             parsed.qualified_writes.push(target.clone());
         }
     }
-    let read_exclusions = read_exclusions(stmt, &write_targets);
     for t in &write_targets {
         if parsed.local_relations.contains(t) {
             continue;
@@ -3124,31 +3133,7 @@ fn collect_trigger_facts(
             parsed.writes.push(t.clone());
         }
     }
-    let _ = visit_relations(stmt, |name| {
-        if name.0.iter().filter_map(|part| part.as_ident()).count() == 3 {
-            if !qualified_writes.contains(name) && !parsed.qualified_reads.contains(name) {
-                parsed.qualified_reads.push(name.clone());
-            }
-            return ControlFlow::<()>::Continue(());
-        }
-        let Some(t) = relation_name_parts(name) else {
-            parsed.ignored_relations.insert(relation_name_key(name));
-            return ControlFlow::<()>::Continue(());
-        };
-        // SQL Server trigger 의사 테이블은 trigger 스코프에서만 존재한다.
-        // dbo.inserted처럼 한정된 이름은 일반 카탈로그 조회로 남긴다.
-        if sqlserver_trigger && is_sqlserver_transition_relation(&t) {
-            return ControlFlow::<()>::Continue(());
-        }
-        if parsed.local_relations.contains(&t) {
-            return ControlFlow::<()>::Continue(());
-        }
-        // 재귀 방문으로 중첩 문장이 여러 번 오므로 중복을 거른다.
-        if !t.1.is_empty() && !read_exclusions.contains(&t) && !parsed.reads.contains(&t) {
-            parsed.reads.push(t);
-        }
-        ControlFlow::<()>::Continue(())
-    });
+    body_relations::collect_reads(stmt, parsed, sqlserver_trigger);
     let _ = visit_expressions(stmt, |e| {
         match e {
             Expr::CompoundIdentifier(parts) => {
@@ -3336,10 +3321,11 @@ fn is_builtin_function(name: &str) -> bool {
 /// DML 문장의 쓰기 대상 — 절차형 블록 안의 문장까지 재귀로 본다.
 /// SELECT-only 문장은 빈 벡터다.
 fn write_targets(stmt: &Statement) -> Vec<(Option<String>, String)> {
-    let mut targets = write_targets_shallow(stmt);
-    for s in nested_statements(stmt) {
-        targets.extend(write_targets(s));
-    }
+    let mut targets = Vec::new();
+    let _ = visit_statements(stmt, |statement| {
+        targets.extend(write_targets_shallow(statement));
+        ControlFlow::<()>::Continue(())
+    });
     targets
 }
 
@@ -3366,6 +3352,10 @@ fn nested_statements(stmt: &Statement) -> Vec<&Statement> {
 /// 한 문장의 표면 쓰기 대상 — 중첩 블록은 write_targets가 본다.
 fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
     match stmt {
+        Statement::Truncate { table_names, .. } => table_names
+            .iter()
+            .filter_map(|target| relation_name_parts(&target.name))
+            .collect(),
         Statement::Update { table, from, .. } => {
             let tables: &[TableWithJoins] = from
                 .as_ref()
@@ -3743,16 +3733,19 @@ fn resolve_member(
 fn resolve_routine_vertex(
     g: &Graph,
     schema: &str,
-    package: Option<&str>,
-    name: &str,
-    signature: Option<&str>,
+    routine: &RoutineDoc,
     kind: VertexKind,
     suffix: &str,
     lookup: Lookup<'_>,
 ) -> Option<VertexId> {
     resolve_renamed(
         g,
-        VertexId::routine(schema, package, name, signature),
+        VertexId::routine(
+            schema,
+            routine.member_of.as_deref(),
+            &routine.name,
+            routine.signature.as_deref(),
+        ),
         kind,
         suffix,
         lookup,
@@ -3815,19 +3808,31 @@ fn resolve_routine(g: &Graph, schema: &str, name: &str, lookup: Lookup<'_>) -> R
     routine_hit(routines.get(&(lookup.key(schema), lookup.key(name))))
 }
 
+/// 한 몸체를 같은 카탈로그·방언·소스 해시로 적용하는 문맥이다。
+struct BodyContext<'a, 'doc> {
+    catalog: &'a scope::CatalogIndex<'doc>,
+    schema: &'a str,
+    ci: bool,
+    body_hash: String,
+    sqlserver_trigger: bool,
+}
+
 /// trigger 파싱 결과를 그래프 간선으로 반영한다 — DML + calls + fired-columns.
 fn apply_trigger(
     g: &mut Graph,
-    catalog: &scope::CatalogIndex<'_>,
-    schema: &str,
+    context: BodyContext<'_, '_>,
     owner_table: &str,
     trigger_id: &VertexId,
     parsed: &mut ParsedTrigger,
     notes: &mut Vec<String>,
-    ci: bool,
-    body_hash: String,
-    sqlserver_trigger: bool,
 ) -> bool {
+    let BodyContext {
+        catalog,
+        schema,
+        ci,
+        body_hash,
+        sqlserver_trigger,
+    } = context;
     if g.vertex(trigger_id).is_none() {
         notes.push(format!(
             "trigger {trigger_id}의 정점이 카탈로그에 없음 — 간선 생략"
@@ -3905,14 +3910,18 @@ fn apply_trigger(
 /// 규칙이지만 발사 테이블(NEW/OLD)은 없다.
 fn apply_routine(
     g: &mut Graph,
-    catalog: &scope::CatalogIndex<'_>,
-    schema: &str,
+    context: BodyContext<'_, '_>,
     owner: &VertexId,
     parsed: &mut ParsedTrigger,
     notes: &mut Vec<String>,
-    ci: bool,
-    body_hash: String,
 ) -> bool {
+    let BodyContext {
+        catalog,
+        schema,
+        ci,
+        body_hash,
+        ..
+    } = context;
     if g.vertex(owner).is_none() {
         notes.push(format!(
             "routine {owner}의 정점이 카탈로그에 없음 — 간선 생략"

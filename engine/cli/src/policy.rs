@@ -102,7 +102,8 @@ fn validate_date(date: &str) -> Result<()> {
         let year: u32 = date[..4].parse().ok()?;
         let month: usize = date[5..7].parse().ok()?;
         let day: u32 = date[8..].parse().ok()?;
-        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
         let days = [
             31,
             if leap { 29 } else { 28 },

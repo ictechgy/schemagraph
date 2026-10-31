@@ -196,7 +196,7 @@ pub enum EdgeKind {
     Inferred,
     /// 출력 컬럼 값의 유래. 조건절에서 읽은 컬럼과 구별한다.
     DerivesFrom,
-    /// DB가 보고했으나 읽기·쓰기 등으로 분류할 수 없는 의존성.
+    /// DB가 보고했거나 컬럼 DEFAULT에서 해석했으나 읽기·쓰기 등으로 분류할 수 없는 의존성.
     DependsOn,
 }
 

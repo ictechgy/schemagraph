@@ -728,7 +728,7 @@ fn column_key(dialect: &str, value: &str) -> String {
     }
 }
 
-fn name(dialect: &str, ident: &Ident) -> String {
+pub(super) fn name(dialect: &str, ident: &Ident) -> String {
     if dialect == "sqlite" {
         return ident.value.to_lowercase();
     }
@@ -1258,8 +1258,7 @@ impl Binder<'_, '_> {
                     ctes,
                     "window",
                     &[],
-                    windows,
-                    stack,
+                    (windows, stack),
                 ));
                 sources
             }
@@ -1868,7 +1867,7 @@ impl Binder<'_, '_> {
         aliases: &[Column],
         windows: &NamedWindows,
     ) -> Sources {
-        self.visit_with_window_stack(node, scope, ctes, role, aliases, windows, &mut Vec::new())
+        self.visit_with_window_stack(node, scope, ctes, role, aliases, (windows, &mut Vec::new()))
     }
 
     fn visit_with_window_stack<T: Visit>(
@@ -1878,9 +1877,9 @@ impl Binder<'_, '_> {
         ctes: &Ctes,
         role: &str,
         aliases: &[Column],
-        windows: &NamedWindows,
-        window_stack: &mut Vec<String>,
+        window_context: (&NamedWindows, &mut Vec<String>),
     ) -> Sources {
+        let (windows, window_stack) = window_context;
         let mut visitor = ExprVisitor {
             binder: self,
             scope: scope.clone(),

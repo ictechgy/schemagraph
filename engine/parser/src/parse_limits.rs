@@ -12,7 +12,7 @@
 //! 이항 연산자는 문장 전체 합이 아니라 그런 경계로 끊긴 구간마다 세고, 괄호·CASE 안
 //! 피연산자의 사슬은 바깥 구간에 더해 가장 긴 경로를 잰다.
 
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Expr, Statement};
 use sqlparser::dialect::Dialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError, ParserOptions};
@@ -49,6 +49,22 @@ pub(crate) fn parse_sql(dialect: &dyn Dialect, sql: &str) -> Result<Vec<Statemen
     Parser::new(dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
+}
+
+/// DEFAULT를 문장으로 포장하지 않고 하나의 식으로만 읽는다. 뒤의 SQL은 허용하지 않는다.
+pub(crate) fn parse_expression(dialect: &dyn Dialect, sql: &str) -> Result<Expr, ParserError> {
+    let tokens = Tokenizer::new(dialect, sql)
+        .with_unescape(ParserOptions::new().unescape)
+        .tokenize_with_location()?;
+    check_chain_lengths(&tokens)?;
+    let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
+    let expression = parser.parse_expr()?;
+    if parser.peek_token().token != Token::EOF {
+        return Err(ParserError::ParserError(
+            "trailing tokens after DEFAULT expression".into(),
+        ));
+    }
+    Ok(expression)
 }
 
 /// 한 문장에서 센 사슬 연산자 수.

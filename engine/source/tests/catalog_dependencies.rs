@@ -237,7 +237,7 @@ fn ndjson_context_trailer_requires_matching_identity_and_filter() {
         .collect::<Vec<_>>()
         .join("\n");
     let decoded = ndjson::document_from_ndjson(&format!("{accepted}\n")).unwrap();
-    assert_eq!(decoded.context.unwrap().catalog_complete, false);
+    assert!(!decoded.context.unwrap().catalog_complete);
 
     for (field, value) in [
         ("source_id", json!("other-app")),

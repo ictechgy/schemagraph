@@ -240,10 +240,7 @@ fn stream_io_failures_cannot_look_like_complete_catalogs() {
     struct Interrupted;
     impl Read for Interrupted {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "fixture input failure",
-            ))
+            Err(io::Error::other("fixture input failure"))
         }
     }
     let error =
