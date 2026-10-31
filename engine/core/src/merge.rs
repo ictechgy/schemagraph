@@ -81,7 +81,7 @@ pub fn merge_graphs(mut inputs: Vec<(String, Graph)>) -> Result<Graph, String> {
                 let mut fk = fk.clone();
                 fk.table = id(&fk.table);
                 fk.columns = fk.columns.iter().map(&id).collect();
-                fk.target_table = fk.target_table.as_ref().map(&id);
+                fk.target_table = fk.target_table.as_ref().map(id);
                 fk.target_columns = fk.target_columns.iter().map(&id).collect();
                 metadata.foreign_keys.insert(id(old), fk);
             }
