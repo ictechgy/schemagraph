@@ -119,8 +119,11 @@ An overloaded call that cannot be narrowed to one overload creates no `calls`
 edge. The caller's analysis diagnostic lists the overloads it may reach in
 `candidates`, and `dead` counts each of them as called by that caller: they
 stay out of the candidates while the caller is live and follow it as
-`allDependentsDead` when it is not. The report then carries the measured
-limitation `routines named by ambiguous overloaded calls: N`. `query`,
+`allDependentsDead` when it is not. Liveness only flows in from a caller that
+is live for another reason, so an overload never keeps itself alive by naming
+itself, and overloads that only call each other ambiguously are still reported
+together. The report then carries the measured limitation
+`routines named by ambiguous overloaded calls: N`. `query`,
 `impact`, `cycles`, and `rules` use resolved edges only. Graphs written before
 this field existed have no candidates; scan again to use them.
 

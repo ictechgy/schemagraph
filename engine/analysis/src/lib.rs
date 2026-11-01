@@ -298,25 +298,24 @@ struct DeadPropagation<'g> {
     queue: VecDeque<&'g VertexId>,
     /// 확정한 후보와 사유.
     reasons: BTreeMap<VertexId, DeadReason>,
-    /// 모호한 호출이 가리킬 수 있는 후보 관계 — 간선처럼 의존자로 센다.
-    possible: PossibleCalls<'g>,
 }
 
 /// 모호한 오버로드 호출처럼 하나로 좁히지 못한 호출의 호출자↔후보 관계다.
 ///
-/// 확정 간선이 아니라 query/impact/cycles에는 섞지 않는다. 다만 후보 중 하나는 실제로
-/// 불리므로, dead에서 후보를 의존자 없는 정점으로 내면 쓰이는 routine을 후보로 오보한다.
-/// 그래서 dead 전파에서만 호출자를 후보의 의존자로 센다 — 호출자가 살아 있으면 후보도
-/// 살고, 호출자가 후보가 되면 후보도 그 뒤를 따른다. 그래프에 없는 후보는 무시한다.
+/// 확정 간선이 아니라 query/impact/cycles와 dead의 의존자 수에는 섞지 않는다. 다만 후보 중
+/// 하나는 실제로 불리므로, 살아 있는 호출자의 후보를 의존자 없는 정점으로 내면 쓰이는
+/// routine을 후보로 오보한다. 그래서 확정 간선만으로 dead를 구한 뒤, 살아 있는 호출자에서
+/// 후보로 생존을 넓힌다 — 생존은 밖에서만 들어오므로 자기 자신을 후보로 둔 호출이나 서로를
+/// 모호하게 부르는 오버로드 묶음은 스스로를 살리지 못한다. 그래프에 없는 후보는 무시한다.
 struct PossibleCalls<'g> {
-    /// 호출자 → 그 호출이 가리킬 수 있는 정점.
+    /// 호출자 → 그 호출이 가리킬 수 있는 다른 정점.
     callees: BTreeMap<&'g VertexId, BTreeSet<&'g VertexId>>,
-    /// 후보 정점 → 그것을 가리킬 수 있는 호출자.
+    /// 후보 정점 → 그것을 가리킬 수 있는 다른 호출자.
     callers: BTreeMap<&'g VertexId, BTreeSet<&'g VertexId>>,
 }
 
 impl<'g> PossibleCalls<'g> {
-    /// 분석 진단에 실린 후보 정점에서 호출자↔후보 관계를 모은다.
+    /// 분석 진단에 실린 후보 정점에서 호출자↔후보 관계를 모은다. 호출자 자신은 뺀다.
     fn new(graph: &'g Graph) -> Self {
         let mut possible = Self {
             callees: BTreeMap::new(),
@@ -327,6 +326,7 @@ impl<'g> PossibleCalls<'g> {
                 .diagnostics
                 .iter()
                 .flat_map(|diagnostic| &diagnostic.candidates)
+                .filter(|candidate| *candidate != owner)
                 .filter_map(|candidate| graph.vertex(candidate).map(|vertex| &vertex.id));
             for candidate in candidates {
                 possible.callees.entry(owner).or_default().insert(candidate);
@@ -336,22 +336,40 @@ impl<'g> PossibleCalls<'g> {
         possible
     }
 
-    /// `id`를 가리킬 수 있는 호출자.
-    fn callers_of(&self, id: &VertexId) -> impl Iterator<Item = &'g VertexId> + '_ {
-        self.callers.get(id).into_iter().flatten().copied()
-    }
-
-    /// `id`의 모호한 호출이 가리킬 수 있는 정점.
-    fn callees_of(&self, id: &VertexId) -> impl Iterator<Item = &'g VertexId> + '_ {
-        self.callees.get(id).into_iter().flatten().copied()
+    /// 확정 간선만으로 구한 후보에서, 살아 있는 호출자가 닿을 수 있는 후보와 그 후보가
+    /// 의존하는 정점을 되살린다. 남은 후보 중 모호한 호출자(모두 후보)가 있는 것은
+    /// "의존자가 모두 후보"로 사유를 바로잡는다.
+    fn rescue(&self, graph: &'g Graph, reasons: &mut BTreeMap<VertexId, DeadReason>) {
+        let mut queue: VecDeque<&'g VertexId> = self
+            .callees
+            .keys()
+            .copied()
+            .filter(|caller| !reasons.contains_key(*caller))
+            .collect();
+        while let Some(live) = queue.pop_front() {
+            let possible = self.callees.get(live).into_iter().flatten().copied();
+            for target in dependency_ends(graph.outgoing(live), |edge| &edge.to)
+                .into_iter()
+                .chain(possible)
+            {
+                if reasons.remove(target).is_some() {
+                    queue.push_back(target);
+                }
+            }
+        }
+        for (id, reason) in reasons.iter_mut() {
+            if *reason == DeadReason::NoDependents && self.callers.contains_key(id) {
+                *reason = DeadReason::AllDependentsDead;
+            }
+        }
     }
 
     /// 실측 limitation — 모호한 호출의 후보가 있을 때만 그 수를 싣는다.
     fn limitation(&self) -> Option<String> {
         (!self.callers.is_empty()).then(|| {
             format!(
-                "routines named by ambiguous overloaded calls: {}; each counts as called \
-                 until a single target is resolved",
+                "routines named by ambiguous overloaded calls: {}; each is kept while \
+                 a live caller may reach it",
                 self.callers.len()
             )
         })
@@ -360,24 +378,17 @@ impl<'g> PossibleCalls<'g> {
 
 impl<'g> DeadPropagation<'g> {
     /// 보존되지 않은 소비자 정점의 의존자 수를 세고, 의존자가 없는 정점은 바로 후보로 둔다.
-    fn seed(
-        graph: &'g Graph,
-        protected: &BTreeMap<VertexId, String>,
-        possible: PossibleCalls<'g>,
-    ) -> Self {
+    fn seed(graph: &'g Graph, protected: &BTreeMap<VertexId, String>) -> Self {
         let mut state = Self {
             remaining: BTreeMap::new(),
             queue: VecDeque::new(),
             reasons: BTreeMap::new(),
-            possible,
         };
         let consumers = graph
             .vertices()
             .filter(|v| is_consumer_kind(v.kind) && !protected.contains_key(&v.id));
         for vertex in consumers {
-            let mut dependents = dependency_ends(graph.incoming(&vertex.id), |edge| &edge.from);
-            dependents.extend(state.possible.callers_of(&vertex.id));
-            match dependents.len() {
+            match dependency_ends(graph.incoming(&vertex.id), |edge| &edge.from).len() {
                 0 => state.confirm(&vertex.id, DeadReason::NoDependents),
                 count => {
                     state.remaining.insert(&vertex.id, count);
@@ -396,10 +407,7 @@ impl<'g> DeadPropagation<'g> {
     /// 확정한 후보마다 의존 대상의 남은 의존자 수를 한 번씩 줄여 고정점까지 전파한다.
     fn run(mut self, graph: &'g Graph) -> BTreeMap<VertexId, DeadReason> {
         while let Some(id) = self.queue.pop_front() {
-            // 의존자 수를 셀 때와 같은 기준 — 확정 간선과 모호한 호출의 후보를 한 집합으로.
-            let mut targets = dependency_ends(graph.outgoing(id), |edge| &edge.to);
-            targets.extend(self.possible.callees_of(id));
-            for target in targets {
+            for target in dependency_ends(graph.outgoing(id), |edge| &edge.to) {
                 self.release(target);
             }
         }
@@ -450,9 +458,10 @@ pub fn dead_with_policy(
     policy: &RetentionPolicy,
 ) -> DeadReport {
     let protected = retention::retained(graph, policy);
+    let mut reasons = DeadPropagation::seed(graph, &protected).run(graph);
     let possible = PossibleCalls::new(graph);
+    possible.rescue(graph, &mut reasons);
     let possible_note = possible.limitation();
-    let reasons = DeadPropagation::seed(graph, &protected, possible).run(graph);
     let mut candidates: Vec<DeadCandidate> = reasons
         .iter()
         .filter_map(|(id, reason)| {
@@ -1470,11 +1479,91 @@ mod tests {
         );
         assert!(
             report.limitations.iter().any(|l| l
-                == "routines named by ambiguous overloaded calls: 4; each counts as \
-                    called until a single target is resolved"),
+                == "routines named by ambiguous overloaded calls: 4; each is kept while \
+                    a live caller may reach it"),
             "{:?}",
             report.limitations
         );
+    }
+
+    #[test]
+    fn dead는_모호한_호출로_자기_자신이나_서로를_살리지_않는다() {
+        let mut g = Graph::new();
+        let id = |name: &str, signature: &str| VertexId::routine("s", None, name, Some(signature));
+        // log_event(msg text)가 같은 이름의 log_event(msg text, lvl text)로 위임한다. 아무도
+        // 둘을 부르지 않으면 둘 다 후보다 — 자기 자신을 후보로 둔 모호한 호출이 살리지 않는다.
+        let short = function("s", "log_event", Some("msg text"));
+        let long = function("s", "log_event", Some("msg text, lvl text"));
+        // pair(integer)와 pair(text)는 모호하게 서로를 부르지만 밖에서 부르는 곳이 없다.
+        let pair_int = function("s", "pair", Some("integer"));
+        let pair_text = function("s", "pair", Some("text"));
+        for vertex in [&short, &long, &pair_int, &pair_text] {
+            g.add_vertex(vertex.clone());
+        }
+        ambiguous_call(&mut g, &short.id, &[&short.id, &long.id]);
+        ambiguous_call(&mut g, &pair_int.id, &[&pair_int.id, &pair_text.id]);
+        ambiguous_call(&mut g, &pair_text.id, &[&pair_int.id, &pair_text.id]);
+        let report = dead(&g, 256);
+        let got: Vec<_> = report
+            .candidates
+            .iter()
+            .map(|c| (c.vertex.id.as_str().to_owned(), c.reason))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    id("log_event", "msg text").to_string(),
+                    DeadReason::NoDependents
+                ),
+                (
+                    id("log_event", "msg text, lvl text").to_string(),
+                    DeadReason::AllDependentsDead
+                ),
+                (
+                    id("pair", "integer").to_string(),
+                    DeadReason::AllDependentsDead
+                ),
+                (
+                    id("pair", "text").to_string(),
+                    DeadReason::AllDependentsDead
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn dead는_살아_있는_호출자의_모호한_후보와_그_의존_대상을_살린다() {
+        let mut g = Graph::new();
+        g.add_vertex(table("s", "t"));
+        let trigger = Vertex {
+            id: VertexId::member("s", "t", "trg"),
+            kind: VertexKind::Trigger,
+            name: "trg".into(),
+            schema: "s".into(),
+        };
+        g.add_vertex(trigger.clone());
+        // 트리거가 부르는 entry가 f(*) 중 하나를 부르고, f(integer)만 helper를 부른다. f(text)는
+        // 서로 모호하게 부르는 짝이지만 entry가 살아 있으니 같이 산다. helper도 f(integer) 덕에 산다.
+        let entry = function("s", "entry", None);
+        let f_int = function("s", "f", Some("integer"));
+        let f_text = function("s", "f", Some("text"));
+        let helper = function("s", "helper", None);
+        for vertex in [&entry, &f_int, &f_text, &helper] {
+            g.add_vertex(vertex.clone());
+        }
+        g.add_edge(Edge {
+            kind: EdgeKind::Calls,
+            ..dep(&trigger.id, &entry.id)
+        });
+        g.add_edge(Edge {
+            kind: EdgeKind::Calls,
+            ..dep(&f_int.id, &helper.id)
+        });
+        ambiguous_call(&mut g, &entry.id, &[&f_int.id, &f_text.id]);
+        ambiguous_call(&mut g, &f_text.id, &[&f_int.id, &f_text.id]);
+        let report = dead(&g, 256);
+        assert!(report.candidates.is_empty(), "{:?}", report.candidates);
     }
 
     #[test]

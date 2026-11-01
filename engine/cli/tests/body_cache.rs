@@ -155,7 +155,7 @@ fn warm_cache_scans_keep_ambiguous_call_candidates_for_dead() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|l| l == "routines named by ambiguous overloaded calls: 2; each counts as called until a single target is resolved"),
+            .any(|l| l == "routines named by ambiguous overloaded calls: 2; each is kept while a live caller may reach it"),
         "{report}"
     );
 }
