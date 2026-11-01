@@ -376,6 +376,10 @@ enum Command {
         /// Exit 1 when any rule is violated.
         #[arg(long)]
         strict: bool,
+        /// Check the graph projected to this level, so one object dependency is one
+        /// violation instead of one per column edge (default: every recorded edge).
+        #[arg(long, value_enum)]
+        level: Option<LevelArg>,
     },
 }
 
@@ -808,7 +812,8 @@ async fn run(cli: Cli) -> Result<i32> {
             graph,
             config,
             strict,
-        } => rules(&graph, &config, strict),
+            level,
+        } => rules(&graph, &config, strict, level.map(|level| level.level())),
     }
 }
 
@@ -1957,14 +1962,25 @@ fn load_rules(path: &std::path::Path) -> Result<Vec<analysis::Rule>> {
         .collect()
 }
 
-fn rules(path: &std::path::Path, config: &std::path::Path, strict: bool) -> Result<i32> {
+/// 규칙을 검사한다. 레벨을 주면 투영한 그래프에서 검사해 같은 객체 쌍의 컬럼 간선을
+/// 하나로 묶고, 보고에 그 `level`을 싣는다. 주지 않으면 기록된 간선 그대로다.
+fn rules(
+    path: &std::path::Path,
+    config: &std::path::Path,
+    strict: bool,
+    level: Option<Level>,
+) -> Result<i32> {
     let graph = load_graph(path)?;
     let rule_set = load_rules(config)?;
-    let report = analysis::rules(&graph, &rule_set);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&export::rules_to_value(&report))?
-    );
+    let report = match level {
+        Some(level) => analysis::rules(&graph.project(level), &rule_set),
+        None => analysis::rules(&graph, &rule_set),
+    };
+    let mut value = export::rules_to_value(&report);
+    if let Some(level) = level {
+        value["level"] = serde_json::json!(export::level_label(level));
+    }
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(if strict && !report.violations.is_empty() {
         1
     } else {

@@ -364,6 +364,14 @@ Omit `kinds` to check all dependency kinds. Run
 to use the result as a CI gate. The report names each rule and violating
 edge; `checked: 0` means no rules were evaluated.
 
+Because `*` also matches column ids, a view that reads five columns of a
+forbidden table violates a `to = "core.*"` rule once for the table and once
+per column edge. `--level object` checks the graph projected to objects
+instead, so each object pair is reported once per edge kind, and the report
+carries `level`. `--level schema` compares schema vertices, so its globs name
+schemas (`from = "reporting"`). Without `--level`, every recorded edge is
+checked as before.
+
 ## How it works
 
 ```text

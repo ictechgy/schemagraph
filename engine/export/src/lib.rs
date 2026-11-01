@@ -107,6 +107,11 @@ pub fn vertex_kind_parse(s: &str) -> Option<VertexKind> {
     })
 }
 
+/// 보고서가 싣는 레벨 라벨 — `query`·`cycles`와 같은 문자열이다.
+pub fn level_label(level: Level) -> &'static str {
+    level_str(level)
+}
+
 fn level_str(level: Level) -> &'static str {
     match level {
         Level::Schema => "schema",

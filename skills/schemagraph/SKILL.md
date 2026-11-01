@@ -17,7 +17,7 @@ schemagraph query <object> [--depth N]          # who uses / what it uses
 schemagraph impact <object>                     # what breaks if it changes
 schemagraph dead                                # no-internal-consumer candidates
 schemagraph cycles [--level object|column]      # dependency cycles
-schemagraph rules [--strict]                    # declared rules, CI gate
+schemagraph rules [--strict] [--level object]   # declared rules, CI gate
 schemagraph stats                               # collected usage evidence
 schemagraph document-capabilities               # catalog versions and required features
 schemagraph graph --format mermaid|json|dot|html # render
