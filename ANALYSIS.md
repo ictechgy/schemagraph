@@ -125,7 +125,9 @@ itself, and overloads that only call each other ambiguously are still reported
 together. The report then carries the measured limitation
 `routines named by ambiguous overloaded calls: N`. `query`,
 `impact`, `cycles`, and `rules` use resolved edges only. Graphs written before
-this field existed have no candidates; scan again to use them.
+this field existed have no candidates; scan again to use them. A loaded graph
+keeps only candidates that name one of its vertices and reports how many it
+dropped.
 
 These are reachability facts, not permission to delete database objects. A
 missing usage record is different from observed zero activity; neither is an
@@ -318,7 +320,8 @@ PostgreSQL, SQL Server, and Oracle through the probes. The probes accept the sam
 unsupported catalogs produce measured limitations.
 
 Merge requires a distinct nonempty source ID in every document. Each database is
-parsed independently, then IDs become `source-id::local-id`. Cross-database edges
+parsed independently, then IDs become `source-id::local-id`, including the
+`candidates` of analysis diagnostics. Cross-database edges
 are added only for explicit catalog facts whose target database and object resolve
 uniquely among the supplied documents. Missing or ambiguous targets remain
 limitations. This does not resolve arbitrary dynamic SQL or create remote nodes

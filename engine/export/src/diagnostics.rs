@@ -329,6 +329,36 @@ mod tests {
         assert_eq!(crate::graph_from_doc(&doc).analysis(), graph.analysis());
     }
 
+    #[test]
+    fn restored_candidates_that_name_no_vertex_are_dropped_and_counted() {
+        let mut graph = Graph::new();
+        for name in ["caller", "over(integer)"] {
+            graph.add_vertex(Vertex {
+                id: VertexId::from_raw(&format!("s.{name}")),
+                kind: VertexKind::Function,
+                name: name.into(),
+                schema: "s".into(),
+            });
+        }
+        let json = crate::to_pretty_json(&crate::graph_to_doc(&graph)).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // 다른 그래프에서 옮겨 붙였거나 손으로 고친 graph.json: 없는 정점과 중복을 가리킨다.
+        value["analysis"] = serde_json::json!([{
+            "id": "s.caller", "scope": "object-dependencies", "state": "partial",
+            "diagnostics": [{"code": "SG_BODY_PARTIAL", "message": "ambiguous",
+                "candidates": ["s.over(text)", "s.over(integer)", "s.over(integer)"]}]
+        }]);
+        let doc: crate::GraphDoc = serde_json::from_value(value).unwrap();
+        let restored = crate::graph_from_doc(&doc);
+        let caller = &restored.analysis()[&VertexId::from_raw("s.caller")];
+        assert_eq!(
+            caller.diagnostics[0].candidates,
+            [VertexId::from_raw("s.over(integer)")]
+        );
+        assert!(restored.limitations().iter().any(|note| note
+            == "analysis s.caller: dropped 1 diagnostic candidate(s) that are not graph vertices"));
+    }
+
     /// 세 분석 상태를 하나씩 가진 그래프 — 상한 변형이 요약을 전체 기준으로 두는지 본다.
     fn three_analysis_states() -> Graph {
         let mut graph = Graph::new();

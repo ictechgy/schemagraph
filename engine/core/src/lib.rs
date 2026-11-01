@@ -314,12 +314,31 @@ impl Graph {
     }
 
     /// 같은 분석 입력의 진단 순서와 중복이 출력 바이트를 바꾸지 않게 한다.
+    ///
+    /// 진단 후보는 이 그래프의 정점만 남긴다. 다른 그래프에서 옮겨 온 id(namespace가 다른
+    /// 병합 입력, 손으로 고친 graph.json)가 남으면 `dead`가 후보 근거를 잃은 채 그 사실을
+    /// 모르므로, 버린 수를 limitation으로 알린다.
     pub fn set_analysis(&mut self, id: VertexId, mut analysis: ObjectAnalysis) {
         if !self.vertices.contains_key(&id) {
             self.add_limitation(format!(
                 "analysis target {id} does not exist; annotation omitted"
             ));
             return;
+        }
+        let mut dropped = 0usize;
+        for diagnostic in &mut analysis.diagnostics {
+            diagnostic.candidates.sort();
+            diagnostic.candidates.dedup();
+            let named = diagnostic.candidates.len();
+            diagnostic
+                .candidates
+                .retain(|candidate| self.vertices.contains_key(candidate));
+            dropped += named - diagnostic.candidates.len();
+        }
+        if dropped > 0 {
+            self.add_limitation(format!(
+                "analysis {id}: dropped {dropped} diagnostic candidate(s) that are not graph vertices"
+            ));
         }
         analysis.diagnostics.sort();
         analysis.diagnostics.dedup();
@@ -576,7 +595,17 @@ impl Graph {
         projected.limitations = self.limitations.clone();
         for (id, analysis) in &self.analysis {
             if projected.vertex(id).is_some() {
-                projected.set_analysis(id.clone(), analysis.clone());
+                // 후보도 간선 끝처럼 그 레벨의 조상으로 옮긴다. 조상이 없는 후보는 투영이 지운
+                // 정점이라 limitation 없이 뺀다(붕괴 간선의 origin과 같은 규칙).
+                let mut analysis = analysis.clone();
+                for diagnostic in &mut analysis.diagnostics {
+                    diagnostic.candidates = diagnostic
+                        .candidates
+                        .iter()
+                        .filter_map(|candidate| ancestors.of(candidate))
+                        .collect();
+                }
+                projected.set_analysis(id.clone(), analysis);
             }
         }
         for ((from, to, kind), origins) in &self.origins {
@@ -1574,6 +1603,103 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// 후보를 실은 분석 기록. 진단 하나에 후보를 주어진 순서 그대로 둔다.
+    fn analysis_with_candidates(candidates: Vec<VertexId>) -> ObjectAnalysis {
+        ObjectAnalysis {
+            state: AnalysisState::Partial,
+            scope: "object-dependencies".into(),
+            body_hash: None,
+            diagnostics: vec![Diagnostic {
+                candidates,
+                ..Diagnostic::new("SG_BODY_PARTIAL", "ambiguous", None)
+            }],
+            source: None,
+        }
+    }
+
+    fn function(schema: &str, name: &str) -> Vertex {
+        Vertex {
+            id: VertexId::object(schema, name),
+            kind: VertexKind::Function,
+            name: name.to_owned(),
+            schema: schema.to_owned(),
+        }
+    }
+
+    #[test]
+    fn set_analysis는_정점이_아닌_후보를_버리고_후보를_정렬해_알린다() {
+        let mut g = Graph::new();
+        for name in ["caller", "over_int", "over_text"] {
+            g.add_vertex(function("s", name));
+        }
+        let id = |name: &str| VertexId::object("s", name);
+        // 손으로 고친 graph.json처럼 순서가 섞이고, 중복되고, 없는 정점을 가리키는 후보.
+        g.set_analysis(
+            id("caller"),
+            analysis_with_candidates(vec![
+                id("over_text"),
+                id("ghost"),
+                id("over_int"),
+                id("over_text"),
+            ]),
+        );
+        assert_eq!(
+            g.analysis()[&id("caller")].diagnostics[0].candidates,
+            [id("over_int"), id("over_text")]
+        );
+        assert_eq!(
+            g.limitations(),
+            ["analysis s.caller: dropped 1 diagnostic candidate(s) that are not graph vertices"]
+        );
+    }
+
+    #[test]
+    fn project는_후보를_그_레벨의_정점으로_옮기고_없으면_조용히_뺀다() {
+        let mut g = Graph::new();
+        let schema = VertexId::schema("s");
+        g.add_vertex(Vertex {
+            id: schema.clone(),
+            kind: VertexKind::Schema,
+            name: "s".into(),
+            schema: "s".into(),
+        });
+        g.add_vertex(table("s", "t"));
+        g.add_vertex(function("s", "f"));
+        let trigger = VertexId::member("s", "t", "trg");
+        g.add_vertex(Vertex {
+            id: trigger.clone(),
+            kind: VertexKind::Trigger,
+            name: "trg".into(),
+            schema: "s".into(),
+        });
+        let contains = |from: &VertexId, to: &VertexId| Edge {
+            from: from.clone(),
+            to: to.clone(),
+            kind: EdgeKind::Contains,
+            evidence: vec![],
+        };
+        let f = VertexId::object("s", "f");
+        let t = VertexId::object("s", "t");
+        g.add_edge(contains(&schema, &t));
+        g.add_edge(contains(&schema, &f));
+        g.add_edge(contains(&t, &trigger));
+        g.set_analysis(trigger.clone(), analysis_with_candidates(vec![f.clone()]));
+        // 멤버 레벨에는 함수 정점이 없다. 투영이 지운 정점처럼 후보도 limitation 없이 빠진다.
+        let members = g.project(Level::Member);
+        assert!(members.analysis()[&trigger].diagnostics[0]
+            .candidates
+            .is_empty());
+        assert!(
+            members.limitations().is_empty(),
+            "{:?}",
+            members.limitations()
+        );
+        // 객체 레벨에는 함수 정점이 그대로 있어 후보가 남는다.
+        g.set_analysis(t.clone(), analysis_with_candidates(vec![f.clone()]));
+        let objects = g.project(Level::Object);
+        assert_eq!(objects.analysis()[&t].diagnostics[0].candidates, [f]);
     }
 
     #[test]

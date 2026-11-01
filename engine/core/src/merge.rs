@@ -57,7 +57,15 @@ pub fn merge_graphs(mut inputs: Vec<(String, Graph)>) -> Result<Graph, String> {
             combined.set_usage(id(old), usage.clone());
         }
         for (old, analysis) in graph.analysis() {
-            combined.set_analysis(id(old), analysis.clone());
+            // 모호한 참조의 후보도 정점 id다. 같은 namespace를 붙여야 합친 그래프의 정점을
+            // 가리킨다(같은 접두라 정렬 순서도 그대로다).
+            let mut analysis = analysis.clone();
+            for diagnostic in &mut analysis.diagnostics {
+                for candidate in &mut diagnostic.candidates {
+                    *candidate = id(candidate);
+                }
+            }
+            combined.set_analysis(id(old), analysis);
         }
         for ((from, to, kind), origins) in graph.origins() {
             for origin in origins {
@@ -134,6 +142,55 @@ mod tests {
             ("a".into(), with_metadata(true)),
             ("b".into(), with_metadata(false)),
         ]));
+    }
+
+    /// 모호한 호출의 후보도 정점 id처럼 namespace를 붙인다 — 로컬 id로 남으면 합친 그래프의
+    /// 어떤 정점도 가리키지 않아 `dead`가 후보 근거를 잃는다.
+    #[test]
+    fn merged_diagnostic_candidates_name_namespaced_vertices() {
+        use crate::{AnalysisState, Diagnostic, ObjectAnalysis};
+        let mut graph = Graph::new();
+        let ids = ["caller", "over(integer)", "over(text)"].map(|name| {
+            let id = VertexId::from_raw(&format!("public.{name}"));
+            graph.add_vertex(Vertex {
+                id: id.clone(),
+                name: name.into(),
+                schema: "public".into(),
+                kind: VertexKind::Function,
+            });
+            id
+        });
+        graph.set_analysis(
+            ids[0].clone(),
+            ObjectAnalysis {
+                state: AnalysisState::Partial,
+                scope: "object-dependencies".into(),
+                body_hash: None,
+                diagnostics: vec![Diagnostic::new("SG_BODY_PARTIAL", "ambiguous", None)
+                    .with_candidates([ids[1].clone(), ids[2].clone()])],
+                source: None,
+            },
+        );
+        let merged =
+            merge_graphs(vec![("app".into(), graph), ("reporting".into(), fixture())]).unwrap();
+        let caller = VertexId::from_raw("app::public.caller");
+        let candidates: Vec<&str> = merged.analysis()[&caller].diagnostics[0]
+            .candidates
+            .iter()
+            .map(VertexId::as_str)
+            .collect();
+        assert_eq!(
+            candidates,
+            ["app::public.over(integer)", "app::public.over(text)"]
+        );
+        for candidate in &merged.analysis()[&caller].diagnostics[0].candidates {
+            assert!(merged.vertex(candidate).is_some(), "{candidate}");
+        }
+        assert!(
+            merged.limitations().is_empty(),
+            "{:?}",
+            merged.limitations()
+        );
     }
 
     #[test]
