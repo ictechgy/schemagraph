@@ -379,8 +379,24 @@ enum Command {
         /// Check the graph projected to this level, so one object dependency is one
         /// violation instead of one per column edge (default: every recorded edge).
         #[arg(long, value_enum)]
-        level: Option<LevelArg>,
+        level: Option<RulesLevelArg>,
     },
+}
+
+/// `rules --level`이 받는 레벨. 멤버 레벨 투영은 객체 간선을 지우므로 받지 않는다.
+#[derive(Clone, Copy, ValueEnum)]
+enum RulesLevelArg {
+    Schema,
+    Object,
+}
+
+impl RulesLevelArg {
+    fn level(self) -> Level {
+        match self {
+            RulesLevelArg::Schema => Level::Schema,
+            RulesLevelArg::Object => Level::Object,
+        }
+    }
 }
 
 /// `query`·`impact`의 출력 형식과 `language-traversal` 머리 값.
@@ -1973,7 +1989,14 @@ fn rules(
     let graph = load_graph(path)?;
     let rule_set = load_rules(config)?;
     let report = match level {
-        Some(level) => analysis::rules(&graph.project(level), &rule_set),
+        Some(level) => {
+            let projected = graph.project(level);
+            let mut report = analysis::rules(&projected, &rule_set);
+            report
+                .limitations
+                .extend(unmatched_rule_patterns(&projected, &rule_set, level));
+            report
+        }
         None => analysis::rules(&graph, &rule_set),
     };
     let mut value = export::rules_to_value(&report);
@@ -1986,6 +2009,33 @@ fn rules(
     } else {
         0
     })
+}
+
+/// 투영한 레벨의 어떤 정점에도 맞지 않는 규칙 패턴. 레벨을 바꾸면 정점 id 모양이 달라져
+/// (`public.*`는 스키마 정점 `public`에 맞지 않는다) 위반 0건이 통과처럼 보이므로 알린다.
+fn unmatched_rule_patterns(
+    graph: &Graph,
+    rule_set: &[analysis::Rule],
+    level: Level,
+) -> Vec<String> {
+    let label = export::level_label(level);
+    let matches_any = |pattern: &str| {
+        graph
+            .vertices()
+            .any(|vertex| analysis::glob_match(pattern, vertex.id.as_str()))
+    };
+    let mut notes = Vec::new();
+    for rule in rule_set {
+        for (side, pattern) in [("from", &rule.from), ("to", &rule.to)] {
+            if !matches_any(pattern) {
+                notes.push(format!(
+                    "rule '{}': {side} pattern '{pattern}' matches no {label}-level vertex",
+                    rule.name
+                ));
+            }
+        }
+    }
+    notes
 }
 
 fn write_graph_output(output: &str, graph: &Graph) -> Result<()> {

@@ -369,8 +369,9 @@ forbidden table violates a `to = "core.*"` rule once for the table and once
 per column edge. `--level object` checks the graph projected to objects
 instead, so each object pair is reported once per edge kind, and the report
 carries `level`. `--level schema` compares schema vertices, so its globs name
-schemas (`from = "reporting"`). Without `--level`, every recorded edge is
-checked as before.
+schemas (`from = "reporting"`); a `from` or `to` pattern that matches no vertex
+at the chosen level is listed in `limitations` instead of passing silently.
+Without `--level`, every recorded edge is checked as before.
 
 ## How it works
 

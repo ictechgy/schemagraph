@@ -133,3 +133,82 @@ fn object_level_rules_report_one_violation_per_object_edge_kind() {
         ]
     );
 }
+
+#[test]
+fn level_rules_report_patterns_that_match_no_vertex_and_reject_member_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    let (code, _) = run(
+        root,
+        &["scan", "--document", "catalog.json", "-o", "graph.json"],
+    );
+    assert_eq!(code, 0);
+    // 스키마 레벨 정점 id는 `public`이라 `public.*`에 맞지 않는다. 위반 0건을 통과로
+    // 읽지 않도록, 아무 정점에도 맞지 않는 패턴을 limitation으로 알린다.
+    let (code, report) = run(
+        root,
+        &[
+            "rules",
+            "-g",
+            "graph.json",
+            "-c",
+            "rules.toml",
+            "--level",
+            "schema",
+            "--strict",
+        ],
+    );
+    assert_eq!(code, 0);
+    let report: Value = serde_json::from_slice(&report).unwrap();
+    assert_eq!(report["violations"], json!([]));
+    let limitations: Vec<&str> = report["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        limitations.contains(
+            &"rule 'rpt does not read public': from pattern 'rpt.*' matches no schema-level vertex"
+        ) && limitations.contains(
+            &"rule 'rpt does not read public': to pattern 'public.*' matches no schema-level vertex"
+        ),
+        "{limitations:?}"
+    );
+    // 객체 레벨에서는 두 패턴 모두 정점에 맞아 알릴 것이 없다.
+    let (_, report) = run(
+        root,
+        &[
+            "rules",
+            "-g",
+            "graph.json",
+            "-c",
+            "rules.toml",
+            "--level",
+            "object",
+        ],
+    );
+    let report: Value = serde_json::from_slice(&report).unwrap();
+    assert!(!report["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|note| note.as_str().unwrap().contains("matches no")));
+    // 멤버 레벨 투영은 객체 간선을 지우므로 rules에는 받지 않는다.
+    for level in ["member", "column"] {
+        let (code, _) = run(
+            root,
+            &[
+                "rules",
+                "-g",
+                "graph.json",
+                "-c",
+                "rules.toml",
+                "--level",
+                level,
+            ],
+        );
+        assert_eq!(code, 2, "{level}");
+    }
+}
