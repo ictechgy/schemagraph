@@ -84,3 +84,78 @@ fn cold_and_warm_cache_scans_write_the_uncached_graph_bytes() {
     assert!(cold == uncached, "cold cache scan changed graph.json bytes");
     assert!(warm == uncached, "warm cache scan changed graph.json bytes");
 }
+
+/// 트리거가 부르는 함수가 시그니처만 다른 오버로드 둘 중 하나를 부르는 문서.
+///
+/// 모호한 호출은 확정 간선이 없고 진단의 후보로만 남는다. 캐시 hit가 그 후보를
+/// 잃으면 warm 스캔의 `dead`가 쓰이는 오버로드를 다시 후보로 낸다.
+fn ambiguous_catalog(root: &Path) {
+    let document = json!({
+        "version": 1, "reader": "fixture", "dialect": "postgres", "limitations": [],
+        "schemas": [{"name": "public", "objects": [{
+            "name": "orders", "kind": "table", "constraints": [], "indexes": [],
+            "triggers": [{"name": "trg_touch",
+                "body": "CREATE TRIGGER trg_touch AFTER INSERT ON orders EXECUTE FUNCTION touch()"}],
+            "columns": [
+                {"name": "id", "data_type": "integer", "nullable": false, "ordinal": 1, "pk_position": 1}
+            ]}],
+            "routines": [
+                {"name": "touch", "kind": "function", "language": "sql", "body": "SELECT over(1)"},
+                {"name": "over", "kind": "function", "language": "sql", "signature": "integer", "body": "SELECT 1"},
+                {"name": "over", "kind": "function", "language": "sql", "signature": "text", "body": "SELECT 2"}
+            ]}]
+    });
+    fs::write(
+        root.join("catalog.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn warm_cache_scans_keep_ambiguous_call_candidates_for_dead() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    ambiguous_catalog(root);
+    let (uncached, _) = scan(root, "uncached.json", None);
+    let graph: Value = serde_json::from_slice(&uncached).unwrap();
+    let touch = graph["analysis"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|analysis| analysis["id"] == "public.touch")
+        .unwrap_or_else(|| panic!("{graph}"));
+    assert_eq!(
+        touch["diagnostics"],
+        json!([{
+            "candidates": ["public.over(integer)", "public.over(text)"],
+            "code": "SG_BODY_PARTIAL",
+            "message": "public.touch이(가) 부르는 public.over에 2개 오버로드가 있어 간선 생략"
+        }]),
+        "{graph}"
+    );
+
+    let (cold, _) = scan(root, "cold.json", Some("cache"));
+    let (warm, warm_stderr) = scan(root, "warm.json", Some("cache"));
+    assert!(warm_stderr.contains("misses=0"), "{warm_stderr}");
+    assert!(cold == uncached, "cold cache scan changed graph.json bytes");
+    assert!(warm == uncached, "warm cache scan changed graph.json bytes");
+
+    let dead = Command::new(env!("CARGO_BIN_EXE_schemagraph"))
+        .current_dir(root)
+        .args(["dead", "-g", "warm.json"])
+        .output()
+        .unwrap();
+    assert_eq!(dead.status.code(), Some(0), "{dead:?}");
+    let report: Value = serde_json::from_slice(&dead.stdout).unwrap();
+    // 트리거가 부르는 touch가 살아 있으니 그 몸체가 부를 수 있는 오버로드도 후보가 아니다.
+    assert_eq!(report["candidates"], json!([]), "{report}");
+    assert!(
+        report["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == "routines named by ambiguous overloaded calls: 2; each counts as called until a single target is resolved"),
+        "{report}"
+    );
+}

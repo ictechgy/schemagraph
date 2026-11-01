@@ -146,6 +146,7 @@ pub(crate) fn restore(
     if cached.owner != *owner
         || cached.analysis.body_hash.as_deref() != Some(hash.as_str())
         || cached.enriched > 1
+        || !candidates_exist(graph, &cached.analysis)
         || !CachedKeys::new(graph, owner, &hash, &cached).accept(graph, &cached)
     {
         return false;
@@ -160,6 +161,16 @@ pub(crate) fn restore(
     notes.extend(cached.notes);
     *enriched += cached.enriched;
     true
+}
+
+/// 진단이 후보로 가리키는 정점이 모두 현재 그래프에 있는가. 후보는 `dead`가 의존자로
+/// 세는 근거라, 사라진 정점을 가리키는 캐시 결과를 복원하면 유령 후보가 된다.
+fn candidates_exist(graph: &Graph, analysis: &ObjectAnalysis) -> bool {
+    analysis
+        .diagnostics
+        .iter()
+        .flat_map(|diagnostic| &diagnostic.candidates)
+        .all(|candidate| graph.vertex(candidate).is_some())
 }
 
 /// 빌린 (from, to, kind) 간선 키.
@@ -514,6 +525,41 @@ mod tests {
             .outgoing(&owner)
             .iter()
             .any(|e| e.kind == EdgeKind::Reads));
+    }
+
+    #[test]
+    fn cached_ambiguous_call_candidates_must_exist_in_the_current_graph() {
+        let doc: CatalogDocument = serde_json::from_value(serde_json::json!({
+            "version":1,"dialect":"postgres","reader":"test","limitations":[],
+            "schemas":[{"name":"public","objects":[],"routines":[
+                {"name":"caller","kind":"function","language":"sql","body":"SELECT over(1)"},
+                {"name":"over","kind":"function","language":"sql","signature":"integer","body":"SELECT 1"},
+                {"name":"over","kind":"function","language":"sql","signature":"text","body":"SELECT 2"}
+            ]}]
+        }))
+        .unwrap();
+        let mut cache = MemoryCache::default();
+        let mut cold = schemagraph_source::graph::document_to_graph(&doc);
+        crate::enrich_with_cache(&mut cold, &doc, Some(&mut cache));
+        let owner = VertexId::object("public", "caller");
+        let candidates = |graph: &Graph| -> Vec<String> {
+            graph.analysis()[&owner]
+                .diagnostics
+                .iter()
+                .flat_map(|diagnostic| diagnostic.candidates.iter().map(|id| id.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            candidates(&cold),
+            ["public.over(integer)", "public.over(text)"]
+        );
+        // 캐시 결과의 후보 하나를 그래프에 없는 정점으로 바꾸면 복원하지 않고 다시 해석한다.
+        cache.0.get_mut(&owner).unwrap().analysis.diagnostics[0].candidates[0] =
+            VertexId::from_raw("public.over(ghost)");
+        let mut warm = schemagraph_source::graph::document_to_graph(&doc);
+        crate::enrich_with_cache(&mut warm, &doc, Some(&mut cache));
+        assert_eq!(cache.2, 1);
+        assert_eq!(warm.analysis(), cold.analysis());
     }
 
     #[test]

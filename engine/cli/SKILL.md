@@ -113,7 +113,9 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   64 candidates, then `candidatesTotal` and `candidatesTruncated: true`.
 - `dead` — objects nothing inside the database consumes. Consumer-kind
   objects (views, routines, packages) with no caller are the usual
-  candidates; each carries its usage evidence when collected.
+  candidates; each carries its usage evidence when collected. Overloads named
+  in a diagnostic's `candidates` (an ambiguous call) count as called by that
+  caller, so they follow the caller's dead/live state.
 - `cycles` — dependency cycles, useful for delete ordering and deadlock analysis.
 - `unused` — tables and indexes with zero observed reads since `usage.since`.
   Objects without counters are `unobserved`, not unused. Quote the attached

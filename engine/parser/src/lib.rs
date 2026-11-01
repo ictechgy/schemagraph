@@ -581,11 +581,18 @@ fn record_body(
         }
     }
     let mut diagnostics: Vec<Diagnostic> = structured_diagnostics.to_vec();
-    diagnostics.extend(notes.iter().map(|message| Diagnostic {
-        code: code.into(),
-        message: message.clone(),
-        location: None,
-    }));
+    // 구조화 진단이 이미 같은 문구를 싣고 있으면(후보를 실은 모호 호출 등) note로
+    // 같은 진단을 한 번 더 만들지 않는다.
+    let structured: BTreeSet<&str> = structured_diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    diagnostics.extend(
+        notes
+            .iter()
+            .filter(|message| !structured.contains(message.as_str()))
+            .map(|message| Diagnostic::new(code, message.clone(), None)),
+    );
     g.set_analysis(
         owner.clone(),
         ObjectAnalysis {
@@ -1582,6 +1589,7 @@ fn parse_procedural_body(
                 "{reason}; dynamic SQL after the limit was not folded from variable values"
             ),
             location: None,
+            candidates: Vec::new(),
         });
     }
     for stmt in &stmts {
@@ -1609,6 +1617,7 @@ fn parse_procedural_body(
             code: "SG_DML_CONTROL_FLOW".into(),
             message: "DML extracted from a control-flow body is analyzed conservatively".into(),
             location: None,
+            candidates: Vec::new(),
         });
     }
     invalidate_temp_state_if_unsafe(&mut parsed, body, unextracted);
@@ -1634,6 +1643,7 @@ fn invalidate_temp_state_if_unsafe(parsed: &mut ParsedTrigger, body: &str, unext
         code: "SG_DML_TEMP_STATE".into(),
         message: "temporary relation state crosses dynamic, dropped, or unextracted SQL; local lineage omitted".into(),
         location: None,
+        candidates: Vec::new(),
     });
 }
 
@@ -3114,6 +3124,7 @@ fn collect_trigger_facts(
             message: "DML inside conditional or loop control flow is analyzed conservatively"
                 .into(),
             location: None,
+            candidates: Vec::new(),
         });
     }
     // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
@@ -3539,11 +3550,12 @@ fn table_factor_name(factor: &TableFactor) -> Option<(Option<String>, String)> {
 }
 
 /// routine 이름 해석 결과 — 오버로드는 호출 정확도상 구분 못 하므로
-/// 모호함을 숨기지 않고 별도로 보고한다.
+/// 모호함을 숨기지 않고 별도로 보고한다. 모호하면 실제 후보 정점을 함께 돌려
+/// 진단이 "어느 것 중 하나"를 잃지 않게 한다.
 enum RoutineHit {
     One(VertexId),
     None,
-    Ambiguous(usize),
+    Ambiguous(Vec<VertexId>),
 }
 
 #[cfg(test)]
@@ -3711,7 +3723,7 @@ fn routine_hit(candidates: Option<&Vec<VertexId>>) -> RoutineHit {
     match candidates.map(Vec::as_slice).unwrap_or_default() {
         [] => RoutineHit::None,
         [only] => RoutineHit::One(only.clone()),
-        many => RoutineHit::Ambiguous(many.len()),
+        many => RoutineHit::Ambiguous(many.to_vec()),
     }
 }
 
@@ -3872,7 +3884,10 @@ fn apply_trigger(
         schema,
         trigger_id,
         &parsed.calls,
-        notes,
+        CallNotes {
+            notes,
+            diagnostics: &mut parsed.diagnostics,
+        },
         catalog.lookup(ci),
     );
     // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다. 컬럼이 id 충돌로
@@ -3949,7 +3964,17 @@ fn apply_routine(
         },
         &mut parsed.diagnostics,
     );
-    apply_call_edges(g, schema, owner, &parsed.calls, notes, catalog.lookup(ci));
+    apply_call_edges(
+        g,
+        schema,
+        owner,
+        &parsed.calls,
+        CallNotes {
+            notes,
+            diagnostics: &mut parsed.diagnostics,
+        },
+        catalog.lookup(ci),
+    );
     parsed.partial
 }
 
@@ -4018,6 +4043,7 @@ fn apply_dml_edges(
                         code: "SG_CROSS_DATABASE".into(),
                         message,
                         location: None,
+                        candidates: Vec::new(),
                     });
                     continue;
                 }
@@ -4042,6 +4068,15 @@ fn apply_dml_edges(
     }
 }
 
+/// 호출 해석이 남기는 limitation note와 몸체의 구조화 진단.
+///
+/// 모호한 오버로드 호출은 note 문구를 그대로 두고, 같은 문구의 진단에 후보 정점을
+/// 싣는다 — `dead`가 불릴 수 있는 오버로드를 후보로 내지 않게 하는 근거다.
+struct CallNotes<'a> {
+    notes: &'a mut Vec<String>,
+    diagnostics: &'a mut Vec<schemagraph_core::Diagnostic>,
+}
+
 /// EXECUTE FUNCTION/PROCEDURE 호출 대상을 간선으로 — routine 정점 id는
 /// 시그니처를 포함할 수 있어 이름으로 해석한다.
 fn apply_call_edges(
@@ -4049,9 +4084,10 @@ fn apply_call_edges(
     schema: &str,
     from: &VertexId,
     calls: &[(Option<String>, String)],
-    notes: &mut Vec<String>,
+    out: CallNotes<'_>,
     lookup: Lookup<'_>,
 ) {
+    let CallNotes { notes, diagnostics } = out;
     for (ref_schema, name) in calls {
         let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
         let hit = match resolve_routine(g, &target_schema, name, lookup) {
@@ -4081,9 +4117,19 @@ fn apply_call_edges(
                 "{from}이(가) 부르는 {target_schema}.{name}이 카탈로그에 없음 \
                  (내장 함수이거나 미수집)"
             )),
-            RoutineHit::Ambiguous(n) => notes.push(format!(
-                "{from}이(가) 부르는 {target_schema}.{name}에 {n}개 오버로드가 있어 간선 생략"
-            )),
+            RoutineHit::Ambiguous(candidates) => {
+                let note = format!(
+                    "{from}이(가) 부르는 {target_schema}.{name}에 {}개 오버로드가 있어 간선 생략",
+                    candidates.len()
+                );
+                // 확정 간선은 만들지 않는다. 진단의 후보는 note와 같은 문구라
+                // record_body가 note 진단을 따로 만들지 않는다.
+                diagnostics.push(
+                    schemagraph_core::Diagnostic::new("SG_BODY_PARTIAL", note.clone(), None)
+                        .with_candidates(candidates),
+                );
+                notes.push(note);
+            }
         }
     }
 }
@@ -5892,6 +5938,51 @@ mod tests {
         let (g, notes) = build(&doc);
         assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Calls));
         assert!(notes.iter().any(|n| n.contains("오버로드")));
+        // 간선 대신 진단 하나가 두 후보를 싣는다 — note 문구로 같은 진단을 또 만들지 않는다.
+        let trigger = g
+            .analysis()
+            .get(&VertexId::from_raw("public.orders.trg_touch"))
+            .expect("trigger analysis");
+        let ambiguous: Vec<_> = trigger
+            .diagnostics
+            .iter()
+            .filter(|d| d.message.contains("오버로드"))
+            .collect();
+        assert_eq!(ambiguous.len(), 1, "{:?}", trigger.diagnostics);
+        assert_eq!(ambiguous[0].code, "SG_BODY_PARTIAL");
+        assert_eq!(
+            ambiguous[0]
+                .candidates
+                .iter()
+                .map(VertexId::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "public.touch_customer(integer)",
+                "public.touch_customer(text)"
+            ]
+        );
+    }
+
+    #[test]
+    fn 해석된_호출의_진단에는_후보를_싣지_않는다() {
+        let mut int_ver = routine("touch_customer", Some("plpgsql"), "BEGIN END");
+        int_ver.signature = Some("integer".into());
+        let doc = doc_with_routine(
+            vec![
+                int_ver,
+                routine("nightly", Some("sql"), "SELECT touch_customer(1)"),
+            ],
+            "",
+        );
+        let (g, _) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+            && e.from.as_str() == "public.nightly"
+            && e.to.as_str() == "public.touch_customer(integer)"));
+        assert!(g
+            .analysis()
+            .values()
+            .flat_map(|analysis| &analysis.diagnostics)
+            .all(|diagnostic| diagnostic.candidates.is_empty()));
     }
 
     #[test]
@@ -6314,7 +6405,7 @@ mod tests {
         match hit {
             RoutineHit::None => (0, None),
             RoutineHit::One(id) => (1, Some(id)),
-            RoutineHit::Ambiguous(count) => (count, None),
+            RoutineHit::Ambiguous(candidates) => (candidates.len(), None),
         }
     }
 

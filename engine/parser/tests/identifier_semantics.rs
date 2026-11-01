@@ -437,6 +437,14 @@ fn ambiguous_same_arity_overloads_report_partial_without_a_call_edge() {
     assert!(diagnostics(&graph, "s.v")
         .iter()
         .any(|code| code == "SG_CALL_AMBIGUOUS"));
+    // 확정 간선 없이 진단만 두 오버로드를 후보로 싣는다.
+    let candidates: Vec<_> = graph.analysis()[&vertex("s.v")]
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "SG_CALL_AMBIGUOUS")
+        .flat_map(|diagnostic| diagnostic.candidates.iter().map(VertexId::as_str))
+        .collect();
+    assert_eq!(candidates, ["s.foo(integer)", "s.foo(text)"]);
 }
 
 #[test]

@@ -287,6 +287,10 @@ views, functions, procedures, and packages can be.
 - **Evidence and gaps:** reports carry `limitations` for observed collection
   and parsing gaps. Unsupported routine languages, unresolved references,
   and ambiguous names are reported without inventing target vertices.
+  An ambiguous overloaded call lists the overloads it may reach as
+  `candidates` on the caller's analysis diagnostic. `dead` counts each
+  candidate as called by that caller; `query` and `impact` still follow only
+  resolved edges.
 - **Partial results:** `query`, `impact`, and `dead` report `truncated` when
   results are cut short by a result limit. Check it alongside `limitations`
   before treating a result as complete. Budgeted traversals separately report

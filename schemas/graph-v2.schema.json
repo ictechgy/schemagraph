@@ -97,6 +97,7 @@
       "type": "object",
       "required": ["code", "message"],
       "properties": {
+        "candidates": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "code": {"type": "string"},
         "location": {"anyOf": [{"$ref": "#/$defs/location"}, {"type": "null"}]},
         "message": {"type": "string"}

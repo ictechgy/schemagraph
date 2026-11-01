@@ -1,5 +1,7 @@
 //! 해석의 성공 범위와 원문 근거를 그래프와 함께 보존한다.
 
+use crate::VertexId;
+
 /// 명시한 분석 범위에서 확인한 상태다. 실행 시점 SQL 전체의 안전성을 뜻하지 않는다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AnalysisState {
@@ -26,6 +28,38 @@ pub struct Diagnostic {
     pub code: String,
     pub message: String,
     pub location: Option<SourceLocation>,
+    /// 하나로 좁히지 못한 참조가 가리킬 수 있는 실제 정점들(id 순, 중복 없음).
+    ///
+    /// 간선이 아니다 — 모호한 오버로드 호출처럼 확정 의존을 만들 수 없을 때, `dead`가
+    /// 실제로 불릴 수 있는 정점을 후보로 내지 않도록 보수적 판정의 근거만 남긴다.
+    /// 후보가 없는 진단은 비워 둔다.
+    pub candidates: Vec<VertexId>,
+}
+
+impl Diagnostic {
+    /// 후보 정점이 없는 진단 — 대부분의 진단은 가리킬 정점이 없다.
+    pub fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        location: Option<SourceLocation>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            location,
+            candidates: Vec::new(),
+        }
+    }
+
+    /// 모호한 참조의 후보 정점을 정렬·중복 제거해 싣는다. 같은 입력이 늘 같은 출력이
+    /// 되도록 후보 순서를 해석 순서가 아니라 id 순으로 고정한다.
+    pub fn with_candidates(mut self, candidates: impl IntoIterator<Item = VertexId>) -> Self {
+        let mut candidates: Vec<VertexId> = candidates.into_iter().collect();
+        candidates.sort();
+        candidates.dedup();
+        self.candidates = candidates;
+        self
+    }
 }
 
 /// 객체별 분석 범위를 보존해 미지원과 성공한 빈 결과를 구별한다.

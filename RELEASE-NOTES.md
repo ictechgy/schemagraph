@@ -3,6 +3,7 @@
 - PostgreSQL body relations and routine names fold only unquoted identifiers. TRUNCATE and data-modifying CTEs retain write evidence; CTE aliases do not become physical relations.
 - Column DEFAULT expressions retain uniquely resolved function dependencies as `depends-on` edges with body-parse evidence. Overloaded, missing and unparsable calls remain measured limitations. Literal defaults do not invent dependencies.
 - CI checks Clippy on the established Rust 1.96.0 toolchain. Mechanical lint fixes and explicit boundary exceptions preserve public API and command behavior.
+- An overloaded call that cannot be narrowed to one overload still creates no `calls` edge, but the caller's analysis diagnostic now lists the overloads it may reach in an optional `candidates` array. `dead` counts each candidate as called by that caller instead of reporting every overload as `noDependents`, and adds the measured limitation `routines named by ambiguous overloaded calls: N`. `query`, `impact`, `cycles` and `rules` are unchanged. Existing diagnostic codes and messages are kept; graphs scanned before this change carry no candidates. `schemagraph_core::Diagnostic` gains the `candidates` field and `Diagnostic::new`; the body cache format moves to 5.
 
 # schemagraph 0.8.1
 

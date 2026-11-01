@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 /// 인증한다. 공개된 재료(실행 파일·문서)만으로 다시 계산한 위조 항목이 hit가 되지 않게
 /// 하기 위해서다. 3 이하의 항목은 namespace가 달라 읽지 않으므로 한 번 miss가 나고 다시 쓴다.
 /// (3: notes를 정렬하지 않고 parser 순서로 저장한다.)
-const CACHE_FORMAT_VERSION: u32 = 4;
+const CACHE_FORMAT_VERSION: u32 = 5;
 const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const CACHE_SUFFIX: &str = ".json";
@@ -401,6 +401,8 @@ struct DiagnosticDoc {
     code: String,
     message: String,
     location: Option<LocationDoc>,
+    /// 모호한 참조의 후보 정점 id. 캐시 hit가 cold 해석과 같은 그래프를 복원해야 한다.
+    candidates: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -641,6 +643,11 @@ impl DiagnosticDoc {
             code: diagnostic.code.clone(),
             message: diagnostic.message.clone(),
             location: diagnostic.location.as_ref().map(LocationDoc::from_location),
+            candidates: diagnostic
+                .candidates
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
         }
     }
 
@@ -649,6 +656,11 @@ impl DiagnosticDoc {
             code: self.code,
             message: self.message,
             location: self.location.map(LocationDoc::into_location),
+            candidates: self
+                .candidates
+                .iter()
+                .map(|id| VertexId::from_raw(id))
+                .collect(),
         }
     }
 }

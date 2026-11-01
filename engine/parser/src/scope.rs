@@ -835,11 +835,18 @@ impl Binder<'_, '_> {
             super::RoutineHit::One(id) => {
                 self.calls.entry(id).or_default().insert(source);
             }
-            super::RoutineHit::Ambiguous(count) => self.note(
-                "SG_CALL_AMBIGUOUS",
-                format!("function '{function}' has {count} matching overloads; no target guessed"),
-                source,
-            ),
+            super::RoutineHit::Ambiguous(candidates) => {
+                // 확정 간선 없이 후보만 진단에 싣는다 — dead가 불릴 수 있는 오버로드를
+                // 후보로 내지 않게 하는 근거이고, query/impact의 확정 의존은 그대로다.
+                let message = format!(
+                    "function '{function}' has {} matching overloads; no target guessed",
+                    candidates.len()
+                );
+                self.diagnostics.push(
+                    Diagnostic::new("SG_CALL_AMBIGUOUS", message, source)
+                        .with_candidates(candidates),
+                );
+            }
             super::RoutineHit::None => self.note(
                 "SG_CALL_UNRESOLVED",
                 format!("function '{function}' was not resolved in the collected catalog"),
@@ -852,6 +859,7 @@ impl Binder<'_, '_> {
             code: code.into(),
             message,
             location,
+            candidates: Vec::new(),
         });
     }
 
@@ -2900,6 +2908,7 @@ impl DmlAnalyzer<'_, '_> {
             code: code.into(),
             message: message.into(),
             location: None,
+            candidates: Vec::new(),
         });
     }
 
@@ -3161,6 +3170,7 @@ pub(crate) fn enrich_view(
                     code: "SG_BODY_UNAVAILABLE".into(),
                     message: "view definition was not collected".into(),
                     location: None,
+                    candidates: Vec::new(),
                 }],
             },
         );
@@ -3269,6 +3279,7 @@ pub(crate) fn enrich_view(
             message: "catalog output width differs from parsed projection; output lineage omitted"
                 .into(),
             location: None,
+            candidates: Vec::new(),
         });
     }
     let output_shape_known = !diagnostics.iter().any(|d| {
