@@ -130,6 +130,11 @@ impl<'a> CatalogIndex<'a> {
         self.vertices.lookup(ci)
     }
 
+    /// 이 색인이 정규화 규칙으로 쓰는 문서 방언.
+    pub(crate) fn dialect(&self) -> &str {
+        self.dialect
+    }
+
     /// owner의 DML 효과에 origin을 단 간선 키를 기록한다.
     fn record_dml_origin(&self, owner: &VertexId, key: OriginKey) {
         self.dml_origins
@@ -1683,9 +1688,21 @@ impl Binder<'_, '_> {
             .cloned()
             .unwrap_or_default();
         if matches.len() != 1 {
+            let hint = if matches.is_empty() {
+                super::case_only_hint(
+                    self.graph,
+                    self.catalog.dialect,
+                    &VertexId::object(&schema, &table),
+                    self.catalog.lookup(false),
+                )
+                .map(|hint| format!("; {hint}"))
+                .unwrap_or_default()
+            } else {
+                String::new()
+            };
             self.note(
                 "SG_RELATION_UNRESOLVED",
-                format!("relation '{schema}.{table}' is missing or ambiguous in the catalog"),
+                format!("relation '{schema}.{table}' is missing or ambiguous in the catalog{hint}"),
                 source,
             );
             return Relation {

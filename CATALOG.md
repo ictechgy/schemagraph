@@ -96,6 +96,11 @@ generic dialect, and the graph then carries the limitation
 `dialect '<name>' is not recognized; generic SQL parsing used for N
 body/default text(s)`, counting the bodies and column defaults it read.
 
+SQL Server names are compared exactly, because case sensitivity depends on the
+database collation and documents do not carry it. When a body names a relation
+that exists only with different letter case, the unresolved-relation message
+names that variant (or counts several) and no edge is created.
+
 A PostgreSQL routine `body` that is a full definition, as `pg_get_functiondef`
 returns it, keeps the routine's `SET search_path` line. The engine looks up
 unqualified relation and routine names in that path order: the first listed

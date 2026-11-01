@@ -4029,6 +4029,51 @@ fn vertex_hit(g: &Graph, id: &VertexId, lookup: Lookup<'_>) -> Option<VertexId> 
     }
 }
 
+/// 대소문자 구분이 collation에 달린 방언(SQL Server)에서 정확히 일치하는 관계가 없을 때,
+/// 대소문자만 다른 카탈로그 관계를 찾아 누락 이유로 덧붙일 문구를 만든다.
+///
+/// 문서는 collation을 싣지 않으므로 이어 주지는 않는다 — 대소문자를 구분하는 DB에서는
+/// 다른 객체다. 후보가 여럿이면 고르지 않고 수만 알린다.
+pub(crate) fn case_only_hint(
+    g: &Graph,
+    dialect: &str,
+    id: &VertexId,
+    lookup: Lookup<'_>,
+) -> Option<String> {
+    if !matches!(dialect, "sqlserver" | "mssql") {
+        return None;
+    }
+    let variants: Vec<&VertexId> = lookup
+        .index
+        .folded_ids(g)
+        .get(&fold_case(id.as_str()))?
+        .iter()
+        .filter(|variant| *variant != id)
+        .filter(|variant| {
+            g.vertex(variant).is_some_and(|vertex| {
+                matches!(
+                    vertex.kind,
+                    VertexKind::Table
+                        | VertexKind::View
+                        | VertexKind::MaterializedView
+                        | VertexKind::Synonym
+                )
+            })
+        })
+        .collect();
+    let suffix = "not matched (a case-insensitive collation is not assumed)";
+    match variants.as_slice() {
+        [] => None,
+        [only] => Some(format!(
+            "{only} differs only by letter case and is {suffix}"
+        )),
+        many => Some(format!(
+            "{} catalog objects differ only by letter case and are {suffix}",
+            many.len()
+        )),
+    }
+}
+
 /// 스키마 안에서 routine 정점을 이름으로 찾는다. 정확한 id(name 그대로)가
 /// 먼저이고, 없으면 routine kind 정점의 표시 이름과 비교한다 — 호출자는
 /// 시그니처를 모르므로 이름이 유일할 때만 받아들인다(resolve()와 같은 철학).
@@ -4275,8 +4320,11 @@ fn apply_dml_edges(
             });
             let target_id = VertexId::object(&target_schema, table);
             let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
+                let hint = case_only_hint(g, catalog.dialect(), &target_id, catalog.lookup(ci))
+                    .map(|hint| format!("; {hint}"))
+                    .unwrap_or_default();
                 notes.push(format!(
-                    "{from} references {target_schema}.{table}, which is missing from the catalog"
+                    "{from} references {target_schema}.{table}, which is missing from the catalog{hint}"
                 ));
                 continue;
             };

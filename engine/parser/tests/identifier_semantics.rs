@@ -668,3 +668,62 @@ fn unrecognized_dialect_reports_generic_parsing_once_with_the_measured_text_coun
     ))
     .is_empty());
 }
+
+#[test]
+fn sqlserver_case_only_mismatch_is_explained_without_guessing_a_match() {
+    // SQL Server의 대소문자 구분은 collation에 달렸고 문서는 collation을 싣지 않는다.
+    // 대소문자만 다른 카탈로그 객체를 이어 주지는 않되, 누락 이유를 알린다.
+    let hint = |text: &str| text.contains("differs only by letter case");
+    let graph = analyze(
+        "sqlserver",
+        vec![
+            table("Orders", &["Id"]),
+            view("v", &["Id"], "SELECT Id FROM s.orders"),
+        ],
+        vec![function("p", None, "SELECT Id FROM orders")],
+    );
+    assert!(!has_edge(&graph, "s.v", "s.Orders", EdgeKind::Reads));
+    assert!(!has_edge(&graph, "s.p", "s.Orders", EdgeKind::Reads));
+    let view_notes: Vec<_> = graph.analysis()[&vertex("s.v")]
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "SG_RELATION_UNRESOLVED")
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        view_notes.iter().any(|m| hint(m) && m.contains("s.Orders")),
+        "{view_notes:?}"
+    );
+    assert!(
+        graph
+            .limitations()
+            .iter()
+            .any(|note| note.starts_with("s.p references s.orders")
+                && hint(note)
+                && note.contains("s.Orders")),
+        "{:?}",
+        graph.limitations()
+    );
+
+    // 대소문자만 다른 후보가 둘이면 고르지 않고 수만 알린다.
+    let graph = analyze(
+        "sqlserver",
+        vec![table("Orders", &["Id"]), table("ORDERS", &["Id"])],
+        vec![function("p", None, "SELECT Id FROM orders")],
+    );
+    assert!(graph
+        .limitations()
+        .iter()
+        .any(|note| note.contains("2 catalog objects differ only by letter case")));
+
+    // PostgreSQL의 따옴표 없는 이름은 확실히 접히므로 대소문자 힌트가 필요 없다.
+    let graph = analyze(
+        "postgres",
+        vec![
+            table("Orders", &["Id"]),
+            view("v", &["Id"], "SELECT 1 AS \"Id\" FROM s.orders"),
+        ],
+        vec![],
+    );
+    assert!(!graph.limitations().iter().any(|note| hint(note)));
+}
