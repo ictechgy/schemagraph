@@ -88,6 +88,14 @@ Version 2 replaces `reader` and adds the sorted feature declaration:
 }
 ```
 
+`dialect` selects the SQL parser and identifier rules. `sqlite`, `postgres`
+(or `postgresql`), `mysql` (or `mariadb`), and `sqlserver` (or `mssql`) use
+dedicated parsers. `oracle`, `db2`, `informix`, `h2`, and `external` are parsed
+with the generic SQL dialect by design. Any other name is also parsed with the
+generic dialect, and the graph then carries the limitation
+`dialect '<name>' is not recognized; generic SQL parsing used for N
+body/default text(s)`, counting the bodies and column defaults it read.
+
 The remaining record fields are unchanged between versions. A schema has
 `name`, `objects`, and `routines`. Object, column, constraint, referenced,
 index, trigger, routine, and usage fields are the v1 internal document fields;

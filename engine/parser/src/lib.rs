@@ -67,8 +67,10 @@ pub fn enrich_with_cache(
     let mut unavailable = 0usize;
     let mut notes: Vec<String> = Vec::new();
 
+    notes.extend(unrecognized_dialect_note(doc));
+
     // 컬럼 기본값은 routine/view 몸체 캐시의 소유가 아니다. 현재 카탈로그에서 매번 읽는다.
-    defaults::enrich(g, doc, &catalog_index, dialect.as_deref(), ci, &mut notes);
+    defaults::enrich(g, doc, &catalog_index, dialect.as_ref(), ci, &mut notes);
 
     for schema in &doc.schemas {
         for obj in &schema.objects {
@@ -109,7 +111,7 @@ pub fn enrich_with_cache(
                             &schema.name,
                             obj,
                             &owner,
-                            dialect.as_deref(),
+                            dialect.as_ref(),
                         ));
                         enriched += usize::from(obj.body.is_some());
                         cache::save(
@@ -178,10 +180,10 @@ pub fn enrich_with_cache(
                 let mut state = schemagraph_core::AnalysisState::Complete;
                 let mut record_body_diagnostics = Vec::new();
                 let parsed_body = match doc.dialect.as_str() {
-                    "db2" => parse_db2_trigger_body(dialect.as_deref(), body),
-                    "informix" => parse_informix_trigger_body(dialect.as_deref(), body),
+                    "db2" => parse_db2_trigger_body(dialect.as_ref(), body),
+                    "informix" => parse_informix_trigger_body(dialect.as_ref(), body),
                     _ => parse_trigger_body(
-                        dialect.as_deref(),
+                        dialect.as_ref(),
                         body,
                         doc.dialect == "sqlserver" || doc.dialect == "mssql",
                         doc.dialect == "sqlite",
@@ -295,7 +297,7 @@ pub fn enrich_with_cache(
             }
             let note_start = notes.len();
             let enriched_start = enriched;
-            if routine.kind == "query" && scope::is_select(dialect.as_deref(), body) {
+            if routine.kind == "query" && scope::is_select(dialect.as_ref(), body) {
                 let object = ObjectDoc {
                     name: routine.name.clone(),
                     kind: "query".into(),
@@ -312,7 +314,7 @@ pub fn enrich_with_cache(
                     &schema.name,
                     &object,
                     &owner,
-                    dialect.as_deref(),
+                    dialect.as_ref(),
                 ));
                 enriched += 1;
                 cache::save(
@@ -373,7 +375,7 @@ pub fn enrich_with_cache(
                 match routine.language.as_deref() {
                     // SQL 언어 함수는 몸체가 그대로 SQL이라 파싱 가능 — 나머지
                     // 언어는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
-                    Some("sql") | None => match parse_routine_body(dialect.as_deref(), body) {
+                    Some("sql") | None => match parse_routine_body(dialect.as_ref(), body) {
                         Ok(mut parsed) => {
                             let partial = apply_routine(
                                 g,
@@ -400,7 +402,7 @@ pub fn enrich_with_cache(
                             // 거부한다. 문장 추출로 부분 복구해 파싱된 문장의
                             // 간선만 취하고, 미추출은 limitation으로 센다.
                             let (mut parsed, unextracted) = parse_procedural_body(
-                                dialect.as_deref(),
+                                dialect.as_ref(),
                                 body,
                                 constant_sql::dialect(&doc.dialect),
                                 format_shadowed,
@@ -443,7 +445,7 @@ pub fn enrich_with_cache(
                     // 꺼내지 못한 문장(동적 SQL 등)은 수를 세어 limitation으로 남긴다.
                     Some("plpgsql" | "plsql" | "pl/sql") => {
                         let (mut parsed, unextracted) = parse_procedural_body(
-                            dialect.as_deref(),
+                            dialect.as_ref(),
                             body,
                             constant_sql::dialect(&doc.dialect),
                             format_shadowed,
@@ -687,9 +689,10 @@ pub fn enrich_inferred(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<Stri
 }
 
 /// doc.dialect 문자열 → sqlparser 방언. 모르는 방언은 Generic으로 돌린다 —
-/// 파싱을 아예 포기하는 것보다 Generic이 낫다(못 읽으면 실패로 센다).
-fn dialect_for(dialect: &str) -> Option<Box<dyn Dialect>> {
-    Some(match dialect {
+/// 파싱을 아예 포기하는 것보다 Generic이 낫다(못 읽으면 실패로 센다). 모르는 이름인지는
+/// [`recognized_dialect`]가 따로 판정해 limitation으로 알린다.
+fn dialect_for(dialect: &str) -> Box<dyn Dialect> {
+    match dialect {
         "sqlite" => Box::new(SQLiteDialect {}),
         // 이름 정규화(scope)·상수 SQL이 같은 방언으로 보는 별칭도 같은 파서로 읽는다.
         // JDBC 프로브는 jdbc:mariadb: URL을 "mariadb"로 싣는다.
@@ -699,6 +702,63 @@ fn dialect_for(dialect: &str) -> Option<Box<dyn Dialect>> {
         // Generic으로 파싱하면 문장째 실패하던 것이 풀린다.
         "sqlserver" | "mssql" => Box::new(MsSqlDialect {}),
         _ => Box::new(GenericDialect {}),
+    }
+}
+
+/// sqlparser에 전용 방언이 없어 일부러 Generic으로 읽는 이름. 엔진이 이 이름들로
+/// 이름 접기·몸체 추출을 따로 분기하므로 "모르는 방언"이 아니다. `external`은
+/// 방언을 모르는 애플리케이션 SQL 문서(`--sql-dir`·import)의 이름이다.
+const GENERIC_DIALECTS: [&str; 5] = ["oracle", "db2", "informix", "h2", "external"];
+
+/// 엔진이 이름을 아는 방언인가 — 전용 파서가 있거나 의도적으로 Generic을 쓰는 이름.
+fn recognized_dialect(dialect: &str) -> bool {
+    matches!(
+        dialect,
+        "sqlite" | "postgres" | "postgresql" | "mysql" | "mariadb" | "sqlserver" | "mssql"
+    ) || GENERIC_DIALECTS.contains(&dialect)
+}
+
+/// 모르는 방언 이름이면, 그 문서에서 Generic으로 읽게 될 SQL 원문 수를 세어 알린다.
+/// 읽을 SQL이 없으면 방언이 결과를 바꾸지 않으므로 조용히 둔다.
+fn unrecognized_dialect_note(doc: &CatalogDocument) -> Option<String> {
+    if recognized_dialect(&doc.dialect) {
+        return None;
+    }
+    let present = |text: Option<&String>| text.is_some_and(|text| !text.trim().is_empty());
+    let texts: usize = doc
+        .schemas
+        .iter()
+        .map(|schema| {
+            let objects: usize = schema
+                .objects
+                .iter()
+                .map(|object| {
+                    usize::from(present(object.body.as_ref()))
+                        + object
+                            .triggers
+                            .iter()
+                            .filter(|trigger| present(trigger.body.as_ref()))
+                            .count()
+                        + object
+                            .columns
+                            .iter()
+                            .filter(|column| present(column.default.as_ref()))
+                            .count()
+                })
+                .sum();
+            objects
+                + schema
+                    .routines
+                    .iter()
+                    .filter(|routine| present(routine.body.as_ref()))
+                    .count()
+        })
+        .sum();
+    (texts > 0).then(|| {
+        format!(
+            "dialect '{}' is not recognized; generic SQL parsing used for {texts} body/default text(s)",
+            doc.dialect
+        )
     })
 }
 
@@ -832,13 +892,11 @@ fn statement_hash(statement: &Statement) -> u64 {
 /// 벗기고 안쪽 문장만 파서에 넘긴다. 껍질이 없는 몸체(reader가 내부
 /// 문장만 저장한 경우)는 통째로 파싱한다.
 fn parse_trigger_body(
-    dialect: Option<&dyn Dialect>,
+    dialect: &dyn Dialect,
     body: &str,
     sqlserver_trigger: bool,
     sqlite_trigger: bool,
 ) -> Result<ParsedTrigger, String> {
-    let default = GenericDialect {};
-    let dialect = dialect.unwrap_or(&default);
     let calls = extract_execute_targets(body);
     let inner = extract_trigger_inner(body).unwrap_or(body);
     let locations_trusted =
@@ -904,7 +962,7 @@ fn needs_procedural_recovery(body: &str) -> bool {
 
 /// routine 몸체 파싱 — CREATE FUNCTION 전문이 들어오면 AS 뒤의 몸체만
 /// 꺼내고, 나머지는 trigger와 같은 문장 수집 골격으로 파싱한다.
-fn parse_routine_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedTrigger, String> {
+fn parse_routine_body(dialect: &dyn Dialect, body: &str) -> Result<ParsedTrigger, String> {
     let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
     let transformed =
         inner.as_ref().len() != body.len() || !std::ptr::eq(inner.as_ref().as_ptr(), body.as_ptr());
@@ -927,7 +985,7 @@ fn parse_catalog_routine_body(dialect_name: &str, body: &str) -> (ParsedTrigger,
     };
     let dialect = dialect_for(dialect_name);
     parse_procedural_body(
-        dialect.as_deref(),
+        dialect.as_ref(),
         inner,
         constant_sql::dialect(dialect_name),
         false,
@@ -1074,10 +1132,7 @@ fn find_top_level_semicolon(text: &str) -> Option<usize> {
     None
 }
 
-fn parse_informix_trigger_body(
-    dialect: Option<&dyn Dialect>,
-    body: &str,
-) -> Result<ParsedTrigger, String> {
+fn parse_informix_trigger_body(dialect: &dyn Dialect, body: &str) -> Result<ParsedTrigger, String> {
     let inner = strip_catalog_trigger_header("informix", body)
         .and_then(strip_outer_parentheses)
         .or_else(|| strip_catalog_trigger_header("informix", body))
@@ -1140,10 +1195,7 @@ fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#' | b'.') || byte >= 128
 }
 
-fn parse_db2_trigger_body(
-    dialect: Option<&dyn Dialect>,
-    body: &str,
-) -> Result<ParsedTrigger, String> {
+fn parse_db2_trigger_body(dialect: &dyn Dialect, body: &str) -> Result<ParsedTrigger, String> {
     let inner = strip_catalog_trigger_header("db2", body).unwrap_or(body);
     parse_trigger_body(dialect, inner, false, false)
 }
@@ -1547,7 +1599,7 @@ impl ExtractionState {
 /// 한 문장이 이상해도 나머지가 살도록 개별 파싱하고, 실패는 미추출 수에
 /// 합산한다. 반환의 usize는 추출·파싱에 실패한 문장 수다.
 fn parse_procedural_body(
-    dialect: Option<&dyn Dialect>,
+    dialect: &dyn Dialect,
     body: &str,
     text_dialect: constant_sql::TextDialect,
     format_shadowed: bool,
@@ -1563,8 +1615,6 @@ fn parse_procedural_body(
         .extend(routine_parameter_symbols(body));
     let (stmts, mut unextracted) =
         extract_procedural_statements(&inner, &mut state, starts_in_declare);
-    let default = GenericDialect {};
-    let dialect = dialect.unwrap_or(&default);
     let mut parsed = ParsedTrigger {
         writes: Vec::new(),
         reads: Vec::new(),
@@ -6543,8 +6593,7 @@ mod tests {
     fn dml_문장_중복_확인은_해시가_같은_후보와만_비교한다() {
         let body = repeated_insert_body(2_000, &[7, 1_999]);
         work::take_compared_statements();
-        let parsed =
-            parse_routine_body(Some(&GenericDialect {}), &body).expect("INSERT만 있는 몸체");
+        let parsed = parse_routine_body(&GenericDialect {}, &body).expect("INSERT만 있는 몸체");
         // 위치만 다른 사본은 합쳐지고 처음 나온 순서가 그대로 남는다.
         assert_eq!(parsed.dml_statements.len(), 2_000);
         let leading: Vec<String> = parsed
@@ -6600,7 +6649,7 @@ mod tests {
             .map(|row| format!("SELECT {row} FROM customers"))
             .collect();
         let body = format!("INSERT INTO orders (id) {}", rows.join(" UNION ALL "));
-        let parsed = parse_routine_body(Some(&GenericDialect {}), &body).expect("INSERT SELECT");
+        let parsed = parse_routine_body(&GenericDialect {}, &body).expect("INSERT SELECT");
         assert_eq!(parsed.dml_statements.len(), 1);
         assert_eq!(parsed.writes, [(None, "orders".to_owned())]);
         assert_eq!(parsed.reads, [(None, "customers".to_owned())]);

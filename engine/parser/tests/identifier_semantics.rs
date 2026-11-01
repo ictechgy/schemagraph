@@ -624,3 +624,47 @@ fn mariadb_and_postgresql_documents_parse_with_their_engine_dialects() {
         );
     }
 }
+
+#[test]
+fn unrecognized_dialect_reports_generic_parsing_once_with_the_measured_text_count() {
+    let generic_note = |graph: &Graph| -> Vec<String> {
+        graph
+            .limitations()
+            .iter()
+            .filter(|note| note.contains("generic SQL parsing"))
+            .cloned()
+            .collect()
+    };
+    let mut orders = table("orders", &["id"]);
+    orders["columns"][0]["default"] = json!("0");
+    let objects = || vec![orders.clone(), view("v", &["id"], "SELECT id FROM orders")];
+    let routines = || {
+        vec![function(
+            "count_orders",
+            None,
+            "SELECT count(*) FROM orders",
+        )]
+    };
+    // 뷰 몸체, 컬럼 기본값, routine 몸체를 하나씩 센다. 일반 방언으로도 파싱은 계속한다.
+    let graph = analyze("snowflake", objects(), routines());
+    assert_eq!(
+        generic_note(&graph),
+        ["dialect 'snowflake' is not recognized; generic SQL parsing used for 3 body/default text(s)"]
+    );
+    assert!(has_edge(&graph, "s.v", "s.orders", EdgeKind::Reads));
+    // 엔진이 알고 일부러 일반 방언으로 읽는 이름과, 읽을 SQL이 없는 문서는 알리지 않는다.
+    for known in [
+        "oracle", "db2", "informix", "h2", "external", "postgres", "mariadb",
+    ] {
+        assert!(
+            generic_note(&analyze(known, objects(), routines())).is_empty(),
+            "{known}"
+        );
+    }
+    assert!(generic_note(&analyze(
+        "snowflake",
+        vec![table("orders", &["id"])],
+        vec![]
+    ))
+    .is_empty());
+}

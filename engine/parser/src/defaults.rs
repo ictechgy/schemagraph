@@ -15,7 +15,7 @@ pub(super) fn enrich(
     graph: &mut Graph,
     document: &CatalogDocument,
     catalog: &scope::CatalogIndex<'_>,
-    dialect: Option<&dyn Dialect>,
+    dialect: &dyn Dialect,
     ci: bool,
     notes: &mut Vec<String>,
 ) {
@@ -34,12 +34,6 @@ pub(super) fn enrich(
                     "column",
                     catalog.lookup(ci),
                 ) else {
-                    continue;
-                };
-                let Some(dialect) = dialect else {
-                    notes.push(format!(
-                        "column {owner} DEFAULT: unsupported dialect; dependencies unavailable"
-                    ));
                     continue;
                 };
                 let expression = match parse_limits::parse_expression(dialect, default) {

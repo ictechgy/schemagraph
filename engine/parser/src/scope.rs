@@ -18,7 +18,7 @@ use sqlparser::ast::{
     TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value, Visit, Visitor,
     WildcardAdditionalOptions, WindowType,
 };
-use sqlparser::dialect::{Dialect, GenericDialect};
+use sqlparser::dialect::Dialect;
 
 use crate::cache::CacheContext;
 
@@ -393,8 +393,7 @@ impl<'a> CatalogIndex<'a> {
             return self.conservative_context(graph, owner);
         }
         let dialect = super::dialect_for(self.dialect);
-        let default = GenericDialect {};
-        let parsed = super::parse_limits::parse_sql(dialect.as_deref().unwrap_or(&default), body);
+        let parsed = super::parse_limits::parse_sql(dialect.as_ref(), body);
         let Ok(statements) = parsed else {
             return self.conservative_context(graph, owner);
         };
@@ -687,9 +686,8 @@ fn object_shape(object: &ObjectDoc) -> String {
 }
 
 /// 목적지가 없는 단일 SELECT만 읽기 해석기로 보내고 SELECT INTO는 DML로 남긴다.
-pub(crate) fn is_select(dialect: Option<&dyn Dialect>, body: &str) -> bool {
-    let default = GenericDialect {};
-    super::parse_limits::parse_sql(dialect.unwrap_or(&default), body).is_ok_and(|s| {
+pub(crate) fn is_select(dialect: &dyn Dialect, body: &str) -> bool {
+    super::parse_limits::parse_sql(dialect, body).is_ok_and(|s| {
         s.len() == 1
             && matches!(s[0], Statement::Query(_))
             && !super::is_column_dml_statement(&s[0])
@@ -3156,7 +3154,7 @@ pub(crate) fn enrich_view(
     schema: &str,
     object: &ObjectDoc,
     owner: &VertexId,
-    dialect: Option<&dyn Dialect>,
+    dialect: &dyn Dialect,
 ) -> Vec<String> {
     let Some(body) = object.body.as_ref().filter(|s| !s.trim().is_empty()) else {
         graph.set_analysis(
@@ -3179,8 +3177,7 @@ pub(crate) fn enrich_view(
         )];
     };
     let hash = body_hash(body);
-    let default = GenericDialect {};
-    let parsed = super::parse_limits::parse_sql(dialect.unwrap_or(&default), body);
+    let parsed = super::parse_limits::parse_sql(dialect, body);
     let mut binder = Binder {
         catalog,
         graph,
