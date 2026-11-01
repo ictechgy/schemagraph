@@ -96,6 +96,16 @@ generic dialect, and the graph then carries the limitation
 `dialect '<name>' is not recognized; generic SQL parsing used for N
 body/default text(s)`, counting the bodies and column defaults it read.
 
+A PostgreSQL routine `body` that is a full definition, as `pg_get_functiondef`
+returns it, keeps the routine's `SET search_path` line. The engine looks up
+unqualified relation and routine names in that path order: the first listed
+schema that has the name wins, and a name missing from every listed schema is
+reported as missing from the first one. `pg_catalog` and `pg_temp` entries are
+skipped because they are not collected. `$user` depends on the calling role, so
+it is skipped and reported as a limitation, as are listed schemas that were not
+collected. Without a declared path, unqualified names resolve in the routine's
+own schema as before.
+
 The remaining record fields are unchanged between versions. A schema has
 `name`, `objects`, and `routines`. Object, column, constraint, referenced,
 index, trigger, routine, and usage fields are the v1 internal document fields;

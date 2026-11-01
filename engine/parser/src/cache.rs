@@ -765,6 +765,23 @@ mod tests {
     }
 
     #[test]
+    fn declared_search_path_uses_conservative_cache_context() {
+        // 줄바꿈으로 갈린 CREATE·FUNCTION은 정의문 감싸기 검사에 걸리지 않는다. 경로의 다른
+        // 스키마에 같은 이름이 생기면 해석이 바뀌므로 관계 footprint로 좁히지 않는다.
+        let body = "CREATE\nFUNCTION public.f() RETURNS bigint LANGUAGE sql \
+                    SET search_path = app, public AS $$SELECT count(*) FROM items$$";
+        let doc: CatalogDocument = serde_json::from_value(serde_json::json!({
+            "version":1,"dialect":"postgres","reader":"test","limitations":[],
+            "schemas":[{"name":"public","objects":[],"routines":[
+                {"name":"f","kind":"function","language":"sql","body":body}]}]
+        }))
+        .unwrap();
+        let owner = VertexId::routine("public", None, "f", None);
+        let graph = schemagraph_source::graph::document_to_graph(&doc);
+        assert!(!crate::scope::cache_context(&doc, &graph, &owner, body).trusted);
+    }
+
+    #[test]
     fn scoped_context_tracks_cross_schema_routine_overloads() {
         let mut doc: CatalogDocument = serde_json::from_value(serde_json::json!({
             "version":1,"dialect":"postgres","reader":"test","limitations":[],

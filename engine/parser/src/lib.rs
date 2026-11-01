@@ -200,6 +200,7 @@ pub fn enrich_with_cache(
                                 body_hash: scope::body_hash(body),
                                 sqlserver_trigger: doc.dialect == "sqlserver"
                                     || doc.dialect == "mssql",
+                                search_path: None,
                             },
                             &obj.name,
                             &trigger_id,
@@ -331,6 +332,36 @@ pub fn enrich_with_cache(
                 );
                 continue;
             }
+            // 정의문이 선언한 search_path 순서로 한 부분 이름을 찾는다. 호출 role에 따른
+            // `$user`와 수집 대상이 없는 경로는 추측하지 않고 note로 남긴다.
+            let search_path = routine_search_path(&doc.dialect, body);
+            if let Some(path) = &search_path {
+                if path.role_dependent {
+                    notes.push(format!(
+                        "routine {owner}: search_path entry $user depends on the calling role; \
+                         unqualified names were resolved in the remaining entries"
+                    ));
+                }
+                if path.schemas.is_empty() {
+                    notes.push(format!(
+                        "routine {owner}: search_path names no collected schema; \
+                         unqualified names were resolved in the routine schema"
+                    ));
+                }
+                let uncollected: Vec<&str> = path
+                    .schemas
+                    .iter()
+                    .filter(|name| !doc.schemas.iter().any(|schema| &schema.name == *name))
+                    .map(String::as_str)
+                    .collect();
+                if !uncollected.is_empty() {
+                    notes.push(format!(
+                        "routine {owner}: search_path schemas not collected ({}); \
+                         unqualified names they hold are unknown",
+                        uncollected.join(", ")
+                    ));
+                }
+            }
             let mut state = schemagraph_core::AnalysisState::Complete;
             let mut record_body_diagnostics = Vec::new();
             (|| {
@@ -346,6 +377,7 @@ pub fn enrich_with_cache(
                             ci,
                             body_hash: scope::body_hash(body),
                             sqlserver_trigger: false,
+                            search_path: search_path.as_ref(),
                         },
                         &owner,
                         &mut parsed,
@@ -385,6 +417,7 @@ pub fn enrich_with_cache(
                                     ci,
                                     body_hash: scope::body_hash(body),
                                     sqlserver_trigger: false,
+                                    search_path: search_path.as_ref(),
                                 },
                                 &owner,
                                 &mut parsed,
@@ -417,6 +450,7 @@ pub fn enrich_with_cache(
                                             ci,
                                             body_hash: scope::body_hash(body),
                                             sqlserver_trigger: false,
+                                            search_path: search_path.as_ref(),
                                         },
                                         &owner,
                                         &mut parsed,
@@ -458,6 +492,7 @@ pub fn enrich_with_cache(
                                 ci,
                                 body_hash: scope::body_hash(body),
                                 sqlserver_trigger: false,
+                                search_path: search_path.as_ref(),
                             },
                             &owner,
                             &mut parsed,
@@ -1261,19 +1296,152 @@ fn strip_outer_parentheses(text: &str) -> Option<&str> {
 /// pg_get_functiondef·SHOW CREATE FUNCTION류 정의문은 몸체를 AS 뒤에
 /// 문자열로 담으므로, 그 껍질을 벗겨야 SQL 문장이 나온다.
 fn extract_as_body(body: &str) -> Option<std::borrow::Cow<'_, str>> {
+    as_body(body).map(|(_, inner)| inner)
+}
+
+/// 몸체를 감싼 `AS` 키워드의 위치와 그 안쪽 몸체. 정의문 머리는 그 앞까지다.
+fn as_body(body: &str) -> Option<(usize, std::borrow::Cow<'_, str>)> {
     for i in find_all_keywords(body, "AS") {
         let rest = body[i + "AS".len()..].trim_start();
         if rest.starts_with('\'') {
             if let Some(inner) = unquote_sql_string(rest) {
-                return Some(inner);
+                return Some((i, inner));
             }
         } else if rest.starts_with('$') {
             if let Some(inner) = undollar_quote(rest) {
-                return Some(inner);
+                return Some((i, inner));
             }
         }
     }
     None
+}
+
+/// PostgreSQL routine 정의문 머리(`AS` 몸체 앞)가 선언한 `SET search_path`.
+///
+/// pg_get_functiondef는 proconfig를 ` SET search_path TO 'app', 'public'` 줄로 싣고, 손으로 쓴
+/// 정의문은 `SET search_path = app, "Public"`처럼 쓴다. 한 부분 이름의 해석 순서만 바꾸고,
+/// 호출 role에 따라 달라지는 `$user`는 추측하지 않고 표시한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchPath {
+    /// 사용자 객체를 찾는 순서의 스키마. pg_catalog·pg_temp는 수집하지 않으므로 뺀다.
+    schemas: Vec<String>,
+    /// 호출 role에 따라 달라지는 `$user`가 있었는가.
+    role_dependent: bool,
+}
+
+impl SearchPath {
+    /// 한 부분 이름을 담은 첫 경로 스키마. 어느 경로 스키마에도 없으면 첫 경로 스키마의
+    /// 누락으로 남긴다 — PostgreSQL도 경로 밖 스키마를 보지 않는다. 경로에 수집 대상
+    /// 스키마가 하나도 없으면 routine 스키마(`fallback`)를 쓰고, 그 사실은 note로 알린다.
+    pub(crate) fn schema_for<'s>(
+        &'s self,
+        fallback: &'s str,
+        holds: impl Fn(&str) -> bool,
+    ) -> &'s str {
+        self.schemas
+            .iter()
+            .find(|schema| holds(schema))
+            .or(self.schemas.first())
+            .map_or(fallback, String::as_str)
+    }
+}
+
+/// 경로가 없으면 routine 스키마, 있으면 경로 순서로 한 부분 이름의 스키마를 고른다.
+pub(crate) fn unqualified_schema<'s>(
+    path: Option<&'s SearchPath>,
+    schema: &'s str,
+    holds: impl Fn(&str) -> bool,
+) -> &'s str {
+    path.map_or(schema, |path| path.schema_for(schema, holds))
+}
+
+/// 정의문 머리의 마지막 `SET search_path` 선언을 읽는다. 정의문이 아니거나(몸체 원문만
+/// 실린 문서) 선언이 없거나 값을 알 수 없으면(`FROM CURRENT`·`DEFAULT`) None이다.
+fn routine_search_path(dialect: &str, body: &str) -> Option<SearchPath> {
+    if !matches!(dialect, "postgres" | "postgresql") {
+        return None;
+    }
+    let (start, _) = as_body(body)?;
+    let header = &body[..start];
+    if !starts_with_keyword(skip_ws_comments(header), "CREATE") {
+        return None;
+    }
+    let mut declared = None;
+    for set in find_all_keywords(header, "SET") {
+        let rest = header[set + "SET".len()..].trim_start();
+        if !starts_with_keyword(rest, "search_path") {
+            continue;
+        }
+        let rest = rest["search_path".len()..].trim_start();
+        let value = if let Some(value) = rest.strip_prefix('=') {
+            value
+        } else if starts_with_keyword(rest, "TO") {
+            &rest["TO".len()..]
+        } else {
+            continue;
+        };
+        declared = parse_search_path_value(value);
+    }
+    declared
+}
+
+/// `'a', "B", c` 꼴 값 목록을 읽는다. 문자열·큰따옴표 이름은 그대로, 따옴표 없는 이름은
+/// PostgreSQL처럼 소문자로 접는다. 목록은 쉼표가 끊기는 곳(다음 절)에서 끝난다.
+fn parse_search_path_value(value: &str) -> Option<SearchPath> {
+    let mut path = SearchPath {
+        schemas: Vec::new(),
+        role_dependent: false,
+    };
+    let mut rest = value.trim_start();
+    if starts_with_keyword(rest, "FROM") || starts_with_keyword(rest, "DEFAULT") {
+        return None;
+    }
+    loop {
+        let (name, after) = search_path_entry(rest)?;
+        match name.as_str() {
+            "$user" => path.role_dependent = true,
+            // 빈 이름(`SET search_path TO ''`)과 수집하지 않는 시스템 스키마는 사용자 객체를
+            // 담지 않는다. pg_temp_N도 세션 임시 스키마다.
+            "" | "pg_catalog" => {}
+            temp if temp == "pg_temp" || temp.starts_with("pg_temp_") => {}
+            _ if path.schemas.contains(&name) => {}
+            _ => path.schemas.push(name),
+        }
+        rest = after.trim_start();
+        match rest.strip_prefix(',') {
+            Some(next) => rest = next.trim_start(),
+            None => return Some(path),
+        }
+    }
+}
+
+/// 목록 항목 하나와 그 뒤 나머지. 알 수 없는 모양이면 None으로 선언 전체를 무시한다.
+fn search_path_entry(rest: &str) -> Option<(String, &str)> {
+    let quote = rest.chars().next()?;
+    if quote == '\'' || quote == '"' {
+        let bytes = rest.as_bytes();
+        let mut name = String::new();
+        let mut i = 1;
+        let mut run = 1;
+        while i < bytes.len() {
+            if bytes[i] == quote as u8 {
+                name.push_str(&rest[run..i]);
+                if bytes.get(i + 1) == Some(&(quote as u8)) {
+                    name.push(quote);
+                    i += 2;
+                    run = i;
+                    continue;
+                }
+                return Some((name, &rest[i + 1..]));
+            }
+            i += 1;
+        }
+        return None;
+    }
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| (rest[..end].to_lowercase(), &rest[end..]))
 }
 
 /// '...' 리터럴의 내용 — '' 이스케이프는 따옴표 하나로 되돌린다.
@@ -3879,6 +4047,8 @@ struct BodyContext<'a, 'doc> {
     ci: bool,
     body_hash: String,
     sqlserver_trigger: bool,
+    /// routine 정의문이 선언한 한 부분 이름의 해석 순서. 없으면 `schema`로 찾는다.
+    search_path: Option<&'a SearchPath>,
 }
 
 /// trigger 파싱 결과를 그래프 간선으로 반영한다 — DML + calls + fired-columns.
@@ -3896,6 +4066,7 @@ fn apply_trigger(
         ci,
         body_hash,
         sqlserver_trigger,
+        ..
     } = context;
     if g.vertex(trigger_id).is_none() {
         notes.push(format!(
@@ -3904,7 +4075,11 @@ fn apply_trigger(
         return false;
     }
     note_ignored_relations(trigger_id, &parsed.ignored_relations, notes);
-    apply_dml_edges(g, catalog, schema, trigger_id, parsed, notes, ci);
+    let namespace = Namespace {
+        schema,
+        search_path: None,
+    };
+    apply_dml_edges(g, catalog, namespace, trigger_id, parsed, notes, ci);
     let transition = if sqlserver_trigger {
         Some((owner_table, &["inserted", "deleted"][..]))
     } else if !parsed.fired_columns.is_empty() {
@@ -3928,12 +4103,13 @@ fn apply_trigger(
                 && parsed.temp_state_safe,
             locations_trusted: parsed.locations_trusted,
             scalar_symbols: &parsed.scalar_symbols,
+            search_path: None,
         },
         &mut parsed.diagnostics,
     );
     apply_call_edges(
         g,
-        schema,
+        namespace,
         trigger_id,
         &parsed.calls,
         CallNotes {
@@ -3987,6 +4163,7 @@ fn apply_routine(
         schema,
         ci,
         body_hash,
+        search_path,
         ..
     } = context;
     if g.vertex(owner).is_none() {
@@ -3996,7 +4173,18 @@ fn apply_routine(
         return false;
     }
     note_ignored_relations(owner, &parsed.ignored_relations, notes);
-    apply_dml_edges(g, catalog, schema, owner, parsed, notes, ci);
+    apply_dml_edges(
+        g,
+        catalog,
+        Namespace {
+            schema,
+            search_path,
+        },
+        owner,
+        parsed,
+        notes,
+        ci,
+    );
     parsed.partial |= scope::apply_dml_column_effects(
         g,
         catalog,
@@ -4013,12 +4201,16 @@ fn apply_routine(
                 && parsed.temp_state_safe,
             locations_trusted: parsed.locations_trusted,
             scalar_symbols: &parsed.scalar_symbols,
+            search_path,
         },
         &mut parsed.diagnostics,
     );
     apply_call_edges(
         g,
-        schema,
+        Namespace {
+            schema,
+            search_path,
+        },
         owner,
         &parsed.calls,
         CallNotes {
@@ -4041,11 +4233,25 @@ fn note_ignored_relations(from: &VertexId, relations: &BTreeSet<String>, notes: 
     ));
 }
 
+/// 한 부분 이름을 찾는 곳 — 몸체 소유자의 스키마와, routine 정의문이 선언한 해석 순서.
+#[derive(Clone, Copy)]
+struct Namespace<'a> {
+    schema: &'a str,
+    search_path: Option<&'a SearchPath>,
+}
+
+impl Namespace<'_> {
+    /// 스키마를 적지 않은 이름의 스키마. `holds`는 그 스키마에 이름이 있는지 답한다.
+    fn schema_for(&self, holds: impl Fn(&str) -> bool) -> String {
+        unqualified_schema(self.search_path, self.schema, holds).to_owned()
+    }
+}
+
 /// 몸체 문장의 writes/reads 대상을 간선으로 만든다 — trigger와 routine이 공유.
 fn apply_dml_edges(
     g: &mut Graph,
     catalog: &scope::CatalogIndex<'_>,
-    schema: &str,
+    namespace: Namespace<'_>,
     from: &VertexId,
     parsed: &mut ParsedTrigger,
     notes: &mut Vec<String>,
@@ -4062,7 +4268,11 @@ fn apply_dml_edges(
             {
                 continue;
             }
-            let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
+            let target_schema = ref_schema.clone().unwrap_or_else(|| {
+                namespace.schema_for(|schema| {
+                    vertex_hit(g, &VertexId::object(schema, table), catalog.lookup(ci)).is_some()
+                })
+            });
             let target_id = VertexId::object(&target_schema, table);
             let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
                 notes.push(format!(
@@ -4133,15 +4343,20 @@ struct CallNotes<'a> {
 /// 시그니처를 포함할 수 있어 이름으로 해석한다.
 fn apply_call_edges(
     g: &mut Graph,
-    schema: &str,
+    namespace: Namespace<'_>,
     from: &VertexId,
     calls: &[(Option<String>, String)],
     out: CallNotes<'_>,
     lookup: Lookup<'_>,
 ) {
     let CallNotes { notes, diagnostics } = out;
+    let schema = namespace.schema;
     for (ref_schema, name) in calls {
-        let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
+        let target_schema = ref_schema.clone().unwrap_or_else(|| {
+            namespace.schema_for(|schema| {
+                !matches!(resolve_routine(g, schema, name, lookup), RoutineHit::None)
+            })
+        });
         let hit = match resolve_routine(g, &target_schema, name, lookup) {
             RoutineHit::None => {
                 // `pkg.member()` 꼴 — qualifier가 스키마가 아니라 패키지면

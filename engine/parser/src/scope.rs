@@ -204,6 +204,8 @@ struct Binder<'a, 'd> {
     catalog: &'a CatalogIndex<'d>,
     graph: &'a Graph,
     schema: &'a str,
+    /// 한 부분 이름을 `schema` 대신 찾는 순서(routine 정의문의 `SET search_path`).
+    search_path: Option<&'a super::SearchPath>,
     reads: BTreeMap<VertexId, BTreeSet<(String, Option<SourceLocation>)>>,
     calls: BTreeMap<VertexId, BTreeSet<Option<SourceLocation>>>,
     diagnostics: Vec<Diagnostic>,
@@ -389,7 +391,11 @@ impl<'a> CatalogIndex<'a> {
     ) -> CacheContext {
         #[cfg(test)]
         count_cache_key(|counters| counters.contexts += 1);
-        if wraps_definition_or_dynamic_sql(body) {
+        // 선언된 search_path는 경로의 모든 스키마가 한 부분 이름의 해석을 바꿀 수 있어
+        // 관계 footprint로 좁히지 않는다.
+        if wraps_definition_or_dynamic_sql(body)
+            || super::routine_search_path(self.dialect, body).is_some()
+        {
             return self.conservative_context(graph, owner);
         }
         let dialect = super::dialect_for(self.dialect);
@@ -777,7 +783,14 @@ impl Binder<'_, '_> {
             .is_some_and(|ident| ident.quote_style.is_some());
         let default = catalog_key(self.catalog.dialect, self.schema);
         let (schema, routine) = match parts.as_slice() {
-            [routine] => (default.clone(), routine.clone()),
+            [routine] => {
+                let schema = super::unqualified_schema(self.search_path, self.schema, |schema| {
+                    self.catalog
+                        .routines
+                        .contains(&(catalog_key(self.catalog.dialect, schema), routine.clone()))
+                });
+                (catalog_key(self.catalog.dialect, schema), routine.clone())
+            }
             [schema, routine]
                 if self
                     .catalog
@@ -1641,7 +1654,15 @@ impl Binder<'_, '_> {
     }
 
     fn table(&mut self, parts: &[String], source: Option<SourceLocation>) -> Relation {
-        let Some((schema, table)) = self.catalog.relation_key(parts, self.schema) else {
+        let default_schema = match parts {
+            [table] => super::unqualified_schema(self.search_path, self.schema, |schema| {
+                self.catalog
+                    .tables
+                    .contains_key(&(catalog_key(self.catalog.dialect, schema), table.clone()))
+            }),
+            _ => self.schema,
+        };
+        let Some((schema, table)) = self.catalog.relation_key(parts, default_schema) else {
             self.note(
                 "SG_CROSS_DATABASE",
                 format!(
@@ -1928,6 +1949,7 @@ pub(crate) fn apply_dml_column_effects(
             catalog,
             graph: &*graph,
             schema,
+            search_path: options.search_path,
             reads: BTreeMap::new(),
             calls: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -2010,6 +2032,8 @@ pub(crate) struct DmlApplyOptions<'a> {
     pub(crate) allow_local_temps: bool,
     pub(crate) locations_trusted: bool,
     pub(crate) scalar_symbols: &'a BTreeSet<String>,
+    /// routine 정의문이 선언한 한 부분 이름의 해석 순서.
+    pub(crate) search_path: Option<&'a super::SearchPath>,
 }
 
 struct DmlEffect {
@@ -3182,6 +3206,7 @@ pub(crate) fn enrich_view(
         catalog,
         graph,
         schema,
+        search_path: None,
         reads: BTreeMap::new(),
         calls: BTreeMap::new(),
         diagnostics: Vec::new(),
