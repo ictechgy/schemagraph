@@ -3,6 +3,7 @@ name = "schemagraph-source"
 description = "Catalog document types and database readers for schemagraph"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
