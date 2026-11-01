@@ -130,7 +130,7 @@ fn warm_cache_scans_keep_ambiguous_call_candidates_for_dead() {
         json!([{
             "candidates": ["public.over(integer)", "public.over(text)"],
             "code": "SG_BODY_PARTIAL",
-            "message": "public.touch이(가) 부르는 public.over에 2개 오버로드가 있어 간선 생략"
+            "message": "public.touch calls public.over, which has 2 overloads; edge omitted"
         }]),
         "{graph}"
     );

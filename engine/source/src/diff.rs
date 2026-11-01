@@ -240,7 +240,7 @@ pub fn diff_documents(old: &CatalogDocument, new: &CatalogDocument) -> DocumentD
     let mut limitations = Vec::new();
     if old.dialect != new.dialect {
         limitations.push(format!(
-            "dialect가 다르다({} → {}) — 같은 이름도 의미가 다를 수 있다",
+            "dialects differ ({} → {}); the same name can mean different objects",
             old.dialect, new.dialect
         ));
     }

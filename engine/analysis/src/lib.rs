@@ -163,7 +163,7 @@ pub struct QueryReport {
 pub fn query(graph: &Graph, subject: &VertexId, depth: u32, max_neighbors: usize) -> QueryReport {
     let vertex = graph
         .vertex(subject)
-        .expect("query는 resolve로 확인된 id만 받는다");
+        .expect("query receives only ids confirmed by resolve");
 
     let (dependents, dep_trunc) = bfs(graph, subject, depth, max_neighbors, Direction::In);
     let (dependencies, out_trunc) = bfs(graph, subject, depth, max_neighbors, Direction::Out);
@@ -207,7 +207,7 @@ pub struct ImpactReport {
 pub fn impact(graph: &Graph, subject: &VertexId, max_neighbors: usize) -> ImpactReport {
     let vertex = graph
         .vertex(subject)
-        .expect("impact는 resolve로 확인된 id만 받는다");
+        .expect("impact receives only ids confirmed by resolve");
     let (impacted, truncated) = bfs(graph, subject, u32::MAX, max_neighbors, Direction::In);
     ImpactReport {
         subject: vertex.clone(),
@@ -866,7 +866,7 @@ impl GlobPattern {
                 let skipped = text[star_t..]
                     .chars()
                     .next()
-                    .expect("star_t는 ti 이하의 문자 경계다");
+                    .expect("star_t is a char boundary at or before ti");
                 star_t += skipped.len_utf8();
                 ti = star_t;
             } else {

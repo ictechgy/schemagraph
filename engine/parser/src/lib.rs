@@ -143,7 +143,7 @@ pub fn enrich_with_cache(
                     catalog_index.lookup(ci),
                 ) else {
                     notes.push(format!(
-                        "trigger {}.{}.{}: 정점을 못 찾음(이름 충돌?) — 몸체 간선 생략",
+                        "trigger {}.{}.{}: vertex not found (name collision?); body edges omitted",
                         schema.name, obj.name, trg.name
                     ));
                     continue;
@@ -260,7 +260,7 @@ pub fn enrich_with_cache(
             );
             let Some(owner) = owner else {
                 notes.push(format!(
-                    "routine {}.{}: 정점을 못 찾음 — 몸체 간선 생략",
+                    "routine {}.{}: vertex not found; body edges omitted",
                     schema.name, routine.name
                 ));
                 continue;
@@ -464,8 +464,8 @@ pub fn enrich_with_cache(
                                 // 미추출 0건은 완전 복구 — 한계가 아니므로 조용히 둔다.
                                 if unextracted > 0 {
                                     notes.push(format!(
-                                        "routine {owner}: 몸체 문장 {unextracted}건 미추출\
-                                     (절차형 구문) — 몸체 간선 불완전 ({msg})"
+                                        "routine {owner}: {unextracted} body statement(s) not extracted \
+                                     (procedural syntax); body edges incomplete ({msg})"
                                     ));
                                 }
                                 enriched += 1;
@@ -507,14 +507,14 @@ pub fn enrich_with_cache(
                         // 멤버 몸체가 통째로 실린 옛 형식이라는 뜻이라 그때만 알린다.
                         if routine.kind == "package" && parsed.has_edges() {
                             notes.push(format!(
-                                "routine {owner}: 패키지 몸체 간선은 패키지 정점에 귀속 \
-                             — 멤버 구분은 문서의 member_of를 쓴다"
+                                "routine {owner}: package body edges are attributed to the package vertex; \
+                             use member_of in the document to separate members"
                             ));
                         }
                         if unextracted > 0 {
                             notes.push(format!(
-                                "routine {owner}: 몸체 문장 {unextracted}건 미추출\
-                             (동적 SQL·비SQL 구문) — 몸체 간선 불완전"
+                                "routine {owner}: {unextracted} body statement(s) not extracted \
+                             (dynamic SQL or non-SQL syntax); body edges incomplete"
                             ));
                         }
                         enriched += 1;
@@ -702,7 +702,7 @@ pub fn enrich_inferred(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<Stri
                             evidence: vec![Evidence {
                                 layer: EvidenceLayer::Inferred,
                                 detail: format!(
-                                    "{}.{}.{} ~ {to}.id 이름 규칙 추정(선언된 FK 없음)",
+                                    "{}.{}.{} ~ {to}.id name-rule guess (no declared FK)",
                                     schema.name, obj.name, col.name
                                 ),
                             }],
@@ -717,7 +717,7 @@ pub fn enrich_inferred(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<Stri
     }
     if ambiguous > 0 {
         notes.push(format!(
-            "inferred: 컬럼 {ambiguous}건이 후보 테이블 모호로 생략됨"
+            "inferred: {ambiguous} column(s) skipped because the candidate table is ambiguous"
         ));
     }
     (made, notes)
@@ -977,7 +977,7 @@ fn parse_trigger_body(
         // EXECUTE FUNCTION 꼴 trigger는 본문 자체는 못 파지만 호출 대상은
         // 채취됐다 — 문장 파싱 실패를 호출 간선 포기 이유로 쓰지 않는다.
         _ if !parsed.calls.is_empty() => Ok(parsed),
-        Ok(_) => Err("본문에서 문장을 찾지 못함".to_owned()),
+        Ok(_) => Err("no statement found in the body".to_owned()),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -4070,7 +4070,7 @@ fn apply_trigger(
     } = context;
     if g.vertex(trigger_id).is_none() {
         notes.push(format!(
-            "trigger {trigger_id}의 정점이 카탈로그에 없음 — 간선 생략"
+            "trigger {trigger_id}: vertex missing from the catalog; edges omitted"
         ));
         return false;
     }
@@ -4168,7 +4168,7 @@ fn apply_routine(
     } = context;
     if g.vertex(owner).is_none() {
         notes.push(format!(
-            "routine {owner}의 정점이 카탈로그에 없음 — 간선 생략"
+            "routine {owner}: vertex missing from the catalog; edges omitted"
         ));
         return false;
     }
@@ -4276,7 +4276,7 @@ fn apply_dml_edges(
             let target_id = VertexId::object(&target_schema, table);
             let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
                 notes.push(format!(
-                    "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
+                    "{from} references {target_schema}.{table}, which is missing from the catalog"
                 ));
                 continue;
             };
@@ -4313,7 +4313,7 @@ fn apply_dml_edges(
             let target_id = VertexId::object(&target_schema, &table);
             let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
                 notes.push(format!(
-                    "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
+                    "{from} references {target_schema}.{table}, which is missing from the catalog"
                 ));
                 continue;
             };
@@ -4381,12 +4381,12 @@ fn apply_call_edges(
                 });
             }
             RoutineHit::None => notes.push(format!(
-                "{from}이(가) 부르는 {target_schema}.{name}이 카탈로그에 없음 \
-                 (내장 함수이거나 미수집)"
+                "{from} calls {target_schema}.{name}, which is missing from the catalog \
+                 (built-in or not collected)"
             )),
             RoutineHit::Ambiguous(candidates) => {
                 let note = format!(
-                    "{from}이(가) 부르는 {target_schema}.{name}에 {}개 오버로드가 있어 간선 생략",
+                    "{from} calls {target_schema}.{name}, which has {} overloads; edge omitted",
                     candidates.len()
                 );
                 // 확정 간선은 만들지 않는다. 진단의 후보는 note와 같은 문구라
@@ -5043,7 +5043,7 @@ mod tests {
         assert!(
             notes
                 .iter()
-                .any(|n| n.contains("wipe") && n.contains("미추출")),
+                .any(|n| n.contains("wipe") && n.contains("not extracted")),
             "notes: {notes:?}"
         );
     }
@@ -5208,7 +5208,9 @@ mod tests {
                 ])
             );
             assert!(
-                notes.iter().any(|note| note.contains("1건 미추출")),
+                notes
+                    .iter()
+                    .any(|note| note.contains("1 body statement(s) not extracted")),
                 "{notes:?}"
             );
         }
@@ -5355,7 +5357,7 @@ mod tests {
                 && edge.from.as_str() == "public.dynamic_cleanup"
                 && edge.to.as_str() == "public.customers"));
         assert!(
-            notes.iter().any(|note| note.contains("미추출")),
+            notes.iter().any(|note| note.contains("not extracted")),
             "{notes:?}"
         );
     }
@@ -5398,7 +5400,7 @@ mod tests {
             if !expect_orders {
                 assert!(notes
                     .iter()
-                    .any(|note| note.contains(name) && note.contains("미추출")));
+                    .any(|note| note.contains(name) && note.contains("not extracted")));
             } else {
                 assert!(notes.is_empty(), "{name}: {notes:?}");
             }
@@ -5422,7 +5424,7 @@ mod tests {
             .iter()
             .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
         assert!(
-            notes.iter().any(|note| note.contains("미추출")),
+            notes.iter().any(|note| note.contains("not extracted")),
             "{notes:?}"
         );
     }
@@ -5457,10 +5459,10 @@ mod tests {
         }));
         assert!(notes
             .iter()
-            .any(|note| note.contains("exec_caller") && note.contains("미추출")));
+            .any(|note| note.contains("exec_caller") && note.contains("not extracted")));
         assert!(notes
             .iter()
-            .any(|note| note.contains("fetch_caller") && note.contains("미추출")));
+            .any(|note| note.contains("fetch_caller") && note.contains("not extracted")));
 
         let mut callee = routine("mutate", Some("plpgsql"), "SELECT 1");
         callee.kind = "procedure".into();
@@ -5483,7 +5485,7 @@ mod tests {
         assert!(
             call_notes
                 .iter()
-                .any(|note| note.contains("call_caller") && note.contains("미추출")),
+                .any(|note| note.contains("call_caller") && note.contains("not extracted")),
             "{call_notes:?}"
         );
     }
@@ -5509,7 +5511,7 @@ mod tests {
         assert!(
             notes
                 .iter()
-                .any(|note| note.contains("dynamic_cleanup") && note.contains("미추출")),
+                .any(|note| note.contains("dynamic_cleanup") && note.contains("not extracted")),
             "{notes:?}"
         );
     }
@@ -5533,7 +5535,9 @@ mod tests {
             .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"
                 && edge.kind == EdgeKind::Writes));
         assert!(
-            notes.iter().any(|note| note.contains("1건 미추출")),
+            notes
+                .iter()
+                .any(|note| note.contains("1 body statement(s) not extracted")),
             "{notes:?}"
         );
     }
@@ -5553,7 +5557,7 @@ mod tests {
                 .edges()
                 .iter()
                 .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
-            assert!(notes.iter().any(|note| note.contains("미추출")), "{notes:?}");
+            assert!(notes.iter().any(|note| note.contains("not extracted")), "{notes:?}");
         }
     }
 
@@ -5574,7 +5578,7 @@ mod tests {
             .iter()
             .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
         assert!(
-            notes.iter().any(|note| note.contains("미추출")),
+            notes.iter().any(|note| note.contains("not extracted")),
             "{notes:?}"
         );
     }
@@ -5596,7 +5600,7 @@ mod tests {
             .iter()
             .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
         assert!(
-            notes.iter().any(|note| note.contains("미추출")),
+            notes.iter().any(|note| note.contains("not extracted")),
             "{notes:?}"
         );
     }
@@ -5698,7 +5702,7 @@ mod tests {
         doc.dialect = "sqlserver".into();
         let (graph, notes) = build(&doc);
         assert!(
-            notes.iter().any(|note| note.contains("미추출")),
+            notes.iter().any(|note| note.contains("not extracted")),
             "{notes:?}"
         );
         assert!(!graph
@@ -5771,7 +5775,9 @@ mod tests {
             let (graph, notes) = build(&doc);
             if body == "x" {
                 assert!(
-                    notes.iter().any(|note| note.contains("1건 미추출")),
+                    notes
+                        .iter()
+                        .any(|note| note.contains("1 body statement(s) not extracted")),
                     "{notes:?}"
                 );
             }
@@ -5954,7 +5960,9 @@ mod tests {
             && e.from.as_str() == "public.order_ops"
             && e.to.as_str() == "public.orders"));
         assert!(
-            notes.iter().any(|n| n.contains("패키지 정점에 귀속")),
+            notes
+                .iter()
+                .any(|n| n.contains("attributed to the package vertex")),
             "notes: {notes:?}"
         );
     }
@@ -6082,7 +6090,10 @@ mod tests {
             .edges()
             .iter()
             .any(|e| e.kind == EdgeKind::Inferred && e.from.as_str() == "public.returns"));
-        assert!(notes.iter().any(|n| n.contains("모호")), "notes: {notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("ambiguous")),
+            "notes: {notes:?}"
+        );
         // inferred는 의존성 질의 근거가 아니다.
         assert!(!EdgeKind::Inferred.is_dependency());
     }
@@ -6204,7 +6215,7 @@ mod tests {
         );
         let (g, notes) = build(&doc);
         assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Calls));
-        assert!(notes.iter().any(|n| n.contains("오버로드")));
+        assert!(notes.iter().any(|n| n.contains("overloads")));
         // 간선 대신 진단 하나가 두 후보를 싣는다 — note 문구로 같은 진단을 또 만들지 않는다.
         let trigger = g
             .analysis()
@@ -6213,7 +6224,7 @@ mod tests {
         let ambiguous: Vec<_> = trigger
             .diagnostics
             .iter()
-            .filter(|d| d.message.contains("오버로드"))
+            .filter(|d| d.message.contains("overloads"))
             .collect();
         assert_eq!(ambiguous.len(), 1, "{:?}", trigger.diagnostics);
         assert_eq!(ambiguous[0].code, "SG_BODY_PARTIAL");
@@ -7030,9 +7041,8 @@ mod tests {
             "nested DO beyond the limit must not be extracted"
         );
         assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("public.deep_do") && note.contains("1건 미추출")),
+            notes.iter().any(|note| note.contains("public.deep_do")
+                && note.contains("1 body statement(s) not extracted")),
             "notes: {notes:?}"
         );
     }
@@ -7069,9 +7079,8 @@ mod tests {
             && e.from.as_str() == "public.copy_values"
             && e.to.as_str() == "public.customers"));
         assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("copy_values") && note.contains("1건 미추출")),
+            notes.iter().any(|note| note.contains("copy_values")
+                && note.contains("1 body statement(s) not extracted")),
             "notes: {notes:?}"
         );
     }
@@ -7142,9 +7151,8 @@ mod tests {
             "{record:?}"
         );
         assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("branch_first") && note.contains("1건 미추출")),
+            notes.iter().any(|note| note.contains("branch_first")
+                && note.contains("1 body statement(s) not extracted")),
             "notes: {notes:?}"
         );
     }

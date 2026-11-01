@@ -366,17 +366,17 @@ pub fn graph_from_doc(doc: &GraphDoc) -> Graph {
     g.add_edges(edges);
     if dropped_v > 0 {
         g.add_limitation(format!(
-            "graph.json의 정점 {dropped_v}개가 알 수 없는 kind라 버림 (버전 불일치?)"
+            "dropped {dropped_v} graph.json vertices with unknown kinds (version mismatch?)"
         ));
     }
     if dropped_e > 0 {
         g.add_limitation(format!(
-            "graph.json의 간선 {dropped_e}개가 알 수 없는 kind라 버림 (버전 불일치?)"
+            "dropped {dropped_e} graph.json edges with unknown kinds (version mismatch?)"
         ));
     }
     if dangling_e > 0 {
         g.add_limitation(format!(
-            "graph.json의 간선 {dangling_e}개가 존재하지 않는 정점을 가리켜 버림"
+            "dropped {dangling_e} graph.json edges that point to missing vertices"
         ));
     }
     diagnostics::restore(&mut g, &doc.analysis, &doc.origins);
@@ -1087,7 +1087,7 @@ mod tests {
         assert!(graph
             .limitations()
             .iter()
-            .any(|note| note.contains("존재하지 않는 정점")));
+            .any(|note| note.contains("missing vertices")));
     }
 
     /// 근거를 (layer, detail) 쌍으로 받는 graph.json 간선.
@@ -1197,8 +1197,8 @@ mod tests {
         assert_eq!(
             graph.limitations(),
             [
-                "graph.json의 간선 1개가 알 수 없는 kind라 버림 (버전 불일치?)",
-                "graph.json의 간선 1개가 존재하지 않는 정점을 가리켜 버림",
+                "dropped 1 graph.json edges with unknown kinds (version mismatch?)",
+                "dropped 1 graph.json edges that point to missing vertices",
             ]
         );
     }

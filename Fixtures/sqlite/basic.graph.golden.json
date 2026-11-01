@@ -595,7 +595,7 @@
     }
   ],
   "limitations": [
-    "DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (인라인 제약 파싱 미지원)"
+    "inline UNIQUE/CHECK constraints are not exposed by the catalog; inline DDL constraint parsing is unsupported"
   ],
   "origins": [
     {

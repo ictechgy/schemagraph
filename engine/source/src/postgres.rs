@@ -27,10 +27,10 @@ pub async fn read_with_dependencies(
     include_dependencies: bool,
 ) -> Result<CatalogDocument, SourceError> {
     let options = PgConnectOptions::from_str(url)
-        .map_err(|e| SourceError::Connect(format!("postgres URL 해석 실패: {e}")))?;
+        .map_err(|e| SourceError::Connect(format!("postgres URL could not be parsed: {e}")))?;
     let (pool, transport) = connect(&options)
         .await
-        .map_err(|e| SourceError::Connect(format!("postgres 접속 실패: {e}")))?;
+        .map_err(|e| SourceError::Connect(format!("postgres connection failed: {e}")))?;
 
     let mut doc = CatalogDocument {
         context: None,
@@ -322,7 +322,9 @@ async fn attach_usage(
                 }
             }
         }
-        Err(e) => limitations.push(format!("pg_stat_user_tables 미수확 — usage 증거 없음: {e}")),
+        Err(e) => limitations.push(format!(
+            "pg_stat_user_tables unavailable; no usage evidence — {e}"
+        )),
     }
 
     let rows = sqlx::query(
@@ -355,7 +357,7 @@ async fn attach_usage(
             }
         }
         Err(e) => limitations.push(format!(
-            "pg_stat_user_indexes 미수확 — index usage 증거 없음: {e}"
+            "pg_stat_user_indexes unavailable; no index usage evidence — {e}"
         )),
     }
 
@@ -374,14 +376,14 @@ async fn track_counts_enabled(pool: &PgPool, limitations: &mut Vec<String>) -> b
         Ok(value) if value == "on" => true,
         Ok(_) => {
             limitations.push(
-                "track_counts=off — table/index usage 미수집(카운터 비활성, 0행은 관측이 아님)"
+                "track_counts=off — table/index usage unavailable because counters are disabled (zero rows are not observations)"
                     .to_owned(),
             );
             false
         }
         Err(e) => {
             limitations.push(format!(
-                "track_counts 확인 실패 — table/index usage 미수집: {e}"
+                "failed to inspect track_counts; no table/index usage — {e}"
             ));
             false
         }
@@ -407,7 +409,7 @@ async fn attach_routine_usage(
         .ok();
     if tracking.as_deref() == Some("none") {
         limitations
-            .push("track_functions=none — routine usage 미수집(함수 통계 비활성)".to_owned());
+            .push("track_functions=none — routine usage unavailable because function statistics are disabled".to_owned());
         return;
     }
     let rows = sqlx::query(
@@ -442,13 +444,13 @@ async fn attach_routine_usage(
             }
             if ambiguous > 0 {
                 limitations.push(format!(
-                    "{schema}: 오버로드된 routine {ambiguous}개는 funcname만으로 \
-                     귀속 못 해 usage 미수집"
+                    "{schema}: usage unavailable for {ambiguous} overloaded routines \
+                     because funcname is ambiguous"
                 ));
             }
         }
         Err(e) => limitations.push(format!(
-            "pg_stat_user_functions 미수확 — routine usage 증거 없음: {e}"
+            "pg_stat_user_functions unavailable; no routine usage evidence — {e}"
         )),
     }
 }
