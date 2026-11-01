@@ -589,3 +589,38 @@ fn quoted_dotted_names_and_literal_routine_names_resolve_to_escaped_ids() {
         EdgeKind::Calls
     ));
 }
+
+#[test]
+fn mariadb_and_postgresql_documents_parse_with_their_engine_dialects() {
+    // JDBC 프로브는 jdbc:mariadb: URL을 "mariadb"로 싣는다. MySQL 전용 DIV와 PostgreSQL
+    // 전용 `#`(비트 XOR)는 일반 방언이 거부하므로, 별칭을 일반 방언으로 보내면 의존이 사라진다.
+    for (dialect, body) in [
+        ("mysql", "SELECT total DIV 2 AS half FROM orders"),
+        ("mariadb", "SELECT total DIV 2 AS half FROM orders"),
+        ("postgres", "SELECT total # 1 AS half FROM orders"),
+        ("postgresql", "SELECT total # 1 AS half FROM orders"),
+    ] {
+        let graph = analyze(
+            dialect,
+            vec![
+                table("orders", &["id", "total"]),
+                view("v", &["half"], body),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            state(&graph, "s.v"),
+            AnalysisState::Complete,
+            "{dialect}: {:?}",
+            graph.limitations()
+        );
+        assert!(
+            has_edge(&graph, "s.v", "s.orders", EdgeKind::Reads),
+            "{dialect}"
+        );
+        assert!(
+            has_edge(&graph, "s.v.half", "s.orders.total", EdgeKind::DerivesFrom),
+            "{dialect}"
+        );
+    }
+}

@@ -691,8 +691,10 @@ pub fn enrich_inferred(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<Stri
 fn dialect_for(dialect: &str) -> Option<Box<dyn Dialect>> {
     Some(match dialect {
         "sqlite" => Box::new(SQLiteDialect {}),
-        "postgres" => Box::new(PostgreSqlDialect {}),
-        "mysql" => Box::new(MySqlDialect {}),
+        // 이름 정규화(scope)·상수 SQL이 같은 방언으로 보는 별칭도 같은 파서로 읽는다.
+        // JDBC 프로브는 jdbc:mariadb: URL을 "mariadb"로 싣는다.
+        "postgres" | "postgresql" => Box::new(PostgreSqlDialect {}),
+        "mysql" | "mariadb" => Box::new(MySqlDialect {}),
         // MsSqlDialect는 [bracket] 식별자·TOP 같은 T-SQL 표면을 이해한다 —
         // Generic으로 파싱하면 문장째 실패하던 것이 풀린다.
         "sqlserver" | "mssql" => Box::new(MsSqlDialect {}),
