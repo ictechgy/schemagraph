@@ -534,6 +534,14 @@ impl<'a> CatalogIndex<'a> {
             let candidates = self.relation_candidates(index, &ref_schema, &ref_name);
             if candidates.is_empty() {
                 footprint.push(format!("missing-object={ref_schema}.{ref_name}"));
+                // SQL Server 누락 메시지는 대소문자만 다른 관계를 적는다(case_only_hint).
+                // 그 변형이 생기거나 사라지면 저장한 메시지가 낡으므로 지문에 넣는다.
+                if matches!(self.dialect, "sqlserver" | "mssql") {
+                    let variants = index.objects.get(&folded_key(&ref_schema, &ref_name));
+                    footprint.extend(variants.into_iter().flatten().map(|(schema, object)| {
+                        format!("case-variant={}.{}:{:?}", schema, object.name, object.kind)
+                    }));
+                }
             }
             footprint.extend(candidates.into_iter().map(|(schema, object)| {
                 format!(

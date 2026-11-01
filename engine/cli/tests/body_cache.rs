@@ -159,3 +159,59 @@ fn warm_cache_scans_keep_ambiguous_call_candidates_for_dead() {
         "{report}"
     );
 }
+
+/// SQL Server 뷰·프로시저가 `orders`를 부르는 문서. `with_variant`면 대소문자만 다른
+/// `dbo.Orders`가 생긴다.
+fn sqlserver_catalog(root: &Path, with_variant: bool) {
+    let column =
+        json!({"name": "Id", "data_type": "int", "nullable": true, "ordinal": 1, "pk_position": 0});
+    let table = |name: &str| {
+        json!({"name": name, "kind": "table", "constraints": [], "indexes": [], "triggers": [],
+               "columns": [column.clone()]})
+    };
+    let mut objects = vec![table("customers")];
+    if with_variant {
+        objects.push(table("Orders"));
+    }
+    objects.push(
+        json!({"name": "v", "kind": "view", "constraints": [], "indexes": [],
+        "triggers": [], "columns": [column.clone()], "body": "SELECT Id FROM dbo.orders"}),
+    );
+    let document = json!({
+        "version": 1, "reader": "fixture", "dialect": "sqlserver", "limitations": [],
+        "schemas": [{"name": "dbo", "objects": objects, "routines": [
+            {"name": "p", "kind": "procedure", "language": "sql", "body": "SELECT Id FROM orders"}
+        ]}]
+    });
+    fs::write(
+        root.join("catalog.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn warm_cache_follows_sqlserver_case_variants_that_appear_or_disappear() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // 대소문자 변형이 없을 때 저장한 결과를, 변형이 생긴 뒤와 다시 사라진 뒤에 재사용하면
+    // 누락 이유의 대소문자 힌트가 실제 카탈로그와 어긋난다.
+    for with_variant in [false, true, false] {
+        sqlserver_catalog(root, with_variant);
+        let (uncached, _) = scan(root, "uncached.json", None);
+        let (warm, _) = scan(root, "warm.json", Some("cache"));
+        assert!(
+            warm == uncached,
+            "warm cache scan changed graph.json bytes (variant: {with_variant})\n{}\n{}",
+            String::from_utf8_lossy(&uncached),
+            String::from_utf8_lossy(&warm)
+        );
+        let graph: Value = serde_json::from_slice(&uncached).unwrap();
+        let hinted = graph["limitations"].as_array().unwrap().iter().any(|note| {
+            note.as_str()
+                .unwrap()
+                .contains("dbo.Orders differs only by letter case")
+        });
+        assert_eq!(hinted, with_variant, "{graph}");
+    }
+}
