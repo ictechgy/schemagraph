@@ -215,3 +215,46 @@ fn warm_cache_follows_sqlserver_case_variants_that_appear_or_disappear() {
         assert_eq!(hinted, with_variant, "{graph}");
     }
 }
+
+/// 줄바꿈으로 갈린 `CREATE`/`FUNCTION` 정의문이 `items`를 읽는 문서. `with_items`면 그 테이블이
+/// 생긴다.
+fn split_definition_catalog(root: &Path, with_items: bool) {
+    let mut objects = vec![];
+    if with_items {
+        objects.push(json!({"name": "items", "kind": "table", "constraints": [], "indexes": [],
+            "triggers": [], "columns": [
+                {"name": "id", "data_type": "integer", "nullable": false, "ordinal": 1, "pk_position": 1}
+            ]}));
+    }
+    let document = json!({
+        "version": 1, "reader": "fixture", "dialect": "postgres", "limitations": [],
+        "schemas": [{"name": "public", "objects": objects, "routines": [
+            {"name": "count_items", "kind": "function", "language": "sql",
+             "body": "CREATE\nFUNCTION public.count_items() RETURNS bigint LANGUAGE sql\nAS $$SELECT count(*) FROM items$$"}
+        ]}]
+    });
+    fs::write(
+        root.join("catalog.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn warm_cache_reparses_definitions_split_across_lines_when_their_relations_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // 정의문 감싸기 검사가 공백 한 칸만 알아보면, 몸체 관계를 모르는 좁은 지문으로 저장해
+    // 테이블이 생긴 뒤에도 "카탈로그에 없음" 결과를 재사용한다.
+    for with_items in [false, true] {
+        split_definition_catalog(root, with_items);
+        let (uncached, _) = scan(root, "uncached.json", None);
+        let (warm, _) = scan(root, "warm.json", Some("cache"));
+        assert!(
+            warm == uncached,
+            "warm cache scan changed graph.json bytes (items: {with_items})\n{}\n{}",
+            String::from_utf8_lossy(&uncached),
+            String::from_utf8_lossy(&warm)
+        );
+    }
+}

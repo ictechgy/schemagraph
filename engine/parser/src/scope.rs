@@ -595,7 +595,13 @@ pub(crate) fn cache_context(
 
 /// 정의 껍질이나 동적 SQL은 몸체만으로 소비하는 이름을 고정할 수 없다.
 fn wraps_definition_or_dynamic_sql(body: &str) -> bool {
-    let uppercase = body.to_ascii_uppercase();
+    // 공백의 종류와 개수는 머리의 뜻을 바꾸지 않는다 — `CREATE\nFUNCTION`도 정의문이고, 이를
+    // 놓치면 몸체 관계를 모르는 좁은 지문으로 저장해 관계가 바뀐 뒤에도 재사용한다.
+    let uppercase = body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
     [
         "CREATE FUNCTION",
         "CREATE PROCEDURE",
