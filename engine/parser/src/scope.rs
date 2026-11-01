@@ -399,7 +399,7 @@ impl<'a> CatalogIndex<'a> {
         // 선언된 search_path는 경로의 모든 스키마가 한 부분 이름의 해석을 바꿀 수 있어
         // 관계 footprint로 좁히지 않는다.
         if wraps_definition_or_dynamic_sql(body)
-            || super::routine_search_path(self.dialect, body).is_some()
+            || super::routine_search_path(self.dialect, body, |_| true).is_some()
         {
             return self.conservative_context(graph, owner);
         }
@@ -786,16 +786,13 @@ impl Binder<'_, '_> {
             .last()
             .and_then(|part| part.as_ident())
             .is_some_and(|ident| ident.quote_style.is_some());
+        if let ([routine], Some(path)) = (parts.as_slice(), self.search_path) {
+            self.call_through_path(function, routine, path, quoted_name, source);
+            return;
+        }
         let default = catalog_key(self.catalog.dialect, self.schema);
         let (schema, routine) = match parts.as_slice() {
-            [routine] => {
-                let schema = super::unqualified_schema(self.search_path, self.schema, |schema| {
-                    self.catalog
-                        .routines
-                        .contains(&(catalog_key(self.catalog.dialect, schema), routine.clone()))
-                });
-                (catalog_key(self.catalog.dialect, schema), routine.clone())
-            }
+            [routine] => (default.clone(), routine.clone()),
             [schema, routine]
                 if self
                     .catalog
@@ -847,6 +844,51 @@ impl Binder<'_, '_> {
         } else {
             super::RoutineHit::None
         };
+        self.record_call(function, hit, source);
+    }
+
+    /// routine 정의문이 선언한 search_path로 한 부분 함수 이름을 해석한다. 경로의 모든 수집
+    /// 스키마에서 후보를 모으므로 스키마마다 다른 오버로드는 모호함으로 남는다.
+    fn call_through_path(
+        &mut self,
+        function: &ObjectName,
+        routine: &str,
+        path: &super::SearchPath,
+        quoted_name: bool,
+        source: Option<SourceLocation>,
+    ) {
+        let known = path.collected().any(|schema| {
+            self.catalog.routines.contains(&(
+                catalog_key(self.catalog.dialect, schema),
+                routine.to_owned(),
+            ))
+        });
+        let builtin_spelling = !quoted_name || routine == routine.to_ascii_lowercase();
+        if !known && builtin_spelling && super::is_builtin_function(routine) {
+            return;
+        }
+        let hit = if known {
+            path.routine_hit(self.graph, routine, self.catalog.lookup(false))
+        } else {
+            path.collected().next().map(|_| super::RoutineHit::None)
+        };
+        match hit {
+            Some(hit) => self.record_call(function, hit, source),
+            None => self.note(
+                "SG_CALL_UNRESOLVED",
+                format!("function '{function}' is not in a collected search_path schema"),
+                source,
+            ),
+        }
+    }
+
+    /// 해석 결과를 호출 근거나 진단으로 남긴다.
+    fn record_call(
+        &mut self,
+        function: &ObjectName,
+        hit: super::RoutineHit,
+        source: Option<SourceLocation>,
+    ) {
         match hit {
             super::RoutineHit::One(id) => {
                 self.calls.entry(id).or_default().insert(source);
@@ -1659,12 +1701,26 @@ impl Binder<'_, '_> {
     }
 
     fn table(&mut self, parts: &[String], source: Option<SourceLocation>) -> Relation {
-        let default_schema = match parts {
-            [table] => super::unqualified_schema(self.search_path, self.schema, |schema| {
-                self.catalog
-                    .tables
-                    .contains_key(&(catalog_key(self.catalog.dialect, schema), table.clone()))
-            }),
+        let default_schema = match (parts, self.search_path) {
+            ([table], Some(path)) => {
+                let schema = path.relation_schema(table, |schema| {
+                    self.catalog
+                        .tables
+                        .contains_key(&(catalog_key(self.catalog.dialect, schema), table.clone()))
+                });
+                let Some(schema) = schema else {
+                    self.note(
+                        "SG_RELATION_UNRESOLVED",
+                        format!("relation '{table}' is not in a collected search_path schema"),
+                        source,
+                    );
+                    return Relation {
+                        unknown: true,
+                        ..Relation::default()
+                    };
+                };
+                schema
+            }
             _ => self.schema,
         };
         let Some((schema, table)) = self.catalog.relation_key(parts, default_schema) else {

@@ -102,14 +102,22 @@ that exists only with different letter case, the unresolved-relation message
 names that variant (or counts several) and no edge is created.
 
 A PostgreSQL routine `body` that is a full definition, as `pg_get_functiondef`
-returns it, keeps the routine's `SET search_path` line. The engine looks up
-unqualified relation and routine names in that path order: the first listed
+returns it, keeps the routine's `SET search_path` line; a hand-written
+definition may also put the clause after the `AS` body. The engine looks up
+unqualified relation names in that path order: the first listed collected
 schema that has the name wins, and a name missing from every listed schema is
-reported as missing from the first one. `pg_catalog` and `pg_temp` entries are
-skipped because they are not collected. `$user` depends on the calling role, so
-it is skipped and reported as a limitation, as are listed schemas that were not
-collected. Without a declared path, unqualified names resolve in the routine's
-own schema as before.
+reported as missing from the first one. Unqualified routine names gather
+candidates from every listed collected schema, and a later schema's routine is
+hidden only by an earlier one with the same argument list, so overloads spread
+across schemas stay ambiguous instead of resolving to the first schema.
+`pg_catalog` and `pg_temp` entries are skipped because they hold no user
+objects. A listed schema that was not collected, or `$user` (which depends on the
+calling role), may hold a name, so a limitation names the unqualified names whose
+lookup passed such an entry. If the path lists no collected schema, unqualified
+names stay unresolved and are reported; they are not resolved in the routine's
+own schema. Bodies whose names are all schema-qualified are unaffected by the
+path. Without a declared path, unqualified names resolve in the routine's own
+schema as before.
 
 The remaining record fields are unchanged between versions. A schema has
 `name`, `objects`, and `routines`. Object, column, constraint, referenced,

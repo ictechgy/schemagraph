@@ -7,7 +7,7 @@
 //! 뷰는 스키마·스코프별로 컬럼을 해석하고, 절차형 몸체는 지원하는 SQL 문장을
 //! 추출한다. 값의 계보와 조건절의 읽기 의존성을 구분하고 미해석은 진단한다.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
@@ -332,36 +332,11 @@ pub fn enrich_with_cache(
                 );
                 continue;
             }
-            // 정의문이 선언한 search_path 순서로 한 부분 이름을 찾는다. 호출 role에 따른
-            // `$user`와 수집 대상이 없는 경로는 추측하지 않고 note로 남긴다.
-            let search_path = routine_search_path(&doc.dialect, body);
-            if let Some(path) = &search_path {
-                if path.role_dependent {
-                    notes.push(format!(
-                        "routine {owner}: search_path entry $user depends on the calling role; \
-                         unqualified names were resolved in the remaining entries"
-                    ));
-                }
-                if path.schemas.is_empty() {
-                    notes.push(format!(
-                        "routine {owner}: search_path names no collected schema; \
-                         unqualified names were resolved in the routine schema"
-                    ));
-                }
-                let uncollected: Vec<&str> = path
-                    .schemas
-                    .iter()
-                    .filter(|name| !doc.schemas.iter().any(|schema| &schema.name == *name))
-                    .map(String::as_str)
-                    .collect();
-                if !uncollected.is_empty() {
-                    notes.push(format!(
-                        "routine {owner}: search_path schemas not collected ({}); \
-                         unqualified names they hold are unknown",
-                        uncollected.join(", ")
-                    ));
-                }
-            }
+            // 정의문이 선언한 search_path 순서로 한 부분 이름을 찾는다. 경로의 불확실한 항목에
+            // 실제로 기댄 이름은 해석을 마친 뒤 note로 남긴다.
+            let search_path = routine_search_path(&doc.dialect, body, |name| {
+                doc.schemas.iter().any(|schema| schema.name == name)
+            });
             let mut state = schemagraph_core::AnalysisState::Complete;
             let mut record_body_diagnostics = Vec::new();
             (|| {
@@ -525,6 +500,9 @@ pub fn enrich_with_cache(
                     }
                 }
             })();
+            if let Some(path) = &search_path {
+                notes.extend(path.notes(&owner));
+            }
             record_body(
                 g,
                 &owner,
@@ -1316,101 +1294,262 @@ fn as_body(body: &str) -> Option<(usize, std::borrow::Cow<'_, str>)> {
     None
 }
 
-/// PostgreSQL routine 정의문 머리(`AS` 몸체 앞)가 선언한 `SET search_path`.
+/// PostgreSQL routine 정의문이 선언한 `SET search_path`.
 ///
 /// pg_get_functiondef는 proconfig를 ` SET search_path TO 'app', 'public'` 줄로 싣고, 손으로 쓴
-/// 정의문은 `SET search_path = app, "Public"`처럼 쓴다. 한 부분 이름의 해석 순서만 바꾸고,
-/// 호출 role에 따라 달라지는 `$user`는 추측하지 않고 표시한다.
+/// 정의문은 `SET search_path = app, "Public"`처럼 쓴다. 한 부분 이름의 해석 순서만 바꾼다.
+/// 수집하지 않은 스키마와 호출 role에 따른 `$user`는 순서 안 자리를 지켜 두고, 이름이 실제로
+/// 그 자리를 지나 해석됐을 때만 알린다 — 스키마를 모두 적은 몸체는 경로의 영향을 받지 않는다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SearchPath {
-    /// 사용자 객체를 찾는 순서의 스키마. pg_catalog·pg_temp는 수집하지 않으므로 뺀다.
-    schemas: Vec<String>,
-    /// 호출 role에 따라 달라지는 `$user`가 있었는가.
-    role_dependent: bool,
+    /// 선언 순서의 항목. pg_catalog·pg_temp는 사용자 객체를 담지 않아 뺀다.
+    entries: Vec<PathEntry>,
+    /// 수집하지 않은 항목을 지나(또는 그곳에 있을 수 있는 채로) 해석한 한 부분 이름.
+    uncertain: RefCell<BTreeSet<String>>,
+    /// 경로에 수집한 스키마가 없어 해석하지 않은 한 부분 이름.
+    unresolved: RefCell<BTreeSet<String>>,
+}
+
+/// search_path 항목 하나.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathEntry {
+    /// 문서에 있는 스키마.
+    Collected(String),
+    /// 문서에 없는 스키마나 `$user` — 그곳의 같은 이름이 뒤 스키마를 가릴 수 있다.
+    Outside(String),
 }
 
 impl SearchPath {
-    /// 한 부분 이름을 담은 첫 경로 스키마. 어느 경로 스키마에도 없으면 첫 경로 스키마의
-    /// 누락으로 남긴다 — PostgreSQL도 경로 밖 스키마를 보지 않는다. 경로에 수집 대상
-    /// 스키마가 하나도 없으면 routine 스키마(`fallback`)를 쓰고, 그 사실은 note로 알린다.
-    pub(crate) fn schema_for<'s>(
-        &'s self,
-        fallback: &'s str,
-        holds: impl Fn(&str) -> bool,
-    ) -> &'s str {
-        self.schemas
+    /// 수집한 스키마를 경로 순서로 돌려준다.
+    fn collected(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().filter_map(|entry| match entry {
+            PathEntry::Collected(schema) => Some(schema.as_str()),
+            PathEntry::Outside(_) => None,
+        })
+    }
+
+    /// 한 부분 관계 이름의 스키마. 이름을 담은 첫 수집 스키마이고, 어느 수집 스키마에도
+    /// 없으면 첫 수집 스키마의 누락이다 — PostgreSQL도 경로 밖 스키마를 보지 않는다. 경로에
+    /// 수집한 스키마가 없으면 None이다(routine 스키마로 대신 잇지 않는다).
+    pub(crate) fn relation_schema(&self, name: &str, holds: impl Fn(&str) -> bool) -> Option<&str> {
+        let mut passed_outside = false;
+        for entry in &self.entries {
+            match entry {
+                PathEntry::Collected(schema) if holds(schema) => {
+                    if passed_outside {
+                        self.uncertain.borrow_mut().insert(name.to_owned());
+                    }
+                    return Some(schema);
+                }
+                PathEntry::Collected(_) => {}
+                PathEntry::Outside(_) => passed_outside = true,
+            }
+        }
+        self.missing(name)
+    }
+
+    /// 어느 수집 스키마도 담지 않은 이름. 수집하지 않은 항목이 있으면 그곳에 있을 수 있다.
+    fn missing(&self, name: &str) -> Option<&str> {
+        let first = self.collected().next();
+        if first.is_none() {
+            self.unresolved.borrow_mut().insert(name.to_owned());
+        } else if self
+            .entries
             .iter()
-            .find(|schema| holds(schema))
-            .or(self.schemas.first())
-            .map_or(fallback, String::as_str)
+            .any(|entry| matches!(entry, PathEntry::Outside(_)))
+        {
+            self.uncertain.borrow_mut().insert(name.to_owned());
+        }
+        first
+    }
+
+    /// 한 부분 routine 이름의 후보. PostgreSQL처럼 경로의 모든 수집 스키마에서 같은 이름을
+    /// 모으고, 앞 스키마와 인자 목록이 같은 뒤 스키마의 routine만 가린다. 인자 목록은 정점
+    /// id의 시그니처 문자열로 비교해, 표기가 다르면 둘 다 후보로 남긴다(하나로 추측하지 않음).
+    /// 경로에 수집한 스키마가 없으면 None이다.
+    fn routine_hit(&self, g: &Graph, name: &str, lookup: Lookup<'_>) -> Option<RoutineHit> {
+        let routines = &lookup.index.routines(g, lookup.ci).routines;
+        let mut signatures = BTreeSet::new();
+        let mut candidates = Vec::new();
+        for schema in self.collected() {
+            let prefix = format!("{}.", VertexId::schema(schema).as_str());
+            for id in routines
+                .get(&(lookup.key(schema), lookup.key(name)))
+                .into_iter()
+                .flatten()
+            {
+                let signature = id.as_str().strip_prefix(&prefix).unwrap_or(id.as_str());
+                if signatures.insert(signature.to_owned()) {
+                    candidates.push(id.clone());
+                }
+            }
+        }
+        // 함수 해석은 경로 전체를 보므로 수집하지 않은 항목은 어디에 있든 후보를 바꿀 수 있다.
+        if candidates.is_empty() {
+            self.missing(name)?;
+        } else if self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, PathEntry::Outside(_)))
+        {
+            self.uncertain.borrow_mut().insert(name.to_owned());
+        }
+        Some(routine_hit(Some(&candidates)))
+    }
+
+    /// 메시지에 쓰는 수집 스키마 목록.
+    fn label(&self) -> String {
+        self.collected().collect::<Vec<_>>().join(", ")
+    }
+
+    /// 해석이 실제로 경로의 불확실한 항목에 기댄 이름만 note로 만든다.
+    fn notes(&self, owner: &VertexId) -> Vec<String> {
+        let mut notes = Vec::new();
+        let join = |names: &BTreeSet<String>| names.iter().cloned().collect::<Vec<_>>().join(", ");
+        let unresolved = self.unresolved.borrow();
+        if !unresolved.is_empty() {
+            notes.push(format!(
+                "routine {owner}: search_path names no collected schema; \
+                 unqualified names {} were not resolved",
+                join(&unresolved)
+            ));
+        }
+        let uncertain = self.uncertain.borrow();
+        if !uncertain.is_empty() {
+            let outside: Vec<&str> = self
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    PathEntry::Outside(name) => Some(name.as_str()),
+                    PathEntry::Collected(_) => None,
+                })
+                .collect();
+            notes.push(format!(
+                "routine {owner}: search_path entries outside the collection ({}) \
+                 may hold unqualified names {}",
+                outside.join(", "),
+                join(&uncertain)
+            ));
+        }
+        notes
     }
 }
 
-/// 경로가 없으면 routine 스키마, 있으면 경로 순서로 한 부분 이름의 스키마를 고른다.
-pub(crate) fn unqualified_schema<'s>(
-    path: Option<&'s SearchPath>,
-    schema: &'s str,
-    holds: impl Fn(&str) -> bool,
-) -> &'s str {
-    path.map_or(schema, |path| path.schema_for(schema, holds))
-}
-
-/// 정의문 머리의 마지막 `SET search_path` 선언을 읽는다. 정의문이 아니거나(몸체 원문만
-/// 실린 문서) 선언이 없거나 값을 알 수 없으면(`FROM CURRENT`·`DEFAULT`) None이다.
-fn routine_search_path(dialect: &str, body: &str) -> Option<SearchPath> {
+/// 정의문의 마지막 `SET search_path` 선언을 읽는다. AS 몸체 앞의 머리와, 손으로 쓴 정의문이
+/// SET 절을 둘 수 있는 몸체 뒤를 본다. 정의문이 아니거나(몸체 원문만 실린 문서) 선언이
+/// 없거나 값을 알 수 없으면(`FROM CURRENT`·`DEFAULT`) None이다. `collected`는 문서에 있는
+/// 스키마인지 답한다.
+fn routine_search_path(
+    dialect: &str,
+    body: &str,
+    collected: impl Fn(&str) -> bool,
+) -> Option<SearchPath> {
     if !matches!(dialect, "postgres" | "postgresql") {
         return None;
     }
-    let (start, _) = as_body(body)?;
-    let header = &body[..start];
-    if !starts_with_keyword(skip_ws_comments(header), "CREATE") {
+    let (start, end) = as_body_span(body)?;
+    if !starts_with_keyword(skip_ws_comments(&body[..start]), "CREATE") {
         return None;
     }
     let mut declared = None;
-    for set in find_all_keywords(header, "SET") {
-        let rest = header[set + "SET".len()..].trim_start();
-        if !starts_with_keyword(rest, "search_path") {
-            continue;
+    for clauses in [&body[..start], &body[end..]] {
+        for set in find_all_keywords(clauses, "SET") {
+            let rest = clauses[set + "SET".len()..].trim_start();
+            if !starts_with_keyword(rest, "search_path") {
+                continue;
+            }
+            let rest = rest["search_path".len()..].trim_start();
+            let value = if let Some(value) = rest.strip_prefix('=') {
+                value
+            } else if starts_with_keyword(rest, "TO") {
+                &rest["TO".len()..]
+            } else {
+                continue;
+            };
+            declared = parse_search_path_value(value, &collected);
         }
-        let rest = rest["search_path".len()..].trim_start();
-        let value = if let Some(value) = rest.strip_prefix('=') {
-            value
-        } else if starts_with_keyword(rest, "TO") {
-            &rest["TO".len()..]
-        } else {
-            continue;
-        };
-        declared = parse_search_path_value(value);
     }
     declared
 }
 
+/// 몸체를 감싼 `AS` 키워드의 위치와, 닫는 따옴표 바로 뒤의 위치.
+fn as_body_span(body: &str) -> Option<(usize, usize)> {
+    for i in find_all_keywords(body, "AS") {
+        let after = i + "AS".len();
+        let rest = body[after..].trim_start();
+        let offset = body.len() - rest.len();
+        let end = if rest.starts_with('\'') {
+            quoted_literal_end(rest)
+        } else if rest.starts_with('$') {
+            as_dollar_body_end(rest)
+        } else {
+            None
+        };
+        if let Some(end) = end {
+            return Some((i, offset + end));
+        }
+    }
+    None
+}
+
+/// `'...'` 리터럴이 끝나는 바이트 위치('' 이스케이프 포함).
+fn quoted_literal_end(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut j = 1;
+    while j < bytes.len() {
+        if bytes[j] == b'\'' {
+            if bytes.get(j + 1) == Some(&b'\'') {
+                j += 2;
+                continue;
+            }
+            return Some(j + 1);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// `$tag$...$tag$`가 끝나는 바이트 위치. `undollar_quote`와 같은 태그 규칙이라 같은 몸체를 가리킨다.
+fn as_dollar_body_end(rest: &str) -> Option<usize> {
+    let tag_end = rest[1..].find('$').map(|k| k + 1)?;
+    let tag = &rest[..=tag_end];
+    let close = rest[tag.len()..].find(tag)? + tag.len();
+    Some(close + tag.len())
+}
+
 /// `'a', "B", c` 꼴 값 목록을 읽는다. 문자열·큰따옴표 이름은 그대로, 따옴표 없는 이름은
 /// PostgreSQL처럼 소문자로 접는다. 목록은 쉼표가 끊기는 곳(다음 절)에서 끝난다.
-fn parse_search_path_value(value: &str) -> Option<SearchPath> {
-    let mut path = SearchPath {
-        schemas: Vec::new(),
-        role_dependent: false,
-    };
+fn parse_search_path_value(value: &str, collected: &impl Fn(&str) -> bool) -> Option<SearchPath> {
+    let mut entries = Vec::new();
     let mut rest = value.trim_start();
     if starts_with_keyword(rest, "FROM") || starts_with_keyword(rest, "DEFAULT") {
         return None;
     }
     loop {
         let (name, after) = search_path_entry(rest)?;
-        match name.as_str() {
-            "$user" => path.role_dependent = true,
+        let entry = match name.as_str() {
             // 빈 이름(`SET search_path TO ''`)과 수집하지 않는 시스템 스키마는 사용자 객체를
             // 담지 않는다. pg_temp_N도 세션 임시 스키마다.
-            "" | "pg_catalog" => {}
-            temp if temp == "pg_temp" || temp.starts_with("pg_temp_") => {}
-            _ if path.schemas.contains(&name) => {}
-            _ => path.schemas.push(name),
+            "" | "pg_catalog" => None,
+            temp if temp == "pg_temp" || temp.starts_with("pg_temp_") => None,
+            schema if schema != "$user" && collected(schema) => {
+                Some(PathEntry::Collected(name.clone()))
+            }
+            _ => Some(PathEntry::Outside(name.clone())),
+        };
+        if let Some(entry) = entry.filter(|entry| !entries.contains(entry)) {
+            entries.push(entry);
         }
         rest = after.trim_start();
         match rest.strip_prefix(',') {
             Some(next) => rest = next.trim_start(),
-            None => return Some(path),
+            None => {
+                return Some(SearchPath {
+                    entries,
+                    uncertain: RefCell::default(),
+                    unresolved: RefCell::default(),
+                })
+            }
         }
     }
 }
@@ -4286,9 +4425,13 @@ struct Namespace<'a> {
 }
 
 impl Namespace<'_> {
-    /// 스키마를 적지 않은 이름의 스키마. `holds`는 그 스키마에 이름이 있는지 답한다.
-    fn schema_for(&self, holds: impl Fn(&str) -> bool) -> String {
-        unqualified_schema(self.search_path, self.schema, holds).to_owned()
+    /// 스키마를 적지 않은 관계 이름의 스키마. `holds`는 그 스키마에 이름이 있는지 답한다.
+    /// 경로가 없으면 소유자 스키마이고, 경로에 수집한 스키마가 없으면 None이다.
+    fn relation_schema(&self, name: &str, holds: impl Fn(&str) -> bool) -> Option<String> {
+        match self.search_path {
+            Some(path) => path.relation_schema(name, holds).map(str::to_owned),
+            None => Some(self.schema.to_owned()),
+        }
     }
 }
 
@@ -4313,11 +4456,16 @@ fn apply_dml_edges(
             {
                 continue;
             }
-            let target_schema = ref_schema.clone().unwrap_or_else(|| {
-                namespace.schema_for(|schema| {
+            let target_schema = match ref_schema {
+                Some(schema) => schema.clone(),
+                // 경로에 수집한 스키마가 없으면 SearchPath::notes가 한 번에 알린다.
+                None => match namespace.relation_schema(table, |schema| {
                     vertex_hit(g, &VertexId::object(schema, table), catalog.lookup(ci)).is_some()
-                })
-            });
+                }) {
+                    Some(schema) => schema,
+                    None => continue,
+                },
+            };
             let target_id = VertexId::object(&target_schema, table);
             let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
                 let hint = case_only_hint(g, catalog.dialect(), &target_id, catalog.lookup(ci))
@@ -4400,21 +4548,28 @@ fn apply_call_edges(
     let CallNotes { notes, diagnostics } = out;
     let schema = namespace.schema;
     for (ref_schema, name) in calls {
-        let target_schema = ref_schema.clone().unwrap_or_else(|| {
-            namespace.schema_for(|schema| {
-                !matches!(resolve_routine(g, schema, name, lookup), RoutineHit::None)
-            })
-        });
-        let hit = match resolve_routine(g, &target_schema, name, lookup) {
-            RoutineHit::None => {
-                // `pkg.member()` 꼴 — qualifier가 스키마가 아니라 패키지면
-                // 멤버 정점 schema.pkg.member를 찾는다.
-                ref_schema
-                    .as_ref()
-                    .map(|pkg| resolve_pkg_member(g, schema, pkg, name, lookup))
-                    .unwrap_or(RoutineHit::None)
+        let (target, hit) = match (ref_schema, namespace.search_path) {
+            // 선언된 search_path는 경로의 모든 수집 스키마에서 후보를 모은다. 수집한 스키마가
+            // 없으면 SearchPath::notes가 한 번에 알린다.
+            (None, Some(path)) => match path.routine_hit(g, name, lookup) {
+                Some(hit) => (format!("{name} in search_path {}", path.label()), hit),
+                None => continue,
+            },
+            _ => {
+                let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
+                let hit = match resolve_routine(g, &target_schema, name, lookup) {
+                    RoutineHit::None => {
+                        // `pkg.member()` 꼴 — qualifier가 스키마가 아니라 패키지면
+                        // 멤버 정점 schema.pkg.member를 찾는다.
+                        ref_schema
+                            .as_ref()
+                            .map(|pkg| resolve_pkg_member(g, schema, pkg, name, lookup))
+                            .unwrap_or(RoutineHit::None)
+                    }
+                    hit => hit,
+                };
+                (format!("{target_schema}.{name}"), hit)
             }
-            hit => hit,
         };
         match hit {
             RoutineHit::One(target) => {
@@ -4429,12 +4584,12 @@ fn apply_call_edges(
                 });
             }
             RoutineHit::None => notes.push(format!(
-                "{from} calls {target_schema}.{name}, which is missing from the catalog \
+                "{from} calls {target}, which is missing from the catalog \
                  (built-in or not collected)"
             )),
             RoutineHit::Ambiguous(candidates) => {
                 let note = format!(
-                    "{from} calls {target_schema}.{name}, which has {} overloads; edge omitted",
+                    "{from} calls {target}, which has {} overloads; edge omitted",
                     candidates.len()
                 );
                 // 확정 간선은 만들지 않는다. 진단의 후보는 note와 같은 문구라

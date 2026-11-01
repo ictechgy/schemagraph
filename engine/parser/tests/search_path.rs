@@ -2,7 +2,7 @@
 //! 검증한다. pg_get_functiondef는 proconfig를 `SET search_path TO 'app', 'public'` 줄로
 //! 싣기 때문에 문서 형식을 바꾸지 않고도 실제 해석 순서를 알 수 있다.
 
-use schemagraph_core::{EdgeKind, Graph, VertexId};
+use schemagraph_core::{AnalysisState, EdgeKind, Graph, VertexId};
 use schemagraph_parser::enrich_from_document;
 use schemagraph_source::codec::document_from_value;
 use schemagraph_source::graph::document_to_graph;
@@ -33,11 +33,16 @@ fn definition(name: &str, language: &str, config: &str, body: &str) -> String {
 
 /// `app`(items, helper)과 `public`(orders, items)에 걸친 문서를 분석한다.
 fn analyze(routines: Vec<Value>) -> Graph {
+    analyze_with(vec![routine("helper", "sql", "SELECT 1")], routines)
+}
+
+/// `app` routine을 따로 정해 같은 두 스키마 문서를 분석한다.
+fn analyze_with(app_routines: Vec<Value>, routines: Vec<Value>) -> Graph {
     let document = document_from_value(json!({
         "version": 1, "dialect": "postgres", "reader": "search-path-test", "limitations": [],
         "schemas": [
             {"name": "app", "objects": [table("items", &["id", "order_id"])],
-             "routines": [routine("helper", "sql", "SELECT 1")]},
+             "routines": app_routines},
             {"name": "public",
              "objects": [table("orders", &["id"]), table("items", &["id", "order_id"])],
              "routines": routines}
@@ -50,6 +55,16 @@ fn analyze(routines: Vec<Value>) -> Graph {
         graph.add_limitation(note);
     }
     graph
+}
+
+fn signed(name: &str, signature: &str, body: &str) -> Value {
+    let mut value = routine(name, "sql", body);
+    value["signature"] = json!(signature);
+    value
+}
+
+fn state(graph: &Graph, owner: &str) -> AnalysisState {
+    graph.analysis()[&VertexId::from_raw(owner)].state
 }
 
 fn has_edge(graph: &Graph, from: &str, to: &str, kind: EdgeKind) -> bool {
@@ -222,7 +237,7 @@ fn search_path_names_follow_postgres_quoting_and_skip_special_entries() {
 }
 
 #[test]
-fn role_dependent_search_path_entry_is_reported_not_guessed() {
+fn role_dependent_search_path_entry_is_reported_when_a_name_passes_it() {
     let sql = definition(
         "count_items",
         "sql",
@@ -230,69 +245,191 @@ fn role_dependent_search_path_entry_is_reported_not_guessed() {
         "SELECT count(*) FROM items",
     );
     let graph = analyze(vec![routine("count_items", "sql", &sql)]);
-    // $user는 호출 role에 따라 다르다. 나머지 경로로 해석하되 그 사실을 남긴다.
+    // $user는 호출 role에 따라 다르다. 나머지 경로로 해석하되, 그 앞을 지난 이름을 남긴다.
     assert!(has_edge(
         &graph,
         "public.count_items",
         "app.items",
         EdgeKind::Reads
     ));
-    let notes = notes_for(&graph, "public.count_items");
-    assert!(
-        notes
-            .iter()
-            .any(|note| note.contains("search_path entry $user depends on the calling role")),
-        "{notes:?}"
+    assert_eq!(
+        notes_for(&graph, "public.count_items"),
+        [
+            "SG_BODY_PARTIAL: routine public.count_items: search_path entries outside the \
+          collection ($user) may hold unqualified names items"
+        ]
     );
 }
 
 #[test]
-fn search_path_without_collected_schemas_keeps_the_routine_schema_and_says_so() {
-    // `SET search_path TO ''`는 보안 권장 꼴이다. 사용자 스키마가 경로에 없으니 PostgreSQL은
-    // 한 부분 사용자 이름을 찾지 못한다 — 확실하지 않은 쪽은 기존처럼 살려 두고 이유를 남긴다.
-    let sql = definition(
-        "count_items",
-        "sql",
+fn search_path_without_collected_schemas_leaves_unqualified_names_unresolved() {
+    // `SET search_path TO ''`·pg_catalog만 있는 경로는 보안 권장 꼴이다. PostgreSQL은 한 부분
+    // 사용자 이름을 찾지 못하므로 routine 스키마로 대신 잇지 않는다.
+    for config in [
         " SET search_path TO ''\n",
-        "SELECT count(*) FROM items",
-    );
-    let graph = analyze(vec![routine("count_items", "sql", &sql)]);
-    assert!(has_edge(
-        &graph,
-        "public.count_items",
-        "public.items",
-        EdgeKind::Reads
-    ));
-    let notes = notes_for(&graph, "public.count_items");
-    assert!(
-        notes
-            .iter()
-            .any(|note| note.contains("search_path names no collected schema")),
-        "{notes:?}"
-    );
+        " SET search_path TO 'pg_catalog', 'pg_temp'\n",
+    ] {
+        let sql = definition("count_items", "sql", config, "SELECT count(*) FROM items");
+        let graph = analyze(vec![routine("count_items", "sql", &sql)]);
+        assert!(
+            !graph
+                .outgoing(&VertexId::from_raw("public.count_items"))
+                .iter()
+                .any(|edge| edge.kind.is_dependency()),
+            "{config}"
+        );
+        let notes = notes_for(&graph, "public.count_items");
+        assert!(
+            notes.iter().any(|note| note.contains(
+                "search_path names no collected schema; unqualified names items were not resolved"
+            )),
+            "{config}: {notes:?}"
+        );
+    }
 }
 
 #[test]
-fn search_path_schemas_outside_the_collection_are_reported() {
+fn search_path_schemas_outside_the_collection_are_reported_only_when_they_can_shadow() {
     // audit는 수집하지 않았다. 그곳의 같은 이름이 public을 가릴 수 있으므로 알린다.
-    let sql = definition(
-        "count_items",
+    let before = definition(
+        "count_before",
         "sql",
         " SET search_path TO 'audit', 'public'\n",
         "SELECT count(*) FROM orders",
     );
-    let graph = analyze(vec![routine("count_items", "sql", &sql)]);
+    // 이름을 먼저 찾은 스키마 뒤의 수집하지 않은 항목은 해석을 바꾸지 않는다.
+    let after = definition(
+        "count_after",
+        "sql",
+        " SET search_path TO 'public', 'audit'\n",
+        "SELECT count(*) FROM orders",
+    );
+    let graph = analyze(vec![
+        routine("count_before", "sql", &before),
+        routine("count_after", "sql", &after),
+    ]);
+    for owner in ["public.count_before", "public.count_after"] {
+        assert!(
+            has_edge(&graph, owner, "public.orders", EdgeKind::Reads),
+            "{owner}"
+        );
+    }
+    assert_eq!(
+        notes_for(&graph, "public.count_before"),
+        [
+            "SG_BODY_PARTIAL: routine public.count_before: search_path entries outside the \
+          collection (audit) may hold unqualified names orders"
+        ]
+    );
+    assert_eq!(
+        notes_for(&graph, "public.count_after"),
+        Vec::<String>::new()
+    );
+    assert_eq!(state(&graph, "public.count_after"), AnalysisState::Complete);
+}
+
+#[test]
+fn qualified_bodies_stay_complete_whatever_the_search_path_holds() {
+    // SECURITY DEFINER 권장 꼴처럼 모든 이름을 스키마로 적은 몸체는 경로의 영향을 받지 않는다.
+    let configs = [
+        " SET search_path TO ''\n",
+        " SET search_path TO '$user', 'public'\n",
+        " SET search_path TO 'pg_catalog', 'pg_temp'\n",
+        " SET search_path TO 'audit', 'public'\n",
+    ];
+    let routines: Vec<Value> = configs
+        .iter()
+        .enumerate()
+        .map(|(index, config)| {
+            let name = format!("qualified_{index}");
+            routine(
+                &name,
+                "sql",
+                &definition(&name, "sql", config, "SELECT count(*) FROM public.orders"),
+            )
+        })
+        .collect();
+    let graph = analyze(routines);
+    for index in 0..configs.len() {
+        let owner = format!("public.qualified_{index}");
+        assert!(
+            has_edge(&graph, &owner, "public.orders", EdgeKind::Reads),
+            "{owner}"
+        );
+        assert_eq!(notes_for(&graph, &owner), Vec::<String>::new(), "{owner}");
+        assert_eq!(state(&graph, &owner), AnalysisState::Complete, "{owner}");
+    }
+}
+
+#[test]
+fn unqualified_calls_gather_overloads_from_every_search_path_schema() {
+    // PostgreSQL은 경로의 모든 스키마에서 같은 이름의 함수를 모으고, 같은 인자 목록만 앞 스키마가
+    // 가린다. app.f(i integer)와 public.f(t text)는 서로 가리지 않으므로 f('x')는 하나로 정할 수 없다.
+    let cross = definition(
+        "cross_call",
+        "sql",
+        " SET search_path TO 'app', 'public'\n",
+        "SELECT f('x')",
+    );
+    let hidden = definition(
+        "hidden_call",
+        "sql",
+        " SET search_path TO 'app', 'public'\n",
+        "SELECT g(1)",
+    );
+    let graph = analyze_with(
+        vec![
+            signed("f", "i integer", "SELECT 1"),
+            signed("g", "integer", "SELECT 1"),
+        ],
+        vec![
+            routine("cross_call", "sql", &cross),
+            routine("hidden_call", "sql", &hidden),
+            signed("f", "t text", "SELECT 2"),
+            signed("g", "integer", "SELECT 2"),
+        ],
+    );
+    assert!(!graph
+        .outgoing(&VertexId::from_raw("public.cross_call"))
+        .iter()
+        .any(|edge| edge.kind == EdgeKind::Calls));
+    let candidates: Vec<String> = graph.analysis()[&VertexId::from_raw("public.cross_call")]
+        .diagnostics
+        .iter()
+        .flat_map(|diagnostic| diagnostic.candidates.iter().map(|id| id.to_string()))
+        .collect();
+    assert_eq!(candidates, ["app.f(i integer)", "public.f(t text)"]);
+    // 같은 인자 목록은 앞 스키마의 것 하나로 정해진다.
     assert!(has_edge(
         &graph,
-        "public.count_items",
-        "public.orders",
+        "public.hidden_call",
+        "app.g(integer)",
+        EdgeKind::Calls
+    ));
+    assert!(!has_edge(
+        &graph,
+        "public.hidden_call",
+        "public.g(integer)",
+        EdgeKind::Calls
+    ));
+}
+
+#[test]
+fn search_path_declared_after_the_body_is_read() {
+    // 손으로 쓴 정의문은 SET 절을 AS 몸체 뒤에 둘 수 있다.
+    let ddl = "CREATE FUNCTION public.after_as() RETURNS bigint \
+               AS $$SELECT count(*) FROM items$$ LANGUAGE sql SET search_path = app";
+    let graph = analyze(vec![routine("after_as", "sql", ddl)]);
+    assert!(has_edge(
+        &graph,
+        "public.after_as",
+        "app.items",
         EdgeKind::Reads
     ));
-    let notes = notes_for(&graph, "public.count_items");
-    assert!(
-        notes
-            .iter()
-            .any(|note| note.contains("search_path schemas not collected (audit)")),
-        "{notes:?}"
-    );
+    assert!(!has_edge(
+        &graph,
+        "public.after_as",
+        "public.items",
+        EdgeKind::Reads
+    ));
 }
