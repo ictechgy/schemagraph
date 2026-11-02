@@ -422,9 +422,11 @@ exporting one dataset for both; distinct namespaces, or distinct database names
 without dots, always separate them. Dots inside schema or object names can also
 give two datasets of one source, or of a single graph, the same name (`a.b`
 table `c` and `a` table `b.c`). No option separates those, so the export is
-unchanged and a note on stderr lists them. Export merged graphs again after
-upgrading: their dataset names, and so their `runId`s, differ from earlier
-versions.
+unchanged and a note on stderr lists them. A name shared by both kinds, such as
+two such datasets of one source and one dataset of another, exits 2; once the
+sources are named apart, the remaining pair of the one source gets the note.
+Export merged graphs again after upgrading: their dataset names, and so their
+`runId`s, differ from earlier versions.
 
 ## Export declarations to isthmus
 

@@ -369,6 +369,12 @@ fn single_graph_name_overlaps_are_reported_on_stderr_only() {
         stderr.contains("dataset (postgres://shared:5432, a.b.c) would name a%2Eb.c, a.b%2Ec"),
         "{stderr}"
     );
+    // 어떤 옵션으로도 풀 수 없으므로 옵션을 권하지 않는다.
+    assert!(
+        stderr.contains("no naming option can separate them"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("--source-"), "{stderr}");
 }
 
 /// 한 source 안에서 이름 안의 `.`로 겹치는 두 데이터셋은 두 데이터셋이 같은 source 자리를
@@ -423,8 +429,81 @@ fn same_source_name_overlaps_in_a_merged_graph_are_reported_on_stderr_only() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains(
-            "note: 1 OpenLineage dataset name(s) are shared by distinct objects because their schema or object names contain dots; consumers will merge them: dataset (postgres://shared:5432, dot.a.b.c) would name dot::a%2Eb.c, dot::a.b%2Ec"
+            "note: 1 OpenLineage dataset name(s) are shared by distinct objects because dots inside their schema or object names blur the name boundary; no naming option can separate them, so consumers will merge them: dataset (postgres://shared:5432, dot.a.b.c) would name dot::a%2Eb.c, dot::a.b%2Ec"
         ),
+        "{stderr}"
+    );
+}
+
+/// 한 source의 두 데이터셋(이름 안의 `.`로 겹침)과 다른 source의 데이터셋 하나가 같은 이름을
+/// 얻으면 서로 다른 source에 걸친 겹침이라 2로 끝난다. 다른 source에 점 없는 다른 데이터베이스
+/// 이름을 주면 그 source는 풀리고, 어떤 옵션으로도 풀 수 없는 한 source 안의 겹침만 note로 남는다.
+#[test]
+fn a_collision_that_mixes_sources_fails_until_they_are_named_apart_and_the_rest_is_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    dotted_document(root, "dot.json", Some("dot"));
+    // source `rep`는 `"a.b".c` 하나만 뷰로 읽는다.
+    let view = json!({"name": "only", "kind": "view", "constraints": [], "indexes": [],
+        "triggers": [], "columns": [column("id", 1)],
+        "body": "SELECT y.id FROM \"a.b\".c y"});
+    let document = json!({
+        "version": 1, "reader": "fixture", "dialect": "postgres", "limitations": [],
+        "context": {"source_id": "rep", "catalog_complete": true},
+        "schemas": [{"name": "a.b", "objects": [table("c"), view], "routines": []}]
+    });
+    fs::write(
+        root.join("rep.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+    succeed(
+        root,
+        &["merge", "dot.json", "rep.json", "-o", "merged.graph.json"],
+    );
+    let export = |database: &str| {
+        run(
+            root,
+            &[
+                "openlineage",
+                "--graph",
+                "merged.graph.json",
+                "--namespace",
+                NAMESPACE,
+                "--source-database",
+                database,
+                "--event-time",
+                EVENT_TIME,
+                "-o",
+                "lineage.ndjson",
+            ],
+        )
+    };
+
+    // `rep`에 `dot`과 같은 데이터베이스 이름을 주면 두 source의 세 정점이 한 이름을 얻는다.
+    let mixed = export("rep=dot");
+    assert_eq!(mixed.status.code(), Some(2), "{mixed:?}");
+    let stderr = String::from_utf8(mixed.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "dataset (postgres://shared:5432, dot.a.b.c) would name dot::a%2Eb.c, dot::a.b%2Ec, rep::a%2Eb.c"
+        ),
+        "{stderr}"
+    );
+    assert!(!root.join("lineage.ndjson").exists());
+
+    // 점 없는 다른 이름을 주면 `dot` 안의 겹침만 남고, 내보낸 뒤 note로 알린다.
+    let apart = export("rep=repdb");
+    assert_eq!(apart.status.code(), Some(0), "{apart:?}");
+    assert!(root.join("lineage.ndjson").exists());
+    let stderr = String::from_utf8(apart.stderr).unwrap();
+    let notes: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("OpenLineage dataset name(s)"))
+        .collect();
+    assert_eq!(
+        notes,
+        ["note: 1 OpenLineage dataset name(s) are shared by distinct objects because dots inside their schema or object names blur the name boundary; no naming option can separate them, so consumers will merge them: dataset (postgres://shared:5432, dot.a.b.c) would name dot::a%2Eb.c, dot::a.b%2Ec"],
         "{stderr}"
     );
 }

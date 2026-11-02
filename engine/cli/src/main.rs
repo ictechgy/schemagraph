@@ -1227,7 +1227,7 @@ fn lineage_events(
     }
     if !within.is_empty() {
         eprintln!(
-            "note: {} OpenLineage dataset name(s) are shared by distinct objects because their schema or object names contain dots; consumers will merge them: {}",
+            "note: {} OpenLineage dataset name(s) are shared by distinct objects because dots inside their schema or object names blur the name boundary; no naming option can separate them, so consumers will merge them: {}",
             within.len(),
             list(&within)
         );
