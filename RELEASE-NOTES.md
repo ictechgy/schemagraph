@@ -2,6 +2,7 @@
 
 - PostgreSQL body relations and routine names fold only unquoted identifiers. TRUNCATE and data-modifying CTEs retain write evidence; CTE aliases do not become physical relations.
 - Column DEFAULT expressions retain uniquely resolved function dependencies as `depends-on` edges with body-parse evidence. Overloaded, missing and unparsable calls remain measured limitations. Literal defaults do not invent dependencies.
+- `merge` also namespaces the job ID inside DML origin roles (`dml-owner:<job>:<role>`), so `openlineage` on a merged graph attributes column lineage to its routine and trigger jobs instead of emitting their outputs without `columnLineage`. Diagnostic messages, evidence details and limitations in a merged graph remain the source's local text; ANALYSIS.md documents this together with OpenLineage dataset names, which come from local schema and object names.
 - The body cache treats a definition such as `CREATE\nFUNCTION ...` as a definition whatever whitespace separates its keywords. Such bodies use the whole-catalog cache key, so adding or dropping a relation they read is no longer hidden by a stale cached result.
 - Workspace crates declare `rust-version = "1.96"`, the toolchain CI builds, tests and lints. Older toolchains are not verified.
 - CI checks Clippy on the established Rust 1.96.0 toolchain. Mechanical lint fixes and explicit boundary exceptions preserve public API and command behavior.
