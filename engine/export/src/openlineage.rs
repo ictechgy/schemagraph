@@ -873,6 +873,55 @@ mod tests {
         assert!(identity_collisions(&plain, &jobs(&plain), &context()).is_empty());
     }
 
+    /// 이벤트는 작업의 `inputs`에 없는 데이터셋도 inputFields로 가리킬 수 있다. `jobs()`는 DIRECT
+    /// 입력의 데이터셋을 늘 `inputs`에 넣지만 `Job`의 필드는 공개라 호출자가 직접 만들 수 있으므로,
+    /// 겹침 검사는 이벤트가 싣는 범위 전체를 봐야 한다.
+    #[test]
+    fn datasets_reached_only_through_input_fields_count_as_collisions() {
+        let mut graph = Graph::new();
+        let (out, out_v) = (id("s.out"), id("s.out.v"));
+        let left = VertexId::member("a", "b.c", "v");
+        let right = VertexId::member("a.b", "c", "v");
+        for (vertex_id, kind, schema, name) in [
+            (out.clone(), VertexKind::Table, "s", "out"),
+            (out_v.clone(), VertexKind::Column, "s", "v"),
+            (VertexId::object("a", "b.c"), VertexKind::Table, "a", "b.c"),
+            (left.clone(), VertexKind::Column, "a", "v"),
+            (VertexId::object("a.b", "c"), VertexKind::Table, "a.b", "c"),
+            (right.clone(), VertexKind::Column, "a.b", "v"),
+        ] {
+            graph.add_vertex(Vertex {
+                id: vertex_id,
+                kind,
+                name: name.into(),
+                schema: schema.into(),
+            });
+        }
+        // 입력 테이블은 `inputs`에 없고 출력 컬럼의 DIRECT 입력으로만 닿는다.
+        let job = Job {
+            outputs: BTreeSet::from([out]),
+            direct: BTreeMap::from([(out_v, BTreeSet::from([left, right]))]),
+            ..Job::default()
+        };
+        let hand_built = BTreeMap::from([(id("s.load"), job)]);
+        let result = events(&graph, &hand_built, &context(), |_| "run".into());
+        let fields = &result.events[0]["outputs"][0]["facets"]["columnLineage"]["fields"];
+        let names: Vec<&str> = fields["v"]["inputFields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["app.a.b.c", "app.a.b.c"]);
+        assert_eq!(
+            identity_collisions(&graph, &hand_built, &context())
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["dataset (postgres://db:5432, app.a.b.c) would name a%2Eb.c, a.b%2Ec"]
+        );
+    }
+
     /// 분석이 부분적인 작업은 job facet으로 상태를 드러낸다.
     #[test]
     fn incomplete_analysis_is_carried_as_a_job_facet() {
