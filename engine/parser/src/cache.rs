@@ -222,7 +222,7 @@ impl<'a> CachedKeys<'a> {
 
     /// origin 키를 몸체 해시가 맞는 것과 owner DML이 남긴 것으로 나눠 담는다.
     fn add_origins(&mut self, cached: &'a BodyResult) {
-        let prefix = format!("dml-owner:{}:", self.owner.as_str());
+        let prefix = Origin::dml_owner_role(self.owner, "");
         for (key, origin) in &cached.origins {
             #[cfg(test)]
             count_restore_visit();
@@ -379,7 +379,7 @@ pub(crate) fn capture(
     // — 몸체마다 그래프의 모든 origin을 훑으면 저장 비용이 몸체 수의 제곱이 된다.
     // 키를 정렬 순서로 돌므로 모으는 순서는 전체 origin을 훑을 때와 같다.
     let mut captured: BTreeSet<OriginKey> = edges.iter().map(edge_key).collect();
-    let owner_prefix = format!("dml-owner:{}:", owner.as_str());
+    let owner_prefix = Origin::dml_owner_role(owner, "");
     let evidence_prefix = format!("{} ", owner.as_str());
     for key in &outcome.dml_origins {
         #[cfg(test)]
