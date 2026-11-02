@@ -1188,9 +1188,9 @@ fn source_assignments(
 /// 계보 작업을 RunEvent로 만든다. 생산자와 facet 설명 URL은 이 도구 버전을 가리킨다.
 ///
 /// 서로 다른 데이터셋이 같은 (namespace, 이름)을 얻으면 소비자가 둘을 한 데이터셋으로 합쳐
-/// 없는 계보를 그린다. 합친 그래프에서는 사용자 매핑이 만든 겹침이라 내보내지 않는다. 단일
-/// 그래프에서는 이름 안의 `.` 때문에만 겹치므로, 출력과 종료 코드는 그대로 두고 stderr로
-/// 알린다.
+/// 없는 계보를 그린다. 서로 다른 source끼리의 겹침은 source 옵션으로 풀 수 있으므로 내보내지
+/// 않는다. 단일 그래프나 한 source 안의 겹침은 이름 안의 `.` 때문이라 어떤 옵션으로도 풀 수
+/// 없으므로, 출력과 종료 코드는 그대로 두고 stderr로 알린다.
 fn lineage_events(
     graph: &Graph,
     names: &LineageNames<'_>,
@@ -1212,17 +1212,24 @@ fn lineage_events(
     };
     let jobs = analysis::lineage::jobs(graph);
     let collisions = export::openlineage::identity_collisions(graph, &jobs, &context);
-    if !collisions.is_empty() {
-        if !context.sources.is_empty() {
-            bail!(
-                "OpenLineage names would merge distinct datasets; give the sources distinct --source-namespace or --source-database values: {}",
-                collisions.join("; ")
-            );
-        }
+    let (across, within): (Vec<_>, Vec<_>) = collisions
+        .iter()
+        .partition(|collision| collision.across_sources);
+    let list = |collisions: &[&export::openlineage::IdentityCollision]| {
+        let lines: Vec<String> = collisions.iter().map(ToString::to_string).collect();
+        lines.join("; ")
+    };
+    if !across.is_empty() {
+        bail!(
+            "OpenLineage names would merge datasets of different sources; give those sources distinct --source-namespace values or distinct --source-database values without dots: {}",
+            list(&across)
+        );
+    }
+    if !within.is_empty() {
         eprintln!(
             "note: {} OpenLineage dataset name(s) are shared by distinct objects because their schema or object names contain dots; consumers will merge them: {}",
-            collisions.len(),
-            collisions.join("; ")
+            within.len(),
+            list(&within)
         );
     }
     Ok(export::openlineage::events(

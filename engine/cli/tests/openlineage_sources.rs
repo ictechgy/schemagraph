@@ -2,8 +2,8 @@
 //!
 //! 두 source가 같은 이름의 테이블을 가지면, 로컬 스키마·객체 이름만으로 만든 데이터셋
 //! 이름이 겹쳐 OpenLineage 소비자가 없는 source 사이 계보를 그린다. 합친 그래프는 source마다
-//! 데이터셋의 데이터베이스 자리(기본은 source id)를 따로 쓰고, 그래도 겹치면 내보내지 않는다.
-//! 작업 이름은 바꾸지 않는다.
+//! 데이터셋의 데이터베이스 자리(기본은 source id)를 따로 쓰고, 서로 다른 source끼리 그래도
+//! 겹치면 내보내지 않는다. 작업 이름은 바꾸지 않는다.
 
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -308,28 +308,32 @@ fn naming_options_that_do_not_fit_the_graph_are_usage_errors() {
     }
 }
 
-/// 단일 그래프에서 이름 안의 `.`로 두 데이터셋 이름이 겹치면 출력과 종료 코드는 그대로 두고
-/// stderr로만 알린다.
-#[test]
-fn single_graph_name_overlaps_are_reported_on_stderr_only() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    // 스키마 `a`의 테이블 `b.c`와 스키마 `a.b`의 테이블 `c`는 둘 다 `a.b.c`가 된다.
+/// 스키마 `a`의 테이블 `b.c`와 스키마 `a.b`의 테이블 `c`를 뷰 `a.both`가 함께 읽는 문서.
+/// 두 테이블의 데이터셋 이름은 둘 다 `[DB.]a.b.c`가 된다.
+fn dotted_document(root: &Path, file: &str, source_id: Option<&str>) {
     let view = json!({"name": "both", "kind": "view", "constraints": [], "indexes": [],
         "triggers": [], "columns": [column("id", 1)],
         "body": "SELECT x.id FROM a.\"b.c\" x JOIN \"a.b\".c y ON y.id = x.id"});
-    let document = json!({
+    let mut document = json!({
         "version": 1, "reader": "fixture", "dialect": "postgres", "limitations": [],
         "schemas": [
             {"name": "a", "objects": [table("b.c"), view], "routines": []},
             {"name": "a.b", "objects": [table("c")], "routines": []}
         ]
     });
-    fs::write(
-        root.join("dotted.json"),
-        serde_json::to_vec(&document).unwrap(),
-    )
-    .unwrap();
+    if let Some(source_id) = source_id {
+        document["context"] = json!({"source_id": source_id, "catalog_complete": true});
+    }
+    fs::write(root.join(file), serde_json::to_vec(&document).unwrap()).unwrap();
+}
+
+/// 단일 그래프에서 이름 안의 `.`로 두 데이터셋 이름이 겹치면 출력과 종료 코드는 그대로 두고
+/// stderr로만 알린다.
+#[test]
+fn single_graph_name_overlaps_are_reported_on_stderr_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    dotted_document(root, "dotted.json", None);
     succeed(
         root,
         &[
@@ -363,6 +367,64 @@ fn single_graph_name_overlaps_are_reported_on_stderr_only() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("dataset (postgres://shared:5432, a.b.c) would name a%2Eb.c, a.b%2Ec"),
+        "{stderr}"
+    );
+}
+
+/// 한 source 안에서 이름 안의 `.`로 겹치는 두 데이터셋은 두 데이터셋이 같은 source 자리를
+/// 쓰므로 어떤 옵션으로도 나눌 수 없다. 내보내기를 막지 않고 단일 그래프처럼 stderr로만
+/// 알린다. 서로 다른 source끼리의 겹침은 여전히 실패한다(T4).
+#[test]
+fn same_source_name_overlaps_in_a_merged_graph_are_reported_on_stderr_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    document(root, "app.json", "app");
+    dotted_document(root, "dot.json", Some("dot"));
+    succeed(
+        root,
+        &["merge", "app.json", "dot.json", "-o", "merged.graph.json"],
+    );
+    let output = run(
+        root,
+        &[
+            "openlineage",
+            "--graph",
+            "merged.graph.json",
+            "--namespace",
+            NAMESPACE,
+            "--event-time",
+            EVENT_TIME,
+            "-o",
+            "lineage.ndjson",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let events: Vec<Value> = fs::read_to_string(root.join("lineage.ndjson"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let jobs: Vec<&str> = events
+        .iter()
+        .map(|event| event["job"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        jobs,
+        ["app::public.load", "app::public.report", "dot::a.both"]
+    );
+    let both = &events[2];
+    let inputs: Vec<&str> = both["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|dataset| dataset["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(inputs, ["dot.a.b.c", "dot.a.b.c"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "note: 1 OpenLineage dataset name(s) are shared by distinct objects because their schema or object names contain dots; consumers will merge them: dataset (postgres://shared:5432, dot.a.b.c) would name dot::a%2Eb.c, dot::a.b%2Ec"
+        ),
         "{stderr}"
     );
 }

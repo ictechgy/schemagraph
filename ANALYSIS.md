@@ -414,14 +414,17 @@ schemagraph openlineage --graph combined.graph.json --namespace postgres://jobs:
 `--database` names a single source and is rejected for a merged graph (exit 2,
 like other usage errors; nothing is written); `--source-namespace` and
 `--source-database` are rejected for a single graph or a source that is not in
-the merged graph. If two distinct datasets of a merged graph would still get the
-same namespace and name, which only a mapping can cause (for example two sources
-given the same namespace and database), the command exits 2 and lists them
-instead of exporting one dataset for both. In a single graph this can only happen
-when dots inside schema or object names blur the boundary (`a.b` table `c` and
-`a` table `b.c`); the export is unchanged and a note on stderr lists them. Export
-merged graphs again after upgrading: their dataset names, and so their `runId`s,
-differ from earlier versions.
+the merged graph. If datasets of two different sources would still get the same
+namespace and name, because a mapping gives the sources the same namespace and
+database or because dots in a source ID blur the boundary (source `a.b` schema
+`c` and source `a` schema `b.c`), the command exits 2 and lists them instead of
+exporting one dataset for both; distinct namespaces, or distinct database names
+without dots, always separate them. Dots inside schema or object names can also
+give two datasets of one source, or of a single graph, the same name (`a.b`
+table `c` and `a` table `b.c`). No option separates those, so the export is
+unchanged and a note on stderr lists them. Export merged graphs again after
+upgrading: their dataset names, and so their `runId`s, differ from earlier
+versions.
 
 ## Export declarations to isthmus
 

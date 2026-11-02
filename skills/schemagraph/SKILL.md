@@ -126,7 +126,7 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
   only for views. Partial analysis appears as a `schemagraphAnalysis` job facet.
   A merged graph names datasets per source (default `source.schema.object`;
   `--source-namespace SRC=URI`, `--source-database SRC=NAME`), keeps job names,
-  and exits 2 rather than give two datasets one name.
+  and exits 2 rather than give datasets of two sources one name.
 - `stats` — every collected usage entry with `since`; `totals` shows how
   much of the graph went unobserved.
 - `dead --retain <glob>` protects a root and its dependency closure. TOML
