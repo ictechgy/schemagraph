@@ -290,7 +290,8 @@ views, functions, procedures, and packages can be.
   An ambiguous overloaded call lists the overloads it may reach as
   `candidates` on the caller's analysis diagnostic. `dead` counts each
   candidate as called by that caller; `query` and `impact` still follow only
-  resolved edges.
+  resolved edges. A `--level` projection keeps a candidate only when it has a
+  vertex at that level, like an edge end; see [ANALYSIS.md](ANALYSIS.md).
 - **Partial results:** `query`, `impact`, and `dead` report `truncated` when
   results are cut short by a result limit. Check it alongside `limitations`
   before treating a result as complete. Budgeted traversals separately report

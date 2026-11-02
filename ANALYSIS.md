@@ -129,6 +129,16 @@ this field existed have no candidates; scan again to use them. A loaded graph
 keeps only candidates that name one of its vertices and reports how many it
 dropped.
 
+Commands with `--level` (for example `graph --level`) work on a projected graph,
+and candidates are projected like edge ends: each moves to the vertex that
+represents it at that level. A candidate with no vertex at that level is removed
+without a limitation, just as an edge is not drawn when one of its ends has no
+vertex there. For example, functions are object-level vertices, so in
+`graph --level column` a trigger's analysis keeps its diagnostics but lists no
+function candidates, the same way an edge from the trigger to a function is not
+drawn at that level. `dead` reads the unprojected graph and always sees every
+candidate.
+
 These are reachability facts, not permission to delete database objects. A
 missing usage record is different from observed zero activity; neither is an
 application entry-point inventory.
