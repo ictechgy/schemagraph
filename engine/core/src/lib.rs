@@ -1703,6 +1703,19 @@ mod tests {
     }
 
     #[test]
+    fn dml_owner_역할은_로컬과_병합_namespace_작업_id를_되돌린다() {
+        for owner in ["s.load", "app::s.load", "s.load(id integer)"] {
+            let role = Origin::dml_owner_role(&VertexId::from_raw(owner), "value");
+            assert_eq!(role, format!("dml-owner:{owner}:value"));
+            let (parsed, suffix) = Origin::dml_owner(&role).expect("dml role");
+            assert_eq!((parsed.as_str(), suffix), (owner, "value"));
+        }
+        for role in ["value", "body-dependency", "dml-owner:", "dml-owner:s.load"] {
+            assert!(Origin::dml_owner(role).is_none(), "{role}");
+        }
+    }
+
+    #[test]
     fn project는_usage를_조상으로_합산한다() {
         let mut g = Graph::new();
         g.add_vertex(table("s", "a"));

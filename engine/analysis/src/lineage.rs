@@ -179,9 +179,7 @@ fn add_read(
 
 /// `dml-owner:<작업 id>:<역할>`에서 작업 id를 꺼낸다.
 fn dml_owner(role: &str) -> Option<VertexId> {
-    let rest = role.strip_prefix("dml-owner:")?;
-    let (owner, _) = rest.rsplit_once(':')?;
-    Some(VertexId::from_raw(owner))
+    Origin::dml_owner(role).map(|(owner, _)| owner)
 }
 
 /// origin 역할을 간접 사용 종류로 옮긴다. DML 역할은 마지막 세그먼트를 본다.

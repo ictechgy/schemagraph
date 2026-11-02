@@ -3006,7 +3006,7 @@ impl DmlAnalyzer<'_, '_> {
             to,
             kind,
             detail,
-            role: format!("dml-owner:{}:{role}", self.owner),
+            role: Origin::dml_owner_role(self.owner, role),
             location: self.locations_trusted.then_some(location).flatten(),
         });
     }

@@ -78,7 +78,27 @@ pub struct ObjectAnalysis {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Origin {
     pub body_hash: String,
-    /// value, predicate, relation, call 등 수집한 의미를 설명한다.
+    /// value, predicate, relation, call 등 수집한 의미를 설명한다. DML 효과는
+    /// [`Origin::dml_owner_role`]의 `dml-owner:<작업 id>:<역할>` 꼴로 효과를 만든 작업을 밝힌다.
     pub role: String,
     pub location: Option<SourceLocation>,
+}
+
+impl Origin {
+    /// DML 효과 역할의 접두. 뒤에 효과를 만든 작업(routine·trigger)의 정점 id가 온다.
+    const DML_OWNER_PREFIX: &'static str = "dml-owner:";
+
+    /// `dml-owner:<작업 id>:<역할>` 역할을 만든다. 작업 id는 구조화된 정점 id라, 정점 id를
+    /// 바꾸는 변환(병합)은 [`Origin::dml_owner`]로 꺼내 같이 바꿔야 한다.
+    pub fn dml_owner_role(owner: &VertexId, role: &str) -> String {
+        format!("{}{owner}:{role}", Self::DML_OWNER_PREFIX)
+    }
+
+    /// DML 효과 역할이면 (작업 id, 역할). 역할 이름에는 `:`가 없고, 작업 id에는 병합
+    /// namespace의 `::`가 들어갈 수 있으므로 마지막 `:`에서 나눈다.
+    pub fn dml_owner(role: &str) -> Option<(VertexId, &str)> {
+        let rest = role.strip_prefix(Self::DML_OWNER_PREFIX)?;
+        let (owner, role) = rest.rsplit_once(':')?;
+        Some((VertexId::from_raw(owner), role))
+    }
 }

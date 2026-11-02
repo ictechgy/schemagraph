@@ -129,6 +129,16 @@ this field existed have no candidates; scan again to use them. A loaded graph
 keeps only candidates that name one of its vertices and reports how many it
 dropped.
 
+Commands with `--level` (for example `graph --level`) work on a projected graph,
+and candidates are projected like edge ends: each moves to the vertex that
+represents it at that level. A candidate with no vertex at that level is removed
+without a limitation, just as an edge is not drawn when one of its ends has no
+vertex there. For example, functions are object-level vertices, so in
+`graph --level column` a trigger's analysis keeps its diagnostics but lists no
+function candidates, the same way an edge from the trigger to a function is not
+drawn at that level. `dead` reads the unprojected graph and always sees every
+candidate.
+
 These are reachability facts, not permission to delete database objects. A
 missing usage record is different from observed zero activity; neither is an
 application entry-point inventory.
@@ -320,12 +330,30 @@ PostgreSQL, SQL Server, and Oracle through the probes. The probes accept the sam
 unsupported catalogs produce measured limitations.
 
 Merge requires a distinct nonempty source ID in every document. Each database is
-parsed independently, then IDs become `source-id::local-id`, including the
-`candidates` of analysis diagnostics. Cross-database edges
+parsed independently, then IDs become `source-id::local-id` in every structured
+field: vertices, edge ends, usage, analysis owners and their diagnostic
+`candidates`, origin keys, the job ID inside a DML origin role
+(`dml-owner:app::public.load:write`), and schema metadata. Cross-database edges
 are added only for explicit catalog facts whose target database and object resolve
 uniquely among the supplied documents. Missing or ambiguous targets remain
 limitations. This does not resolve arbitrary dynamic SQL or create remote nodes
 for databases that were not collected.
+
+Free text written while one source was analyzed is not rewritten, so it keeps
+that source's local IDs: diagnostic messages, edge evidence details, and
+limitations (which get a `source-id: ` prefix). Vertex `name` and `schema` stay
+local too. For example, merging source `app` gives `app::public.caller` this
+diagnostic:
+
+```json
+{"candidates": ["app::public.over(integer)", "app::public.over(text)"],
+ "code": "SG_BODY_PARTIAL",
+ "message": "public.caller calls public.over, which has 2 overloads; edge omitted"}
+```
+
+and its `writes` edge to `app::public.dst` keeps the evidence detail
+`public.load Writes public.dst`. Join and filter by the structured fields, not by
+IDs found in text.
 
 ## Export lineage to OpenLineage
 
@@ -354,12 +382,16 @@ lineage exists, a `columnLineage` facet:
 
 Jobs and datasets share the `[database.]` prefix: a view's job name equals its
 output dataset name (`database.schema.object`); a routine's job name is its
-graph id with the prefix. The `runId` is a version 8 UUID derived from the event
-content, so fixing `--event-time` (validated as RFC 3339) makes the output
-byte-for-byte reproducible and re-ingestion idempotent. This is a static
-snapshot, not an observed run. Events are validated against the pinned official
-schemas in `schemas/openlineage`, including their formats; ingestion by a
-specific catalog (Marquez, DataHub, OpenMetadata) has not been tested.
+graph id with the prefix. Dataset names come from each vertex's local schema and
+object name, so in a merged graph a routine's job carries its `source-id::`
+namespace but its datasets do not, and same-named tables from different sources
+share a dataset name. Export each source's own graph with its own `--namespace`
+or `--database` when those names overlap. The `runId` is a version 8 UUID
+derived from the event content, so fixing `--event-time` (validated as RFC 3339)
+makes the output byte-for-byte reproducible and re-ingestion idempotent. This is
+a static snapshot, not an observed run. Events are validated against the pinned
+official schemas in `schemas/openlineage`, including their formats; ingestion by
+a specific catalog (Marquez, DataHub, OpenMetadata) has not been tested.
 
 ## Export declarations to isthmus
 

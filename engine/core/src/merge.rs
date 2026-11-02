@@ -1,6 +1,6 @@
 //! 독립 DB 그래프는 해석을 마친 뒤 명시적인 namespace로 합친다.
 
-use crate::{Graph, SchemaMetadata, VertexId};
+use crate::{Graph, Origin, SchemaMetadata, VertexId};
 use std::collections::BTreeSet;
 
 /// 실제 source id를 보존해 동명 스키마끼리 합쳐지는 일을 막는다.
@@ -69,7 +69,13 @@ pub fn merge_graphs(mut inputs: Vec<(String, Graph)>) -> Result<Graph, String> {
         }
         for ((from, to, kind), origins) in graph.origins() {
             for origin in origins {
-                combined.add_origin((id(from), id(to), *kind), origin.clone());
+                // DML 역할 안의 작업 id도 구조화된 정점 id다. 계보 귀속(OpenLineage 작업)이
+                // 합친 그래프에서 그 작업을 찾도록 같은 namespace를 붙인다.
+                let mut origin = origin.clone();
+                if let Some((owner, role)) = Origin::dml_owner(&origin.role) {
+                    origin.role = Origin::dml_owner_role(&id(&owner), role);
+                }
+                combined.add_origin((id(from), id(to), *kind), origin);
             }
         }
         for limitation in graph.limitations() {
@@ -191,6 +197,55 @@ mod tests {
             "{:?}",
             merged.limitations()
         );
+    }
+
+    /// DML origin 역할 `dml-owner:<작업 id>:<역할>`의 작업 id는 구조화된 정점 id다. 로컬 id로
+    /// 남으면 합친 그래프에서 계보를 만든 작업을 찾지 못한다. 다른 역할 문자열은 그대로 둔다.
+    #[test]
+    fn merged_dml_origin_roles_name_namespaced_jobs() {
+        use crate::{Edge, EdgeKind, Origin};
+        let mut graph = Graph::new();
+        let ids = ["load", "dst"].map(|name| {
+            let id = VertexId::object("s", name);
+            graph.add_vertex(Vertex {
+                id: id.clone(),
+                name: name.into(),
+                schema: "s".into(),
+                kind: if name == "load" {
+                    VertexKind::Procedure
+                } else {
+                    VertexKind::Table
+                },
+            });
+            id
+        });
+        graph.add_edge(Edge {
+            from: ids[0].clone(),
+            to: ids[1].clone(),
+            kind: EdgeKind::Writes,
+            evidence: vec![],
+        });
+        for role in ["dml-owner:s.load:write", "body-dependency"] {
+            graph.add_origin(
+                (ids[0].clone(), ids[1].clone(), EdgeKind::Writes),
+                Origin {
+                    body_hash: "sha256:test".into(),
+                    role: role.into(),
+                    location: None,
+                },
+            );
+        }
+        let merged = merge_graphs(vec![("app".into(), graph)]).unwrap();
+        let key = (
+            VertexId::from_raw("app::s.load"),
+            VertexId::from_raw("app::s.dst"),
+            EdgeKind::Writes,
+        );
+        let roles: Vec<&str> = merged.origins()[&key]
+            .iter()
+            .map(|origin| origin.role.as_str())
+            .collect();
+        assert_eq!(roles, ["body-dependency", "dml-owner:app::s.load:write"]);
     }
 
     #[test]

@@ -306,7 +306,8 @@ struct DeadPropagation<'g> {
 /// 하나는 실제로 불리므로, 살아 있는 호출자의 후보를 의존자 없는 정점으로 내면 쓰이는
 /// routine을 후보로 오보한다. 그래서 확정 간선만으로 dead를 구한 뒤, 살아 있는 호출자에서
 /// 후보로 생존을 넓힌다 — 생존은 밖에서만 들어오므로 자기 자신을 후보로 둔 호출이나 서로를
-/// 모호하게 부르는 오버로드 묶음은 스스로를 살리지 못한다. 그래프에 없는 후보는 무시한다.
+/// 모호하게 부르는 오버로드 묶음은 스스로를 살리지 못한다. 후보는 늘 그래프의 정점이다 —
+/// `Graph::set_analysis`가 정점이 아닌 후보를 버리고, 정점은 그래프에서 지워지지 않는다.
 struct PossibleCalls<'g> {
     /// 호출자 → 그 호출이 가리킬 수 있는 다른 정점.
     callees: BTreeMap<&'g VertexId, BTreeSet<&'g VertexId>>,
@@ -326,9 +327,12 @@ impl<'g> PossibleCalls<'g> {
                 .diagnostics
                 .iter()
                 .flat_map(|diagnostic| &diagnostic.candidates)
-                .filter(|candidate| *candidate != owner)
-                .filter_map(|candidate| graph.vertex(candidate).map(|vertex| &vertex.id));
+                .filter(|candidate| *candidate != owner);
             for candidate in candidates {
+                debug_assert!(
+                    graph.vertex(candidate).is_some(),
+                    "set_analysis keeps only candidates that are vertices: {candidate}"
+                );
                 possible.callees.entry(owner).or_default().insert(candidate);
                 possible.callers.entry(candidate).or_default().insert(owner);
             }
@@ -1459,7 +1463,7 @@ mod tests {
             ..dep(&trigger.id, &live_caller.id)
         });
         ambiguous_call(&mut g, &live_caller.id, &[&over_int.id, &over_text.id]);
-        // 그래프에 없는 후보는 의존자를 만들지 않는다.
+        // 그래프에 없는 후보는 set_analysis가 버리므로 의존자를 만들지 않는다.
         let ghost = VertexId::routine("s", None, "lone", Some("ghost"));
         ambiguous_call(&mut g, &orphan.id, &[&lone_int.id, &lone_text.id, &ghost]);
 
