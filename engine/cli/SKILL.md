@@ -124,9 +124,9 @@ schemagraph serve --graph graph.json            # read-only MCP over one snapsho
 - `openlineage --namespace <uri>` — column lineage as OpenLineage RunEvents
   (NDJSON). `DIRECT` has no subtype; `INDIRECT` covers only JOIN and FILTER, and
   only for views. Partial analysis appears as a `schemagraphAnalysis` job facet.
-  A merged graph names each source separately (default `source.schema.object`;
-  `--source-namespace SRC=URI`, `--source-database SRC=NAME`) and exits 2 rather
-  than give two objects one name.
+  A merged graph names datasets per source (default `source.schema.object`;
+  `--source-namespace SRC=URI`, `--source-database SRC=NAME`), keeps job names,
+  and exits 2 rather than give two datasets one name.
 - `stats` — every collected usage entry with `since`; `totals` shows how
   much of the graph went unobserved.
 - `dead --retain <glob>` protects a root and its dependency closure. TOML

@@ -327,20 +327,21 @@ enum Command {
     Openlineage {
         #[arg(short, long, default_value = "graph.json")]
         graph: PathBuf,
-        /// Dataset and job namespace, for example postgres://db.example:5432. In a merged
-        /// graph it is the namespace of every source without --source-namespace.
+        /// Job and dataset namespace, for example postgres://db.example:5432. In a merged
+        /// graph it is the job namespace and the dataset namespace of every source without
+        /// --source-namespace.
         #[arg(long)]
         namespace: String,
         /// Database name prefixed to dataset and job names (database.schema.object). Single
-        /// graphs only; a merged graph uses each source id, or --source-database.
+        /// graphs only; a merged graph prefixes each source's datasets with --source-database
+        /// or the source id.
         #[arg(long)]
         database: Option<String>,
-        /// Merged graphs: namespace for one source, as SRC=URI (repeatable). Its datasets get
-        /// no database prefix unless --source-database names one.
+        /// Merged graphs: dataset namespace for one source, as SRC=URI (repeatable).
         #[arg(long = "source-namespace", value_name = "SRC=URI")]
         source_namespaces: Vec<String>,
-        /// Merged graphs: database name for one source, as SRC=NAME (repeatable). Defaults to
-        /// the source id when the source keeps the shared --namespace.
+        /// Merged graphs: database name in one source's dataset names, as SRC=NAME
+        /// (repeatable); defaults to the source id.
         #[arg(long = "source-database", value_name = "SRC=NAME")]
         source_databases: Vec<String>,
         /// RFC 3339 event time; defaults to now. Fix it for reproducible output.
@@ -1107,12 +1108,11 @@ fn openlineage(
     Ok(0)
 }
 
-/// 합친 그래프면 source마다 OpenLineage 이름 자리를 정한다. 단일 그래프면 빈 맵이다.
+/// 합친 그래프면 source마다 데이터셋 이름 자리를 정한다. 단일 그래프면 빈 맵이다.
 ///
-/// 정점의 스키마·객체 이름은 source 안의 로컬 이름이라, source가 같은 namespace를 쓰면 source
-/// id를 데이터베이스 자리에 둬야 같은 이름의 테이블이 한 데이터셋으로 합쳐지지 않는다.
-/// `--source-namespace`로 source마다 namespace를 주면 그 source만 따로 내보낸 결과와 같은
-/// 이름이 되도록 데이터베이스 접두는 `--source-database`가 있을 때만 붙인다.
+/// 정점의 스키마·객체 이름은 source 안의 로컬 이름이라, source마다 데이터베이스 자리(기본은
+/// source id)를 따로 둬야 같은 이름의 테이블이 한 데이터셋으로 합쳐지지 않는다. namespace는
+/// `--source-namespace`가 없으면 전역 `--namespace`다.
 fn lineage_sources(
     graph: &Graph,
     names: &LineageNames<'_>,
@@ -1138,13 +1138,15 @@ fn lineage_sources(
     Ok(sources
         .iter()
         .map(|source| {
-            let mapped = namespaces.get(*source);
             let naming = export::openlineage::SourceNaming {
-                namespace: mapped.map_or(names.namespace, String::as_str).to_owned(),
+                namespace: namespaces
+                    .get(*source)
+                    .map_or(names.namespace, String::as_str)
+                    .to_owned(),
                 database: databases
                     .get(*source)
-                    .cloned()
-                    .or_else(|| mapped.is_none().then(|| (*source).to_owned())),
+                    .map_or(*source, String::as_str)
+                    .to_owned(),
             };
             ((*source).to_owned(), naming)
         })
@@ -1185,8 +1187,10 @@ fn source_assignments(
 
 /// 계보 작업을 RunEvent로 만든다. 생산자와 facet 설명 URL은 이 도구 버전을 가리킨다.
 ///
-/// 서로 다른 정점이 같은 (namespace, 이름)을 얻으면 내보내지 않는다 — 소비자가 둘을 한
-/// 데이터셋·작업으로 합쳐 없는 계보를 그린다.
+/// 서로 다른 데이터셋이 같은 (namespace, 이름)을 얻으면 소비자가 둘을 한 데이터셋으로 합쳐
+/// 없는 계보를 그린다. 합친 그래프에서는 사용자 매핑이 만든 겹침이라 내보내지 않는다. 단일
+/// 그래프에서는 이름 안의 `.` 때문에만 겹치므로, 출력과 종료 코드는 그대로 두고 stderr로
+/// 알린다.
 fn lineage_events(
     graph: &Graph,
     names: &LineageNames<'_>,
@@ -1209,8 +1213,15 @@ fn lineage_events(
     let jobs = analysis::lineage::jobs(graph);
     let collisions = export::openlineage::identity_collisions(graph, &jobs, &context);
     if !collisions.is_empty() {
-        bail!(
-            "OpenLineage names would merge distinct objects; give the sources distinct --source-namespace or --source-database values: {}",
+        if !context.sources.is_empty() {
+            bail!(
+                "OpenLineage names would merge distinct datasets; give the sources distinct --source-namespace or --source-database values: {}",
+                collisions.join("; ")
+            );
+        }
+        eprintln!(
+            "note: {} OpenLineage dataset name(s) are shared by distinct objects because their schema or object names contain dots; consumers will merge them: {}",
+            collisions.len(),
             collisions.join("; ")
         );
     }
