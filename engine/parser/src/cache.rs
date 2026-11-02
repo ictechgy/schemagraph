@@ -220,16 +220,16 @@ impl<'a> CachedKeys<'a> {
         keys
     }
 
-    /// origin 키를 몸체 해시가 맞는 것과 owner DML이 남긴 것으로 나눠 담는다.
+    /// origin 키를 몸체 해시가 맞는 것과 owner DML이 남긴 것으로 나눠 담는다. DML 역할의
+    /// 작업 id를 문법대로 꺼내 owner와 비교한다(Origin::dml_owner).
     fn add_origins(&mut self, cached: &'a BodyResult) {
-        let prefix = Origin::dml_owner_role(self.owner, "");
         for (key, origin) in &cached.origins {
             #[cfg(test)]
             count_restore_visit();
             if origin.body_hash == self.hash {
                 self.hashed_origins.insert((&key.0, &key.1, key.2));
             }
-            if origin.role.starts_with(&prefix) {
+            if Origin::dml_owner(&origin.role).is_some_and(|(owner, _)| owner == *self.owner) {
                 self.owned_origins.insert((&key.0, &key.1, key.2));
             }
         }
@@ -379,7 +379,6 @@ pub(crate) fn capture(
     // — 몸체마다 그래프의 모든 origin을 훑으면 저장 비용이 몸체 수의 제곱이 된다.
     // 키를 정렬 순서로 돌므로 모으는 순서는 전체 origin을 훑을 때와 같다.
     let mut captured: BTreeSet<OriginKey> = edges.iter().map(edge_key).collect();
-    let owner_prefix = Origin::dml_owner_role(owner, "");
     let evidence_prefix = format!("{} ", owner.as_str());
     for key in &outcome.dml_origins {
         #[cfg(test)]
@@ -390,7 +389,8 @@ pub(crate) fn capture(
         let owned_values: Vec<_> = values
             .iter()
             .filter(|origin| {
-                origin.body_hash == body_hash && origin.role.starts_with(&owner_prefix)
+                origin.body_hash == body_hash
+                    && Origin::dml_owner(&origin.role).is_some_and(|(tagged, _)| tagged == *owner)
             })
             .cloned()
             .collect();
@@ -677,6 +677,78 @@ mod tests {
         cached.origins.retain(|(key, _)| {
             !(key.0 == owner && key.1.as_str() == "main.audit.amount" && key.2 == EdgeKind::Writes)
         });
+        let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+        assert!(!restore(
+            &mut graph,
+            &owner,
+            body,
+            cached,
+            &mut Vec::new(),
+            &mut 0
+        ));
+    }
+
+    /// 시그니처가 붙은 routine(`main.f(id integer)`)이 DML 계보를 남기는 문서.
+    fn signature_dml_document() -> CatalogDocument {
+        serde_json::from_value(serde_json::json!({
+            "version":1,"dialect":"postgres","reader":"test","limitations":[],
+            "schemas":[{"name":"main","objects":[
+                {"name":"orders","kind":"table","columns":[{"name":"amount","data_type":"INTEGER","nullable":true,"ordinal":1,"pk_position":0}],"constraints":[],"indexes":[],"triggers":[]},
+                {"name":"audit","kind":"table","columns":[{"name":"amount","data_type":"INTEGER","nullable":true,"ordinal":1,"pk_position":0}],"constraints":[],"indexes":[],"triggers":[]}
+            ],"routines":[{"name":"f","kind":"function","language":"sql","signature":"id integer",
+                "body":"INSERT INTO audit(amount) SELECT amount FROM orders"}]}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn warm_cache_restores_dml_origins_of_a_signature_owner() {
+        let doc = signature_dml_document();
+        let owner = VertexId::routine("main", None, "f", Some("id integer"));
+        let mut cache = MemoryCache::default();
+        let mut cold = schemagraph_source::graph::document_to_graph(&doc);
+        crate::enrich_with_cache(&mut cold, &doc, Some(&mut cache));
+        // 전제: 계보 간선에 이 owner의 DML 역할이 붙어 있다.
+        let lineage = (
+            VertexId::from_raw("main.audit.amount"),
+            VertexId::from_raw("main.orders.amount"),
+            EdgeKind::DerivesFrom,
+        );
+        let role = Origin::dml_owner_role(&owner, "value");
+        assert!(
+            cold.origins()[&lineage].iter().any(|o| o.role == role),
+            "{role}"
+        );
+        let mut warm = schemagraph_source::graph::document_to_graph(&doc);
+        crate::enrich_with_cache(&mut warm, &doc, Some(&mut cache));
+        assert_eq!((cache.1, cache.2), (1, 0), "hit without restore failure");
+        assert_eq!(warm.edges(), cold.edges());
+        assert_eq!(warm.origins(), cold.origins());
+    }
+
+    #[test]
+    fn cached_dml_origins_tagged_for_another_owner_are_not_restored() {
+        let doc = signature_dml_document();
+        let owner = VertexId::routine("main", None, "f", Some("id integer"));
+        let body = doc.schemas[0].routines[0].body.as_deref().unwrap();
+        let mut cache = MemoryCache::default();
+        crate::enrich_with_cache(
+            &mut schemagraph_source::graph::document_to_graph(&doc),
+            &doc,
+            Some(&mut cache),
+        );
+        // 다른 routine의 DML 역할로 바꾼 캐시 결과 — 계보 간선은 owner가 소유하지 않으므로
+        // 이 owner의 DML origin으로만 복원을 허락받는다.
+        let other = VertexId::routine("main", None, "f", Some("id bigint"));
+        let mut cached = cache.0[&owner].clone();
+        let mut retagged = 0;
+        for (_, origin) in &mut cached.origins {
+            if let Some((_, role)) = Origin::dml_owner(&origin.role) {
+                origin.role = Origin::dml_owner_role(&other, role);
+                retagged += 1;
+            }
+        }
+        assert!(retagged > 0);
         let mut graph = schemagraph_source::graph::document_to_graph(&doc);
         assert!(!restore(
             &mut graph,
