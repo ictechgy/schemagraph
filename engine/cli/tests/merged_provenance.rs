@@ -93,27 +93,31 @@ fn merged_graph_keeps_dml_job_column_lineage_in_openlineage() {
             "combined.graph.json",
         ],
     );
-    let lineage = |graph: &str| {
-        run(
-            root,
-            &[
-                "openlineage",
-                "--graph",
-                graph,
-                "--namespace",
-                "postgres://db",
-                "--event-time",
-                EVENT_TIME,
-            ],
-        )
+    let lineage = |graph: &str, extra: &[&str]| {
+        let mut args = vec![
+            "openlineage",
+            "--graph",
+            graph,
+            "--namespace",
+            "postgres://db",
+            "--event-time",
+            EVENT_TIME,
+        ];
+        args.extend_from_slice(extra);
+        run(root, &args)
     };
-    let single = column_lineage(&lineage("app.graph.json"), "public.load");
+    // 합친 그래프는 데이터셋의 데이터베이스 자리에 source id를 두므로, 같은 데이터셋 이름은 그
+    // source 그래프를 `--database app`으로 내보낸 결과다. 작업 이름은 합친 정점 id 그대로다.
+    let single = column_lineage(
+        &lineage("app.graph.json", &["--database", "app"]),
+        "app.public.load",
+    );
     assert_eq!(
         single["id"]["inputFields"][0]["field"], "id",
         "the single-source export is the reference: {single}"
     );
     // 합친 그래프의 같은 작업도 같은 컬럼 계보를 낸다.
-    let merged = column_lineage(&lineage("combined.graph.json"), "app::public.load");
+    let merged = column_lineage(&lineage("combined.graph.json", &[]), "app::public.load");
     assert_eq!(merged, single);
 }
 

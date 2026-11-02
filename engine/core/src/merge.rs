@@ -8,17 +8,44 @@ pub fn namespaced_id(namespace: &str, id: &VertexId) -> VertexId {
     VertexId::from_raw(&format!("{namespace}::{id}"))
 }
 
+/// [`namespaced_id`]의 역 — (source, source 안의 로컬 id).
+///
+/// 첫 `::`에서 나눈다. 정점 id 생성자는 이름 안의 `:`를 escape하고 source 이름에는 `:`가
+/// 없으므로, 단일 그래프의 정규 id에는 `::`가 없고 합친 id의 첫 `::`가 경계다. 원문을
+/// 그대로 읽는 옛 id가 우연히 `::`를 품을 수 있어 접두가 source 이름 규칙에 맞을 때만
+/// 나눈다.
+pub fn split_namespaced_id(id: &VertexId) -> Option<(&str, VertexId)> {
+    let (namespace, local) = id.as_str().split_once("::")?;
+    (is_namespace(namespace) && !local.is_empty()).then(|| (namespace, VertexId::from_raw(local)))
+}
+
+/// 모든 정점이 namespace를 가진 합친 그래프면 그 source 이름들이다. namespace가 없는
+/// 정점이 하나라도 있거나 정점이 없으면 None — 단일 그래프로 다룬다.
+pub fn merged_sources(graph: &Graph) -> Option<BTreeSet<&str>> {
+    let mut sources = BTreeSet::new();
+    for vertex in graph.vertices() {
+        let (source, _) = split_namespaced_id(&vertex.id)?;
+        sources.insert(source);
+    }
+    (!sources.is_empty()).then_some(sources)
+}
+
+/// source 이름 규칙 — 연결 문자열이 아닌 논리 이름이다(`source::context::validate_source_id`와
+/// 같은 규칙).
+fn is_namespace(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-./".contains(&b))
+}
+
 /// DB별 분석 결과를 섞지 않고 조합한다. DB 간 간선은 호출자가 확인한 근거만 추가한다.
 pub fn merge_graphs(mut inputs: Vec<(String, Graph)>) -> Result<Graph, String> {
     inputs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut names = BTreeSet::new();
     for (name, _) in &inputs {
-        if name.is_empty()
-            || name.len() > 128
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-./".contains(&b))
-        {
+        if !is_namespace(name) {
             return Err(
                 "each graph needs a logical namespace using letters, digits, _, -, ., or /".into(),
             );
@@ -246,6 +273,41 @@ mod tests {
             .map(|origin| origin.role.as_str())
             .collect();
         assert_eq!(roles, ["body-dependency", "dml-owner:app::s.load:write"]);
+    }
+
+    #[test]
+    fn namespaced_ids_split_back_to_their_source_and_local_id() {
+        for local in ["s.t", "s.t.c", "s.f(integer)", "app%3A%3Ax.t"] {
+            let id = VertexId::from_raw(local);
+            let merged = namespaced_id("wh.v2", &id);
+            assert_eq!(split_namespaced_id(&merged), Some(("wh.v2", id.clone())));
+            // 정규 단일 그래프 id에는 `::`가 없다.
+            assert_eq!(split_namespaced_id(&id), None);
+        }
+        // 옛 원문 id의 `::`는 접두가 source 이름 규칙에 맞지 않으면 나누지 않는다.
+        for raw in ["postgres://x::s.t", "a b::s.t", "::s.t", "app::"] {
+            assert_eq!(split_namespaced_id(&VertexId::from_raw(raw)), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_graph_is_merged_only_when_every_vertex_is_namespaced() {
+        let merged =
+            merge_graphs(vec![("wh".into(), fixture()), ("app".into(), fixture())]).unwrap();
+        assert_eq!(
+            merged_sources(&merged).map(|s| s.into_iter().collect::<Vec<_>>()),
+            Some(vec!["app", "wh"])
+        );
+        assert_eq!(merged_sources(&fixture()), None);
+        assert_eq!(merged_sources(&Graph::new()), None);
+        let mut mixed = merged.clone();
+        mixed.add_vertex(Vertex {
+            id: VertexId::object("s", "local"),
+            name: "local".into(),
+            schema: "s".into(),
+            kind: VertexKind::Table,
+        });
+        assert_eq!(merged_sources(&mixed), None);
     }
 
     #[test]
