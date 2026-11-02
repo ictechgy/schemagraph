@@ -382,16 +382,46 @@ lineage exists, a `columnLineage` facet:
 
 Jobs and datasets share the `[database.]` prefix: a view's job name equals its
 output dataset name (`database.schema.object`); a routine's job name is its
-graph id with the prefix. Dataset names come from each vertex's local schema and
-object name, so in a merged graph a routine's job carries its `source-id::`
-namespace but its datasets do not, and same-named tables from different sources
-share a dataset name. Export each source's own graph with its own `--namespace`
-or `--database` when those names overlap. The `runId` is a version 8 UUID
-derived from the event content, so fixing `--event-time` (validated as RFC 3339)
-makes the output byte-for-byte reproducible and re-ingestion idempotent. This is
-a static snapshot, not an observed run. Events are validated against the pinned
-official schemas in `schemas/openlineage`, including their formats; ingestion by
-a specific catalog (Marquez, DataHub, OpenMetadata) has not been tested.
+graph id with the prefix. The `runId` is a version 8 UUID derived from the event
+content, so fixing `--event-time` (validated as RFC 3339) makes the output
+byte-for-byte reproducible and re-ingestion idempotent. This is a static
+snapshot, not an observed run. Events are validated against the pinned official
+schemas in `schemas/openlineage`, including their formats; ingestion by a
+specific catalog (Marquez, DataHub, OpenMetadata) has not been tested.
+
+A merged graph (every vertex ID is `source-id::local-id`, see
+[merge](#collect-and-combine-db-catalog-references)) keeps each vertex's local
+schema and object names, and two sources can both have `public.orders`. Its
+datasets are therefore named per source, in inputs, outputs, and column-lineage
+input fields alike:
+
+- namespace: `--source-namespace SRC=URI` for that source, otherwise `--namespace`;
+- name: `DB.schema.object`, where `DB` is `--source-database SRC=NAME` for that
+  source, otherwise the source ID.
+
+So by default `app`'s orders table is `(--namespace, app.public.orders)` and the
+warehouse copy is `(--namespace, wh.public.orders)`. Job names do not change: a
+merged job keeps the `--namespace` namespace and its vertex ID as name
+(`app::public.load`). Job IDs already differ per source, so keeping them keeps the
+job history a catalog has collected.
+
+```sh
+schemagraph openlineage --graph combined.graph.json --namespace postgres://jobs:5432 \
+  --source-namespace app=postgres://app-db:5432 --source-database app=appdb \
+  --event-time 2026-09-25T00:00:00Z -o lineage.ndjson
+```
+
+`--database` names a single source and is rejected for a merged graph (exit 2,
+like other usage errors; nothing is written); `--source-namespace` and
+`--source-database` are rejected for a single graph or a source that is not in
+the merged graph. If two distinct datasets of a merged graph would still get the
+same namespace and name, which only a mapping can cause (for example two sources
+given the same namespace and database), the command exits 2 and lists them
+instead of exporting one dataset for both. In a single graph this can only happen
+when dots inside schema or object names blur the boundary (`a.b` table `c` and
+`a` table `b.c`); the export is unchanged and a note on stderr lists them. Export
+merged graphs again after upgrading: their dataset names, and so their `runId`s,
+differ from earlier versions.
 
 ## Export declarations to isthmus
 

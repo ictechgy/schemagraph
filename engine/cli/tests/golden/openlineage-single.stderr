@@ -1,0 +1,3 @@
+note: join/filter columns of 2 routine job(s) were not exported because the graph does not record which statement a condition belongs to: public.fan_out, public.load_archive
+note: 1 job(s) have incomplete SQL analysis and may miss lineage; see their schemagraphAnalysis job facet: public.dynamic_cleanup
+note: the graph records 1 collection limitation(s); read graph.json limitations before treating missing lineage as absent
