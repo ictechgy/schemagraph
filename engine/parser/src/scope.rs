@@ -18,7 +18,7 @@ use sqlparser::ast::{
     TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value, Visit, Visitor,
     WildcardAdditionalOptions, WindowType,
 };
-use sqlparser::dialect::{Dialect, GenericDialect};
+use sqlparser::dialect::Dialect;
 
 use crate::cache::CacheContext;
 
@@ -130,6 +130,11 @@ impl<'a> CatalogIndex<'a> {
         self.vertices.lookup(ci)
     }
 
+    /// 이 색인이 정규화 규칙으로 쓰는 문서 방언.
+    pub(crate) fn dialect(&self) -> &str {
+        self.dialect
+    }
+
     /// owner의 DML 효과에 origin을 단 간선 키를 기록한다.
     fn record_dml_origin(&self, owner: &VertexId, key: OriginKey) {
         self.dml_origins
@@ -204,6 +209,8 @@ struct Binder<'a, 'd> {
     catalog: &'a CatalogIndex<'d>,
     graph: &'a Graph,
     schema: &'a str,
+    /// 한 부분 이름을 `schema` 대신 찾는 순서(routine 정의문의 `SET search_path`).
+    search_path: Option<&'a super::SearchPath>,
     reads: BTreeMap<VertexId, BTreeSet<(String, Option<SourceLocation>)>>,
     calls: BTreeMap<VertexId, BTreeSet<Option<SourceLocation>>>,
     diagnostics: Vec<Diagnostic>,
@@ -389,12 +396,15 @@ impl<'a> CatalogIndex<'a> {
     ) -> CacheContext {
         #[cfg(test)]
         count_cache_key(|counters| counters.contexts += 1);
-        if wraps_definition_or_dynamic_sql(body) {
+        // 선언된 search_path는 경로의 모든 스키마가 한 부분 이름의 해석을 바꿀 수 있어
+        // 관계 footprint로 좁히지 않는다.
+        if wraps_definition_or_dynamic_sql(body)
+            || super::routine_search_path(self.dialect, body, |_| true).is_some()
+        {
             return self.conservative_context(graph, owner);
         }
         let dialect = super::dialect_for(self.dialect);
-        let default = GenericDialect {};
-        let parsed = super::parse_limits::parse_sql(dialect.as_deref().unwrap_or(&default), body);
+        let parsed = super::parse_limits::parse_sql(dialect.as_ref(), body);
         let Ok(statements) = parsed else {
             return self.conservative_context(graph, owner);
         };
@@ -524,6 +534,14 @@ impl<'a> CatalogIndex<'a> {
             let candidates = self.relation_candidates(index, &ref_schema, &ref_name);
             if candidates.is_empty() {
                 footprint.push(format!("missing-object={ref_schema}.{ref_name}"));
+                // SQL Server 누락 메시지는 대소문자만 다른 관계를 적는다(case_only_hint).
+                // 그 변형이 생기거나 사라지면 저장한 메시지가 낡으므로 지문에 넣는다.
+                if matches!(self.dialect, "sqlserver" | "mssql") {
+                    let variants = index.objects.get(&folded_key(&ref_schema, &ref_name));
+                    footprint.extend(variants.into_iter().flatten().map(|(schema, object)| {
+                        format!("case-variant={}.{}:{:?}", schema, object.name, object.kind)
+                    }));
+                }
             }
             footprint.extend(candidates.into_iter().map(|(schema, object)| {
                 format!(
@@ -577,7 +595,13 @@ pub(crate) fn cache_context(
 
 /// 정의 껍질이나 동적 SQL은 몸체만으로 소비하는 이름을 고정할 수 없다.
 fn wraps_definition_or_dynamic_sql(body: &str) -> bool {
-    let uppercase = body.to_ascii_uppercase();
+    // 공백의 종류와 개수는 머리의 뜻을 바꾸지 않는다 — `CREATE\nFUNCTION`도 정의문이고, 이를
+    // 놓치면 몸체 관계를 모르는 좁은 지문으로 저장해 관계가 바뀐 뒤에도 재사용한다.
+    let uppercase = body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
     [
         "CREATE FUNCTION",
         "CREATE PROCEDURE",
@@ -687,9 +711,8 @@ fn object_shape(object: &ObjectDoc) -> String {
 }
 
 /// 목적지가 없는 단일 SELECT만 읽기 해석기로 보내고 SELECT INTO는 DML로 남긴다.
-pub(crate) fn is_select(dialect: Option<&dyn Dialect>, body: &str) -> bool {
-    let default = GenericDialect {};
-    super::parse_limits::parse_sql(dialect.unwrap_or(&default), body).is_ok_and(|s| {
+pub(crate) fn is_select(dialect: &dyn Dialect, body: &str) -> bool {
+    super::parse_limits::parse_sql(dialect, body).is_ok_and(|s| {
         s.len() == 1
             && matches!(s[0], Statement::Query(_))
             && !super::is_column_dml_statement(&s[0])
@@ -777,6 +800,10 @@ impl Binder<'_, '_> {
             .last()
             .and_then(|part| part.as_ident())
             .is_some_and(|ident| ident.quote_style.is_some());
+        if let ([routine], Some(path)) = (parts.as_slice(), self.search_path) {
+            self.call_through_path(function, routine, path, quoted_name, source);
+            return;
+        }
         let default = catalog_key(self.catalog.dialect, self.schema);
         let (schema, routine) = match parts.as_slice() {
             [routine] => (default.clone(), routine.clone()),
@@ -831,15 +858,67 @@ impl Binder<'_, '_> {
         } else {
             super::RoutineHit::None
         };
+        self.record_call(function, hit, source);
+    }
+
+    /// routine 정의문이 선언한 search_path로 한 부분 함수 이름을 해석한다. 경로의 모든 수집
+    /// 스키마에서 후보를 모으므로 스키마마다 다른 오버로드는 모호함으로 남는다.
+    fn call_through_path(
+        &mut self,
+        function: &ObjectName,
+        routine: &str,
+        path: &super::SearchPath,
+        quoted_name: bool,
+        source: Option<SourceLocation>,
+    ) {
+        let known = path.collected().any(|schema| {
+            self.catalog.routines.contains(&(
+                catalog_key(self.catalog.dialect, schema),
+                routine.to_owned(),
+            ))
+        });
+        let builtin_spelling = !quoted_name || routine == routine.to_ascii_lowercase();
+        if !known && builtin_spelling && super::is_builtin_function(routine) {
+            return;
+        }
+        let hit = if known {
+            path.routine_hit(self.graph, routine, self.catalog.lookup(false))
+        } else {
+            path.collected().next().map(|_| super::RoutineHit::None)
+        };
+        match hit {
+            Some(hit) => self.record_call(function, hit, source),
+            None => self.note(
+                "SG_CALL_UNRESOLVED",
+                format!("function '{function}' is not in a collected search_path schema"),
+                source,
+            ),
+        }
+    }
+
+    /// 해석 결과를 호출 근거나 진단으로 남긴다.
+    fn record_call(
+        &mut self,
+        function: &ObjectName,
+        hit: super::RoutineHit,
+        source: Option<SourceLocation>,
+    ) {
         match hit {
             super::RoutineHit::One(id) => {
                 self.calls.entry(id).or_default().insert(source);
             }
-            super::RoutineHit::Ambiguous(count) => self.note(
-                "SG_CALL_AMBIGUOUS",
-                format!("function '{function}' has {count} matching overloads; no target guessed"),
-                source,
-            ),
+            super::RoutineHit::Ambiguous(candidates) => {
+                // 확정 간선 없이 후보만 진단에 싣는다 — dead가 불릴 수 있는 오버로드를
+                // 후보로 내지 않게 하는 근거이고, query/impact의 확정 의존은 그대로다.
+                let message = format!(
+                    "function '{function}' has {} matching overloads; no target guessed",
+                    candidates.len()
+                );
+                self.diagnostics.push(
+                    Diagnostic::new("SG_CALL_AMBIGUOUS", message, source)
+                        .with_candidates(candidates),
+                );
+            }
             super::RoutineHit::None => self.note(
                 "SG_CALL_UNRESOLVED",
                 format!("function '{function}' was not resolved in the collected catalog"),
@@ -852,6 +931,7 @@ impl Binder<'_, '_> {
             code: code.into(),
             message,
             location,
+            candidates: Vec::new(),
         });
     }
 
@@ -1635,7 +1715,29 @@ impl Binder<'_, '_> {
     }
 
     fn table(&mut self, parts: &[String], source: Option<SourceLocation>) -> Relation {
-        let Some((schema, table)) = self.catalog.relation_key(parts, self.schema) else {
+        let default_schema = match (parts, self.search_path) {
+            ([table], Some(path)) => {
+                let schema = path.relation_schema(table, |schema| {
+                    self.catalog
+                        .tables
+                        .contains_key(&(catalog_key(self.catalog.dialect, schema), table.clone()))
+                });
+                let Some(schema) = schema else {
+                    self.note(
+                        "SG_RELATION_UNRESOLVED",
+                        format!("relation '{table}' is not in a collected search_path schema"),
+                        source,
+                    );
+                    return Relation {
+                        unknown: true,
+                        ..Relation::default()
+                    };
+                };
+                schema
+            }
+            _ => self.schema,
+        };
+        let Some((schema, table)) = self.catalog.relation_key(parts, default_schema) else {
             self.note(
                 "SG_CROSS_DATABASE",
                 format!(
@@ -1656,9 +1758,21 @@ impl Binder<'_, '_> {
             .cloned()
             .unwrap_or_default();
         if matches.len() != 1 {
+            let hint = if matches.is_empty() {
+                super::case_only_hint(
+                    self.graph,
+                    self.catalog.dialect,
+                    &VertexId::object(&schema, &table),
+                    self.catalog.lookup(false),
+                )
+                .map(|hint| format!("; {hint}"))
+                .unwrap_or_default()
+            } else {
+                String::new()
+            };
             self.note(
                 "SG_RELATION_UNRESOLVED",
-                format!("relation '{schema}.{table}' is missing or ambiguous in the catalog"),
+                format!("relation '{schema}.{table}' is missing or ambiguous in the catalog{hint}"),
                 source,
             );
             return Relation {
@@ -1922,6 +2036,7 @@ pub(crate) fn apply_dml_column_effects(
             catalog,
             graph: &*graph,
             schema,
+            search_path: options.search_path,
             reads: BTreeMap::new(),
             calls: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -2004,6 +2119,8 @@ pub(crate) struct DmlApplyOptions<'a> {
     pub(crate) allow_local_temps: bool,
     pub(crate) locations_trusted: bool,
     pub(crate) scalar_symbols: &'a BTreeSet<String>,
+    /// routine 정의문이 선언한 한 부분 이름의 해석 순서.
+    pub(crate) search_path: Option<&'a super::SearchPath>,
 }
 
 struct DmlEffect {
@@ -2900,6 +3017,7 @@ impl DmlAnalyzer<'_, '_> {
             code: code.into(),
             message: message.into(),
             location: None,
+            candidates: Vec::new(),
         });
     }
 
@@ -3147,7 +3265,7 @@ pub(crate) fn enrich_view(
     schema: &str,
     object: &ObjectDoc,
     owner: &VertexId,
-    dialect: Option<&dyn Dialect>,
+    dialect: &dyn Dialect,
 ) -> Vec<String> {
     let Some(body) = object.body.as_ref().filter(|s| !s.trim().is_empty()) else {
         graph.set_analysis(
@@ -3161,6 +3279,7 @@ pub(crate) fn enrich_view(
                     code: "SG_BODY_UNAVAILABLE".into(),
                     message: "view definition was not collected".into(),
                     location: None,
+                    candidates: Vec::new(),
                 }],
             },
         );
@@ -3169,12 +3288,12 @@ pub(crate) fn enrich_view(
         )];
     };
     let hash = body_hash(body);
-    let default = GenericDialect {};
-    let parsed = super::parse_limits::parse_sql(dialect.unwrap_or(&default), body);
+    let parsed = super::parse_limits::parse_sql(dialect, body);
     let mut binder = Binder {
         catalog,
         graph,
         schema,
+        search_path: None,
         reads: BTreeMap::new(),
         calls: BTreeMap::new(),
         diagnostics: Vec::new(),
@@ -3269,6 +3388,7 @@ pub(crate) fn enrich_view(
             message: "catalog output width differs from parsed projection; output lineage omitted"
                 .into(),
             location: None,
+            candidates: Vec::new(),
         });
     }
     let output_shape_known = !diagnostics.iter().any(|d| {

@@ -437,6 +437,14 @@ fn ambiguous_same_arity_overloads_report_partial_without_a_call_edge() {
     assert!(diagnostics(&graph, "s.v")
         .iter()
         .any(|code| code == "SG_CALL_AMBIGUOUS"));
+    // 확정 간선 없이 진단만 두 오버로드를 후보로 싣는다.
+    let candidates: Vec<_> = graph.analysis()[&vertex("s.v")]
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "SG_CALL_AMBIGUOUS")
+        .flat_map(|diagnostic| diagnostic.candidates.iter().map(VertexId::as_str))
+        .collect();
+    assert_eq!(candidates, ["s.foo(integer)", "s.foo(text)"]);
 }
 
 #[test]
@@ -580,4 +588,142 @@ fn quoted_dotted_names_and_literal_routine_names_resolve_to_escaped_ids() {
         literal_name.as_str(),
         EdgeKind::Calls
     ));
+}
+
+#[test]
+fn mariadb_and_postgresql_documents_parse_with_their_engine_dialects() {
+    // JDBC 프로브는 jdbc:mariadb: URL을 "mariadb"로 싣는다. MySQL 전용 DIV와 PostgreSQL
+    // 전용 `#`(비트 XOR)는 일반 방언이 거부하므로, 별칭을 일반 방언으로 보내면 의존이 사라진다.
+    for (dialect, body) in [
+        ("mysql", "SELECT total DIV 2 AS half FROM orders"),
+        ("mariadb", "SELECT total DIV 2 AS half FROM orders"),
+        ("postgres", "SELECT total # 1 AS half FROM orders"),
+        ("postgresql", "SELECT total # 1 AS half FROM orders"),
+    ] {
+        let graph = analyze(
+            dialect,
+            vec![
+                table("orders", &["id", "total"]),
+                view("v", &["half"], body),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            state(&graph, "s.v"),
+            AnalysisState::Complete,
+            "{dialect}: {:?}",
+            graph.limitations()
+        );
+        assert!(
+            has_edge(&graph, "s.v", "s.orders", EdgeKind::Reads),
+            "{dialect}"
+        );
+        assert!(
+            has_edge(&graph, "s.v.half", "s.orders.total", EdgeKind::DerivesFrom),
+            "{dialect}"
+        );
+    }
+}
+
+#[test]
+fn unrecognized_dialect_reports_generic_parsing_once_with_the_measured_text_count() {
+    let generic_note = |graph: &Graph| -> Vec<String> {
+        graph
+            .limitations()
+            .iter()
+            .filter(|note| note.contains("generic SQL parsing"))
+            .cloned()
+            .collect()
+    };
+    let mut orders = table("orders", &["id"]);
+    orders["columns"][0]["default"] = json!("0");
+    let objects = || vec![orders.clone(), view("v", &["id"], "SELECT id FROM orders")];
+    let routines = || {
+        vec![function(
+            "count_orders",
+            None,
+            "SELECT count(*) FROM orders",
+        )]
+    };
+    // 뷰 몸체, 컬럼 기본값, routine 몸체를 하나씩 센다. 일반 방언으로도 파싱은 계속한다.
+    let graph = analyze("snowflake", objects(), routines());
+    assert_eq!(
+        generic_note(&graph),
+        ["dialect 'snowflake' is not recognized; generic SQL parsing used for 3 body/default text(s)"]
+    );
+    assert!(has_edge(&graph, "s.v", "s.orders", EdgeKind::Reads));
+    // 엔진이 알고 일부러 일반 방언으로 읽는 이름과, 읽을 SQL이 없는 문서는 알리지 않는다.
+    for known in [
+        "oracle", "db2", "informix", "h2", "external", "postgres", "mariadb",
+    ] {
+        assert!(
+            generic_note(&analyze(known, objects(), routines())).is_empty(),
+            "{known}"
+        );
+    }
+    assert!(generic_note(&analyze(
+        "snowflake",
+        vec![table("orders", &["id"])],
+        vec![]
+    ))
+    .is_empty());
+}
+
+#[test]
+fn sqlserver_case_only_mismatch_is_explained_without_guessing_a_match() {
+    // SQL Server의 대소문자 구분은 collation에 달렸고 문서는 collation을 싣지 않는다.
+    // 대소문자만 다른 카탈로그 객체를 이어 주지는 않되, 누락 이유를 알린다.
+    let hint = |text: &str| text.contains("differs only by letter case");
+    let graph = analyze(
+        "sqlserver",
+        vec![
+            table("Orders", &["Id"]),
+            view("v", &["Id"], "SELECT Id FROM s.orders"),
+        ],
+        vec![function("p", None, "SELECT Id FROM orders")],
+    );
+    assert!(!has_edge(&graph, "s.v", "s.Orders", EdgeKind::Reads));
+    assert!(!has_edge(&graph, "s.p", "s.Orders", EdgeKind::Reads));
+    let view_notes: Vec<_> = graph.analysis()[&vertex("s.v")]
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "SG_RELATION_UNRESOLVED")
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        view_notes.iter().any(|m| hint(m) && m.contains("s.Orders")),
+        "{view_notes:?}"
+    );
+    assert!(
+        graph
+            .limitations()
+            .iter()
+            .any(|note| note.starts_with("s.p references s.orders")
+                && hint(note)
+                && note.contains("s.Orders")),
+        "{:?}",
+        graph.limitations()
+    );
+
+    // 대소문자만 다른 후보가 둘이면 고르지 않고 수만 알린다.
+    let graph = analyze(
+        "sqlserver",
+        vec![table("Orders", &["Id"]), table("ORDERS", &["Id"])],
+        vec![function("p", None, "SELECT Id FROM orders")],
+    );
+    assert!(graph
+        .limitations()
+        .iter()
+        .any(|note| note.contains("2 catalog objects differ only by letter case")));
+
+    // PostgreSQL의 따옴표 없는 이름은 확실히 접히므로 대소문자 힌트가 필요 없다.
+    let graph = analyze(
+        "postgres",
+        vec![
+            table("Orders", &["Id"]),
+            view("v", &["Id"], "SELECT 1 AS \"Id\" FROM s.orders"),
+        ],
+        vec![],
+    );
+    assert!(!graph.limitations().iter().any(|note| hint(note)));
 }

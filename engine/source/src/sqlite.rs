@@ -45,7 +45,7 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         .map_err(|e| {
             // 접속 문자열이나 URL 오타가 경로로 남았을 수 있어 경로의 자격 증명 형태는 가린다.
             let path = crate::redact_connection_secrets(&path);
-            SourceError::Connect(format!("sqlite 접속 실패 ({path}): {e}"))
+            SourceError::Connect(format!("sqlite connection failed ({path}): {e}"))
         })?;
 
     let mut doc = CatalogDocument {
@@ -118,7 +118,7 @@ pub fn database_path(url: &str) -> Result<Option<PathBuf>, SourceError> {
 fn connect_options(path: &str) -> Result<SqliteConnectOptions, SourceError> {
     SqliteConnectOptions::from_str(&format!("sqlite:{path}"))
         .map(|options| options.read_only(true))
-        .map_err(|e| SourceError::Connect(format!("sqlite 경로 해석 실패: {e}")))
+        .map_err(|e| SourceError::Connect(format!("sqlite path could not be resolved: {e}")))
 }
 
 /// `sqlite:`/`sqlite://` 접두와 쿼리스트링을 벗긴다.
@@ -214,14 +214,14 @@ async fn read_schema(
             obj.triggers.push(TriggerDoc { name, body: sql });
         } else {
             limitations.push(format!(
-                "trigger {schema}.{name}의 대상 {tbl}을 스캔에서 찾지 못함"
+                "trigger {schema}.{name} targets {tbl}, which is missing from the scanned catalog"
             ));
         }
     }
 
     if inline_constraints {
         limitations.push(
-            "DDL 인라인 UNIQUE/CHECK 제약은 카탈로그에 없어 수집하지 못함 (인라인 제약 파싱 미지원)"
+            "inline UNIQUE/CHECK constraints are not exposed by the catalog; inline DDL constraint parsing is unsupported"
                 .to_owned(),
         );
     }

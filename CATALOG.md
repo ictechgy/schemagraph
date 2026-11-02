@@ -88,6 +88,37 @@ Version 2 replaces `reader` and adds the sorted feature declaration:
 }
 ```
 
+`dialect` selects the SQL parser and identifier rules. `sqlite`, `postgres`
+(or `postgresql`), `mysql` (or `mariadb`), and `sqlserver` (or `mssql`) use
+dedicated parsers. `oracle`, `db2`, `informix`, `h2`, and `external` are parsed
+with the generic SQL dialect by design. Any other name is also parsed with the
+generic dialect, and the graph then carries the limitation
+`dialect '<name>' is not recognized; generic SQL parsing used for N
+body/default text(s)`, counting the bodies and column defaults it read.
+
+SQL Server names are compared exactly, because case sensitivity depends on the
+database collation and documents do not carry it. When a body names a relation
+that exists only with different letter case, the unresolved-relation message
+names that variant (or counts several) and no edge is created.
+
+A PostgreSQL routine `body` that is a full definition, as `pg_get_functiondef`
+returns it, keeps the routine's `SET search_path` line; a hand-written
+definition may also put the clause after the `AS` body. The engine looks up
+unqualified relation names in that path order: the first listed collected
+schema that has the name wins, and a name missing from every listed schema is
+reported as missing from the first one. Unqualified routine names gather
+candidates from every listed collected schema, and a later schema's routine is
+hidden only by an earlier one with the same argument list, so overloads spread
+across schemas stay ambiguous instead of resolving to the first schema.
+`pg_catalog` and `pg_temp` entries are skipped because they hold no user
+objects. A listed schema that was not collected, or `$user` (which depends on the
+calling role), may hold a name, so a limitation names the unqualified names whose
+lookup passed such an entry. If the path lists no collected schema, unqualified
+names stay unresolved and are reported; they are not resolved in the routine's
+own schema. Bodies whose names are all schema-qualified are unaffected by the
+path. Without a declared path, unqualified names resolve in the routine's own
+schema as before.
+
 The remaining record fields are unchanged between versions. A schema has
 `name`, `objects`, and `routines`. Object, column, constraint, referenced,
 index, trigger, routine, and usage fields are the v1 internal document fields;

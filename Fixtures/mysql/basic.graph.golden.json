@@ -714,13 +714,13 @@
     }
   ],
   "limitations": [
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.a.a_b_fk\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.a.a_b_fk@index\ub85c \ubd84\ub9ac",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.b.b_a_fk\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.b.b_a_fk@index\ub85c \ubd84\ub9ac",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.loop_self.parent_id\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.loop_self.parent_id@index\ub85c \ubd84\ub9ac",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.order_items.order_id\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.order_items.order_id@index\ub85c \ubd84\ub9ac",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.order_items.product_id\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.order_items.product_id@index\ub85c \ubd84\ub9ac",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.products.sku\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 constraint \uc815\uc810\uc740 sgfix.products.sku@constraint\ub85c \ubd84\ub9ac",
-    "\uba64\ubc84 id \ucda9\ub3cc: sgfix.products.sku\ub294 \ub2e4\ub978 kind\uac00 \uba3c\uc800 \ucc28\uc9c0 \u2014 index \uc815\uc810\uc740 sgfix.products.sku@index\ub85c \ubd84\ub9ac"
+    "member id collision: sgfix.a.a_b_fk is already taken by another kind; the index vertex is split into sgfix.a.a_b_fk@index",
+    "member id collision: sgfix.b.b_a_fk is already taken by another kind; the index vertex is split into sgfix.b.b_a_fk@index",
+    "member id collision: sgfix.loop_self.parent_id is already taken by another kind; the index vertex is split into sgfix.loop_self.parent_id@index",
+    "member id collision: sgfix.order_items.order_id is already taken by another kind; the index vertex is split into sgfix.order_items.order_id@index",
+    "member id collision: sgfix.order_items.product_id is already taken by another kind; the index vertex is split into sgfix.order_items.product_id@index",
+    "member id collision: sgfix.products.sku is already taken by another kind; the constraint vertex is split into sgfix.products.sku@constraint",
+    "member id collision: sgfix.products.sku is already taken by another kind; the index vertex is split into sgfix.products.sku@index"
   ],
   "origins": [
     {

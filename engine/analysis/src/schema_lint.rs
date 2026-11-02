@@ -817,6 +817,7 @@ mod tests {
                     code: "SG_COLUMN_AMBIGUOUS".into(),
                     message: "ambiguous column".into(),
                     location: None,
+                    candidates: Vec::new(),
                 }],
                 source: None,
             },

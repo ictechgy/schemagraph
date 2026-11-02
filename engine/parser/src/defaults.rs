@@ -15,7 +15,7 @@ pub(super) fn enrich(
     graph: &mut Graph,
     document: &CatalogDocument,
     catalog: &scope::CatalogIndex<'_>,
-    dialect: Option<&dyn Dialect>,
+    dialect: &dyn Dialect,
     ci: bool,
     notes: &mut Vec<String>,
 ) {
@@ -34,12 +34,6 @@ pub(super) fn enrich(
                     "column",
                     catalog.lookup(ci),
                 ) else {
-                    continue;
-                };
-                let Some(dialect) = dialect else {
-                    notes.push(format!(
-                        "column {owner} DEFAULT: unsupported dialect; dependencies unavailable"
-                    ));
                     continue;
                 };
                 let expression = match parse_limits::parse_expression(dialect, default) {
@@ -91,7 +85,7 @@ pub(super) fn enrich(
                                     detail: format!("column {owner} DEFAULT depends on {target}") }],
                             });
                         }
-                        RoutineHit::Ambiguous(count) => notes.push(format!("column {owner} DEFAULT: {target_schema}.{name} has {count} overloads; dependency unresolved")),
+                        RoutineHit::Ambiguous(candidates) => notes.push(format!("column {owner} DEFAULT: {target_schema}.{name} has {} overloads; dependency unresolved", candidates.len())),
                         RoutineHit::None if sequence_builtin => {},
                         RoutineHit::None if parts.len() == 1 && parts[0].quote_style.is_none() && is_builtin_function(&name) => {},
                         _ => notes.push(format!("column {owner} DEFAULT: function {target_schema}.{name} unavailable in catalog; dependency unresolved")),

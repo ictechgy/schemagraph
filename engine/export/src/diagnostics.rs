@@ -39,6 +39,9 @@ impl From<&LocationDoc> for SourceLocation {
 /// 안정적인 진단 코드와 표시 메시지를 분리한다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticDoc {
+    /// 모호한 참조가 가리킬 수 있는 정점 id. 후보가 없는 진단은 키를 생략해 기존 출력과 같다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
     pub code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<LocationDoc>,
@@ -96,6 +99,11 @@ fn analysis_doc(id: &VertexId, a: &ObjectAnalysis) -> AnalysisDoc {
             .diagnostics
             .iter()
             .map(|d| DiagnosticDoc {
+                candidates: d
+                    .candidates
+                    .iter()
+                    .map(|id| id.as_str().to_owned())
+                    .collect(),
                 code: d.code.clone(),
                 location: d.location.as_ref().map(Into::into),
                 message: d.message.clone(),
@@ -152,6 +160,11 @@ pub(crate) fn restore(graph: &mut Graph, analyses: &[AnalysisDoc], origins: &[Or
                         code: d.code.clone(),
                         message: d.message.clone(),
                         location: d.location.as_ref().map(Into::into),
+                        candidates: d
+                            .candidates
+                            .iter()
+                            .map(|id| VertexId::from_raw(id))
+                            .collect(),
                     })
                     .collect(),
             },
@@ -244,6 +257,7 @@ mod tests {
                         end_line: 1,
                         end_column: 10,
                     }),
+                    candidates: Vec::new(),
                 }],
             },
         );
@@ -272,6 +286,77 @@ mod tests {
         let restored = crate::graph_from_doc(&doc);
         assert_eq!(graph.analysis(), restored.analysis());
         assert_eq!(graph.origins(), restored.origins());
+    }
+
+    #[test]
+    fn ambiguous_call_candidates_survive_graph_json_and_are_omitted_when_absent() {
+        let mut graph = Graph::new();
+        let ids = ["caller", "over(integer)", "over(text)"].map(|name| {
+            let id = VertexId::from_raw(&format!("s.{name}"));
+            graph.add_vertex(Vertex {
+                id: id.clone(),
+                kind: VertexKind::Function,
+                name: name.into(),
+                schema: "s".into(),
+            });
+            id
+        });
+        graph.set_analysis(
+            ids[0].clone(),
+            ObjectAnalysis {
+                source: None,
+                state: AnalysisState::Partial,
+                scope: "object-dependencies".into(),
+                body_hash: None,
+                diagnostics: vec![
+                    Diagnostic::new("SG_BODY_PARTIAL", "ambiguous overload", None)
+                        .with_candidates([ids[2].clone(), ids[1].clone()]),
+                    Diagnostic::new("SG_BODY_PARTIAL", "other note", None),
+                ],
+            },
+        );
+        let json = crate::to_pretty_json(&crate::graph_to_doc(&graph)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["analysis"][0]["diagnostics"],
+            serde_json::json!([
+                {"candidates": ["s.over(integer)", "s.over(text)"],
+                 "code": "SG_BODY_PARTIAL", "message": "ambiguous overload"},
+                {"code": "SG_BODY_PARTIAL", "message": "other note"}
+            ])
+        );
+        let doc: crate::GraphDoc = serde_json::from_str(&json).unwrap();
+        assert_eq!(crate::graph_from_doc(&doc).analysis(), graph.analysis());
+    }
+
+    #[test]
+    fn restored_candidates_that_name_no_vertex_are_dropped_and_counted() {
+        let mut graph = Graph::new();
+        for name in ["caller", "over(integer)"] {
+            graph.add_vertex(Vertex {
+                id: VertexId::from_raw(&format!("s.{name}")),
+                kind: VertexKind::Function,
+                name: name.into(),
+                schema: "s".into(),
+            });
+        }
+        let json = crate::to_pretty_json(&crate::graph_to_doc(&graph)).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // 다른 그래프에서 옮겨 붙였거나 손으로 고친 graph.json: 없는 정점과 중복을 가리킨다.
+        value["analysis"] = serde_json::json!([{
+            "id": "s.caller", "scope": "object-dependencies", "state": "partial",
+            "diagnostics": [{"code": "SG_BODY_PARTIAL", "message": "ambiguous",
+                "candidates": ["s.over(text)", "s.over(integer)", "s.over(integer)"]}]
+        }]);
+        let doc: crate::GraphDoc = serde_json::from_value(value).unwrap();
+        let restored = crate::graph_from_doc(&doc);
+        let caller = &restored.analysis()[&VertexId::from_raw("s.caller")];
+        assert_eq!(
+            caller.diagnostics[0].candidates,
+            [VertexId::from_raw("s.over(integer)")]
+        );
+        assert!(restored.limitations().iter().any(|note| note
+            == "analysis s.caller: dropped 1 diagnostic candidate(s) that are not graph vertices"));
     }
 
     /// 세 분석 상태를 하나씩 가진 그래프 — 상한 변형이 요약을 전체 기준으로 두는지 본다.

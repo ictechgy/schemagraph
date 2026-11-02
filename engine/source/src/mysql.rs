@@ -37,7 +37,7 @@ const READ_ONLY_STATEMENTS: [&str; 2] = [
 /// `mysql://…` URL로 접속해 카탈로그를 읽는다.
 pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
     let options = MySqlConnectOptions::from_str(url)
-        .map_err(|e| SourceError::Connect(format!("mysql URL 해석 실패: {e}")))?;
+        .map_err(|e| SourceError::Connect(format!("mysql URL could not be parsed: {e}")))?;
 
     // URL에 데이터베이스가 있으면 그것만 — 없으면 사용자 스키마 전부.
     let scope_db = options.get_database().map(|d| d.to_owned());
@@ -47,7 +47,7 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
     let read_only_cause = Arc::new(OnceLock::<String>::new());
     let (pool, transport) = connect(&options, &read_only_cause)
         .await
-        .map_err(|e| SourceError::Connect(format!("mysql 접속 실패: {e}")))?;
+        .map_err(|e| SourceError::Connect(format!("mysql connection failed: {e}")))?;
 
     let mut doc = CatalogDocument {
         context: None,
@@ -217,7 +217,7 @@ async fn read_schema(
     }
     if expr_index_cols > 0 {
         limitations.push(format!(
-            "{schema}: 식(functional) 인덱스 컬럼 {expr_index_cols}개는 이름이 없어 생략됨"
+            "{schema}: omitted {expr_index_cols} functional index columns because they have no names"
         ));
     }
     let mut routines = read_routines(pool, schema, limitations).await?;
@@ -248,7 +248,7 @@ async fn attach_usage(
         .ok();
     if matches!(pfs.as_deref(), Some("0") | Some("OFF")) {
         limitations
-            .push("performance_schema=OFF — usage 미수집(통계 비활성, MariaDB 기본값)".to_owned());
+            .push("performance_schema=OFF — usage unavailable because statistics are disabled (MariaDB default)".to_owned());
         return;
     }
 
@@ -289,7 +289,7 @@ async fn attach_usage(
             }
         }
         Err(e) => limitations.push(format!(
-            "{schema}: sys.schema_table_statistics 미수확 — usage 증거 없음: {e}"
+            "{schema}: sys.schema_table_statistics unavailable; no usage evidence — {e}"
         )),
     }
 
@@ -323,7 +323,7 @@ async fn attach_usage(
             }
         }
         Err(e) => limitations.push(format!(
-            "{schema}: sys.schema_unused_indexes 미수확 — index usage 증거 없음: {e}"
+            "{schema}: sys.schema_unused_indexes unavailable; no index usage evidence — {e}"
         )),
     }
 }
@@ -624,7 +624,7 @@ async fn read_routines(
         // 숨기지 않고 limitation으로 보고한다.
         if !seen_ids.insert(id_name) {
             limitations.push(format!(
-                "{schema}.{name}: function과 procedure의 정점 id가 충돌해 한 정점으로 합쳐짐"
+                "{schema}.{name}: function and procedure share a vertex id and will be merged"
             ));
         }
         routines.push(RoutineDoc {
@@ -647,7 +647,7 @@ async fn read_routines(
     }
     if null_bodies > 0 {
         limitations.push(format!(
-            "{schema}: routine 몸체 {null_bodies}개를 읽지 못함(ROUTINE_DEFINITION NULL — 권한 확인)"
+            "{schema}: {null_bodies} routine bodies were unavailable (ROUTINE_DEFINITION is NULL; check permissions)"
         ));
     }
     Ok(routines)

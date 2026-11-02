@@ -7,7 +7,7 @@
 //! 뷰는 스키마·스코프별로 컬럼을 해석하고, 절차형 몸체는 지원하는 SQL 문장을
 //! 추출한다. 값의 계보와 조건절의 읽기 의존성을 구분하고 미해석은 진단한다.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
@@ -67,8 +67,10 @@ pub fn enrich_with_cache(
     let mut unavailable = 0usize;
     let mut notes: Vec<String> = Vec::new();
 
+    notes.extend(unrecognized_dialect_note(doc));
+
     // 컬럼 기본값은 routine/view 몸체 캐시의 소유가 아니다. 현재 카탈로그에서 매번 읽는다.
-    defaults::enrich(g, doc, &catalog_index, dialect.as_deref(), ci, &mut notes);
+    defaults::enrich(g, doc, &catalog_index, dialect.as_ref(), ci, &mut notes);
 
     for schema in &doc.schemas {
         for obj in &schema.objects {
@@ -109,7 +111,7 @@ pub fn enrich_with_cache(
                             &schema.name,
                             obj,
                             &owner,
-                            dialect.as_deref(),
+                            dialect.as_ref(),
                         ));
                         enriched += usize::from(obj.body.is_some());
                         cache::save(
@@ -141,7 +143,7 @@ pub fn enrich_with_cache(
                     catalog_index.lookup(ci),
                 ) else {
                     notes.push(format!(
-                        "trigger {}.{}.{}: 정점을 못 찾음(이름 충돌?) — 몸체 간선 생략",
+                        "trigger {}.{}.{}: vertex not found (name collision?); body edges omitted",
                         schema.name, obj.name, trg.name
                     ));
                     continue;
@@ -178,10 +180,10 @@ pub fn enrich_with_cache(
                 let mut state = schemagraph_core::AnalysisState::Complete;
                 let mut record_body_diagnostics = Vec::new();
                 let parsed_body = match doc.dialect.as_str() {
-                    "db2" => parse_db2_trigger_body(dialect.as_deref(), body),
-                    "informix" => parse_informix_trigger_body(dialect.as_deref(), body),
+                    "db2" => parse_db2_trigger_body(dialect.as_ref(), body),
+                    "informix" => parse_informix_trigger_body(dialect.as_ref(), body),
                     _ => parse_trigger_body(
-                        dialect.as_deref(),
+                        dialect.as_ref(),
                         body,
                         doc.dialect == "sqlserver" || doc.dialect == "mssql",
                         doc.dialect == "sqlite",
@@ -198,6 +200,7 @@ pub fn enrich_with_cache(
                                 body_hash: scope::body_hash(body),
                                 sqlserver_trigger: doc.dialect == "sqlserver"
                                     || doc.dialect == "mssql",
+                                search_path: None,
                             },
                             &obj.name,
                             &trigger_id,
@@ -257,7 +260,7 @@ pub fn enrich_with_cache(
             );
             let Some(owner) = owner else {
                 notes.push(format!(
-                    "routine {}.{}: 정점을 못 찾음 — 몸체 간선 생략",
+                    "routine {}.{}: vertex not found; body edges omitted",
                     schema.name, routine.name
                 ));
                 continue;
@@ -295,7 +298,7 @@ pub fn enrich_with_cache(
             }
             let note_start = notes.len();
             let enriched_start = enriched;
-            if routine.kind == "query" && scope::is_select(dialect.as_deref(), body) {
+            if routine.kind == "query" && scope::is_select(dialect.as_ref(), body) {
                 let object = ObjectDoc {
                     name: routine.name.clone(),
                     kind: "query".into(),
@@ -312,7 +315,7 @@ pub fn enrich_with_cache(
                     &schema.name,
                     &object,
                     &owner,
-                    dialect.as_deref(),
+                    dialect.as_ref(),
                 ));
                 enriched += 1;
                 cache::save(
@@ -329,6 +332,11 @@ pub fn enrich_with_cache(
                 );
                 continue;
             }
+            // 정의문이 선언한 search_path 순서로 한 부분 이름을 찾는다. 경로의 불확실한 항목에
+            // 실제로 기댄 이름은 해석을 마친 뒤 note로 남긴다.
+            let search_path = routine_search_path(&doc.dialect, body, |name| {
+                doc.schemas.iter().any(|schema| schema.name == name)
+            });
             let mut state = schemagraph_core::AnalysisState::Complete;
             let mut record_body_diagnostics = Vec::new();
             (|| {
@@ -344,6 +352,7 @@ pub fn enrich_with_cache(
                             ci,
                             body_hash: scope::body_hash(body),
                             sqlserver_trigger: false,
+                            search_path: search_path.as_ref(),
                         },
                         &owner,
                         &mut parsed,
@@ -373,7 +382,7 @@ pub fn enrich_with_cache(
                 match routine.language.as_deref() {
                     // SQL 언어 함수는 몸체가 그대로 SQL이라 파싱 가능 — 나머지
                     // 언어는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
-                    Some("sql") | None => match parse_routine_body(dialect.as_deref(), body) {
+                    Some("sql") | None => match parse_routine_body(dialect.as_ref(), body) {
                         Ok(mut parsed) => {
                             let partial = apply_routine(
                                 g,
@@ -383,6 +392,7 @@ pub fn enrich_with_cache(
                                     ci,
                                     body_hash: scope::body_hash(body),
                                     sqlserver_trigger: false,
+                                    search_path: search_path.as_ref(),
                                 },
                                 &owner,
                                 &mut parsed,
@@ -400,7 +410,7 @@ pub fn enrich_with_cache(
                             // 거부한다. 문장 추출로 부분 복구해 파싱된 문장의
                             // 간선만 취하고, 미추출은 limitation으로 센다.
                             let (mut parsed, unextracted) = parse_procedural_body(
-                                dialect.as_deref(),
+                                dialect.as_ref(),
                                 body,
                                 constant_sql::dialect(&doc.dialect),
                                 format_shadowed,
@@ -415,6 +425,7 @@ pub fn enrich_with_cache(
                                             ci,
                                             body_hash: scope::body_hash(body),
                                             sqlserver_trigger: false,
+                                            search_path: search_path.as_ref(),
                                         },
                                         &owner,
                                         &mut parsed,
@@ -428,8 +439,8 @@ pub fn enrich_with_cache(
                                 // 미추출 0건은 완전 복구 — 한계가 아니므로 조용히 둔다.
                                 if unextracted > 0 {
                                     notes.push(format!(
-                                        "routine {owner}: 몸체 문장 {unextracted}건 미추출\
-                                     (절차형 구문) — 몸체 간선 불완전 ({msg})"
+                                        "routine {owner}: {unextracted} body statement(s) not extracted \
+                                     (procedural syntax); body edges incomplete ({msg})"
                                     ));
                                 }
                                 enriched += 1;
@@ -443,7 +454,7 @@ pub fn enrich_with_cache(
                     // 꺼내지 못한 문장(동적 SQL 등)은 수를 세어 limitation으로 남긴다.
                     Some("plpgsql" | "plsql" | "pl/sql") => {
                         let (mut parsed, unextracted) = parse_procedural_body(
-                            dialect.as_deref(),
+                            dialect.as_ref(),
                             body,
                             constant_sql::dialect(&doc.dialect),
                             format_shadowed,
@@ -456,6 +467,7 @@ pub fn enrich_with_cache(
                                 ci,
                                 body_hash: scope::body_hash(body),
                                 sqlserver_trigger: false,
+                                search_path: search_path.as_ref(),
                             },
                             &owner,
                             &mut parsed,
@@ -470,14 +482,14 @@ pub fn enrich_with_cache(
                         // 멤버 몸체가 통째로 실린 옛 형식이라는 뜻이라 그때만 알린다.
                         if routine.kind == "package" && parsed.has_edges() {
                             notes.push(format!(
-                                "routine {owner}: 패키지 몸체 간선은 패키지 정점에 귀속 \
-                             — 멤버 구분은 문서의 member_of를 쓴다"
+                                "routine {owner}: package body edges are attributed to the package vertex; \
+                             use member_of in the document to separate members"
                             ));
                         }
                         if unextracted > 0 {
                             notes.push(format!(
-                                "routine {owner}: 몸체 문장 {unextracted}건 미추출\
-                             (동적 SQL·비SQL 구문) — 몸체 간선 불완전"
+                                "routine {owner}: {unextracted} body statement(s) not extracted \
+                             (dynamic SQL or non-SQL syntax); body edges incomplete"
                             ));
                         }
                         enriched += 1;
@@ -488,6 +500,9 @@ pub fn enrich_with_cache(
                     }
                 }
             })();
+            if let Some(path) = &search_path {
+                notes.extend(path.notes(&owner));
+            }
             record_body(
                 g,
                 &owner,
@@ -581,11 +596,18 @@ fn record_body(
         }
     }
     let mut diagnostics: Vec<Diagnostic> = structured_diagnostics.to_vec();
-    diagnostics.extend(notes.iter().map(|message| Diagnostic {
-        code: code.into(),
-        message: message.clone(),
-        location: None,
-    }));
+    // 구조화 진단이 이미 같은 문구를 싣고 있으면(후보를 실은 모호 호출 등) note로
+    // 같은 진단을 한 번 더 만들지 않는다.
+    let structured: BTreeSet<&str> = structured_diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    diagnostics.extend(
+        notes
+            .iter()
+            .filter(|message| !structured.contains(message.as_str()))
+            .map(|message| Diagnostic::new(code, message.clone(), None)),
+    );
     g.set_analysis(
         owner.clone(),
         ObjectAnalysis {
@@ -658,7 +680,7 @@ pub fn enrich_inferred(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<Stri
                             evidence: vec![Evidence {
                                 layer: EvidenceLayer::Inferred,
                                 detail: format!(
-                                    "{}.{}.{} ~ {to}.id 이름 규칙 추정(선언된 FK 없음)",
+                                    "{}.{}.{} ~ {to}.id name-rule guess (no declared FK)",
                                     schema.name, obj.name, col.name
                                 ),
                             }],
@@ -673,23 +695,83 @@ pub fn enrich_inferred(g: &mut Graph, doc: &CatalogDocument) -> (usize, Vec<Stri
     }
     if ambiguous > 0 {
         notes.push(format!(
-            "inferred: 컬럼 {ambiguous}건이 후보 테이블 모호로 생략됨"
+            "inferred: {ambiguous} column(s) skipped because the candidate table is ambiguous"
         ));
     }
     (made, notes)
 }
 
 /// doc.dialect 문자열 → sqlparser 방언. 모르는 방언은 Generic으로 돌린다 —
-/// 파싱을 아예 포기하는 것보다 Generic이 낫다(못 읽으면 실패로 센다).
-fn dialect_for(dialect: &str) -> Option<Box<dyn Dialect>> {
-    Some(match dialect {
+/// 파싱을 아예 포기하는 것보다 Generic이 낫다(못 읽으면 실패로 센다). 모르는 이름인지는
+/// [`recognized_dialect`]가 따로 판정해 limitation으로 알린다.
+fn dialect_for(dialect: &str) -> Box<dyn Dialect> {
+    match dialect {
         "sqlite" => Box::new(SQLiteDialect {}),
-        "postgres" => Box::new(PostgreSqlDialect {}),
-        "mysql" => Box::new(MySqlDialect {}),
+        // 이름 정규화(scope)·상수 SQL이 같은 방언으로 보는 별칭도 같은 파서로 읽는다.
+        // JDBC 프로브는 jdbc:mariadb: URL을 "mariadb"로 싣는다.
+        "postgres" | "postgresql" => Box::new(PostgreSqlDialect {}),
+        "mysql" | "mariadb" => Box::new(MySqlDialect {}),
         // MsSqlDialect는 [bracket] 식별자·TOP 같은 T-SQL 표면을 이해한다 —
         // Generic으로 파싱하면 문장째 실패하던 것이 풀린다.
         "sqlserver" | "mssql" => Box::new(MsSqlDialect {}),
         _ => Box::new(GenericDialect {}),
+    }
+}
+
+/// sqlparser에 전용 방언이 없어 일부러 Generic으로 읽는 이름. 엔진이 이 이름들로
+/// 이름 접기·몸체 추출을 따로 분기하므로 "모르는 방언"이 아니다. `external`은
+/// 방언을 모르는 애플리케이션 SQL 문서(`--sql-dir`·import)의 이름이다.
+const GENERIC_DIALECTS: [&str; 5] = ["oracle", "db2", "informix", "h2", "external"];
+
+/// 엔진이 이름을 아는 방언인가 — 전용 파서가 있거나 의도적으로 Generic을 쓰는 이름.
+fn recognized_dialect(dialect: &str) -> bool {
+    matches!(
+        dialect,
+        "sqlite" | "postgres" | "postgresql" | "mysql" | "mariadb" | "sqlserver" | "mssql"
+    ) || GENERIC_DIALECTS.contains(&dialect)
+}
+
+/// 모르는 방언 이름이면, 그 문서에서 Generic으로 읽게 될 SQL 원문 수를 세어 알린다.
+/// 읽을 SQL이 없으면 방언이 결과를 바꾸지 않으므로 조용히 둔다.
+fn unrecognized_dialect_note(doc: &CatalogDocument) -> Option<String> {
+    if recognized_dialect(&doc.dialect) {
+        return None;
+    }
+    let present = |text: Option<&String>| text.is_some_and(|text| !text.trim().is_empty());
+    let texts: usize = doc
+        .schemas
+        .iter()
+        .map(|schema| {
+            let objects: usize = schema
+                .objects
+                .iter()
+                .map(|object| {
+                    usize::from(present(object.body.as_ref()))
+                        + object
+                            .triggers
+                            .iter()
+                            .filter(|trigger| present(trigger.body.as_ref()))
+                            .count()
+                        + object
+                            .columns
+                            .iter()
+                            .filter(|column| present(column.default.as_ref()))
+                            .count()
+                })
+                .sum();
+            objects
+                + schema
+                    .routines
+                    .iter()
+                    .filter(|routine| present(routine.body.as_ref()))
+                    .count()
+        })
+        .sum();
+    (texts > 0).then(|| {
+        format!(
+            "dialect '{}' is not recognized; generic SQL parsing used for {texts} body/default text(s)",
+            doc.dialect
+        )
     })
 }
 
@@ -823,13 +905,11 @@ fn statement_hash(statement: &Statement) -> u64 {
 /// 벗기고 안쪽 문장만 파서에 넘긴다. 껍질이 없는 몸체(reader가 내부
 /// 문장만 저장한 경우)는 통째로 파싱한다.
 fn parse_trigger_body(
-    dialect: Option<&dyn Dialect>,
+    dialect: &dyn Dialect,
     body: &str,
     sqlserver_trigger: bool,
     sqlite_trigger: bool,
 ) -> Result<ParsedTrigger, String> {
-    let default = GenericDialect {};
-    let dialect = dialect.unwrap_or(&default);
     let calls = extract_execute_targets(body);
     let inner = extract_trigger_inner(body).unwrap_or(body);
     let locations_trusted =
@@ -875,7 +955,7 @@ fn parse_trigger_body(
         // EXECUTE FUNCTION 꼴 trigger는 본문 자체는 못 파지만 호출 대상은
         // 채취됐다 — 문장 파싱 실패를 호출 간선 포기 이유로 쓰지 않는다.
         _ if !parsed.calls.is_empty() => Ok(parsed),
-        Ok(_) => Err("본문에서 문장을 찾지 못함".to_owned()),
+        Ok(_) => Err("no statement found in the body".to_owned()),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -895,7 +975,7 @@ fn needs_procedural_recovery(body: &str) -> bool {
 
 /// routine 몸체 파싱 — CREATE FUNCTION 전문이 들어오면 AS 뒤의 몸체만
 /// 꺼내고, 나머지는 trigger와 같은 문장 수집 골격으로 파싱한다.
-fn parse_routine_body(dialect: Option<&dyn Dialect>, body: &str) -> Result<ParsedTrigger, String> {
+fn parse_routine_body(dialect: &dyn Dialect, body: &str) -> Result<ParsedTrigger, String> {
     let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
     let transformed =
         inner.as_ref().len() != body.len() || !std::ptr::eq(inner.as_ref().as_ptr(), body.as_ptr());
@@ -918,7 +998,7 @@ fn parse_catalog_routine_body(dialect_name: &str, body: &str) -> (ParsedTrigger,
     };
     let dialect = dialect_for(dialect_name);
     parse_procedural_body(
-        dialect.as_deref(),
+        dialect.as_ref(),
         inner,
         constant_sql::dialect(dialect_name),
         false,
@@ -1065,10 +1145,7 @@ fn find_top_level_semicolon(text: &str) -> Option<usize> {
     None
 }
 
-fn parse_informix_trigger_body(
-    dialect: Option<&dyn Dialect>,
-    body: &str,
-) -> Result<ParsedTrigger, String> {
+fn parse_informix_trigger_body(dialect: &dyn Dialect, body: &str) -> Result<ParsedTrigger, String> {
     let inner = strip_catalog_trigger_header("informix", body)
         .and_then(strip_outer_parentheses)
         .or_else(|| strip_catalog_trigger_header("informix", body))
@@ -1131,10 +1208,7 @@ fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#' | b'.') || byte >= 128
 }
 
-fn parse_db2_trigger_body(
-    dialect: Option<&dyn Dialect>,
-    body: &str,
-) -> Result<ParsedTrigger, String> {
+fn parse_db2_trigger_body(dialect: &dyn Dialect, body: &str) -> Result<ParsedTrigger, String> {
     let inner = strip_catalog_trigger_header("db2", body).unwrap_or(body);
     parse_trigger_body(dialect, inner, false, false)
 }
@@ -1200,19 +1274,313 @@ fn strip_outer_parentheses(text: &str) -> Option<&str> {
 /// pg_get_functiondef·SHOW CREATE FUNCTION류 정의문은 몸체를 AS 뒤에
 /// 문자열로 담으므로, 그 껍질을 벗겨야 SQL 문장이 나온다.
 fn extract_as_body(body: &str) -> Option<std::borrow::Cow<'_, str>> {
+    as_body(body).map(|(_, inner)| inner)
+}
+
+/// 몸체를 감싼 `AS` 키워드의 위치와 그 안쪽 몸체. 정의문 머리는 그 앞까지다.
+fn as_body(body: &str) -> Option<(usize, std::borrow::Cow<'_, str>)> {
     for i in find_all_keywords(body, "AS") {
         let rest = body[i + "AS".len()..].trim_start();
         if rest.starts_with('\'') {
             if let Some(inner) = unquote_sql_string(rest) {
-                return Some(inner);
+                return Some((i, inner));
             }
         } else if rest.starts_with('$') {
             if let Some(inner) = undollar_quote(rest) {
-                return Some(inner);
+                return Some((i, inner));
             }
         }
     }
     None
+}
+
+/// PostgreSQL routine 정의문이 선언한 `SET search_path`.
+///
+/// pg_get_functiondef는 proconfig를 ` SET search_path TO 'app', 'public'` 줄로 싣고, 손으로 쓴
+/// 정의문은 `SET search_path = app, "Public"`처럼 쓴다. 한 부분 이름의 해석 순서만 바꾼다.
+/// 수집하지 않은 스키마와 호출 role에 따른 `$user`는 순서 안 자리를 지켜 두고, 이름이 실제로
+/// 그 자리를 지나 해석됐을 때만 알린다 — 스키마를 모두 적은 몸체는 경로의 영향을 받지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchPath {
+    /// 선언 순서의 항목. pg_catalog·pg_temp는 사용자 객체를 담지 않아 뺀다.
+    entries: Vec<PathEntry>,
+    /// 수집하지 않은 항목을 지나(또는 그곳에 있을 수 있는 채로) 해석한 한 부분 이름.
+    uncertain: RefCell<BTreeSet<String>>,
+    /// 경로에 수집한 스키마가 없어 해석하지 않은 한 부분 이름.
+    unresolved: RefCell<BTreeSet<String>>,
+}
+
+/// search_path 항목 하나.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathEntry {
+    /// 문서에 있는 스키마.
+    Collected(String),
+    /// 문서에 없는 스키마나 `$user` — 그곳의 같은 이름이 뒤 스키마를 가릴 수 있다.
+    Outside(String),
+}
+
+impl SearchPath {
+    /// 수집한 스키마를 경로 순서로 돌려준다.
+    fn collected(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().filter_map(|entry| match entry {
+            PathEntry::Collected(schema) => Some(schema.as_str()),
+            PathEntry::Outside(_) => None,
+        })
+    }
+
+    /// 한 부분 관계 이름의 스키마. 이름을 담은 첫 수집 스키마이고, 어느 수집 스키마에도
+    /// 없으면 첫 수집 스키마의 누락이다 — PostgreSQL도 경로 밖 스키마를 보지 않는다. 경로에
+    /// 수집한 스키마가 없으면 None이다(routine 스키마로 대신 잇지 않는다).
+    pub(crate) fn relation_schema(&self, name: &str, holds: impl Fn(&str) -> bool) -> Option<&str> {
+        let mut passed_outside = false;
+        for entry in &self.entries {
+            match entry {
+                PathEntry::Collected(schema) if holds(schema) => {
+                    if passed_outside {
+                        self.uncertain.borrow_mut().insert(name.to_owned());
+                    }
+                    return Some(schema);
+                }
+                PathEntry::Collected(_) => {}
+                PathEntry::Outside(_) => passed_outside = true,
+            }
+        }
+        self.missing(name)
+    }
+
+    /// 어느 수집 스키마도 담지 않은 이름. 수집하지 않은 항목이 있으면 그곳에 있을 수 있다.
+    fn missing(&self, name: &str) -> Option<&str> {
+        let first = self.collected().next();
+        if first.is_none() {
+            self.unresolved.borrow_mut().insert(name.to_owned());
+        } else if self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, PathEntry::Outside(_)))
+        {
+            self.uncertain.borrow_mut().insert(name.to_owned());
+        }
+        first
+    }
+
+    /// 한 부분 routine 이름의 후보. PostgreSQL처럼 경로의 모든 수집 스키마에서 같은 이름을
+    /// 모으고, 앞 스키마와 인자 목록이 같은 뒤 스키마의 routine만 가린다. 인자 목록은 정점
+    /// id의 시그니처 문자열로 비교해, 표기가 다르면 둘 다 후보로 남긴다(하나로 추측하지 않음).
+    /// 경로에 수집한 스키마가 없으면 None이다.
+    fn routine_hit(&self, g: &Graph, name: &str, lookup: Lookup<'_>) -> Option<RoutineHit> {
+        let routines = &lookup.index.routines(g, lookup.ci).routines;
+        let mut signatures = BTreeSet::new();
+        let mut candidates = Vec::new();
+        for schema in self.collected() {
+            let prefix = format!("{}.", VertexId::schema(schema).as_str());
+            for id in routines
+                .get(&(lookup.key(schema), lookup.key(name)))
+                .into_iter()
+                .flatten()
+            {
+                let signature = id.as_str().strip_prefix(&prefix).unwrap_or(id.as_str());
+                if signatures.insert(signature.to_owned()) {
+                    candidates.push(id.clone());
+                }
+            }
+        }
+        // 함수 해석은 경로 전체를 보므로 수집하지 않은 항목은 어디에 있든 후보를 바꿀 수 있다.
+        if candidates.is_empty() {
+            self.missing(name)?;
+        } else if self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, PathEntry::Outside(_)))
+        {
+            self.uncertain.borrow_mut().insert(name.to_owned());
+        }
+        Some(routine_hit(Some(&candidates)))
+    }
+
+    /// 메시지에 쓰는 수집 스키마 목록.
+    fn label(&self) -> String {
+        self.collected().collect::<Vec<_>>().join(", ")
+    }
+
+    /// 해석이 실제로 경로의 불확실한 항목에 기댄 이름만 note로 만든다.
+    fn notes(&self, owner: &VertexId) -> Vec<String> {
+        let mut notes = Vec::new();
+        let join = |names: &BTreeSet<String>| names.iter().cloned().collect::<Vec<_>>().join(", ");
+        let unresolved = self.unresolved.borrow();
+        if !unresolved.is_empty() {
+            notes.push(format!(
+                "routine {owner}: search_path names no collected schema; \
+                 unqualified names {} were not resolved",
+                join(&unresolved)
+            ));
+        }
+        let uncertain = self.uncertain.borrow();
+        if !uncertain.is_empty() {
+            let outside: Vec<&str> = self
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    PathEntry::Outside(name) => Some(name.as_str()),
+                    PathEntry::Collected(_) => None,
+                })
+                .collect();
+            notes.push(format!(
+                "routine {owner}: search_path entries outside the collection ({}) \
+                 may hold unqualified names {}",
+                outside.join(", "),
+                join(&uncertain)
+            ));
+        }
+        notes
+    }
+}
+
+/// 정의문의 마지막 `SET search_path` 선언을 읽는다. AS 몸체 앞의 머리와, 손으로 쓴 정의문이
+/// SET 절을 둘 수 있는 몸체 뒤를 본다. 정의문이 아니거나(몸체 원문만 실린 문서) 선언이
+/// 없거나 값을 알 수 없으면(`FROM CURRENT`·`DEFAULT`) None이다. `collected`는 문서에 있는
+/// 스키마인지 답한다.
+fn routine_search_path(
+    dialect: &str,
+    body: &str,
+    collected: impl Fn(&str) -> bool,
+) -> Option<SearchPath> {
+    if !matches!(dialect, "postgres" | "postgresql") {
+        return None;
+    }
+    let (start, end) = as_body_span(body)?;
+    if !starts_with_keyword(skip_ws_comments(&body[..start]), "CREATE") {
+        return None;
+    }
+    let mut declared = None;
+    for clauses in [&body[..start], &body[end..]] {
+        for set in find_all_keywords(clauses, "SET") {
+            let rest = clauses[set + "SET".len()..].trim_start();
+            if !starts_with_keyword(rest, "search_path") {
+                continue;
+            }
+            let rest = rest["search_path".len()..].trim_start();
+            let value = if let Some(value) = rest.strip_prefix('=') {
+                value
+            } else if starts_with_keyword(rest, "TO") {
+                &rest["TO".len()..]
+            } else {
+                continue;
+            };
+            declared = parse_search_path_value(value, &collected);
+        }
+    }
+    declared
+}
+
+/// 몸체를 감싼 `AS` 키워드의 위치와, 닫는 따옴표 바로 뒤의 위치.
+fn as_body_span(body: &str) -> Option<(usize, usize)> {
+    for i in find_all_keywords(body, "AS") {
+        let after = i + "AS".len();
+        let rest = body[after..].trim_start();
+        let offset = body.len() - rest.len();
+        let end = if rest.starts_with('\'') {
+            quoted_literal_end(rest)
+        } else if rest.starts_with('$') {
+            as_dollar_body_end(rest)
+        } else {
+            None
+        };
+        if let Some(end) = end {
+            return Some((i, offset + end));
+        }
+    }
+    None
+}
+
+/// `'...'` 리터럴이 끝나는 바이트 위치('' 이스케이프 포함).
+fn quoted_literal_end(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut j = 1;
+    while j < bytes.len() {
+        if bytes[j] == b'\'' {
+            if bytes.get(j + 1) == Some(&b'\'') {
+                j += 2;
+                continue;
+            }
+            return Some(j + 1);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// `$tag$...$tag$`가 끝나는 바이트 위치. `undollar_quote`와 같은 태그 규칙이라 같은 몸체를 가리킨다.
+fn as_dollar_body_end(rest: &str) -> Option<usize> {
+    let tag_end = rest[1..].find('$').map(|k| k + 1)?;
+    let tag = &rest[..=tag_end];
+    let close = rest[tag.len()..].find(tag)? + tag.len();
+    Some(close + tag.len())
+}
+
+/// `'a', "B", c` 꼴 값 목록을 읽는다. 문자열·큰따옴표 이름은 그대로, 따옴표 없는 이름은
+/// PostgreSQL처럼 소문자로 접는다. 목록은 쉼표가 끊기는 곳(다음 절)에서 끝난다.
+fn parse_search_path_value(value: &str, collected: &impl Fn(&str) -> bool) -> Option<SearchPath> {
+    let mut entries = Vec::new();
+    let mut rest = value.trim_start();
+    if starts_with_keyword(rest, "FROM") || starts_with_keyword(rest, "DEFAULT") {
+        return None;
+    }
+    loop {
+        let (name, after) = search_path_entry(rest)?;
+        let entry = match name.as_str() {
+            // 빈 이름(`SET search_path TO ''`)과 수집하지 않는 시스템 스키마는 사용자 객체를
+            // 담지 않는다. pg_temp_N도 세션 임시 스키마다.
+            "" | "pg_catalog" => None,
+            temp if temp == "pg_temp" || temp.starts_with("pg_temp_") => None,
+            schema if schema != "$user" && collected(schema) => {
+                Some(PathEntry::Collected(name.clone()))
+            }
+            _ => Some(PathEntry::Outside(name.clone())),
+        };
+        if let Some(entry) = entry.filter(|entry| !entries.contains(entry)) {
+            entries.push(entry);
+        }
+        rest = after.trim_start();
+        match rest.strip_prefix(',') {
+            Some(next) => rest = next.trim_start(),
+            None => {
+                return Some(SearchPath {
+                    entries,
+                    uncertain: RefCell::default(),
+                    unresolved: RefCell::default(),
+                })
+            }
+        }
+    }
+}
+
+/// 목록 항목 하나와 그 뒤 나머지. 알 수 없는 모양이면 None으로 선언 전체를 무시한다.
+fn search_path_entry(rest: &str) -> Option<(String, &str)> {
+    let quote = rest.chars().next()?;
+    if quote == '\'' || quote == '"' {
+        let bytes = rest.as_bytes();
+        let mut name = String::new();
+        let mut i = 1;
+        let mut run = 1;
+        while i < bytes.len() {
+            if bytes[i] == quote as u8 {
+                name.push_str(&rest[run..i]);
+                if bytes.get(i + 1) == Some(&(quote as u8)) {
+                    name.push(quote);
+                    i += 2;
+                    run = i;
+                    continue;
+                }
+                return Some((name, &rest[i + 1..]));
+            }
+            i += 1;
+        }
+        return None;
+    }
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| (rest[..end].to_lowercase(), &rest[end..]))
 }
 
 /// '...' 리터럴의 내용 — '' 이스케이프는 따옴표 하나로 되돌린다.
@@ -1538,7 +1906,7 @@ impl ExtractionState {
 /// 한 문장이 이상해도 나머지가 살도록 개별 파싱하고, 실패는 미추출 수에
 /// 합산한다. 반환의 usize는 추출·파싱에 실패한 문장 수다.
 fn parse_procedural_body(
-    dialect: Option<&dyn Dialect>,
+    dialect: &dyn Dialect,
     body: &str,
     text_dialect: constant_sql::TextDialect,
     format_shadowed: bool,
@@ -1554,8 +1922,6 @@ fn parse_procedural_body(
         .extend(routine_parameter_symbols(body));
     let (stmts, mut unextracted) =
         extract_procedural_statements(&inner, &mut state, starts_in_declare);
-    let default = GenericDialect {};
-    let dialect = dialect.unwrap_or(&default);
     let mut parsed = ParsedTrigger {
         writes: Vec::new(),
         reads: Vec::new(),
@@ -1582,6 +1948,7 @@ fn parse_procedural_body(
                 "{reason}; dynamic SQL after the limit was not folded from variable values"
             ),
             location: None,
+            candidates: Vec::new(),
         });
     }
     for stmt in &stmts {
@@ -1609,6 +1976,7 @@ fn parse_procedural_body(
             code: "SG_DML_CONTROL_FLOW".into(),
             message: "DML extracted from a control-flow body is analyzed conservatively".into(),
             location: None,
+            candidates: Vec::new(),
         });
     }
     invalidate_temp_state_if_unsafe(&mut parsed, body, unextracted);
@@ -1634,6 +2002,7 @@ fn invalidate_temp_state_if_unsafe(parsed: &mut ParsedTrigger, body: &str, unext
         code: "SG_DML_TEMP_STATE".into(),
         message: "temporary relation state crosses dynamic, dropped, or unextracted SQL; local lineage omitted".into(),
         location: None,
+        candidates: Vec::new(),
     });
 }
 
@@ -3114,6 +3483,7 @@ fn collect_trigger_facts(
             message: "DML inside conditional or loop control flow is analyzed conservatively"
                 .into(),
             location: None,
+            candidates: Vec::new(),
         });
     }
     // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
@@ -3539,11 +3909,12 @@ fn table_factor_name(factor: &TableFactor) -> Option<(Option<String>, String)> {
 }
 
 /// routine 이름 해석 결과 — 오버로드는 호출 정확도상 구분 못 하므로
-/// 모호함을 숨기지 않고 별도로 보고한다.
+/// 모호함을 숨기지 않고 별도로 보고한다. 모호하면 실제 후보 정점을 함께 돌려
+/// 진단이 "어느 것 중 하나"를 잃지 않게 한다.
 enum RoutineHit {
     One(VertexId),
     None,
-    Ambiguous(usize),
+    Ambiguous(Vec<VertexId>),
 }
 
 #[cfg(test)]
@@ -3711,7 +4082,7 @@ fn routine_hit(candidates: Option<&Vec<VertexId>>) -> RoutineHit {
     match candidates.map(Vec::as_slice).unwrap_or_default() {
         [] => RoutineHit::None,
         [only] => RoutineHit::One(only.clone()),
-        many => RoutineHit::Ambiguous(many.len()),
+        many => RoutineHit::Ambiguous(many.to_vec()),
     }
 }
 
@@ -3797,6 +4168,51 @@ fn vertex_hit(g: &Graph, id: &VertexId, lookup: Lookup<'_>) -> Option<VertexId> 
     }
 }
 
+/// 대소문자 구분이 collation에 달린 방언(SQL Server)에서 정확히 일치하는 관계가 없을 때,
+/// 대소문자만 다른 카탈로그 관계를 찾아 누락 이유로 덧붙일 문구를 만든다.
+///
+/// 문서는 collation을 싣지 않으므로 이어 주지는 않는다 — 대소문자를 구분하는 DB에서는
+/// 다른 객체다. 후보가 여럿이면 고르지 않고 수만 알린다.
+pub(crate) fn case_only_hint(
+    g: &Graph,
+    dialect: &str,
+    id: &VertexId,
+    lookup: Lookup<'_>,
+) -> Option<String> {
+    if !matches!(dialect, "sqlserver" | "mssql") {
+        return None;
+    }
+    let variants: Vec<&VertexId> = lookup
+        .index
+        .folded_ids(g)
+        .get(&fold_case(id.as_str()))?
+        .iter()
+        .filter(|variant| *variant != id)
+        .filter(|variant| {
+            g.vertex(variant).is_some_and(|vertex| {
+                matches!(
+                    vertex.kind,
+                    VertexKind::Table
+                        | VertexKind::View
+                        | VertexKind::MaterializedView
+                        | VertexKind::Synonym
+                )
+            })
+        })
+        .collect();
+    let suffix = "not matched (a case-insensitive collation is not assumed)";
+    match variants.as_slice() {
+        [] => None,
+        [only] => Some(format!(
+            "{only} differs only by letter case and is {suffix}"
+        )),
+        many => Some(format!(
+            "{} catalog objects differ only by letter case and are {suffix}",
+            many.len()
+        )),
+    }
+}
+
 /// 스키마 안에서 routine 정점을 이름으로 찾는다. 정확한 id(name 그대로)가
 /// 먼저이고, 없으면 routine kind 정점의 표시 이름과 비교한다 — 호출자는
 /// 시그니처를 모르므로 이름이 유일할 때만 받아들인다(resolve()와 같은 철학).
@@ -3815,6 +4231,8 @@ struct BodyContext<'a, 'doc> {
     ci: bool,
     body_hash: String,
     sqlserver_trigger: bool,
+    /// routine 정의문이 선언한 한 부분 이름의 해석 순서. 없으면 `schema`로 찾는다.
+    search_path: Option<&'a SearchPath>,
 }
 
 /// trigger 파싱 결과를 그래프 간선으로 반영한다 — DML + calls + fired-columns.
@@ -3832,15 +4250,20 @@ fn apply_trigger(
         ci,
         body_hash,
         sqlserver_trigger,
+        ..
     } = context;
     if g.vertex(trigger_id).is_none() {
         notes.push(format!(
-            "trigger {trigger_id}의 정점이 카탈로그에 없음 — 간선 생략"
+            "trigger {trigger_id}: vertex missing from the catalog; edges omitted"
         ));
         return false;
     }
     note_ignored_relations(trigger_id, &parsed.ignored_relations, notes);
-    apply_dml_edges(g, catalog, schema, trigger_id, parsed, notes, ci);
+    let namespace = Namespace {
+        schema,
+        search_path: None,
+    };
+    apply_dml_edges(g, catalog, namespace, trigger_id, parsed, notes, ci);
     let transition = if sqlserver_trigger {
         Some((owner_table, &["inserted", "deleted"][..]))
     } else if !parsed.fired_columns.is_empty() {
@@ -3864,15 +4287,19 @@ fn apply_trigger(
                 && parsed.temp_state_safe,
             locations_trusted: parsed.locations_trusted,
             scalar_symbols: &parsed.scalar_symbols,
+            search_path: None,
         },
         &mut parsed.diagnostics,
     );
     apply_call_edges(
         g,
-        schema,
+        namespace,
         trigger_id,
         &parsed.calls,
-        notes,
+        CallNotes {
+            notes,
+            diagnostics: &mut parsed.diagnostics,
+        },
         catalog.lookup(ci),
     );
     // NEW.x / OLD.x는 발사 테이블의 컬럼을 읽는다는 뜻이다. 컬럼이 id 충돌로
@@ -3920,16 +4347,28 @@ fn apply_routine(
         schema,
         ci,
         body_hash,
+        search_path,
         ..
     } = context;
     if g.vertex(owner).is_none() {
         notes.push(format!(
-            "routine {owner}의 정점이 카탈로그에 없음 — 간선 생략"
+            "routine {owner}: vertex missing from the catalog; edges omitted"
         ));
         return false;
     }
     note_ignored_relations(owner, &parsed.ignored_relations, notes);
-    apply_dml_edges(g, catalog, schema, owner, parsed, notes, ci);
+    apply_dml_edges(
+        g,
+        catalog,
+        Namespace {
+            schema,
+            search_path,
+        },
+        owner,
+        parsed,
+        notes,
+        ci,
+    );
     parsed.partial |= scope::apply_dml_column_effects(
         g,
         catalog,
@@ -3946,10 +4385,24 @@ fn apply_routine(
                 && parsed.temp_state_safe,
             locations_trusted: parsed.locations_trusted,
             scalar_symbols: &parsed.scalar_symbols,
+            search_path,
         },
         &mut parsed.diagnostics,
     );
-    apply_call_edges(g, schema, owner, &parsed.calls, notes, catalog.lookup(ci));
+    apply_call_edges(
+        g,
+        Namespace {
+            schema,
+            search_path,
+        },
+        owner,
+        &parsed.calls,
+        CallNotes {
+            notes,
+            diagnostics: &mut parsed.diagnostics,
+        },
+        catalog.lookup(ci),
+    );
     parsed.partial
 }
 
@@ -3964,11 +4417,29 @@ fn note_ignored_relations(from: &VertexId, relations: &BTreeSet<String>, notes: 
     ));
 }
 
+/// 한 부분 이름을 찾는 곳 — 몸체 소유자의 스키마와, routine 정의문이 선언한 해석 순서.
+#[derive(Clone, Copy)]
+struct Namespace<'a> {
+    schema: &'a str,
+    search_path: Option<&'a SearchPath>,
+}
+
+impl Namespace<'_> {
+    /// 스키마를 적지 않은 관계 이름의 스키마. `holds`는 그 스키마에 이름이 있는지 답한다.
+    /// 경로가 없으면 소유자 스키마이고, 경로에 수집한 스키마가 없으면 None이다.
+    fn relation_schema(&self, name: &str, holds: impl Fn(&str) -> bool) -> Option<String> {
+        match self.search_path {
+            Some(path) => path.relation_schema(name, holds).map(str::to_owned),
+            None => Some(self.schema.to_owned()),
+        }
+    }
+}
+
 /// 몸체 문장의 writes/reads 대상을 간선으로 만든다 — trigger와 routine이 공유.
 fn apply_dml_edges(
     g: &mut Graph,
     catalog: &scope::CatalogIndex<'_>,
-    schema: &str,
+    namespace: Namespace<'_>,
     from: &VertexId,
     parsed: &mut ParsedTrigger,
     notes: &mut Vec<String>,
@@ -3985,11 +4456,23 @@ fn apply_dml_edges(
             {
                 continue;
             }
-            let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
+            let target_schema = match ref_schema {
+                Some(schema) => schema.clone(),
+                // 경로에 수집한 스키마가 없으면 SearchPath::notes가 한 번에 알린다.
+                None => match namespace.relation_schema(table, |schema| {
+                    vertex_hit(g, &VertexId::object(schema, table), catalog.lookup(ci)).is_some()
+                }) {
+                    Some(schema) => schema,
+                    None => continue,
+                },
+            };
             let target_id = VertexId::object(&target_schema, table);
             let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
+                let hint = case_only_hint(g, catalog.dialect(), &target_id, catalog.lookup(ci))
+                    .map(|hint| format!("; {hint}"))
+                    .unwrap_or_default();
                 notes.push(format!(
-                    "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
+                    "{from} references {target_schema}.{table}, which is missing from the catalog{hint}"
                 ));
                 continue;
             };
@@ -4018,6 +4501,7 @@ fn apply_dml_edges(
                         code: "SG_CROSS_DATABASE".into(),
                         message,
                         location: None,
+                        candidates: Vec::new(),
                     });
                     continue;
                 }
@@ -4025,7 +4509,7 @@ fn apply_dml_edges(
             let target_id = VertexId::object(&target_schema, &table);
             let Some(target) = vertex_hit(g, &target_id, catalog.lookup(ci)) else {
                 notes.push(format!(
-                    "{from}이(가) 참조하는 {target_schema}.{table}이 카탈로그에 없음"
+                    "{from} references {target_schema}.{table}, which is missing from the catalog"
                 ));
                 continue;
             };
@@ -4042,28 +4526,50 @@ fn apply_dml_edges(
     }
 }
 
+/// 호출 해석이 남기는 limitation note와 몸체의 구조화 진단.
+///
+/// 모호한 오버로드 호출은 note 문구를 그대로 두고, 같은 문구의 진단에 후보 정점을
+/// 싣는다 — `dead`가 불릴 수 있는 오버로드를 후보로 내지 않게 하는 근거다.
+struct CallNotes<'a> {
+    notes: &'a mut Vec<String>,
+    diagnostics: &'a mut Vec<schemagraph_core::Diagnostic>,
+}
+
 /// EXECUTE FUNCTION/PROCEDURE 호출 대상을 간선으로 — routine 정점 id는
 /// 시그니처를 포함할 수 있어 이름으로 해석한다.
 fn apply_call_edges(
     g: &mut Graph,
-    schema: &str,
+    namespace: Namespace<'_>,
     from: &VertexId,
     calls: &[(Option<String>, String)],
-    notes: &mut Vec<String>,
+    out: CallNotes<'_>,
     lookup: Lookup<'_>,
 ) {
+    let CallNotes { notes, diagnostics } = out;
+    let schema = namespace.schema;
     for (ref_schema, name) in calls {
-        let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
-        let hit = match resolve_routine(g, &target_schema, name, lookup) {
-            RoutineHit::None => {
-                // `pkg.member()` 꼴 — qualifier가 스키마가 아니라 패키지면
-                // 멤버 정점 schema.pkg.member를 찾는다.
-                ref_schema
-                    .as_ref()
-                    .map(|pkg| resolve_pkg_member(g, schema, pkg, name, lookup))
-                    .unwrap_or(RoutineHit::None)
+        let (target, hit) = match (ref_schema, namespace.search_path) {
+            // 선언된 search_path는 경로의 모든 수집 스키마에서 후보를 모은다. 수집한 스키마가
+            // 없으면 SearchPath::notes가 한 번에 알린다.
+            (None, Some(path)) => match path.routine_hit(g, name, lookup) {
+                Some(hit) => (format!("{name} in search_path {}", path.label()), hit),
+                None => continue,
+            },
+            _ => {
+                let target_schema = ref_schema.clone().unwrap_or_else(|| schema.to_owned());
+                let hit = match resolve_routine(g, &target_schema, name, lookup) {
+                    RoutineHit::None => {
+                        // `pkg.member()` 꼴 — qualifier가 스키마가 아니라 패키지면
+                        // 멤버 정점 schema.pkg.member를 찾는다.
+                        ref_schema
+                            .as_ref()
+                            .map(|pkg| resolve_pkg_member(g, schema, pkg, name, lookup))
+                            .unwrap_or(RoutineHit::None)
+                    }
+                    hit => hit,
+                };
+                (format!("{target_schema}.{name}"), hit)
             }
-            hit => hit,
         };
         match hit {
             RoutineHit::One(target) => {
@@ -4078,12 +4584,22 @@ fn apply_call_edges(
                 });
             }
             RoutineHit::None => notes.push(format!(
-                "{from}이(가) 부르는 {target_schema}.{name}이 카탈로그에 없음 \
-                 (내장 함수이거나 미수집)"
+                "{from} calls {target}, which is missing from the catalog \
+                 (built-in or not collected)"
             )),
-            RoutineHit::Ambiguous(n) => notes.push(format!(
-                "{from}이(가) 부르는 {target_schema}.{name}에 {n}개 오버로드가 있어 간선 생략"
-            )),
+            RoutineHit::Ambiguous(candidates) => {
+                let note = format!(
+                    "{from} calls {target}, which has {} overloads; edge omitted",
+                    candidates.len()
+                );
+                // 확정 간선은 만들지 않는다. 진단의 후보는 note와 같은 문구라
+                // record_body가 note 진단을 따로 만들지 않는다.
+                diagnostics.push(
+                    schemagraph_core::Diagnostic::new("SG_BODY_PARTIAL", note.clone(), None)
+                        .with_candidates(candidates),
+                );
+                notes.push(note);
+            }
         }
     }
 }
@@ -4730,7 +5246,7 @@ mod tests {
         assert!(
             notes
                 .iter()
-                .any(|n| n.contains("wipe") && n.contains("미추출")),
+                .any(|n| n.contains("wipe") && n.contains("not extracted")),
             "notes: {notes:?}"
         );
     }
@@ -4895,7 +5411,9 @@ mod tests {
                 ])
             );
             assert!(
-                notes.iter().any(|note| note.contains("1건 미추출")),
+                notes
+                    .iter()
+                    .any(|note| note.contains("1 body statement(s) not extracted")),
                 "{notes:?}"
             );
         }
@@ -5042,7 +5560,7 @@ mod tests {
                 && edge.from.as_str() == "public.dynamic_cleanup"
                 && edge.to.as_str() == "public.customers"));
         assert!(
-            notes.iter().any(|note| note.contains("미추출")),
+            notes.iter().any(|note| note.contains("not extracted")),
             "{notes:?}"
         );
     }
@@ -5085,7 +5603,7 @@ mod tests {
             if !expect_orders {
                 assert!(notes
                     .iter()
-                    .any(|note| note.contains(name) && note.contains("미추출")));
+                    .any(|note| note.contains(name) && note.contains("not extracted")));
             } else {
                 assert!(notes.is_empty(), "{name}: {notes:?}");
             }
@@ -5109,7 +5627,7 @@ mod tests {
             .iter()
             .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
         assert!(
-            notes.iter().any(|note| note.contains("미추출")),
+            notes.iter().any(|note| note.contains("not extracted")),
             "{notes:?}"
         );
     }
@@ -5144,10 +5662,10 @@ mod tests {
         }));
         assert!(notes
             .iter()
-            .any(|note| note.contains("exec_caller") && note.contains("미추출")));
+            .any(|note| note.contains("exec_caller") && note.contains("not extracted")));
         assert!(notes
             .iter()
-            .any(|note| note.contains("fetch_caller") && note.contains("미추출")));
+            .any(|note| note.contains("fetch_caller") && note.contains("not extracted")));
 
         let mut callee = routine("mutate", Some("plpgsql"), "SELECT 1");
         callee.kind = "procedure".into();
@@ -5170,7 +5688,7 @@ mod tests {
         assert!(
             call_notes
                 .iter()
-                .any(|note| note.contains("call_caller") && note.contains("미추출")),
+                .any(|note| note.contains("call_caller") && note.contains("not extracted")),
             "{call_notes:?}"
         );
     }
@@ -5196,7 +5714,7 @@ mod tests {
         assert!(
             notes
                 .iter()
-                .any(|note| note.contains("dynamic_cleanup") && note.contains("미추출")),
+                .any(|note| note.contains("dynamic_cleanup") && note.contains("not extracted")),
             "{notes:?}"
         );
     }
@@ -5220,7 +5738,9 @@ mod tests {
             .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"
                 && edge.kind == EdgeKind::Writes));
         assert!(
-            notes.iter().any(|note| note.contains("1건 미추출")),
+            notes
+                .iter()
+                .any(|note| note.contains("1 body statement(s) not extracted")),
             "{notes:?}"
         );
     }
@@ -5240,7 +5760,7 @@ mod tests {
                 .edges()
                 .iter()
                 .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
-            assert!(notes.iter().any(|note| note.contains("미추출")), "{notes:?}");
+            assert!(notes.iter().any(|note| note.contains("not extracted")), "{notes:?}");
         }
     }
 
@@ -5261,7 +5781,7 @@ mod tests {
             .iter()
             .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
         assert!(
-            notes.iter().any(|note| note.contains("미추출")),
+            notes.iter().any(|note| note.contains("not extracted")),
             "{notes:?}"
         );
     }
@@ -5283,7 +5803,7 @@ mod tests {
             .iter()
             .any(|edge| edge.from.as_str() == "public.dynamic_cleanup"));
         assert!(
-            notes.iter().any(|note| note.contains("미추출")),
+            notes.iter().any(|note| note.contains("not extracted")),
             "{notes:?}"
         );
     }
@@ -5385,7 +5905,7 @@ mod tests {
         doc.dialect = "sqlserver".into();
         let (graph, notes) = build(&doc);
         assert!(
-            notes.iter().any(|note| note.contains("미추출")),
+            notes.iter().any(|note| note.contains("not extracted")),
             "{notes:?}"
         );
         assert!(!graph
@@ -5458,7 +5978,9 @@ mod tests {
             let (graph, notes) = build(&doc);
             if body == "x" {
                 assert!(
-                    notes.iter().any(|note| note.contains("1건 미추출")),
+                    notes
+                        .iter()
+                        .any(|note| note.contains("1 body statement(s) not extracted")),
                     "{notes:?}"
                 );
             }
@@ -5641,7 +6163,9 @@ mod tests {
             && e.from.as_str() == "public.order_ops"
             && e.to.as_str() == "public.orders"));
         assert!(
-            notes.iter().any(|n| n.contains("패키지 정점에 귀속")),
+            notes
+                .iter()
+                .any(|n| n.contains("attributed to the package vertex")),
             "notes: {notes:?}"
         );
     }
@@ -5769,7 +6293,10 @@ mod tests {
             .edges()
             .iter()
             .any(|e| e.kind == EdgeKind::Inferred && e.from.as_str() == "public.returns"));
-        assert!(notes.iter().any(|n| n.contains("모호")), "notes: {notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("ambiguous")),
+            "notes: {notes:?}"
+        );
         // inferred는 의존성 질의 근거가 아니다.
         assert!(!EdgeKind::Inferred.is_dependency());
     }
@@ -5891,7 +6418,52 @@ mod tests {
         );
         let (g, notes) = build(&doc);
         assert!(!g.edges().iter().any(|e| e.kind == EdgeKind::Calls));
-        assert!(notes.iter().any(|n| n.contains("오버로드")));
+        assert!(notes.iter().any(|n| n.contains("overloads")));
+        // 간선 대신 진단 하나가 두 후보를 싣는다 — note 문구로 같은 진단을 또 만들지 않는다.
+        let trigger = g
+            .analysis()
+            .get(&VertexId::from_raw("public.orders.trg_touch"))
+            .expect("trigger analysis");
+        let ambiguous: Vec<_> = trigger
+            .diagnostics
+            .iter()
+            .filter(|d| d.message.contains("overloads"))
+            .collect();
+        assert_eq!(ambiguous.len(), 1, "{:?}", trigger.diagnostics);
+        assert_eq!(ambiguous[0].code, "SG_BODY_PARTIAL");
+        assert_eq!(
+            ambiguous[0]
+                .candidates
+                .iter()
+                .map(VertexId::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "public.touch_customer(integer)",
+                "public.touch_customer(text)"
+            ]
+        );
+    }
+
+    #[test]
+    fn 해석된_호출의_진단에는_후보를_싣지_않는다() {
+        let mut int_ver = routine("touch_customer", Some("plpgsql"), "BEGIN END");
+        int_ver.signature = Some("integer".into());
+        let doc = doc_with_routine(
+            vec![
+                int_ver,
+                routine("nightly", Some("sql"), "SELECT touch_customer(1)"),
+            ],
+            "",
+        );
+        let (g, _) = build(&doc);
+        assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Calls
+            && e.from.as_str() == "public.nightly"
+            && e.to.as_str() == "public.touch_customer(integer)"));
+        assert!(g
+            .analysis()
+            .values()
+            .flat_map(|analysis| &analysis.diagnostics)
+            .all(|diagnostic| diagnostic.candidates.is_empty()));
     }
 
     #[test]
@@ -6314,7 +6886,7 @@ mod tests {
         match hit {
             RoutineHit::None => (0, None),
             RoutineHit::One(id) => (1, Some(id)),
-            RoutineHit::Ambiguous(count) => (count, None),
+            RoutineHit::Ambiguous(candidates) => (candidates.len(), None),
         }
     }
 
@@ -6450,8 +7022,7 @@ mod tests {
     fn dml_문장_중복_확인은_해시가_같은_후보와만_비교한다() {
         let body = repeated_insert_body(2_000, &[7, 1_999]);
         work::take_compared_statements();
-        let parsed =
-            parse_routine_body(Some(&GenericDialect {}), &body).expect("INSERT만 있는 몸체");
+        let parsed = parse_routine_body(&GenericDialect {}, &body).expect("INSERT만 있는 몸체");
         // 위치만 다른 사본은 합쳐지고 처음 나온 순서가 그대로 남는다.
         assert_eq!(parsed.dml_statements.len(), 2_000);
         let leading: Vec<String> = parsed
@@ -6507,7 +7078,7 @@ mod tests {
             .map(|row| format!("SELECT {row} FROM customers"))
             .collect();
         let body = format!("INSERT INTO orders (id) {}", rows.join(" UNION ALL "));
-        let parsed = parse_routine_body(Some(&GenericDialect {}), &body).expect("INSERT SELECT");
+        let parsed = parse_routine_body(&GenericDialect {}, &body).expect("INSERT SELECT");
         assert_eq!(parsed.dml_statements.len(), 1);
         assert_eq!(parsed.writes, [(None, "orders".to_owned())]);
         assert_eq!(parsed.reads, [(None, "customers".to_owned())]);
@@ -6673,9 +7244,8 @@ mod tests {
             "nested DO beyond the limit must not be extracted"
         );
         assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("public.deep_do") && note.contains("1건 미추출")),
+            notes.iter().any(|note| note.contains("public.deep_do")
+                && note.contains("1 body statement(s) not extracted")),
             "notes: {notes:?}"
         );
     }
@@ -6712,9 +7282,8 @@ mod tests {
             && e.from.as_str() == "public.copy_values"
             && e.to.as_str() == "public.customers"));
         assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("copy_values") && note.contains("1건 미추출")),
+            notes.iter().any(|note| note.contains("copy_values")
+                && note.contains("1 body statement(s) not extracted")),
             "notes: {notes:?}"
         );
     }
@@ -6785,9 +7354,8 @@ mod tests {
             "{record:?}"
         );
         assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("branch_first") && note.contains("1건 미추출")),
+            notes.iter().any(|note| note.contains("branch_first")
+                && note.contains("1 body statement(s) not extracted")),
             "notes: {notes:?}"
         );
     }

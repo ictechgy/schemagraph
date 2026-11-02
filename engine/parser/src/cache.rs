@@ -146,6 +146,7 @@ pub(crate) fn restore(
     if cached.owner != *owner
         || cached.analysis.body_hash.as_deref() != Some(hash.as_str())
         || cached.enriched > 1
+        || !candidates_exist(graph, &cached.analysis)
         || !CachedKeys::new(graph, owner, &hash, &cached).accept(graph, &cached)
     {
         return false;
@@ -160,6 +161,16 @@ pub(crate) fn restore(
     notes.extend(cached.notes);
     *enriched += cached.enriched;
     true
+}
+
+/// 진단이 후보로 가리키는 정점이 모두 현재 그래프에 있는가. 후보는 `dead`가 의존자로
+/// 세는 근거라, 사라진 정점을 가리키는 캐시 결과를 복원하면 유령 후보가 된다.
+fn candidates_exist(graph: &Graph, analysis: &ObjectAnalysis) -> bool {
+    analysis
+        .diagnostics
+        .iter()
+        .flat_map(|diagnostic| &diagnostic.candidates)
+        .all(|candidate| graph.vertex(candidate).is_some())
 }
 
 /// 빌린 (from, to, kind) 간선 키.
@@ -517,6 +528,41 @@ mod tests {
     }
 
     #[test]
+    fn cached_ambiguous_call_candidates_must_exist_in_the_current_graph() {
+        let doc: CatalogDocument = serde_json::from_value(serde_json::json!({
+            "version":1,"dialect":"postgres","reader":"test","limitations":[],
+            "schemas":[{"name":"public","objects":[],"routines":[
+                {"name":"caller","kind":"function","language":"sql","body":"SELECT over(1)"},
+                {"name":"over","kind":"function","language":"sql","signature":"integer","body":"SELECT 1"},
+                {"name":"over","kind":"function","language":"sql","signature":"text","body":"SELECT 2"}
+            ]}]
+        }))
+        .unwrap();
+        let mut cache = MemoryCache::default();
+        let mut cold = schemagraph_source::graph::document_to_graph(&doc);
+        crate::enrich_with_cache(&mut cold, &doc, Some(&mut cache));
+        let owner = VertexId::object("public", "caller");
+        let candidates = |graph: &Graph| -> Vec<String> {
+            graph.analysis()[&owner]
+                .diagnostics
+                .iter()
+                .flat_map(|diagnostic| diagnostic.candidates.iter().map(|id| id.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            candidates(&cold),
+            ["public.over(integer)", "public.over(text)"]
+        );
+        // 캐시 결과의 후보 하나를 그래프에 없는 정점으로 바꾸면 복원하지 않고 다시 해석한다.
+        cache.0.get_mut(&owner).unwrap().analysis.diagnostics[0].candidates[0] =
+            VertexId::from_raw("public.over(ghost)");
+        let mut warm = schemagraph_source::graph::document_to_graph(&doc);
+        crate::enrich_with_cache(&mut warm, &doc, Some(&mut cache));
+        assert_eq!(cache.2, 1);
+        assert_eq!(warm.analysis(), cold.analysis());
+    }
+
+    #[test]
     fn same_body_dml_effects_remain_owned_by_their_routine() {
         let doc: CatalogDocument = serde_json::from_value(serde_json::json!({
             "version": 1,
@@ -716,6 +762,23 @@ mod tests {
             doc.schemas[0].routines[0].body.as_deref().unwrap(),
         );
         assert!(!context.trusted);
+    }
+
+    #[test]
+    fn declared_search_path_uses_conservative_cache_context() {
+        // 줄바꿈으로 갈린 CREATE·FUNCTION은 정의문 감싸기 검사에 걸리지 않는다. 경로의 다른
+        // 스키마에 같은 이름이 생기면 해석이 바뀌므로 관계 footprint로 좁히지 않는다.
+        let body = "CREATE\nFUNCTION public.f() RETURNS bigint LANGUAGE sql \
+                    SET search_path = app, public AS $$SELECT count(*) FROM items$$";
+        let doc: CatalogDocument = serde_json::from_value(serde_json::json!({
+            "version":1,"dialect":"postgres","reader":"test","limitations":[],
+            "schemas":[{"name":"public","objects":[],"routines":[
+                {"name":"f","kind":"function","language":"sql","body":body}]}]
+        }))
+        .unwrap();
+        let owner = VertexId::routine("public", None, "f", None);
+        let graph = schemagraph_source::graph::document_to_graph(&doc);
+        assert!(!crate::scope::cache_context(&doc, &graph, &owner, body).trusted);
     }
 
     #[test]

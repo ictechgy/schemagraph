@@ -287,6 +287,10 @@ views, functions, procedures, and packages can be.
 - **Evidence and gaps:** reports carry `limitations` for observed collection
   and parsing gaps. Unsupported routine languages, unresolved references,
   and ambiguous names are reported without inventing target vertices.
+  An ambiguous overloaded call lists the overloads it may reach as
+  `candidates` on the caller's analysis diagnostic. `dead` counts each
+  candidate as called by that caller; `query` and `impact` still follow only
+  resolved edges.
 - **Partial results:** `query`, `impact`, and `dead` report `truncated` when
   results are cut short by a result limit. Check it alongside `limitations`
   before treating a result as complete. Budgeted traversals separately report
@@ -359,6 +363,15 @@ Omit `kinds` to check all dependency kinds. Run
 `schemagraph rules --graph graph.json --config schemagraph.toml --strict`
 to use the result as a CI gate. The report names each rule and violating
 edge; `checked: 0` means no rules were evaluated.
+
+Because `*` also matches column ids, a view that reads five columns of a
+forbidden table violates a `to = "core.*"` rule once for the table and once
+per column edge. `--level object` checks the graph projected to objects
+instead, so each object pair is reported once per edge kind, and the report
+carries `level`. `--level schema` compares schema vertices, so its globs name
+schemas (`from = "reporting"`); a `from` or `to` pattern that matches no vertex
+at the chosen level is listed in `limitations` instead of passing silently.
+Without `--level`, every recorded edge is checked as before.
 
 ## How it works
 

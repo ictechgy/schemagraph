@@ -5,6 +5,8 @@ members = ["core", "source", "parser", "analysis", "export", "cli"]
 [workspace.package]
 version = "0.8.1"
 edition = "2021"
+# CI가 빌드·테스트·Clippy를 도는 최소 툴체인이다. 더 낮은 툴체인은 검증하지 않는다.
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ictechgy/schemagraph"
 readme = "../README.md"

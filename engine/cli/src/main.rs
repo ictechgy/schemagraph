@@ -376,7 +376,27 @@ enum Command {
         /// Exit 1 when any rule is violated.
         #[arg(long)]
         strict: bool,
+        /// Check the graph projected to this level, so one object dependency is one
+        /// violation instead of one per column edge (default: every recorded edge).
+        #[arg(long, value_enum)]
+        level: Option<RulesLevelArg>,
     },
+}
+
+/// `rules --level`이 받는 레벨. 멤버 레벨 투영은 객체 간선을 지우므로 받지 않는다.
+#[derive(Clone, Copy, ValueEnum)]
+enum RulesLevelArg {
+    Schema,
+    Object,
+}
+
+impl RulesLevelArg {
+    fn level(self) -> Level {
+        match self {
+            RulesLevelArg::Schema => Level::Schema,
+            RulesLevelArg::Object => Level::Object,
+        }
+    }
 }
 
 /// `query`·`impact`의 출력 형식과 `language-traversal` 머리 값.
@@ -479,7 +499,7 @@ enum ImportFormat {
 enum LevelArg {
     Schema,
     Object,
-    /// member 레벨의 CLI 이름. 컬럼이 의존성을 가지는 사실상 유일한 멤버다.
+    /// Member level; columns are the members that carry dependencies.
     Column,
     Member,
 }
@@ -808,7 +828,8 @@ async fn run(cli: Cli) -> Result<i32> {
             graph,
             config,
             strict,
-        } => rules(&graph, &config, strict),
+            level,
+        } => rules(&graph, &config, strict, level.map(|level| level.level())),
     }
 }
 
@@ -862,8 +883,8 @@ async fn scan(
         }
         .context("database scan failed; check the connection settings and catalog permissions")?,
         (None, Some(path)) => load_document(path)?,
-        (None, None) => bail!("URL 또는 --document 중 하나는 필요하다"),
-        (Some(_), Some(_)) => bail!("URL과 --document는 같이 쓸 수 없다 — 둘 중 하나만"),
+        (None, None) => bail!("either a URL or --document is required"),
+        (Some(_), Some(_)) => bail!("a URL and --document cannot be used together; pass only one"),
     };
     source::context::annotate(&mut doc, source_id, schemas).map_err(|e| anyhow!(e))?;
     if let Some(files) = &sql_files {
@@ -1008,7 +1029,7 @@ fn facts(document: &Path, project: &Path, output: Option<&str>) -> Result<i32> {
     let doc = load_document(document)?;
     let project = std::fs::canonicalize(project).with_context(|| {
         format!(
-            "project root를 읽을 수 없다: {} — 존재하는 디렉터리를 지정해라",
+            "cannot read project root: {}; pass an existing directory",
             project.display()
         )
     })?;
@@ -1286,7 +1307,7 @@ fn load_document(path: &std::path::Path) -> Result<source::CatalogDocument> {
 
 fn load_graph(path: &std::path::Path) -> Result<Graph> {
     let doc: GraphDoc = serde_json::from_reader(open_reader(path)?)
-        .with_context(|| format!("graph.json 파싱 실패: {}", path.display()))?;
+        .with_context(|| format!("failed to parse graph.json: {}", path.display()))?;
     graph_from_checked_doc(doc)
 }
 
@@ -1302,7 +1323,7 @@ fn load_graph_with_sha256(path: &std::path::Path) -> Result<(Graph, String)> {
         hasher: Sha256::new(),
     };
     let doc: GraphDoc = serde_json::from_reader(&mut reader)
-        .with_context(|| format!("graph.json 파싱 실패: {}", path.display()))?;
+        .with_context(|| format!("failed to parse graph.json: {}", path.display()))?;
     std::io::copy(&mut reader, &mut std::io::sink())
         .with_context(|| format!("cannot finish reading {}; check the file", path.display()))?;
     let digest = reader.hasher.finalize();
@@ -1329,7 +1350,7 @@ impl<R: std::io::Read> std::io::Read for HashingReader<R> {
 fn graph_from_checked_doc(doc: GraphDoc) -> Result<Graph> {
     if !matches!(doc.version, 1 | export::GRAPH_VERSION) {
         bail!(
-            "graph.json 버전 {}는 이 바이너리({})와 다르다 — 다시 scan해라",
+            "graph.json version {} differs from this binary ({}); scan again",
             doc.version,
             export::GRAPH_VERSION
         );
@@ -1829,7 +1850,7 @@ fn snapshot_kind(path: &std::path::Path) -> Result<SnapshotKind> {
         Ok(SnapshotKind::Document)
     } else {
         bail!(
-            "스냅샷 형태를 모르겠다: {} — graph.json(vertices/edges) 또는 catalog document(schemas)여야 한다",
+            "unknown snapshot shape: {}; expected graph.json (vertices/edges) or a catalog document (schemas)",
             path.display()
         )
     }
@@ -1865,7 +1886,7 @@ fn open_reader(path: &std::path::Path) -> Result<BufReader<std::fs::File>> {
 fn diff(old_path: &std::path::Path, new_path: &std::path::Path, strict: bool) -> Result<i32> {
     let (old_kind, new_kind) = (snapshot_kind(old_path)?, snapshot_kind(new_path)?);
     if std::mem::discriminant(&old_kind) != std::mem::discriminant(&new_kind) {
-        bail!("graph.json과 catalog document는 비교할 수 없다 — 같은 종류끼리 diff해라");
+        bail!("graph.json and a catalog document cannot be compared; diff two snapshots of the same kind");
     }
     let (value, changed) = match old_kind {
         SnapshotKind::Graph => {
@@ -1924,9 +1945,9 @@ struct RuleToml {
 /// 오류로 — 조용히 무시하면 규칙이 느슨해지는데 사용자는 엄격해졌다고 믿는다.
 fn load_rules(path: &std::path::Path) -> Result<Vec<analysis::Rule>> {
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("규칙 파일을 못 읽음: {}", path.display()))?;
+        .with_context(|| format!("cannot read rules file: {}", path.display()))?;
     let file: RulesFile = toml::from_str(&text)
-        .with_context(|| format!("규칙 파일 TOML 파싱 실패: {}", path.display()))?;
+        .with_context(|| format!("failed to parse rules file TOML: {}", path.display()))?;
     file.rule
         .iter()
         .map(|r| {
@@ -1938,7 +1959,7 @@ fn load_rules(path: &std::path::Path) -> Result<Vec<analysis::Rule>> {
                         .map(|k| {
                             export::edge_kind_parse(k).ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "규칙 '{}': 알 수 없는 간선 종류 '{k}' — \
+                                    "rule '{}': unknown edge kind '{k}'; use \
                                      references|reads|writes|calls|fires|uses-sequence|uses-type",
                                     r.name
                                 )
@@ -1957,19 +1978,64 @@ fn load_rules(path: &std::path::Path) -> Result<Vec<analysis::Rule>> {
         .collect()
 }
 
-fn rules(path: &std::path::Path, config: &std::path::Path, strict: bool) -> Result<i32> {
+/// 규칙을 검사한다. 레벨을 주면 투영한 그래프에서 검사해 같은 객체 쌍의 컬럼 간선을
+/// 하나로 묶고, 보고에 그 `level`을 싣는다. 주지 않으면 기록된 간선 그대로다.
+fn rules(
+    path: &std::path::Path,
+    config: &std::path::Path,
+    strict: bool,
+    level: Option<Level>,
+) -> Result<i32> {
     let graph = load_graph(path)?;
     let rule_set = load_rules(config)?;
-    let report = analysis::rules(&graph, &rule_set);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&export::rules_to_value(&report))?
-    );
+    let report = match level {
+        Some(level) => {
+            let projected = graph.project(level);
+            let mut report = analysis::rules(&projected, &rule_set);
+            report
+                .limitations
+                .extend(unmatched_rule_patterns(&projected, &rule_set, level));
+            report
+        }
+        None => analysis::rules(&graph, &rule_set),
+    };
+    let mut value = export::rules_to_value(&report);
+    if let Some(level) = level {
+        value["level"] = serde_json::json!(export::level_label(level));
+    }
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(if strict && !report.violations.is_empty() {
         1
     } else {
         0
     })
+}
+
+/// 투영한 레벨의 어떤 정점에도 맞지 않는 규칙 패턴. 레벨을 바꾸면 정점 id 모양이 달라져
+/// (`public.*`는 스키마 정점 `public`에 맞지 않는다) 위반 0건이 통과처럼 보이므로 알린다.
+fn unmatched_rule_patterns(
+    graph: &Graph,
+    rule_set: &[analysis::Rule],
+    level: Level,
+) -> Vec<String> {
+    let label = export::level_label(level);
+    let matches_any = |pattern: &str| {
+        graph
+            .vertices()
+            .any(|vertex| analysis::glob_match(pattern, vertex.id.as_str()))
+    };
+    let mut notes = Vec::new();
+    for rule in rule_set {
+        for (side, pattern) in [("from", &rule.from), ("to", &rule.to)] {
+            if !matches_any(pattern) {
+                notes.push(format!(
+                    "rule '{}': {side} pattern '{pattern}' matches no {label}-level vertex",
+                    rule.name
+                ));
+            }
+        }
+    }
+    notes
 }
 
 fn write_graph_output(output: &str, graph: &Graph) -> Result<()> {

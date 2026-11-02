@@ -403,8 +403,8 @@ fn build_schema(g: &mut Graph, schema: &SchemaDoc, packages: &mut PackageIndex) 
                 None => {
                     g.add_edge(contains(&schema_id, &mem_id));
                     g.add_limitation(format!(
-                        "{}.{pkg}.{}: 부모 패키지 정점이 카탈로그에 없음 \
-                         — 스키마 직속으로 둠",
+                        "{}.{pkg}.{}: parent package vertex is missing from the catalog; \
+                         placed directly under the schema",
                         schema.name, routine.name
                     ));
                 }
@@ -606,7 +606,7 @@ fn add_member(
         VertexKind::Trigger => "trigger",
         _ => "member",
     };
-    let id = resolve_collision(g, base, name, kind, suffix, "멤버")?;
+    let id = resolve_collision(g, base, name, kind, suffix, "member")?;
     g.add_vertex(Vertex {
         id: id.clone(),
         kind,
@@ -633,7 +633,7 @@ fn resolve_collision(
         Some(v) if v.kind == kind => {
             // 같은 kind의 같은 이름은 진짜 중복 — 정점은 합쳐지지만 신고한다.
             g.add_limitation(format!(
-                "{label} 이름 중복: {}는 {suffix}가 이미 있다 — 정점이 합쳐진다",
+                "{label} name duplicate: {} already has a {suffix}; the vertices are merged",
                 base.as_str(),
             ));
             Some(base)
@@ -644,14 +644,14 @@ fn resolve_collision(
             let renamed = VertexId::from_raw(&format!("{}@{suffix}", base.as_str()));
             if g.vertex(&renamed).is_some() {
                 g.add_limitation(format!(
-                    "{label} id 충돌 미해소: {}와 {} 모두 점유 — {name} {suffix} 정점 생략",
+                    "{label} id collision unresolved: {} and {} are both taken; {name} {suffix} vertex omitted",
                     base.as_str(),
                     renamed.as_str(),
                 ));
                 return None;
             }
             g.add_limitation(format!(
-                "{label} id 충돌: {}는 다른 kind가 먼저 차지 — {suffix} 정점은 {}로 분리",
+                "{label} id collision: {} is already taken by another kind; the {suffix} vertex is split into {}",
                 base.as_str(),
                 renamed.as_str(),
             ));
@@ -976,7 +976,10 @@ mod tests {
             Some(VertexKind::Index)
         );
         // 충돌은 limitation으로 신고된다.
-        assert!(g.limitations().iter().any(|l| l.contains("멤버 id 충돌")));
+        assert!(g
+            .limitations()
+            .iter()
+            .any(|l| l.contains("member id collision")));
     }
 
     #[test]
@@ -1041,7 +1044,7 @@ mod tests {
         assert!(g
             .limitations()
             .iter()
-            .any(|l| l.contains("routine id 충돌")));
+            .any(|l| l.contains("routine id collision")));
     }
 
     #[test]
@@ -1081,7 +1084,7 @@ mod tests {
         assert!(!g
             .limitations()
             .iter()
-            .any(|l| l.contains("부모 패키지 정점이 카탈로그에 없음")));
+            .any(|l| l.contains("parent package vertex is missing from the catalog")));
     }
 
     /// 패키지 `package`의 멤버 프로시저 `name`.
@@ -1120,7 +1123,7 @@ mod tests {
     fn orphan_member_notes(g: &Graph) -> usize {
         g.limitations()
             .iter()
-            .filter(|l| l.contains("부모 패키지 정점이 카탈로그에 없음"))
+            .filter(|l| l.contains("parent package vertex is missing from the catalog"))
             .count()
     }
 
