@@ -291,6 +291,15 @@ mod tests {
     }
 
     #[test]
+    fn a_re_merged_id_splits_at_its_outer_source() {
+        // 합친 그래프를 merge_graphs로 다시 합치면 로컬 id에 안쪽 source의 `::`가 남는다. 첫
+        // `::`가 바깥 source의 경계다.
+        let inner = namespaced_id("inner", &VertexId::from_raw("s.t"));
+        let outer = namespaced_id("outer", &inner);
+        assert_eq!(split_namespaced_id(&outer), Some(("outer", inner)));
+    }
+
+    #[test]
     fn a_graph_is_merged_only_when_every_vertex_is_namespaced() {
         let merged =
             merge_graphs(vec![("wh".into(), fixture()), ("app".into(), fixture())]).unwrap();

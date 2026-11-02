@@ -380,9 +380,13 @@ lineage exists, a `columnLineage` facet:
   `schemagraphAnalysis` job facet (`state`, `diagnostics`), so consumers can tell
   missing lineage from absent lineage. stderr also counts graph limitations.
 
-Jobs and datasets share the `[database.]` prefix: a view's job name equals its
-output dataset name (`database.schema.object`); a routine's job name is its
-graph id with the prefix. The `runId` is a version 8 UUID derived from the event
+In a single graph, jobs and datasets share the `[database.]` prefix: a view's
+job name equals its output dataset name (`database.schema.object`) unless its
+graph id differs from `schema.object`, as when a `.` inside a name is escaped; a
+routine's job name is its graph id with the prefix. A merged graph names jobs by
+graph id but datasets per source (see below), so there a view's job and its
+output dataset have different names, such as job `wh::public.v_src` and dataset
+`wh.public.v_src`. The `runId` is a version 8 UUID derived from the event
 content, so fixing `--event-time` (validated as RFC 3339) makes the output
 byte-for-byte reproducible and re-ingestion idempotent. This is a static
 snapshot, not an observed run. Events are validated against the pinned official
