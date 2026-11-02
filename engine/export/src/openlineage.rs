@@ -107,6 +107,11 @@ struct Datasets {
 }
 
 /// 작업들을 RunEvent로 만든다. `run_id`는 runId를 뺀 이벤트 내용으로 id를 만든다.
+///
+/// 이름 겹침은 검사하지 않는다 — 서로 다른 데이터셋이 같은 (namespace, 이름)을 얻어도 그대로
+/// 싣고, 소비자는 둘을 한 데이터셋으로 합친다. 호출자가 먼저 [`identity_collisions`]를 돌려
+/// 정해야 한다. CLI는 [`IdentityCollision::across_sources`]인 겹침이 있으면 내보내지 않고,
+/// 나머지는 stderr로 알린 뒤 내보낸다.
 pub fn events(
     graph: &Graph,
     jobs: &BTreeMap<VertexId, Job>,
