@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 mod diagnostics;
 mod merge;
-pub use merge::{merge_graphs, namespaced_id};
+pub use merge::{merge_graphs, merged_sources, namespaced_id, split_namespaced_id};
 mod schema_metadata;
 pub use diagnostics::{AnalysisState, Diagnostic, ObjectAnalysis, Origin, SourceLocation};
 pub use schema_metadata::{ColumnMetadata, ForeignKeyMetadata, IndexMetadata, SchemaMetadata};
