@@ -1070,9 +1070,6 @@ fn facts(document: &Path, project: &Path, output: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
-/// 그래프 계보를 OpenLineage RunEvent NDJSON으로 쓴다.
-///
-/// 이벤트 시각을 고정하면 같은 그래프는 같은 파일이 된다(runId는 내용에서 만든다).
 /// `openlineage`의 이름 옵션 — 전역 namespace·데이터베이스와 합친 그래프의 source별 자리.
 struct LineageNames<'a> {
     namespace: &'a str,
@@ -1081,6 +1078,9 @@ struct LineageNames<'a> {
     source_databases: &'a [String],
 }
 
+/// 그래프 계보를 OpenLineage RunEvent NDJSON으로 쓴다.
+///
+/// 이벤트 시각을 고정하면 같은 그래프는 같은 파일이 된다(runId는 내용에서 만든다).
 fn openlineage(
     path: &Path,
     names: LineageNames<'_>,
