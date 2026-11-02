@@ -11,9 +11,9 @@
 
 use crate::diagnostics::state_str;
 use schemagraph_analysis::lineage::{IndirectUse, Job};
-use schemagraph_core::{AnalysisState, Graph, VertexId, VertexKind};
+use schemagraph_core::{split_namespaced_id, AnalysisState, Graph, VertexId, VertexKind};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// RunEvent 스키마 URL.
 const RUN_EVENT_SCHEMA: &str = "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent";
@@ -30,12 +30,73 @@ pub struct EventContext<'a> {
     pub namespace: &'a str,
     /// 데이터셋·작업 이름 앞에 붙일 데이터베이스 이름(OpenLineage 명명 규칙).
     pub database: Option<&'a str>,
+    /// 합친 그래프의 source별 이름 자리(source id → namespace·데이터베이스). 비어 있으면
+    /// 단일 그래프로 보고 `namespace`·`database`를 쓴다.
+    pub sources: BTreeMap<String, SourceNaming>,
     /// 이벤트 시각(RFC 3339).
     pub event_time: &'a str,
     /// 생산자 URI — 도구와 버전을 가리킨다.
     pub producer: &'a str,
     /// 분석 상태 job facet을 설명하는 문서 URL(facet의 `_schemaURL`).
     pub analysis_facet_url: &'a str,
+}
+
+/// 합친 그래프에서 한 source의 데이터셋·작업이 이름을 얻는 자리.
+///
+/// 정점의 스키마·객체 이름은 source 안의 로컬 이름이라, source마다 namespace나 데이터베이스
+/// 자리를 달리해야 같은 이름의 테이블이 서로 다른 데이터셋으로 남는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceNaming {
+    pub namespace: String,
+    pub database: Option<String>,
+}
+
+/// 한 정점이 이름을 얻는 자리 — namespace, 데이터베이스 접두, source 안의 로컬 id.
+struct Place<'c> {
+    namespace: &'c str,
+    database: Option<&'c str>,
+    local: VertexId,
+}
+
+impl EventContext<'_> {
+    /// 합친 그래프면 정점의 source 자리를, 아니면 전역 자리를 돌려준다.
+    fn place(&self, id: &VertexId) -> Place<'_> {
+        if !self.sources.is_empty() {
+            if let Some((source, local)) = split_namespaced_id(id) {
+                if let Some(naming) = self.sources.get(source) {
+                    return Place {
+                        namespace: &naming.namespace,
+                        database: naming.database.as_deref(),
+                        local,
+                    };
+                }
+            }
+        }
+        Place {
+            namespace: self.namespace,
+            database: self.database,
+            local: id.clone(),
+        }
+    }
+
+    /// 작업의 (namespace, 이름) — 이름은 데이터베이스 접두 + source 안의 정점 id다.
+    fn job_identity(&self, job: &VertexId) -> (&str, String) {
+        let place = self.place(job);
+        (
+            place.namespace,
+            qualified(place.database, place.local.as_str()),
+        )
+    }
+
+    /// 데이터셋의 (namespace, 이름) — 이름은 `[database.]schema.object`다.
+    fn dataset_identity(&self, graph: &Graph, id: &VertexId) -> (&str, String) {
+        let place = self.place(id);
+        let name = graph.vertex(id).map_or_else(
+            || place.local.as_str().to_owned(),
+            |v| format!("{}.{}", v.schema, v.name),
+        );
+        (place.namespace, qualified(place.database, &name))
+    }
 }
 
 /// 내보내기 결과.
@@ -97,12 +158,13 @@ fn event(
         .iter()
         .map(|id| output(graph, context, datasets, job, id, include_indirect))
         .collect();
+    let (namespace, name) = context.job_identity(job_id);
     json!({
         "eventType": "COMPLETE",
         "eventTime": context.event_time,
         "producer": context.producer,
         "schemaURL": RUN_EVENT_SCHEMA,
-        "job": {"namespace": context.namespace, "name": qualified(context, job_id.as_str())},
+        "job": {"namespace": namespace, "name": name},
         "inputs": job.inputs.iter().map(|id| dataset(graph, context, id)).collect::<Vec<_>>(),
         "outputs": outputs,
     })
@@ -128,26 +190,18 @@ fn analysis_facet(graph: &Graph, context: &EventContext, job: &VertexId) -> Opti
     })
 }
 
-/// `--database`가 있으면 접두를 붙인다 — 작업과 데이터셋 이름이 같은 규칙을 따른다.
-fn qualified(context: &EventContext, name: &str) -> String {
-    match context.database {
+/// 데이터베이스 자리가 있으면 접두를 붙인다 — 작업과 데이터셋 이름이 같은 규칙을 따른다.
+fn qualified(database: Option<&str>, name: &str) -> String {
+    match database {
         Some(database) => format!("{database}.{name}"),
         None => name.to_owned(),
     }
 }
 
-/// OpenLineage 데이터셋 이름 — `[database.]schema.object`.
-fn dataset_name(graph: &Graph, context: &EventContext, id: &VertexId) -> String {
-    let name = graph.vertex(id).map_or_else(
-        || id.as_str().to_owned(),
-        |v| format!("{}.{}", v.schema, v.name),
-    );
-    qualified(context, &name)
-}
-
 /// 입력 데이터셋 참조.
 fn dataset(graph: &Graph, context: &EventContext, id: &VertexId) -> Value {
-    json!({"namespace": context.namespace, "name": dataset_name(graph, context, id)})
+    let (namespace, name) = context.dataset_identity(graph, id);
+    json!({"namespace": namespace, "name": name})
 }
 
 /// 데이터셋별 컬럼(수집된 선언 순서, 없으면 id 순)과 스키마 facet을 만든다.
@@ -282,12 +336,83 @@ fn input_field(
     let vertex = graph.vertex(column)?;
     let parent = column.parent()?;
     graph.vertex(&parent)?;
+    let (namespace, name) = context.dataset_identity(graph, &parent);
     Some(json!({
-        "namespace": context.namespace,
-        "name": dataset_name(graph, context, &parent),
+        "namespace": namespace,
+        "name": name,
         "field": vertex.name,
         "transformations": transformations,
     }))
+}
+
+/// 서로 다른 정점이 같은 OpenLineage 정체성(namespace, 이름)을 얻는 경우를 찾는다.
+///
+/// 소비자는 정체성이 같은 데이터셋·작업을 하나로 합치므로, 내보내면 없는 계보가 생기고
+/// 스키마·컬럼 계보가 서로를 덮는다. 이벤트가 실제로 가리키는 작업과 데이터셋만 본다 —
+/// 단일 그래프에서는 정점마다 이름이 달라 대개 비지만, 스키마·객체 이름 안의 `.`이 경계를
+/// 흐리면(`a.b`의 `c`와 `a`의 `b.c`) 여기서도 잡힌다.
+pub fn identity_collisions(
+    graph: &Graph,
+    jobs: &BTreeMap<VertexId, Job>,
+    context: &EventContext,
+) -> Vec<String> {
+    let datasets = datasets(graph, context);
+    let mut job_names: BTreeMap<(String, String), BTreeSet<VertexId>> = BTreeMap::new();
+    let mut dataset_names: BTreeMap<(String, String), BTreeSet<VertexId>> = BTreeMap::new();
+    for (job_id, job) in jobs {
+        let (namespace, name) = context.job_identity(job_id);
+        job_names
+            .entry((namespace.to_owned(), name))
+            .or_default()
+            .insert(job_id.clone());
+        for id in referenced_datasets(graph, &datasets, job_id, job) {
+            let (namespace, name) = context.dataset_identity(graph, &id);
+            dataset_names
+                .entry((namespace.to_owned(), name))
+                .or_default()
+                .insert(id);
+        }
+    }
+    let describe = |kind: &str, names: BTreeMap<(String, String), BTreeSet<VertexId>>| {
+        names
+            .into_iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .map(move |((namespace, name), ids)| {
+                let ids: Vec<&str> = ids.iter().map(VertexId::as_str).collect();
+                format!("{kind} ({namespace}, {name}) would name {}", ids.join(", "))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut collisions = describe("job", job_names);
+    collisions.extend(describe("dataset", dataset_names));
+    collisions
+}
+
+/// 작업의 이벤트가 가리키는 데이터셋 — 입력, 출력, 출력 컬럼의 DIRECT 입력 컬럼과 (뷰라면)
+/// INDIRECT 사용 컬럼이 속한 데이터셋. `event`·`output`이 싣는 것과 같은 범위다.
+fn referenced_datasets(
+    graph: &Graph,
+    datasets: &Datasets,
+    job_id: &VertexId,
+    job: &Job,
+) -> BTreeSet<VertexId> {
+    let mut referenced: BTreeSet<VertexId> = job.inputs.union(&job.outputs).cloned().collect();
+    let column_dataset = |column: &VertexId| {
+        graph.vertex(column)?;
+        let parent = column.parent()?;
+        graph.vertex(&parent).map(|_| parent)
+    };
+    for output in &job.outputs {
+        let owned = datasets.columns.get(output).map_or(&[][..], Vec::as_slice);
+        for column in owned {
+            let sources = job.direct.get(column).into_iter().flatten();
+            referenced.extend(sources.filter_map(column_dataset));
+        }
+    }
+    if is_view(graph, job_id) {
+        referenced.extend(job.indirect.keys().filter_map(column_dataset));
+    }
+    referenced
 }
 
 /// OpenLineage INDIRECT subtype 이름.
@@ -383,6 +508,7 @@ mod tests {
         EventContext {
             namespace: "postgres://db:5432",
             database: Some("app"),
+            sources: BTreeMap::new(),
             event_time: "2026-09-25T00:00:00Z",
             producer: "https://example.test/schemagraph",
             analysis_facet_url: "https://example.test/analysis",
@@ -430,6 +556,158 @@ mod tests {
         assert_eq!(result.indirect_omitted, vec![id("s.load")]);
         let load = find(&result, "app.s.load");
         assert!(load["outputs"][0]["facets"].get("columnLineage").is_none());
+    }
+
+    /// `s.load`가 `{schema}.src`를 `{schema}.dst`로 옮기는 그래프를 source `source`로 합친 꼴로
+    /// 만든다(모든 정점 id가 `source::` namespace를 가진다).
+    fn merged_source(graph: &mut Graph, source: &str, schema: &str) {
+        let ns = |local: &str| id(&format!("{source}::{local}"));
+        let src = VertexId::object(schema, "src");
+        let dst = VertexId::object(schema, "dst");
+        let src_val = VertexId::member(schema, "src", "val");
+        let dst_val = VertexId::member(schema, "dst", "val");
+        let load = VertexId::object(schema, "load");
+        for (local, kind, name) in [
+            (&src, VertexKind::Table, "src"),
+            (&dst, VertexKind::Table, "dst"),
+            (&src_val, VertexKind::Column, "val"),
+            (&dst_val, VertexKind::Column, "val"),
+            (&load, VertexKind::Procedure, "load"),
+        ] {
+            graph.add_vertex(Vertex {
+                id: ns(local.as_str()),
+                kind,
+                name: name.into(),
+                schema: schema.into(),
+            });
+        }
+        let mut edge = |from: &VertexId, to: &VertexId, kind, role: &str| {
+            let (from, to) = (ns(from.as_str()), ns(to.as_str()));
+            graph.add_edge(Edge {
+                from: from.clone(),
+                to: to.clone(),
+                kind,
+                evidence: vec![],
+            });
+            graph.add_origin(
+                (from, to, kind),
+                Origin {
+                    body_hash: "sha256:t".into(),
+                    role: role.into(),
+                    location: None,
+                },
+            );
+        };
+        let owner = ns(load.as_str());
+        let role = |role: &str| Origin::dml_owner_role(&owner, role);
+        edge(&load, &dst, EdgeKind::Writes, &role("write"));
+        edge(&load, &src, EdgeKind::Reads, &role("projection"));
+        edge(&dst_val, &src_val, EdgeKind::DerivesFrom, &role("value"));
+    }
+
+    /// 합친 그래프 이름 규칙 — 기본값은 source id를 데이터베이스 자리에 둔다.
+    fn merged_context(sources: &[(&str, &str, Option<&str>)]) -> EventContext<'static> {
+        EventContext {
+            namespace: "postgres://shared:5432",
+            database: None,
+            sources: sources
+                .iter()
+                .map(|(source, namespace, database)| {
+                    (
+                        (*source).to_owned(),
+                        SourceNaming {
+                            namespace: (*namespace).to_owned(),
+                            database: database.map(str::to_owned),
+                        },
+                    )
+                })
+                .collect(),
+            ..context()
+        }
+    }
+
+    #[test]
+    fn merged_sources_name_same_named_tables_as_distinct_datasets() {
+        let mut graph = Graph::new();
+        merged_source(&mut graph, "app", "public");
+        merged_source(&mut graph, "wh", "public");
+        let context = merged_context(&[
+            ("app", "postgres://shared:5432", Some("app")),
+            ("wh", "postgres://shared:5432", Some("wh")),
+        ]);
+        let jobs = jobs(&graph);
+        assert!(identity_collisions(&graph, &jobs, &context).is_empty());
+        let result = events(&graph, &jobs, &context, |_| "run".into());
+        let names: Vec<(&str, &str, &str)> = result
+            .events
+            .iter()
+            .map(|event| {
+                (
+                    event["job"]["name"].as_str().unwrap(),
+                    event["inputs"][0]["name"].as_str().unwrap(),
+                    event["outputs"][0]["name"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("app.public.load", "app.public.src", "app.public.dst"),
+                ("wh.public.load", "wh.public.src", "wh.public.dst")
+            ]
+        );
+        let field = &result.events[0]["outputs"][0]["facets"]["columnLineage"]["fields"]["val"];
+        assert_eq!(field["inputFields"][0]["name"], "app.public.src");
+    }
+
+    #[test]
+    fn identity_collisions_list_distinct_objects_that_would_share_a_name() {
+        let mut graph = Graph::new();
+        merged_source(&mut graph, "app", "public");
+        merged_source(&mut graph, "wh", "public");
+        let jobs = jobs(&graph);
+        // 두 source를 같은 namespace·데이터베이스로 두면 작업과 데이터셋이 겹친다.
+        let shared = merged_context(&[
+            ("app", "postgres://shared:5432", Some("corpus")),
+            ("wh", "postgres://shared:5432", Some("corpus")),
+        ]);
+        assert_eq!(
+            identity_collisions(&graph, &jobs, &shared),
+            [
+                "job (postgres://shared:5432, corpus.public.load) would name app::public.load, wh::public.load",
+                "dataset (postgres://shared:5432, corpus.public.dst) would name app::public.dst, wh::public.dst",
+                "dataset (postgres://shared:5432, corpus.public.src) would name app::public.src, wh::public.src",
+            ]
+        );
+        // namespace가 다르면 같은 데이터베이스 이름이어도 겹치지 않는다.
+        let distinct = merged_context(&[
+            ("app", "postgres://app:5432", Some("corpus")),
+            ("wh", "postgres://wh:5432", Some("corpus")),
+        ]);
+        assert!(identity_collisions(&graph, &jobs, &distinct).is_empty());
+    }
+
+    #[test]
+    fn dotted_names_that_blur_the_name_boundary_are_collisions() {
+        // source `a.b`의 스키마 `c`와 source `a`의 스키마 `b.c`는 기본 이름이 같다.
+        let mut merged = Graph::new();
+        merged_source(&mut merged, "a.b", "c");
+        merged_source(&mut merged, "a", "b.c");
+        let naming = merged_context(&[
+            ("a", "postgres://shared:5432", Some("a")),
+            ("a.b", "postgres://shared:5432", Some("a.b")),
+        ]);
+        let collisions = identity_collisions(&merged, &jobs(&merged), &naming);
+        assert!(
+            collisions.iter().any(|c| {
+                c
+                == "dataset (postgres://shared:5432, a.b.c.dst) would name a.b::c.dst, a::b%2Ec.dst"
+            }),
+            "{collisions:?}"
+        );
+        // 보통의 단일 그래프는 정점마다 이름이 달라 아무것도 찾지 않는다.
+        let single = graph();
+        assert!(identity_collisions(&single, &jobs(&single), &context()).is_empty());
     }
 
     /// 분석이 부분적인 작업은 job facet으로 상태를 드러낸다.

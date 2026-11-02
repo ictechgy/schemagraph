@@ -2,7 +2,8 @@
 
 - PostgreSQL body relations and routine names fold only unquoted identifiers. TRUNCATE and data-modifying CTEs retain write evidence; CTE aliases do not become physical relations.
 - Column DEFAULT expressions retain uniquely resolved function dependencies as `depends-on` edges with body-parse evidence. Overloaded, missing and unparsable calls remain measured limitations. Literal defaults do not invent dependencies.
-- `merge` also namespaces the job ID inside DML origin roles (`dml-owner:<job>:<role>`), so `openlineage` on a merged graph attributes column lineage to its routine and trigger jobs instead of emitting their outputs without `columnLineage`. Diagnostic messages, evidence details and limitations in a merged graph remain the source's local text; ANALYSIS.md documents this together with OpenLineage dataset names, which come from local schema and object names.
+- `merge` also namespaces the job ID inside DML origin roles (`dml-owner:<job>:<role>`), so `openlineage` on a merged graph attributes column lineage to its routine and trigger jobs instead of emitting their outputs without `columnLineage`. Diagnostic messages, evidence details and limitations in a merged graph remain the source's local text; ANALYSIS.md documents this.
+- `openlineage` on a merged graph gives each source its own dataset and job names instead of building them from local schema and object names alone, which made same-named tables from different sources one dataset and invented lineage between them. By default the source ID takes the database slot (`app.public.orders`, job `app.public.load`). Repeatable `--source-namespace SRC=URI` and `--source-database SRC=NAME` set per-source names; a mapped source's events equal exporting that source's own graph. `--database` is rejected for merged graphs (exit 2), and any two distinct objects that would still share a namespace and name stop the export with exit 2 and a list. Single-graph exports are unchanged byte for byte.
 - The body cache treats a definition such as `CREATE\nFUNCTION ...` as a definition whatever whitespace separates its keywords. Such bodies use the whole-catalog cache key, so adding or dropping a relation they read is no longer hidden by a stale cached result.
 - Workspace crates declare `rust-version = "1.96"`, the toolchain CI builds, tests and lints. Older toolchains are not verified.
 - CI checks Clippy on the established Rust 1.96.0 toolchain. Mechanical lint fixes and explicit boundary exceptions preserve public API and command behavior.
@@ -17,6 +18,7 @@
 ## Breaking
 
 - `schemagraph_core::Diagnostic` has a new public field, `candidates`. Library code that builds a `Diagnostic` with a struct literal must set it (or use `Diagnostic::new`), so the next crate release has to be 0.9.0 rather than a 0.8.x patch. This change does not bump versions.
+- `openlineage` names change for merged graphs: datasets and jobs carry their source (`app.public.orders` by default) instead of conflated local dataset names and `source-id::` job names. Export merged graphs again; single-graph exports are unchanged.
 - Limitation and diagnostic message text produced by the engine and native readers is now English. Diagnostic codes are unchanged; consumers that matched the earlier Korean text must match the new wording.
 
 # schemagraph 0.8.1

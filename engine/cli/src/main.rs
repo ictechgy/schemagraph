@@ -327,12 +327,22 @@ enum Command {
     Openlineage {
         #[arg(short, long, default_value = "graph.json")]
         graph: PathBuf,
-        /// Dataset and job namespace, for example postgres://db.example:5432.
+        /// Dataset and job namespace, for example postgres://db.example:5432. In a merged
+        /// graph it is the namespace of every source without --source-namespace.
         #[arg(long)]
         namespace: String,
-        /// Database name prefixed to dataset names (database.schema.object).
+        /// Database name prefixed to dataset and job names (database.schema.object). Single
+        /// graphs only; a merged graph uses each source id, or --source-database.
         #[arg(long)]
         database: Option<String>,
+        /// Merged graphs: namespace for one source, as SRC=URI (repeatable). Its datasets get
+        /// no database prefix unless --source-database names one.
+        #[arg(long = "source-namespace", value_name = "SRC=URI")]
+        source_namespaces: Vec<String>,
+        /// Merged graphs: database name for one source, as SRC=NAME (repeatable). Defaults to
+        /// the source id when the source keeps the shared --namespace.
+        #[arg(long = "source-database", value_name = "SRC=NAME")]
+        source_databases: Vec<String>,
         /// RFC 3339 event time; defaults to now. Fix it for reproducible output.
         #[arg(long)]
         event_time: Option<String>,
@@ -784,12 +794,18 @@ async fn run(cli: Cli) -> Result<i32> {
             graph,
             namespace,
             database,
+            source_namespaces,
+            source_databases,
             event_time,
             output,
         } => openlineage(
             &graph,
-            &namespace,
-            database.as_deref(),
+            LineageNames {
+                namespace: &namespace,
+                database: database.as_deref(),
+                source_namespaces: &source_namespaces,
+                source_databases: &source_databases,
+            },
             event_time.as_deref(),
             output.as_deref(),
         ),
@@ -1056,10 +1072,17 @@ fn facts(document: &Path, project: &Path, output: Option<&str>) -> Result<i32> {
 /// 그래프 계보를 OpenLineage RunEvent NDJSON으로 쓴다.
 ///
 /// 이벤트 시각을 고정하면 같은 그래프는 같은 파일이 된다(runId는 내용에서 만든다).
+/// `openlineage`의 이름 옵션 — 전역 namespace·데이터베이스와 합친 그래프의 source별 자리.
+struct LineageNames<'a> {
+    namespace: &'a str,
+    database: Option<&'a str>,
+    source_namespaces: &'a [String],
+    source_databases: &'a [String],
+}
+
 fn openlineage(
     path: &Path,
-    namespace: &str,
-    database: Option<&str>,
+    names: LineageNames<'_>,
     event_time: Option<&str>,
     output: Option<&str>,
 ) -> Result<i32> {
@@ -1067,7 +1090,7 @@ fn openlineage(
         &[path],
         &output::file_path(output).into_iter().collect::<Vec<_>>(),
     )?;
-    if namespace.trim().is_empty() {
+    if names.namespace.trim().is_empty() {
         bail!(
             "--namespace must be nonempty; use the data source URI, such as postgres://host:5432"
         );
@@ -1077,33 +1100,126 @@ fn openlineage(
         None => rfc3339_utc_now()?,
     };
     let graph = load_graph(path)?;
-    let result = lineage_events(&graph, namespace, database, &event_time);
+    let sources = lineage_sources(&graph, &names)?;
+    let result = lineage_events(&graph, &names, sources, &event_time)?;
     write_ndjson(&result.events, output)?;
     report_lineage_gaps(&graph, &result);
     Ok(0)
 }
 
+/// 합친 그래프면 source마다 OpenLineage 이름 자리를 정한다. 단일 그래프면 빈 맵이다.
+///
+/// 정점의 스키마·객체 이름은 source 안의 로컬 이름이라, source가 같은 namespace를 쓰면 source
+/// id를 데이터베이스 자리에 둬야 같은 이름의 테이블이 한 데이터셋으로 합쳐지지 않는다.
+/// `--source-namespace`로 source마다 namespace를 주면 그 source만 따로 내보낸 결과와 같은
+/// 이름이 되도록 데이터베이스 접두는 `--source-database`가 있을 때만 붙인다.
+fn lineage_sources(
+    graph: &Graph,
+    names: &LineageNames<'_>,
+) -> Result<std::collections::BTreeMap<String, export::openlineage::SourceNaming>> {
+    let Some(sources) = schemagraph_core::merged_sources(graph) else {
+        for (flag, values) in [
+            ("--source-namespace", names.source_namespaces),
+            ("--source-database", names.source_databases),
+        ] {
+            if !values.is_empty() {
+                bail!("{flag} applies to merged graphs; this graph has no source namespaces, so use --namespace and --database");
+            }
+        }
+        return Ok(std::collections::BTreeMap::new());
+    };
+    if names.database.is_some() {
+        bail!(
+            "--database names a single source, but this is a merged graph; each source's datasets use its source id as the database name, or set one with --source-database SRC=NAME"
+        );
+    }
+    let namespaces = source_assignments("--source-namespace", names.source_namespaces, &sources)?;
+    let databases = source_assignments("--source-database", names.source_databases, &sources)?;
+    Ok(sources
+        .iter()
+        .map(|source| {
+            let mapped = namespaces.get(*source);
+            let naming = export::openlineage::SourceNaming {
+                namespace: mapped.map_or(names.namespace, String::as_str).to_owned(),
+                database: databases
+                    .get(*source)
+                    .cloned()
+                    .or_else(|| mapped.is_none().then(|| (*source).to_owned())),
+            };
+            ((*source).to_owned(), naming)
+        })
+        .collect())
+}
+
+/// `SRC=VALUE` 옵션을 source별 값으로 읽는다. 모르는 source·중복·빈 값은 오류다 — 오타가
+/// 조용히 기본 이름으로 돌아가 다른 데이터셋을 가리키지 않게 한다.
+fn source_assignments(
+    flag: &str,
+    values: &[String],
+    sources: &std::collections::BTreeSet<&str>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut assignments = std::collections::BTreeMap::new();
+    for value in values {
+        let Some((source, assigned)) = value.split_once('=') else {
+            bail!("{flag} expects SRC=VALUE, got '{value}'");
+        };
+        if !sources.contains(source) {
+            let known: Vec<&str> = sources.iter().copied().collect();
+            bail!(
+                "{flag} names source '{source}', which is not in the merged graph (sources: {})",
+                known.join(", ")
+            );
+        }
+        if assigned.trim().is_empty() {
+            bail!("{flag} for source '{source}' needs a nonempty value");
+        }
+        if assignments
+            .insert(source.to_owned(), assigned.to_owned())
+            .is_some()
+        {
+            bail!("{flag} names source '{source}' more than once");
+        }
+    }
+    Ok(assignments)
+}
+
 /// 계보 작업을 RunEvent로 만든다. 생산자와 facet 설명 URL은 이 도구 버전을 가리킨다.
+///
+/// 서로 다른 정점이 같은 (namespace, 이름)을 얻으면 내보내지 않는다 — 소비자가 둘을 한
+/// 데이터셋·작업으로 합쳐 없는 계보를 그린다.
 fn lineage_events(
     graph: &Graph,
-    namespace: &str,
-    database: Option<&str>,
+    names: &LineageNames<'_>,
+    sources: std::collections::BTreeMap<String, export::openlineage::SourceNaming>,
     event_time: &str,
-) -> export::openlineage::Events {
+) -> Result<export::openlineage::Events> {
     let version = env!("CARGO_PKG_VERSION");
     let producer = format!("https://github.com/ictechgy/schemagraph/tree/v{version}");
     let facet_url = format!(
         "https://github.com/ictechgy/schemagraph/blob/v{version}/ANALYSIS.md#export-lineage-to-openlineage"
     );
     let context = export::openlineage::EventContext {
-        namespace,
-        database,
+        namespace: names.namespace,
+        database: names.database,
+        sources,
         event_time,
         producer: &producer,
         analysis_facet_url: &facet_url,
     };
     let jobs = analysis::lineage::jobs(graph);
-    export::openlineage::events(graph, &jobs, &context, content_run_id)
+    let collisions = export::openlineage::identity_collisions(graph, &jobs, &context);
+    if !collisions.is_empty() {
+        bail!(
+            "OpenLineage names would merge distinct objects; give the sources distinct --source-namespace or --source-database values: {}",
+            collisions.join("; ")
+        );
+    }
+    Ok(export::openlineage::events(
+        graph,
+        &jobs,
+        &context,
+        content_run_id,
+    ))
 }
 
 /// 이벤트를 한 줄에 하나씩 쓴다. `-`나 생략은 stdout이다.
