@@ -72,8 +72,9 @@ fn for_version(ndjson: &str, version: &str) -> String {
 fn single_graph_openlineage_bytes_match_the_golden_export() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
+    // `*.catalog.json`은 산출물로 무시되므로 입력 문서는 `scan --document`를 따라 이름 짓는다.
     let catalog =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/openlineage-single.catalog.json");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/openlineage-single.document.json");
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_schemagraph"))
             .current_dir(root)

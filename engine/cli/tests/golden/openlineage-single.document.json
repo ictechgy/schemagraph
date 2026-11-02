@@ -1,0 +1,149 @@
+{
+  "dialect": "postgres",
+  "limitations": [],
+  "reader": "fixture",
+  "schemas": [
+    {
+      "name": "public",
+      "objects": [
+        {
+          "columns": [
+            {
+              "data_type": "integer",
+              "name": "id",
+              "nullable": false,
+              "ordinal": 1,
+              "pk_position": 1
+            },
+            {
+              "data_type": "text",
+              "name": "name",
+              "nullable": true,
+              "ordinal": 2,
+              "pk_position": 0
+            }
+          ],
+          "constraints": [],
+          "indexes": [],
+          "kind": "table",
+          "name": "customers",
+          "triggers": []
+        },
+        {
+          "columns": [
+            {
+              "data_type": "integer",
+              "name": "id",
+              "nullable": false,
+              "ordinal": 1,
+              "pk_position": 1
+            },
+            {
+              "data_type": "integer",
+              "name": "customer_id",
+              "nullable": true,
+              "ordinal": 2,
+              "pk_position": 0
+            },
+            {
+              "data_type": "integer",
+              "name": "total",
+              "nullable": true,
+              "ordinal": 3,
+              "pk_position": 0
+            }
+          ],
+          "constraints": [],
+          "indexes": [],
+          "kind": "table",
+          "name": "orders",
+          "triggers": []
+        },
+        {
+          "columns": [
+            {
+              "data_type": "text",
+              "name": "customer_name",
+              "nullable": true,
+              "ordinal": 1,
+              "pk_position": 0
+            },
+            {
+              "data_type": "integer",
+              "name": "total",
+              "nullable": true,
+              "ordinal": 2,
+              "pk_position": 0
+            }
+          ],
+          "constraints": [],
+          "indexes": [],
+          "kind": "table",
+          "name": "archive",
+          "triggers": []
+        },
+        {
+          "columns": [
+            {
+              "data_type": "integer",
+              "name": "total",
+              "nullable": true,
+              "ordinal": 1,
+              "pk_position": 0
+            }
+          ],
+          "constraints": [],
+          "indexes": [],
+          "kind": "table",
+          "name": "audit",
+          "triggers": []
+        },
+        {
+          "body": "SELECT c.name AS customer_name, o.total FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.total > 0",
+          "columns": [
+            {
+              "data_type": "text",
+              "name": "customer_name",
+              "nullable": true,
+              "ordinal": 1,
+              "pk_position": 0
+            },
+            {
+              "data_type": "integer",
+              "name": "total",
+              "nullable": true,
+              "ordinal": 2,
+              "pk_position": 0
+            }
+          ],
+          "constraints": [],
+          "indexes": [],
+          "kind": "view",
+          "name": "order_names",
+          "triggers": []
+        }
+      ],
+      "routines": [
+        {
+          "body": "INSERT INTO archive (customer_name, total) SELECT c.name, o.total FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.total > 10",
+          "kind": "function",
+          "language": "sql",
+          "name": "load_archive"
+        },
+        {
+          "body": "INSERT INTO archive (customer_name) SELECT name FROM customers WHERE id > 1; INSERT INTO audit (total) SELECT total FROM orders WHERE total > 5",
+          "kind": "function",
+          "language": "sql",
+          "name": "fan_out"
+        },
+        {
+          "body": "BEGIN\n  INSERT INTO audit (total) SELECT total FROM orders;\n  EXECUTE 'DELETE FROM ' || quote_ident('audit');\nEND",
+          "kind": "function",
+          "language": "plpgsql",
+          "name": "dynamic_cleanup"
+        }
+      ]
+    }
+  ],
+  "version": 1
+}
