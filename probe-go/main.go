@@ -123,7 +123,7 @@ func boolValue(value bool) *bool { return &value }
 // oracleNoObjectsLimitation — Oracle 카탈로그가 테이블·뷰를 주지 않았다는 limitation 원문.
 // 권한 공백의 신호라 남길 때는 항상 markIncomplete로 미완전 표시와 함께 남긴다. 수집 전체가
 // 비었을 때(checkOracleObjects)만 쓴다. 스키마 하나가 빈 것은 정상일 수 있다(oracleSchema).
-const oracleNoObjectsLimitation = "카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라"
+const oracleNoObjectsLimitation = "the catalog returned no tables or views; check the account's metadata permissions"
 
 // Oracle 카탈로그가 노출하는 시스템 스키마 — probe/Extractor.kt의 목록과 동일.
 // PUBLIC은 시노님이 수천 개라 커서를 고갈시킨다 — 항상 억제한다.
@@ -164,7 +164,7 @@ func (h *harvester) bestEffortArgs(label, query string, args []any, row func(row
 	if err != nil {
 		h.catalogIncomplete = true
 		h.limitations = append(h.limitations,
-			fmt.Sprintf("%s 원문 미수확(%s) — 간선이 빠질 수 있다", label, oneLine(err.Error())))
+			fmt.Sprintf("%s source text was not collected (%s); edges may be missing", label, oneLine(err.Error())))
 		return
 	}
 	defer rows.Close()
@@ -172,14 +172,14 @@ func (h *harvester) bestEffortArgs(label, query string, args []any, row func(row
 		if err := row(rows); err != nil {
 			h.catalogIncomplete = true
 			h.limitations = append(h.limitations,
-				fmt.Sprintf("%s 행 읽기 실패(%s) — 간선이 빠질 수 있다", label, oneLine(err.Error())))
+				fmt.Sprintf("%s rows could not be read (%s); edges may be missing", label, oneLine(err.Error())))
 			return
 		}
 	}
 	if err := rows.Err(); err != nil {
 		h.catalogIncomplete = true
 		h.limitations = append(h.limitations,
-			fmt.Sprintf("%s 원문 미수확(%s) — 간선이 빠질 수 있다", label, oneLine(err.Error())))
+			fmt.Sprintf("%s source text was not collected (%s); edges may be missing", label, oneLine(err.Error())))
 	}
 }
 

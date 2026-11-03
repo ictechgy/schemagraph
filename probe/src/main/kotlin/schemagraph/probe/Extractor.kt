@@ -183,7 +183,7 @@ class Extractor(
             if (catalogDependencies) dependencies += collectCatalogDependencies(conn, dialect, schema, limitations)
         }
         if (schemas.none { it.objects.isNotEmpty() }) {
-            limitations += "JDBC 메타데이터가 테이블/뷰를 하나도 주지 않았다 — 드라이버 커버리지를 확인해라"
+            limitations += "JDBC metadata returned no tables or views; check the driver's metadata coverage"
         }
         return CatalogDocument(
             version = DOCUMENT_VERSION,
@@ -230,7 +230,7 @@ class Extractor(
             }
         }
         if (!sawObjects) {
-            limitations += "JDBC 메타데이터가 테이블/뷰를 하나도 주지 않았다 — 드라이버 커버리지를 확인해라"
+            limitations += "JDBC metadata returned no tables or views; check the driver's metadata coverage"
         }
         rec("limitations", "data" to limitations.distinct().sorted(), "context" to collectionContext(limitations.size == metadataStart))
     }
@@ -348,7 +348,7 @@ class Extractor(
             }
         }
     }.getOrElse {
-        limitations += "getTables 실패: ${it.message}"
+        limitations += "getTables failed: ${it.message}"
         emptyList()
     }
 
@@ -368,7 +368,7 @@ class Extractor(
             buildList { while (rs.next()) add(readColumnDoc(rs)) }
         }
     }.getOrElse {
-        limitations += "${obj.schema}.${obj.name}: getColumns 실패 — ${it.message}"
+        limitations += "${obj.schema}.${obj.name}: getColumns failed: ${it.message}"
         emptyList()
     }
 
@@ -390,14 +390,14 @@ class Extractor(
                 ?: batch?.primaryKeysOf(obj.name)
                 ?: meta.getPrimaryKeys(obj.catalog, obj.schemaName, obj.name).use { rs -> readPrimaryKeyRows(rs) }
             addPrimaryKey(obj, rows, out, pkPos)
-        }.onFailure { limitations += "${obj.schema}.${obj.name}: getPrimaryKeys 실패 — ${it.message}" }
+        }.onFailure { limitations += "${obj.schema}.${obj.name}: getPrimaryKeys failed: ${it.message}" }
 
         runCatching {
             val rows = sqliteKeysFor(obj)?.importedKeyRows(obj.name)
                 ?: batch?.importedKeysOf(obj.name)
                 ?: meta.getImportedKeys(obj.catalog, obj.schemaName, obj.name).use { rs -> readImportedKeyRows(rs) }
             addForeignKeys(obj, rows, out)
-        }.onFailure { limitations += "${obj.schema}.${obj.name}: getImportedKeys 실패 — ${it.message}" }
+        }.onFailure { limitations += "${obj.schema}.${obj.name}: getImportedKeys failed: ${it.message}" }
 
         return out.sortedBy { it.name } to pkPos
     }
@@ -470,7 +470,7 @@ class Extractor(
             }.sortedBy { it.name }
         }
     }.getOrElse {
-        limitations += "${obj.schema}.${obj.name}: getIndexInfo 실패 — ${it.message}"
+        limitations += "${obj.schema}.${obj.name}: getIndexInfo failed: ${it.message}"
         emptyList()
     }
     }
@@ -846,7 +846,7 @@ class Extractor(
                             ?.let { rows += MetaRoutine(it, rs.getString("FUNCTION_NAME"), "function") }
                     }
                 }
-            }.onFailure { limitations += "getFunctions 실패: ${it.message}" }
+            }.onFailure { limitations += "getFunctions failed: ${it.message}" }
             runCatching {
                 meta.getProcedures(null, null, null).use { rs ->
                     while (rs.next()) {
@@ -854,7 +854,7 @@ class Extractor(
                             ?.let { rows += MetaRoutine(it, rs.getString("PROCEDURE_NAME"), "procedure") }
                     }
                 }
-            }.onFailure { limitations += "getProcedures 실패: ${it.message}" }
+            }.onFailure { limitations += "getProcedures failed: ${it.message}" }
         }
         rows
     }
@@ -908,8 +908,8 @@ class Extractor(
             nameCounts[it.name] != 1 && usage.functions.containsKey(schema to it.name)
         }
         if (ambiguous > 0) {
-            limitations += "$schema: 오버로드된 routine ${ambiguous}개는 " +
-                "funcname만으로 귀속 못 해 usage 미수집"
+            limitations += "$schema: usage was not collected for $ambiguous overloaded routine(s) " +
+                "because funcname alone cannot attribute it"
         }
         return rts.map { rt ->
             rt.copy(usage = usage.functions[schema to rt.name].takeIf { nameCounts[rt.name] == 1 })
@@ -952,7 +952,7 @@ class Extractor(
                     }
                 }.getOrNull()
                 if (counting != "on") {
-                    limitations += "track_counts=off — table/index usage 미수집(카운터 비활성, 0행은 관측이 아님)"
+                    limitations += "track_counts=off: table/index usage was not collected (counters are disabled; zero rows are not observations)"
                 } else {
                     // 파티션 부모(relkind p)는 스캔이 리프 파티션에 세어져 항상 0이라 제외한다.
                     bestEffort("table stats",
@@ -984,7 +984,7 @@ class Extractor(
                     }
                 }.getOrNull()
                 if (tracking == "none") {
-                    limitations += "track_functions=none — routine usage 미수집(함수 통계 비활성)"
+                    limitations += "track_functions=none: routine usage was not collected (function statistics are disabled)"
                 } else {
                     bestEffort("function stats",
                         "SELECT schemaname, funcname, calls, total_time, self_time " +
@@ -1011,7 +1011,7 @@ class Extractor(
                     }
                 }.getOrNull()
                 if (pfs == "0" || pfs == "OFF") {
-                    limitations += "performance_schema=OFF — usage 미수집(통계 비활성, MariaDB 기본값)"
+                    limitations += "performance_schema=OFF: usage was not collected (statistics are disabled, the MariaDB default)"
                 } else {
                     // performance_schema·sys는 재시작에 리셋된다 — uptime 역산이 since.
                     val since = runCatching {
@@ -1064,7 +1064,7 @@ class Extractor(
         }.onFailure {
             // 한 줄로 — 줄바꿈이 들어가면 limitation 텍스트가 지저분해진다.
             val msg = it.message?.replace(Regex("\\s+"), " ")
-            limitations += "$label 원문 미수확(${it.javaClass.simpleName}: $msg) — 간선이 빠질 수 있다"
+            limitations += "$label source text was not collected (${it.javaClass.simpleName}: $msg); edges may be missing"
         }
     }
 }
