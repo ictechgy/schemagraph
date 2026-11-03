@@ -1,6 +1,6 @@
 # schemagraph
 
-2026-11-01 확인: GitHub [v0.8.1](https://github.com/ictechgy/schemagraph/releases/tag/v0.8.1)과 crates.io `schemagraph-cli` **0.7.0**은 별도 배포 채널이다. 여기 설명된 0.8.1 동작은 검증된 GitHub 산출물이나 해당 태그의 `--locked` 소스 빌드를 사용한다. `cargo install schemagraph-cli`의 현재 발행본은 0.7.0이다. [설치 안내](INSTALLATION.md).
+릴리스 대상은 **0.9.0**이다. GitHub 바이너리·crates.io `schemagraph-cli`·Maven은 별도 배포 채널이므로 설치 전에 정확한 버전을 확인한다. [설치 안내](INSTALLATION.md)와 [Breaking 변경](RELEASE-NOTES.md)을 참고한다.
 
 SQLite SQL migration의 재현 가능한 전후 카탈로그 준비와 앱 계약 연결은
 [격리 migration capture](MIGRATION-CAPTURE.md)를 참고하세요.
