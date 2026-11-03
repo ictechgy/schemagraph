@@ -1,5 +1,8 @@
 # Unreleased
 
+- `facts` on a catalog collected with a schema filter (`--schema`, or the probes' schema options) adds a `catalog-coverage:` limitation naming the requested schemas. The collector only proves completeness inside the filter, so isthmus now reports uses of relations in other schemas as `relation-use-without-decl-unverified` warnings instead of errors. No `limitationScopes` entry is added, because the unscanned relations cannot be listed as channels.
+- `facts` omits relation and column declarations whose schema, object or column name is empty or contains control characters (C0, DEL, C1, U+2028, U+2029), and counts them in a `catalog-coverage:` limitation. isthmus rejects such a name with exit 2 for the whole join, so one odd identifier no longer blocks every other declaration.
+
 # schemagraph 0.9.0 - 2026-11-03
 
 - PostgreSQL body relations and routine names fold only unquoted identifiers. TRUNCATE and data-modifying CTEs retain write evidence; CTE aliases do not become physical relations.

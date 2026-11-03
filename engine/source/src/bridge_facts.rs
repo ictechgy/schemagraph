@@ -34,9 +34,15 @@ pub fn bridge_facts_document(
     generated_at: &str,
 ) -> Value {
     let mut facts: Vec<Value> = Vec::new();
+    // 소비자가 거부하는 이름의 선언 수 — 빼되 센다.
+    let mut omitted_unsafe = 0usize;
     for schema in &doc.schemas {
         for object in &schema.objects {
             if !RELATION_KINDS.contains(&object.kind.as_str()) {
+                continue;
+            }
+            if !is_exchange_safe(&schema.name) || !is_exchange_safe(&object.name) {
+                omitted_unsafe += 1 + object.columns.len();
                 continue;
             }
             let channel = format!(
@@ -49,6 +55,10 @@ pub fn bridge_facts_document(
             relation["dataContract"] = relation_contract(object);
             facts.push(relation);
             for column in &object.columns {
+                if !is_exchange_safe(&column.name) {
+                    omitted_unsafe += 1;
+                    continue;
+                }
                 let member = VertexId::member(&schema.name, &object.name, &column.name);
                 let mut fact = declaration_fact(&channel, Some(&column.name), member.as_str());
                 fact["dataContract"] =
@@ -73,6 +83,22 @@ pub fn bridge_facts_document(
         None => limitations.push(
             "catalog-coverage: no collection context; catalog completeness is unknown".into(),
         ),
+    }
+    // catalog_complete는 "필터 안에서" 완전하다는 뜻이다. 필터 밖 스키마는 보지
+    // 않았으므로 거기 있는 관계의 사용을 미선언 error로 만들면 안 된다. 놓친
+    // 관계 이름을 열거할 수 없어 limitationScopes로 좁히지 않는다.
+    if let Some(filter) = doc
+        .context
+        .as_ref()
+        .and_then(|context| context.schema_filter.as_ref())
+        .filter(|filter| !filter.is_empty())
+    {
+        limitations.push(schema_filter_limitation(filter));
+    }
+    if omitted_unsafe > 0 {
+        limitations.push(format!(
+            "catalog-coverage: {omitted_unsafe} relation or column declaration(s) were omitted because their identifiers are empty or contain control characters the exchange format rejects"
+        ));
     }
     limitations.sort();
     limitations.dedup();
@@ -183,6 +209,56 @@ fn fact_key(fact: &Value) -> (&str, &str) {
         fact["channel"].as_str().unwrap_or_default(),
         fact["method"].as_str().unwrap_or_default(),
     )
+}
+
+/// 한계 문구에 싣는 필터 스키마 이름의 상한이다. 이름 목록은 사람이 확인하는
+/// 단서일 뿐이라, 긴 필터가 한계 문자열을 끝없이 키우지 않게 한다.
+const SCHEMA_FILTER_NAMES_SHOWN: usize = 10;
+
+/// 스키마 필터 수집의 범위 공백 문구다. 이름의 제어문자는 이스케이프해
+/// 한계 문자열 자체가 출력이나 소비자 표시를 깨지 않게 한다.
+fn schema_filter_limitation(filter: &[String]) -> String {
+    let shown: Vec<String> = filter
+        .iter()
+        .take(SCHEMA_FILTER_NAMES_SHOWN)
+        .map(|name| printable(name))
+        .collect();
+    let rest = filter.len().saturating_sub(SCHEMA_FILTER_NAMES_SHOWN);
+    let more = if rest > 0 {
+        format!(" and {rest} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "catalog-coverage: collection was limited to {} requested schema(s) ({}{more}); relations in other schemas were not scanned",
+        filter.len(),
+        shown.join(", ")
+    )
+}
+
+/// 제어문자만 `\u{..}` 형태로 바꾼다 — 나머지 이름은 그대로 읽히게 둔다.
+fn printable(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// isthmus가 채널·컬럼 이름으로 받아들이는 문자열인지 본다.
+///
+/// 소비자는 비어 있거나 C0·DEL·C1 제어문자, U+2028·U+2029가 든 이름을 문서
+/// 전체의 입력 오류로 거부한다(parse.ts `controlCharacterPattern`). 그런 선언
+/// 하나 때문에 조인 전체가 실패하지 않도록 생산자가 먼저 걸러야 한다.
+fn is_exchange_safe(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
 }
 
 /// channel의 한 세그먼트를 escape한다 — `%`를 먼저 escape해야 생산자가
@@ -478,5 +554,69 @@ mod tests {
             .map(|l| l.as_str().unwrap_or_default())
             .collect();
         assert_eq!(limitations, ["a-limit", "z-limit"]);
+    }
+
+    /// 스키마 필터로 일부만 수집한 카탈로그는 필터 안에서만 완전하다. 필터 밖
+    /// 관계를 쓰는 코드가 isthmus에서 error가 되지 않도록 범위 공백을 신고한다.
+    #[test]
+    fn schema_filtered_collection_reports_coverage_gap() {
+        let mut doc = catalog();
+        doc.context.as_mut().unwrap().schema_filter = Some(vec!["public".into()]);
+        let value = bridge_facts_document(&doc, "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        let limitations = value["limitations"].as_array().unwrap();
+        assert_eq!(limitations.len(), 1, "{limitations:?}");
+        let message = limitations[0].as_str().unwrap();
+        assert!(message.starts_with("catalog-coverage:"), "{message}");
+        assert!(message.contains("1 requested schema"), "{message}");
+        assert!(message.contains("public"), "{message}");
+        // 이 공백은 채널 집합으로 증명할 수 없어 스코프를 붙이지 않는다.
+        assert!(value.get("limitationScopes").is_none());
+    }
+
+    /// 필터 이름 목록은 상한이 있고 제어문자를 그대로 싣지 않는다.
+    #[test]
+    fn schema_filter_coverage_message_is_bounded_and_printable() {
+        let mut doc = catalog();
+        let mut names: Vec<String> = (0..30).map(|i| format!("s{i:02}")).collect();
+        names.push("bad\nname".into());
+        doc.context.as_mut().unwrap().schema_filter = Some(names);
+        let value = bridge_facts_document(&doc, "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        let message = value["limitations"][0].as_str().unwrap();
+        assert!(message.contains("31 requested schema"), "{message}");
+        assert!(message.contains("and 21 more"), "{message}");
+        assert!(!message.chars().any(char::is_control), "{message}");
+    }
+
+    /// isthmus는 제어문자가 든 채널·컬럼 하나로 문서 전체를 거부한다. 그 선언만
+    /// 빼고, 뺐다는 사실을 카탈로그 커버리지 공백으로 센다.
+    #[test]
+    fn identifiers_with_control_characters_are_omitted_and_counted() {
+        let mut doc = catalog();
+        let mut odd = doc.schemas[0].objects[0].clone();
+        odd.name = "weird\nname".into();
+        doc.schemas[0].objects.push(odd);
+        let mut column = doc.schemas[0].objects[0].columns[0].clone();
+        column.name = "bad\u{2028}col".into();
+        doc.schemas[0].objects[0].columns.push(column);
+        let value = bridge_facts_document(&doc, "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        let facts = value["facts"].as_array().unwrap();
+        // users+id+events만 남는다. weird 테이블(관계+컬럼)과 bad 컬럼은 빠진다.
+        assert_eq!(facts.len(), 3, "{facts:?}");
+        for fact in facts {
+            for key in ["channel", "method"] {
+                if let Some(text) = fact[key].as_str() {
+                    assert!(is_exchange_safe(text), "{text:?}");
+                }
+            }
+        }
+        let limitations = value["limitations"].as_array().unwrap();
+        assert!(
+            limitations
+                .iter()
+                .any(|l| l.as_str().unwrap().starts_with(
+                    "catalog-coverage: 3 relation or column declaration(s) were omitted"
+                )),
+            "{limitations:?}"
+        );
     }
 }
