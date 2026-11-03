@@ -18,17 +18,20 @@ truncation are separate facts.
 | Db2 LUW / Informix | External JDBC drivers | Dedicated real-container fixture jobs | Fixture accounts; version/driver setup is pinned by the job configuration |
 | Other JDBC databases | Compatible external driver | Metadata baseline only | Not certified |
 
-The released v0.4.3 evidence is the [full fixture job](https://github.com/ictechgy/schemagraph/actions/runs/35686249564),
-[SQL Server/Oracle accuracy job](https://github.com/ictechgy/schemagraph/actions/runs/35686249608),
-and [IBM fixture job](https://github.com/ictechgy/schemagraph/actions/runs/35686249593).
+The released v0.9.0 evidence (tag commit `fad8e9d`) is the [CI run with the full fixture job](https://github.com/ictechgy/schemagraph/actions/runs/41583763434),
+[SQL Server/Oracle accuracy job](https://github.com/ictechgy/schemagraph/actions/runs/41583763488),
+[IBM fixture job](https://github.com/ictechgy/schemagraph/actions/runs/41583763549),
+and [DML producer accuracy job](https://github.com/ictechgy/schemagraph/actions/runs/41583763689).
 These runs apply to their tested commit, not automatically to later source edits.
+The database versions in the table are the ones the pinned fixtures record; a CI
+image can move a patch version (for example PostgreSQL 16.13 to 16.15) between runs.
 Images and independent expectations are recorded under `Fixtures/accuracy`;
 CI configuration records the other fixture environments. The new DML corpus and
 its separate baseline are described in [DML-ACCURACY.md](DML-ACCURACY.md).
 
 ## Restricted PostgreSQL collection
 
-Version 0.5.0 adds a real PostgreSQL 16.13 test with a login role declared
+Since 0.5.0, a real PostgreSQL 16.13 test uses a login role declared
 `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT`. The known schema has two tables,
 one view, one materialized view, one SQL function, eight columns, and one foreign key.
 
@@ -63,13 +66,30 @@ python3 Scripts/verify-collection-scope.py --engine engine/target/debug/schemagr
   --output scope-jdbc.json
 ```
 
+## Known differences between collectors
+
+The three collectors aim at the same document, but these differences remain and are
+not hidden by any comparison step:
+
+| Difference | Native | Go probe | JDBC probe |
+| --- | --- | --- | --- |
+| PostgreSQL primary-key index | Not listed in `indexes` (`NOT indisprimary`) | Not listed | Listed (pgjdbc `getIndexInfo` includes it) |
+| MySQL/MariaDB `PRIMARY` index | Not listed | Not listed | Listed (`getIndexInfo` path) |
+| SQLite inline UNIQUE/CHECK notice | Limitation when the DDL has the keyword | Same | Not reported; unique constraints are still visible as unique indexes |
+| Server case rules in `context` | MySQL `lower_case_table_names` | MySQL, SQL Server collation | MySQL, MariaDB, SQL Server collation |
+| System schemas skipped | Per database | Per database | Per dialect; unknown dialects use the combined list |
+
+Index-level reviews and lints that compare documents from different collectors can
+therefore see a primary-key index appear or disappear without a schema change. Compare
+documents from the same collector when that matters.
+
 ## Runtime and distribution
 
 Released archives target Linux x86_64 and macOS arm64; the JVM probe requires
 Java 17. Windows, Linux arm64 release archives, and additional warehouse
 dialects have no new release support claim here.
 
-Version 0.5.0 includes a [consumer Action](REVIEW-ACTION.md) and a Docker
+Since 0.5.0 the repository includes a [consumer Action](REVIEW-ACTION.md) and a Docker
 build. The Dockerfile pins the official Rust and Debian image manifests and
 runs the CLI as UID/GID 65532. It contains the Rust engine; JDBC and Go collection
 remain separate producer choices. No container image is published by this

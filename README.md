@@ -37,10 +37,12 @@ cargo install schemagraph-cli --locked
 schemagraph --version
 ```
 
-Cargo and GitHub binaries are published separately. For the 0.8.1 migration
-helper, use the matching binary archive or source tag described in
-[the installation guide](INSTALLATION.md); check channel availability before
-pinning a crate version.
+Cargo and GitHub binaries are published separately, and not every version is on
+every channel: crates.io has no 0.7.1, 0.8.0 or 0.8.1 (the SQLite migration helper
+and `merge`/`openlineage` reached Cargo users in 0.9.0). Use the matching binary
+archive or source tag described in [the installation guide](INSTALLATION.md), and
+check the channel table in [RELEASE-NOTES.md](RELEASE-NOTES.md#publication-channels)
+before pinning a crate version.
 
 ### Build from source
 
@@ -151,6 +153,7 @@ read that file by default; use `--graph <path>` to select another snapshot.
 | --- | --- |
 | `scan <url>` | Collect a catalog and build the dependency graph. |
 | `scan --document <path>` | Build a graph from a JSON or NDJSON catalog document. |
+| `import <catalog> --format dbt\|query-log` | Attach offline dbt compiled SQL or observed queries to a catalog document ([EXTERNAL-SQL.md](EXTERNAL-SQL.md)). |
 | `graph --format mermaid\|json\|dot\|html` | Render the graph; select `--level schema\|object\|column`. |
 | `search <pattern>` | Find vertices by case-insensitive name substring or `*`/`?` glob; `--detail summary` adds kind and neighbor counts. |
 | `query <name> --depth N` | List dependencies and dependents, with supporting edges. |

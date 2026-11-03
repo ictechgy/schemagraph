@@ -606,3 +606,28 @@ control path.
 See [review/Action usage](REVIEW-ACTION.md), [external SQL imports](EXTERNAL-SQL.md),
 [DML evidence](DML-ACCURACY.md), [support](SUPPORT-MATRIX.md), and
 [performance measurements](PERFORMANCE.md).
+
+# Publication channels
+
+Each channel is published and checked separately; a tag or a GitHub Release does
+not imply that the crates or the Maven artifact exist. Checked on 2026-11-03 against
+GitHub Releases, the crates.io API and Maven Central metadata.
+
+| Version | GitHub Release (binaries) | crates.io (`schemagraph-*`) | Maven Central (`io.github.ictechgy:schemagraph-probe`) |
+| --- | --- | --- | --- |
+| 0.9.0 | yes | yes | yes |
+| 0.8.1 | yes | no | yes |
+| 0.8.0 | yes | no | yes |
+| 0.7.1 | yes | no | no |
+| 0.7.0 | yes | yes | yes |
+| 0.6.0 | yes | yes | yes |
+| 0.5.1 | yes | yes | yes |
+| 0.5.0 | yes | yes | yes |
+| 0.4.0–0.4.3 | yes | yes | yes |
+| 0.3.0 | yes | yes | yes |
+| 0.1.0–0.2.0 | yes | yes | no |
+
+Cargo users therefore received the 0.7.1 file-output protection and SQLite
+nullability fixes and the 0.8.x `merge`, `openlineage` and SQLite migration helper
+changes only with 0.9.0. Statements such as "already shipped in 0.8.1" above refer
+to the binary and Maven channels.
