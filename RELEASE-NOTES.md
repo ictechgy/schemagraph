@@ -14,6 +14,7 @@
 - The JDBC probe collects PostgreSQL partitioned parent tables and foreign tables (pgjdbc reports them as `PARTITIONED TABLE` and `FOREIGN TABLE`), as the native reader and Go probe already did. Their foreign keys, view edges and `facts` declarations no longer depend on which collector scanned the database.
 - The JDBC probe skips only the system schemas of the database it reads. A PostgreSQL schema named `system`, `sys` or `mysql`, for example, was dropped without a limitation because one list covered every dialect. PostgreSQL now skips `information_schema` and `pg_*` like the native reader; MySQL/MariaDB, SQL Server, Oracle and H2 use their own lists; unknown dialects keep the previous combined list.
 - The JDBC probe attaches SQLite triggers whose `tbl_name` differs from the table only in ASCII letter case, matching the native reader and Go probe.
+- CI checks `facts` with the published isthmus-cli 0.14.0 consumer instead of skipping that step as `partial`. `Scripts/verify-bridge-facts.py` adds a schema-filtered case and a `--require-isthmus` flag that turns a skipped consumer check into a failure.
 
 ## Breaking
 

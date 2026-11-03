@@ -331,6 +331,28 @@ def missing_schema_case(engine, url, work, env, version):
     assert any(note.startswith(COVERAGE_PREFIX) for note in document['limitations']), document['limitations']
 
 
+def filtered_case(engine, url, work, env, version, complete):
+    """스키마 필터로 일부만 수집한 facts는 필터 밖 관계를 못 봤다고 신고해야 한다.
+
+    catalog_complete는 필터 안에서만 참이다. 신고가 없으면 isthmus가 필터 밖 스키마의
+    관계 사용을 relation-use-without-decl error로 만든다.
+    """
+    catalog = work/'filtered.catalog.json'
+    ACCURACY.run([engine, 'scan', url, '--schema', 'public', '--emit-document', catalog,
+                  '-o', work/'filtered.graph.json'], env=env)
+    document = run_facts(engine, catalog, work/'project', work/'filtered.facts.json', env)
+    check_contract(document, work/'project', version)
+    context = json.loads(catalog.read_text())['context']
+    assert context['catalog_complete'] is True and context['schema_filter'] == ['public'], context
+    coverage = [note for note in document['limitations'] if note.startswith(COVERAGE_PREFIX)]
+    assert any('requested schema' in note and 'public' in note for note in coverage), document['limitations']
+    assert 'limitationScopes' not in document, document.get('limitationScopes')
+    relations = {channel for channel, method, _ in actual_facts(document) if method is None}
+    assert relations and all(channel.startswith('public.') for channel in relations), relations
+    assert relations <= {channel for channel, method, _ in actual_facts(complete) if method is None}, relations
+    return document
+
+
 def check_matview_columns(catalog):
     """MV 컬럼 표기가 같은 컬럼을 가진 원본 테이블의 information_schema 표기와 같은지 본다.
 
@@ -361,9 +383,10 @@ def postgres_case(engine, bindir, work, version):
         summary['usr_impact_resolved'] = len(reports)
         summary['language_traversal_roots'] = check_language_traversal(engine, document, reports, graph, work, env)
         restricted = restricted_case(engine, url, psql, work, env, version, document)
+        filtered = filtered_case(engine, url, work, env, version, document)
         missing_schema_case(engine, url, work, env, version)
         server = ACCURACY.run(psql+['-Atqc', 'SHOW server_version'], env=env).strip()
-        return dict(summary, server_version=server), document, restricted
+        return dict(summary, server_version=server), document, restricted, filtered
 
 
 # 호출 측(Go 생산자 모양) 사용 사실과 isthmus가 내야 할 판정이다. 기대 판정은
@@ -404,7 +427,7 @@ def isthmus_check(node, isthmus, work, label, facts_document):
     return {(issue['code'], issue['channel'], issue.get('method')): issue for issue in report['issues']}
 
 
-def isthmus_case(node, isthmus, work, complete, restricted):
+def isthmus_case(node, isthmus, work, complete, restricted, filtered):
     """완전한 카탈로그는 error로, coverage 공백이 있는 카탈로그는 -unverified 경고로 내려가야 한다."""
     issues = isthmus_check(node, isthmus, work, 'complete', complete)
     errors = {key for key, issue in issues.items() if issue['severity'] == 'error'}
@@ -419,7 +442,12 @@ def isthmus_case(node, isthmus, work, complete, restricted):
     degraded = isthmus_check(node, isthmus, work, 'restricted', restricted)
     assert not any(issue['severity'] == 'error' for issue in degraded.values()), sorted(map(str, degraded))
     assert ('relation-use-without-decl-unverified', 'missing_table', None) in degraded, sorted(map(str, degraded))
-    return {'complete_issues': len(issues), 'restricted_issues': len(degraded), 'errors': len(errors)}
+    # 스키마 필터 수집도 같은 판정 불가로 내려가야 한다 — 필터 밖 관계일 수 있다.
+    scoped = isthmus_check(node, isthmus, work, 'filtered', filtered)
+    assert not any(issue['severity'] == 'error' for issue in scoped.values()), sorted(map(str, scoped))
+    assert ('relation-use-without-decl-unverified', 'missing_table', None) in scoped, sorted(map(str, scoped))
+    return {'complete_issues': len(issues), 'restricted_issues': len(degraded),
+            'filtered_issues': len(scoped), 'errors': len(errors)}
 
 
 def engine_version(engine):
@@ -430,17 +458,21 @@ def engine_version(engine):
 def main():
     """DB 사례를 실행하고 결과를 JSON으로 남긴다.
 
-    isthmus의 persistence 조인은 아직 npm 배포본에 없어 --isthmus가 없으면 소비
-    검사를 건너뛴다. 그때 status는 ok가 아니라 partial이다 — 건너뛴 검사를
-    통과로 읽히게 두지 않는다. 실패는 예외로 끝나 종료 코드가 0이 아니다.
+    --isthmus가 없으면 소비 검사를 건너뛴다. 그때 status는 ok가 아니라 partial이다 —
+    건너뛴 검사를 통과로 읽히게 두지 않는다. CI처럼 소비 검사가 필수인 곳은
+    --require-isthmus로 partial을 실패로 만든다. 실패는 예외로 끝나 종료 코드가 0이 아니다.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', type=Path, required=True)
     parser.add_argument('--postgres-bin', type=Path, default=Path(os.environ.get('PGBIN', '/opt/homebrew/opt/postgresql@16/bin')))
     parser.add_argument('--isthmus', type=Path, help='isthmus dist/cli/main.js with persistence support (optional)')
+    parser.add_argument('--require-isthmus', action='store_true',
+                        help='fail instead of reporting partial when --isthmus is not given')
     parser.add_argument('--node', type=Path, default=Path('node'))
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if args.require_isthmus and not args.isthmus:
+        parser.error('--require-isthmus needs --isthmus <dist/cli/main.js>')
     engine = args.engine.resolve()
     digest = hashlib.sha256(engine.read_bytes()).hexdigest()
     version = engine_version(engine)
@@ -449,12 +481,12 @@ def main():
         result = {'status': 'ok', 'engine_sha256': digest, 'engine_version': version,
                   'verifier_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   'sqlite': sqlite_case(engine, work, version)}
-        result['postgres'], complete, restricted = postgres_case(engine, args.postgres_bin, work, version)
+        result['postgres'], complete, restricted, filtered = postgres_case(engine, args.postgres_bin, work, version)
         if args.isthmus:
-            result['isthmus'] = isthmus_case(args.node, args.isthmus.resolve(), work, complete, restricted)
+            result['isthmus'] = isthmus_case(args.node, args.isthmus.resolve(), work, complete, restricted, filtered)
         else:
             result['status'] = 'partial'
-            result['isthmus'] = 'skipped: --isthmus not given (persistence join is unreleased in isthmus 0.9.0)'
+            result['isthmus'] = 'skipped: --isthmus not given'
     assert hashlib.sha256(engine.read_bytes()).hexdigest() == digest, 'engine binary changed during verification'
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2)+'\n')
