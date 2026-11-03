@@ -31,6 +31,55 @@ private val INFORMIX_SYSTEM_SCHEMAS = setOf(
     "sysmaster", "sysutils", "sysadmin", "sysuser", "syscdr", "syscdcv1",
 )
 
+/** MySQL·MariaDB가 내보내는 시스템 스키마다. 네이티브 reader·Go 프로브와 같은 목록이다. */
+private val MYSQL_SYSTEM_SCHEMAS = setOf("information_schema", "mysql", "performance_schema", "sys")
+
+/** SQL Server가 사용자 객체와 함께 내보내는 시스템 스키마다. */
+private val SQLSERVER_SYSTEM_SCHEMAS = setOf("information_schema", "sys")
+
+/** Oracle 사전의 시스템 스키마다. 목록이 길어 공통 목록에서 MySQL·PG 이름을 뺀 것으로 둔다. */
+private val ORACLE_SYSTEM_SCHEMAS =
+    SYSTEM_SCHEMAS - setOf("information_schema", "pg_catalog", "pg_toast", "pg_temp_1", "mysql", "performance_schema", "innodb")
+
+/**
+ * 방언별 시스템 스키마 판정이다. 같은 이름이 다른 방언에서는 평범한 사용자 스키마일 수
+ * 있어(PostgreSQL의 `system`·`sys`·`mysql` 스키마 등) 그 방언의 카탈로그가 실제로 내보내는
+ * 시스템 스키마만 뺀다. 가시성 검사는 수집한 스키마에만 돌아 여기서 빠진 스키마는 한계로도
+ * 남지 않으므로, 방언을 모를 때만 예전처럼 모든 방언의 목록을 합쳐 쓴다(보수적).
+ * Oracle의 PUBLIC은 수만 시노님 슈도스키마라 방언 한정으로 억제한다(H2의 PUBLIC은
+ * 사용자 기본 스키마라 억제하면 안 된다).
+ */
+internal fun isSystemSchema(dialect: String, schema: String): Boolean {
+    val s = schema.lowercase()
+    return when (dialect) {
+        // 네이티브 reader와 같은 규칙 — PostgreSQL은 pg_ 접두 스키마를 사용자에게 허용하지 않는다.
+        "postgres" -> s == "information_schema" || s.startsWith("pg_")
+        "mysql", "mariadb" -> s in MYSQL_SYSTEM_SCHEMAS
+        "sqlserver" -> s in SQLSERVER_SYSTEM_SCHEMAS
+        "oracle" -> s in ORACLE_SYSTEM_SCHEMAS || s == "public"
+        "h2" -> s == "information_schema"
+        "sqlite" -> false
+        "db2" -> s in SYSTEM_SCHEMAS || s in DB2_SYSTEM_SCHEMAS
+        "informix" -> s in SYSTEM_SCHEMAS || s in INFORMIX_SYSTEM_SCHEMAS
+        else -> s in SYSTEM_SCHEMAS
+    }
+}
+
+/** getTables의 TABLE_TYPE을 문서 객체 종류로 바꾼다. 정점이 아닌 종류(SYSTEM TABLE,
+ *  GLOBAL TEMPORARY 등)는 null이다. */
+internal fun tableKindOf(tableType: String): String? {
+    val type = tableType.uppercase()
+    return when {
+        // pgjdbc는 relkind p·f를 PARTITIONED TABLE·FOREIGN TABLE로 준다. 네이티브·Go 수집기는
+        // 둘 다 테이블로 수집하므로(information_schema의 BASE TABLE·FOREIGN) 같은 정점을 만든다.
+        type == "TABLE" || type == "BASE TABLE" || type == "PARTITIONED TABLE" || type == "FOREIGN TABLE" -> "table"
+        type.contains("MATERIALIZED") && type.contains("VIEW") -> "materialized-view"
+        type.contains("VIEW") -> "view"
+        type == "SYNONYM" -> "synonym"
+        else -> null
+    }
+}
+
 /** Oracle 조회의 왕복당 행 수. ALL_SOURCE는 소스 한 줄이 한 행이라 ojdbc 기본값(10행)이면
  *  대형 PL/SQL 스키마의 수집 시간을 왕복 지연이 정한다. 행 최대 약 4KB라 1000행도 버퍼가
  *  작다. LONG 열(ALL_VIEWS.TEXT 등) 조회는 ojdbc가 여전히 행 단위로 받는다 —
@@ -158,17 +207,15 @@ class Extractor(
         conn.createStatement().use { st -> st.executeQuery(sql).use { rs -> if (rs.next()) rs.getString(1) else null } }
     }.getOrNull()
 
-    /** 시스템 스키마 억제 — Oracle의 PUBLIC은 수만 시노님 슈도스키마라 방언
-     *  한정으로 억제한다(H2의 PUBLIC은 사용자 기본 스키마라 억제하면 안 된다). */
-    private fun isSystem(schema: String): Boolean {
-        val s = schema.lowercase()
-        val dialectSystem = when (dialect) {
-            "db2" -> s in DB2_SYSTEM_SCHEMAS
-            "informix" -> s in INFORMIX_SYSTEM_SCHEMAS
-            else -> false
-        }
-        return s in SYSTEM_SCHEMAS || dialectSystem || (dialect == "oracle" && s == "public")
-    }
+    private fun isSystem(schema: String): Boolean = isSystemSchema(dialect, schema)
+
+    /**
+     * 트리거를 대상 객체에 귀속하는 이름 키다. SQLite의 sqlite_master.tbl_name은 DDL 철자를
+     * 보존하지만 식별자는 ASCII 대소문자만 무시하고 비교하므로 접는다(`ON ORDERS` → orders).
+     * 한 스키마에 대소문자만 다른 두 테이블은 SQLite에 있을 수 없다. 다른 방언은 카탈로그 이름 그대로다.
+     */
+    private fun triggerTargetKey(name: String): String =
+        if (dialect == "sqlite") name.map { if (it in 'A'..'Z') it + ('a' - 'A') else it }.joinToString("") else name
 
     fun extract(): CatalogDocument {
         // 읽기 전용 힌트 — sqlite-jdbc처럼 연결 후 변경을 거부하는 드라이버는
@@ -261,7 +308,7 @@ class Extractor(
                         idx.copy(usage = usage.indexes[Triple(schema, raw.name, idx.name)])
                     }
                 else emptyList(),
-                triggers = bodies.triggers[schema to raw.name].orEmpty().sortedBy { it.name },
+                triggers = bodies.triggers[schema to triggerTargetKey(raw.name)].orEmpty().sortedBy { it.name },
                 body = bodies.views[schema to raw.name],
                 usage = usage.tables[schema to raw.name],
             )
@@ -328,14 +375,7 @@ class Extractor(
         meta.getTables(catalog, schema, null, null).use { rs ->
             buildList {
                 while (rs.next()) {
-                    val type = rs.strOrNull("TABLE_TYPE").orEmpty().uppercase()
-                    val kind = when {
-                        type == "TABLE" || type == "BASE TABLE" -> "table"
-                        type.contains("MATERIALIZED") && type.contains("VIEW") -> "materialized-view"
-                        type.contains("VIEW") -> "view"
-                        type == "SYNONYM" -> "synonym"
-                        else -> continue // SYSTEM TABLE, GLOBAL TEMPORARY 등
-                    }
+                    val kind = tableKindOf(rs.strOrNull("TABLE_TYPE").orEmpty()) ?: continue
                     val schemaName = rs.strOrNull("TABLE_SCHEM")
                     val catalogName = rs.strOrNull("TABLE_CAT")
                     // sqlite-jdbc는 둘 다 null로 온다 — SQLite의 유일 스키마는 main이다.
@@ -665,7 +705,7 @@ class Extractor(
                 }
                 bestEffort("triggers",
                     "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'") { rs ->
-                    triggers.getOrPut("main" to rs.getString(2)) { mutableListOf() } +=
+                    triggers.getOrPut("main" to triggerTargetKey(rs.getString(2))) { mutableListOf() } +=
                         TriggerDoc(rs.getString(1), rs.getString(3))
                 }
             }
