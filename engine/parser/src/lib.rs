@@ -14,8 +14,8 @@ use std::ops::ControlFlow;
 use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId, VertexKind};
 use schemagraph_source::document::{CatalogDocument, ObjectDoc, RoutineDoc};
 use sqlparser::ast::{
-    visit_expressions, visit_statements, Expr, ObjectName, Statement, TableFactor, TableObject,
-    TableWithJoins, UpdateTableFromKind,
+    visit_expressions, visit_statements, CopySource, Expr, ObjectName, Statement, TableFactor,
+    TableObject, TableWithJoins, UpdateTableFromKind,
 };
 use sqlparser::dialect::{
     Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
@@ -3486,6 +3486,18 @@ fn collect_trigger_facts(
             candidates: Vec::new(),
         });
     }
+    // COPY FROM의 테이블 쓰기 간선은 write_targets가 남긴다. 적재 값은 외부
+    // 파일·STDIN이라 컬럼별 쓰기 효과를 만들 근거가 없다 — complete로 주장하지
+    // 않도록 부분 분석을 표시한다.
+    if copy_from_table(stmt).is_some() {
+        parsed.partial = true;
+        parsed.diagnostics.push(schemagraph_core::Diagnostic {
+            code: "SG_DML_COPY".into(),
+            message: "COPY FROM loads rows from external data; the table write is recorded but per-column write effects are not modeled".into(),
+            location: None,
+            candidates: Vec::new(),
+        });
+    }
     // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
     // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
     let write_targets = write_targets(stmt);
@@ -3744,6 +3756,10 @@ fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
             TableObject::TableName(name) => relation_name_parts(name).into_iter().collect(),
             _ => vec![],
         },
+        Statement::Copy { .. } => copy_from_table(stmt)
+            .and_then(relation_name_parts)
+            .into_iter()
+            .collect(),
         Statement::CreateTable(create) if create.query.is_some() => {
             relation_name_parts(&create.name).into_iter().collect()
         }
@@ -3857,12 +3873,41 @@ fn qualified_write_targets(stmt: &Statement) -> Vec<ObjectName> {
                 names.push(into.name.clone());
             }
         }
+        Statement::Copy { .. } => names.extend(copy_from_table(stmt).cloned()),
         _ => {}
     }
     names
         .into_iter()
         .filter(|name| name.0.iter().filter_map(|part| part.as_ident()).count() == 3)
         .collect()
+}
+
+/// `COPY t [(cols)] FROM …`의 적재 대상 테이블이다.
+///
+/// sqlparser의 visitor는 `CopySource::Table` 이름을 관계로 방문하지 않는다. 그래서
+/// 쓰기 대상과 읽기 원본을 문장 모양에서 직접 꺼낸다. `COPY (query) TO`의 질의는
+/// visitor가 그대로 내려가므로 여기서 다루지 않는다.
+fn copy_from_table(stmt: &Statement) -> Option<&ObjectName> {
+    match stmt {
+        Statement::Copy {
+            source: CopySource::Table { table_name, .. },
+            to: false,
+            ..
+        } => Some(table_name),
+        _ => None,
+    }
+}
+
+/// `COPY t TO …`의 내보내기 원본 테이블이다. 테이블 원본만 읽기 대상이다.
+fn copy_to_table(stmt: &Statement) -> Option<&ObjectName> {
+    match stmt {
+        Statement::Copy {
+            source: CopySource::Table { table_name, .. },
+            to: true,
+            ..
+        } => Some(table_name),
+        _ => None,
+    }
 }
 
 fn promoted_update_factor<'a>(
@@ -6094,6 +6139,54 @@ mod tests {
         assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
             && e.from.as_str() == "public.touch_customer"
             && e.to.as_str() == "public.customers"));
+    }
+
+    /// COPY FROM은 대상 테이블에 쓰고 COPY TO는 원본 관계를 읽는다. 둘 다
+    /// 놓치면 ETL 적재기가 impact에서 조용히 사라진다.
+    #[test]
+    fn plpgsql의_copy_from은_writes_copy_to는_reads가_된다() {
+        let doc = doc_with_routine(
+            vec![
+                routine(
+                    "load_orders",
+                    Some("plpgsql"),
+                    "BEGIN COPY orders FROM '/tmp/orders.csv' WITH (FORMAT csv); END",
+                ),
+                routine(
+                    "dump_customers",
+                    Some("plpgsql"),
+                    "BEGIN COPY customers TO '/tmp/customers.csv'; END",
+                ),
+                routine(
+                    "dump_join",
+                    Some("plpgsql"),
+                    "BEGIN COPY (SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id) \
+                     TO STDOUT; END",
+                ),
+            ],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        let has = |kind: EdgeKind, from: &str, to: &str| {
+            g.edges()
+                .iter()
+                .any(|e| e.kind == kind && e.from.as_str() == from && e.to.as_str() == to)
+        };
+        assert!(has(EdgeKind::Writes, "public.load_orders", "public.orders"));
+        assert!(!has(EdgeKind::Reads, "public.load_orders", "public.orders"));
+        assert!(has(
+            EdgeKind::Reads,
+            "public.dump_customers",
+            "public.customers"
+        ));
+        assert!(!has(
+            EdgeKind::Writes,
+            "public.dump_customers",
+            "public.customers"
+        ));
+        assert!(has(EdgeKind::Reads, "public.dump_join", "public.orders"));
+        assert!(has(EdgeKind::Reads, "public.dump_join", "public.customers"));
     }
 
     #[test]

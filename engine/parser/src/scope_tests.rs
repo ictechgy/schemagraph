@@ -1769,3 +1769,56 @@ fn sqlserver_database_qualifier_matches_the_collected_database_case_insensitivel
     assert!(!edge(&other, "dbo.v", "dbo.orders", EdgeKind::Reads));
     assert!(has_diagnostic(&other, "SG_CROSS_DATABASE"));
 }
+
+/// COPY FROM은 테이블 쓰기는 남기되, 외부 데이터가 채우는 컬럼별 효과는 알 수
+/// 없어 `complete`로 주장하지 않는다. COPY TO는 읽기라 상태를 낮추지 않는다.
+#[test]
+fn copy_from_records_table_write_and_marks_column_effects_partial() {
+    let graph = scan_routine_with(
+        "BEGIN COPY orders (id, amount) FROM '/tmp/orders.csv'; COPY customers TO STDOUT; END",
+        "postgres",
+        "plpgsql",
+    );
+    assert!(edge(&graph, "s.mutate", "s.orders", EdgeKind::Writes));
+    assert!(edge(&graph, "s.mutate", "s.customers", EdgeKind::Reads));
+    assert!(has_diagnostic(&graph, "SG_DML_COPY"));
+    assert_ne!(
+        graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Complete
+    );
+}
+
+#[test]
+fn copy_to_alone_keeps_routine_complete() {
+    let graph = scan_routine_with(
+        "BEGIN COPY (SELECT id FROM orders) TO STDOUT; END",
+        "postgres",
+        "plpgsql",
+    );
+    assert!(edge(&graph, "s.mutate", "s.orders", EdgeKind::Reads));
+    assert!(!has_diagnostic(&graph, "SG_DML_COPY"));
+    assert_eq!(
+        graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Complete,
+        "{:?}",
+        graph.limitations()
+    );
+}
+
+/// `--sql-dir`의 SQL 파일은 sql 언어 routine으로 붙는다. pg_dump 형식의
+/// `COPY … FROM STDIN;` 데이터 블록도 적재 대상 쓰기로 남는다.
+#[test]
+fn sql_file_copy_from_stdin_records_table_write() {
+    for body in [
+        "COPY orders (id, amount) FROM STDIN;\n1\t10\n\\.\n",
+        "COPY orders (id, amount) FROM STDIN;",
+    ] {
+        let graph = scan_routine_with(body, "postgres", "sql");
+        assert!(
+            edge(&graph, "s.mutate", "s.orders", EdgeKind::Writes),
+            "{body:?}: {:?}",
+            graph.limitations()
+        );
+        assert!(has_diagnostic(&graph, "SG_DML_COPY"), "{body:?}");
+    }
+}
