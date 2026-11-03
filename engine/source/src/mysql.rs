@@ -65,15 +65,29 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
             .push(read_schema(&pool, &schema, &mut doc.limitations, &mut catalog_complete).await?);
     }
     doc.schemas.sort_by(|a, b| a.name.cmp(&b.name));
+    let lower_case_table_names = read_lower_case_table_names(&pool).await;
     doc.context = Some(CollectionContext {
         source_id: String::new(),
         database: scope_db.clone(),
         schema_filter: scope_db.map(|name| vec![name]),
         catalog_complete,
+        lower_case_table_names,
+        collation: None,
     });
     record_read_only_failure(&mut doc, read_only_cause.get().map(String::as_str));
     transport.record_limitation(&mut doc, TLS_REMEDY);
     Ok(doc)
+}
+
+/// 서버의 `@@lower_case_table_names` 원값을 읽는다. 엔진이 테이블·뷰 이름의
+/// 대소문자 규칙을 정하는 근거다. 읽지 못하거나 0·1·2 밖의 값이면 None으로 두어
+/// 엔진이 이름을 정확히 비교하게 한다(규칙을 모르는 상태와 같다).
+async fn read_lower_case_table_names(pool: &MySqlPool) -> Option<u8> {
+    let value: i64 = sqlx::query_scalar("SELECT CAST(@@lower_case_table_names AS SIGNED)")
+        .fetch_one(pool)
+        .await
+        .ok()?;
+    u8::try_from(value).ok().filter(|value| *value <= 2)
 }
 
 /// URL의 ssl-mode를 전송 판정의 세 갈래로 접는다.
@@ -733,6 +747,8 @@ mod tests {
                 database: Some("app".into()),
                 schema_filter: Some(vec!["app".into()]),
                 catalog_complete,
+                lower_case_table_names: None,
+                collation: None,
             }),
             dependencies: vec![],
         }

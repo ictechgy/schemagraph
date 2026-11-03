@@ -77,6 +77,13 @@ internal fun readImportedKeyRow(rs: ResultSet): ImportedKeyRow {
     )
 }
 
+/** MySQL·MariaDB의 테이블 이름 대소문자 규칙 원값 조회다. */
+internal const val LOWER_CASE_TABLE_NAMES_SQL = "SELECT CAST(@@lower_case_table_names AS SIGNED)"
+
+/** SQL Server 현재 데이터베이스의 기본 collation 이름 조회다. */
+internal const val DATABASE_COLLATION_SQL =
+    "SELECT CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation'))"
+
 /** 프로브 추출기 — Connection 하나를 받아 CatalogDocument를 만든다. */
 class Extractor(
     private val conn: Connection,
@@ -127,7 +134,29 @@ class Extractor(
         database = runCatching { conn.catalog }.getOrNull(),
         schemaFilter = schemaFilter.distinct().sorted().takeIf { it.isNotEmpty() },
         catalogComplete = complete && sessionComplete,
+        lowerCaseTableNames = lowerCaseTableNames,
+        collation = collation,
     )
+
+    /** 서버의 테이블 이름 대소문자 규칙 원값이다. 문맥을 여러 번 만들어도 한 번만 읽는다. */
+    private val lowerCaseTableNames: Int? by lazy {
+        if (dialect != "mysql" && dialect != "mariadb") null
+        else scalarText(LOWER_CASE_TABLE_NAMES_SQL)?.trim()?.toIntOrNull()?.takeIf { it in 0..2 }
+    }
+
+    /** SQL Server 데이터베이스 기본 collation 원문이다. */
+    private val collation: String? by lazy {
+        if (dialect != "sqlserver") null else scalarText(DATABASE_COLLATION_SQL)?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * 한 칸짜리 조회 결과를 문자열로 읽는다. 이름 규칙은 보조 근거라, 읽지 못하면 null로
+     * 두어 엔진이 이름을 정확히 비교하게 한다(규칙을 모르는 상태와 같다). 그래서 실패를
+     * 한계로 올리지 않는다.
+     */
+    private fun scalarText(sql: String): String? = runCatching {
+        conn.createStatement().use { st -> st.executeQuery(sql).use { rs -> if (rs.next()) rs.getString(1) else null } }
+    }.getOrNull()
 
     /** 시스템 스키마 억제 — Oracle의 PUBLIC은 수만 시노님 슈도스키마라 방언
      *  한정으로 억제한다(H2의 PUBLIC은 사용자 기본 스키마라 억제하면 안 된다). */

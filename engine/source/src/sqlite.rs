@@ -74,6 +74,8 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
             .limitations
             .iter()
             .all(|limitation| limitation == INLINE_CONSTRAINTS_LIMITATION),
+        lower_case_table_names: None,
+        collation: None,
     });
     Ok(doc)
 }

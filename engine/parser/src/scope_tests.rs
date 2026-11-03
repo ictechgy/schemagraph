@@ -974,6 +974,8 @@ fn matching_database_qualified_relation_is_local_but_mismatch_is_partial() {
                 database: Some("corpus".into()),
                 schema_filter: Some(vec!["public".into()]),
                 catalog_complete: true,
+                lower_case_table_names: None,
+                collation: None,
             }),
             dependencies: Vec::new(),
             version: 1,
@@ -1689,6 +1691,8 @@ fn sqlserver_database_qualifier_matches_the_collected_database_case_insensitivel
                 database: Some("MyDb".into()),
                 schema_filter: Some(vec!["dbo".into()]),
                 catalog_complete: true,
+                lower_case_table_names: None,
+                collation: None,
             }),
             dependencies: Vec::new(),
             version: 1,
@@ -1923,4 +1927,70 @@ fn mysql_routine_calls_fold_case_but_tables_do_not_by_default() {
     );
     // ORDERS ≠ orders: lower_case_table_names=0(리눅스 기본)이면 다른 테이블일 수 있다.
     assert!(!edge(&graph, "s.caller", "s.orders", EdgeKind::Reads));
+}
+
+/// 대소문자 규칙을 실은 문맥으로 MySQL·SQL Server 문서를 만든다.
+fn case_rule_doc(
+    dialect: &str,
+    lower_case_table_names: Option<u8>,
+    collation: Option<&str>,
+    body: &str,
+) -> Graph {
+    let doc = CatalogDocument {
+        context: Some(CollectionContext {
+            source_id: "app".into(),
+            database: None,
+            schema_filter: None,
+            catalog_complete: true,
+            lower_case_table_names,
+            collation: collation.map(str::to_owned),
+        }),
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: dialect.into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: "s".into(),
+            objects: vec![object("Orders", &["id"])],
+            routines: vec![case_routine("reader", "procedure", body)],
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+    for note in notes {
+        graph.add_limitation(note);
+    }
+    graph
+}
+
+/// 서버가 알려 준 대소문자 규칙이 있을 때만 관계 이름을 접는다.
+#[test]
+fn mysql_and_sqlserver_fold_relation_case_only_with_collected_rules() {
+    let mysql = "BEGIN SELECT id FROM orders; END";
+    let sqlserver = "SELECT id FROM orders";
+    let reads = |graph: &Graph| edge(graph, "s.reader", "s.Orders", EdgeKind::Reads);
+    assert!(!reads(&case_rule_doc("mysql", None, None, mysql)));
+    assert!(!reads(&case_rule_doc("mysql", Some(0), None, mysql)));
+    assert!(reads(&case_rule_doc("mysql", Some(1), None, mysql)));
+    assert!(reads(&case_rule_doc("mariadb", Some(2), None, mysql)));
+    assert!(!reads(&case_rule_doc("sqlserver", None, None, sqlserver)));
+    assert!(!reads(&case_rule_doc(
+        "sqlserver",
+        None,
+        Some("Latin1_General_CS_AS"),
+        sqlserver
+    )));
+    assert!(!reads(&case_rule_doc(
+        "sqlserver",
+        None,
+        Some("Latin1_General_100_BIN2"),
+        sqlserver
+    )));
+    assert!(reads(&case_rule_doc(
+        "sqlserver",
+        None,
+        Some("SQL_Latin1_General_CP1_CI_AS"),
+        sqlserver
+    )));
 }

@@ -725,7 +725,30 @@ fn dialect_for(dialect: &str) -> Box<dyn Dialect> {
 /// ASCII 대소문자를 구분하지 않는다. 대소문자를 구분할 수 있는 방언(PG, 설정에 따른
 /// MySQL·SQL Server)에 켜면 다른 객체를 가리킬 수 있어 근거가 있을 때만 켠다.
 fn relation_names_fold_case(doc: &CatalogDocument) -> bool {
-    matches!(doc.dialect.as_str(), "oracle" | "db2" | "sqlite")
+    let context = doc.context.as_ref();
+    match doc.dialect.as_str() {
+        "oracle" | "db2" | "sqlite" => true,
+        // 1은 소문자로 저장·비교, 2는 저장 철자를 두고 소문자로 비교한다. 0(리눅스
+        // 기본)은 대소문자를 구분한다. 값이 없으면 규칙을 모르므로 정확히 비교한다.
+        "mysql" | "mariadb" => context
+            .and_then(|context| context.lower_case_table_names)
+            .is_some_and(|value| value != 0),
+        "sqlserver" | "mssql" => context
+            .and_then(|context| context.collation.as_deref())
+            .is_some_and(collation_is_case_insensitive),
+        _ => false,
+    }
+}
+
+/// SQL Server collation 이름이 대소문자 무시(`_CI`)인가. 이름은 `_`로 나뉜
+/// 속성 목록(`SQL_Latin1_General_CP1_CI_AS`, `Latin1_General_100_CI_AS_SC_UTF8`)이고
+/// `CS`·`BIN`·`BIN2`는 대소문자를 구분한다. 형식을 모르면 구분하는 쪽으로 본다.
+fn collation_is_case_insensitive(collation: &str) -> bool {
+    let parts: Vec<&str> = collation.split('_').collect();
+    parts.iter().any(|part| part.eq_ignore_ascii_case("CI"))
+        && !parts
+            .iter()
+            .any(|part| part.eq_ignore_ascii_case("BIN") || part.eq_ignore_ascii_case("BIN2"))
 }
 
 /// routine 이름을 대소문자 무시로 비교하는 방언인가. MySQL·MariaDB의 stored

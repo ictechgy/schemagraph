@@ -595,6 +595,8 @@ mod tests {
                 database: Some("db".into()),
                 schema_filter: Some(vec!["app".into()]),
                 catalog_complete: true,
+                lower_case_table_names: None,
+                collation: None,
             }),
             dependencies: vec![],
         }

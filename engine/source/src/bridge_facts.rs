@@ -352,6 +352,8 @@ mod tests {
                 database: None,
                 schema_filter: None,
                 catalog_complete: true,
+                lower_case_table_names: None,
+                collation: None,
             }),
             dependencies: vec![],
         }

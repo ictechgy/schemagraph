@@ -27,6 +27,11 @@ data class CollectionContext(
     val database: String? = null,
     val schemaFilter: List<String>? = null,
     val catalogComplete: Boolean,
+    /** MySQL·MariaDB `@@lower_case_table_names` 원값(0·1·2)이다. 테이블 이름의 대소문자
+     *  규칙 판정은 엔진이 한다. 읽지 못하면 null이라 키가 빠진다. */
+    val lowerCaseTableNames: Int? = null,
+    /** SQL Server 데이터베이스 기본 collation 이름 원문이다. 판정은 엔진이 한다. */
+    val collation: String? = null,
 )
 
 /** DB가 제공한 이름을 보존하며 실제 그래프 id 해석은 엔진에 맡긴다. */

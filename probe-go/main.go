@@ -148,6 +148,8 @@ type harvester struct {
 	catalogIncomplete   bool
 	sourceID            string
 	databaseName        *string
+	lowerCaseTableNames *int64
+	collation           *string
 	contextReady        bool
 }
 
