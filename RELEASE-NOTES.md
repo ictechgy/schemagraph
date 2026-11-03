@@ -8,6 +8,7 @@
 - The native SQLite `inline UNIQUE/CHECK constraints` limitation is added only when a table's DDL contains a `UNIQUE` or `CHECK` keyword token outside strings, quoted identifiers and comments; a column named `checksum` no longer triggers it. The limitation no longer makes the catalog incomplete, because missing inline constraints do not hide relations or columns; `facts` therefore stops downgrading every undeclared-relation error for such databases.
 - SQLite bodies (views, triggers) resolve relation names to catalog objects that differ only in ASCII letter case, as SQLite compares identifiers. A trigger writing `INSERT INTO AUDIT …` now records the object-level `writes` edge to `audit` instead of a "missing" limitation. As for Oracle, an exact match still wins and several case-only candidates stay unresolved.
 - MySQL and MariaDB routine calls (`CALL P_Helper()`, `FN_TOTAL(x)`) resolve to routines that differ only in letter case, because MySQL routine names are case-insensitive on every platform. A routine called only that way is no longer reported by `dead` as `noDependents`, and `impact` includes its callers. Table and view names still match exactly, because their case rule depends on the server's `lower_case_table_names`.
+- The Go probe applies the same three SQLite fixes as the native reader: reserved-prefix filtering, case-insensitive trigger attachment, and keyword-token detection of inline UNIQUE/CHECK constraints that no longer marks the catalog incomplete.
 
 # schemagraph 0.9.0 - 2026-11-03
 
