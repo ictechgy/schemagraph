@@ -1,6 +1,6 @@
 # Installing schemagraph
 
-The release target is `0.8.1`. Replace `VERSION` below only with a version listed
+The release target is `0.9.0`. Replace `VERSION` below only with a version listed
 on the [release page](https://github.com/ictechgy/schemagraph/releases) with matching
 artifacts and `SHA256SUMS`; a source version alone does not establish publication.
 GitHub binaries, Cargo crates, and Maven packages are published separately.

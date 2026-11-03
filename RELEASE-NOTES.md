@@ -1,5 +1,7 @@
 # Unreleased
 
+# schemagraph 0.9.0 - 2026-11-03
+
 - PostgreSQL body relations and routine names fold only unquoted identifiers. TRUNCATE and data-modifying CTEs retain write evidence; CTE aliases do not become physical relations.
 - Column DEFAULT expressions retain uniquely resolved function dependencies as `depends-on` edges with body-parse evidence. Overloaded, missing and unparsable calls remain measured limitations. Literal defaults do not invent dependencies.
 - `merge` also namespaces the job ID inside DML origin roles (`dml-owner:<job>:<role>`), so `openlineage` on a merged graph attributes column lineage to its routine and trigger jobs instead of emitting their outputs without `columnLineage`. Diagnostic messages, evidence details and limitations in a merged graph remain the source's local text; ANALYSIS.md documents this.
@@ -17,7 +19,7 @@
 
 ## Breaking
 
-- `schemagraph_core::Diagnostic` has a new public field, `candidates`. Library code that builds a `Diagnostic` with a struct literal must set it (or use `Diagnostic::new`), so the next crate release has to be 0.9.0 rather than a 0.8.x patch. This change does not bump versions.
+- `schemagraph_core::Diagnostic` has a new public field, `candidates`. Library code that builds a `Diagnostic` with a struct literal must set it (or use `Diagnostic::new`), so this crate release is 0.9.0 rather than a 0.8.x patch.
 - `openlineage` dataset names change for merged graphs (merge and openlineage already shipped in 0.8.1): `public.orders` becomes `app.public.orders`, `wh.public.orders`, and so on, so those events also get new `runId`s. In Marquez or DataHub, re-exporting a merged graph adds new per-source dataset nodes while jobs keep their names and history; the old conflated dataset nodes, and the cross-source paths through them, remain until you delete them or ingest into a fresh namespace. Single-graph exports are unchanged.
 - `schemagraph_export::openlineage::EventContext` has a new public field, `sources`; code that builds it with a struct literal must set it (an empty map keeps single-graph naming). Like the `Diagnostic` change, this needs the 0.9.0 release.
 - Limitation and diagnostic message text produced by the engine and native readers is now English. Diagnostic codes are unchanged; consumers that matched the earlier Korean text must match the new wording.

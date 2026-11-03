@@ -1,6 +1,6 @@
 # schemagraph
 
-Verified on 2026-11-01: GitHub [v0.8.1](https://github.com/ictechgy/schemagraph/releases/tag/v0.8.1) and crates.io `schemagraph-cli` **0.7.0** are separate channels. To use the 0.8.1 behavior described here, select a verified GitHub artifact or build that tag with `--locked`; `cargo install schemagraph-cli` currently selects 0.7.0. See [installation](INSTALLATION.md).
+The release target is **0.9.0**. GitHub binaries, crates.io `schemagraph-cli`, and Maven artifacts are separate publication channels; confirm the exact version before installation. See [installation](INSTALLATION.md) and the [breaking changes](RELEASE-NOTES.md).
 
 <img src="icon.png" alt="schemagraph's owl mascot" width="112" height="112" align="right">
 
