@@ -1822,3 +1822,105 @@ fn sql_file_copy_from_stdin_records_table_write() {
         assert!(has_diagnostic(&graph, "SG_DML_COPY"), "{body:?}");
     }
 }
+
+/// 대소문자 규칙 회귀를 위한 문서다. `routines`의 첫 항목이 호출자다.
+fn case_doc(dialect: &str, trigger_body: Option<&str>, routines: Vec<RoutineDoc>) -> Graph {
+    let mut orders = object("orders", &["id", "customer_id", "amount"]);
+    if let Some(body) = trigger_body {
+        orders.triggers.push(TriggerDoc {
+            name: "trg".into(),
+            body: Some(body.into()),
+        });
+    }
+    let doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: dialect.into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: "s".into(),
+            objects: vec![orders, object("audit", &["id", "name"])],
+            routines,
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+    for note in notes {
+        graph.add_limitation(note);
+    }
+    graph
+}
+
+fn case_routine(name: &str, kind: &str, body: &str) -> RoutineDoc {
+    RoutineDoc {
+        name: name.into(),
+        kind: kind.into(),
+        language: Some("sql".into()),
+        body: Some(body.into()),
+        signature: None,
+        usage: None,
+        member_of: None,
+        source: None,
+    }
+}
+
+/// SQLite 식별자는 ASCII 대소문자를 구분하지 않는다. 트리거 몸체의 `AUDIT`도
+/// 카탈로그의 audit 테이블 쓰기다.
+#[test]
+fn sqlite_body_relations_fold_ascii_case() {
+    let graph = case_doc(
+        "sqlite",
+        Some("CREATE TRIGGER trg AFTER INSERT ON orders BEGIN INSERT INTO AUDIT(id, name) VALUES (NEW.id, 'x'); END"),
+        vec![],
+    );
+    let trigger = graph
+        .vertices()
+        .find(|vertex| vertex.kind == schemagraph_core::VertexKind::Trigger)
+        .expect("trigger vertex")
+        .id
+        .as_str()
+        .to_owned();
+    assert!(
+        edge(&graph, &trigger, "s.audit", EdgeKind::Writes),
+        "{:?}",
+        graph.limitations()
+    );
+    assert!(
+        !graph.limitations().iter().any(|l| l.contains("AUDIT")),
+        "{:?}",
+        graph.limitations()
+    );
+}
+
+/// MySQL routine 이름은 플랫폼과 무관하게 대소문자를 구분하지 않는다. 테이블
+/// 이름은 lower_case_table_names에 달려 있어 기본으로 접지 않는다.
+#[test]
+fn mysql_routine_calls_fold_case_but_tables_do_not_by_default() {
+    let graph = case_doc(
+        "mysql",
+        None,
+        vec![
+            case_routine(
+                "caller",
+                "procedure",
+                "BEGIN CALL P_Helper(); SELECT FN_TOTAL(id) FROM ORDERS; END",
+            ),
+            case_routine("p_helper", "procedure", "BEGIN SELECT 1; END"),
+            case_routine("fn_total", "function", "RETURN 1"),
+        ],
+    );
+    assert!(
+        edge(&graph, "s.caller", "s.p_helper", EdgeKind::Calls),
+        "{:?}",
+        graph.limitations()
+    );
+    assert!(
+        edge(&graph, "s.caller", "s.fn_total", EdgeKind::Calls),
+        "{:?}",
+        graph.limitations()
+    );
+    // ORDERS ≠ orders: lower_case_table_names=0(리눅스 기본)이면 다른 테이블일 수 있다.
+    assert!(!edge(&graph, "s.caller", "s.orders", EdgeKind::Reads));
+}

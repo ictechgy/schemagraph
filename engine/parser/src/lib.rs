@@ -55,7 +55,7 @@ pub fn enrich_with_cache(
     // Oracle의 미인용 식별자는 대문자로 접힌다 — 카탈로그는 ORDERS인데 몸체는
     // orders라 정확 일치가 없다. 대소문자 구분 방언(PG 등)에 켜면 다른
     // 객체를 잘못 가리키므로 접힘 의미론이 확실한 방언에만 켠다.
-    let ci = matches!(doc.dialect.as_str(), "oracle" | "db2");
+    let ci = relation_names_fold_case(doc);
     let format_shadowed = matches!(doc.dialect.as_str(), "postgres" | "postgresql")
         && doc
             .schemas
@@ -716,6 +716,23 @@ fn dialect_for(dialect: &str) -> Box<dyn Dialect> {
         "sqlserver" | "mssql" => Box::new(MsSqlDialect {}),
         _ => Box::new(GenericDialect {}),
     }
+}
+
+/// 몸체의 관계 이름을 카탈로그와 대소문자 무시로 맞춰도 되는 문서인가.
+///
+/// 정확 일치가 먼저이고, 없을 때 대소문자만 다른 후보가 하나일 때만 잇는다.
+/// Oracle·DB2는 미인용 식별자를 대문자로 접고, SQLite는 인용 여부와 무관하게
+/// ASCII 대소문자를 구분하지 않는다. 대소문자를 구분할 수 있는 방언(PG, 설정에 따른
+/// MySQL·SQL Server)에 켜면 다른 객체를 가리킬 수 있어 근거가 있을 때만 켠다.
+fn relation_names_fold_case(doc: &CatalogDocument) -> bool {
+    matches!(doc.dialect.as_str(), "oracle" | "db2" | "sqlite")
+}
+
+/// routine 이름을 대소문자 무시로 비교하는 방언인가. MySQL·MariaDB의 stored
+/// routine 이름은 플랫폼·`lower_case_table_names`와 무관하게 대소문자를 구분하지
+/// 않는다.
+pub(crate) fn routine_names_fold_case(dialect: &str) -> bool {
+    matches!(dialect, "mysql" | "mariadb")
 }
 
 /// sqlparser에 전용 방언이 없어 일부러 Generic으로 읽는 이름. 엔진이 이 이름들로
@@ -4031,7 +4048,11 @@ pub(crate) struct VertexIndex {
 impl VertexIndex {
     /// 정확 일치만 볼지, 대소문자 무시 단일 후보까지 볼지 정한 조회 방식.
     pub(crate) fn lookup(&self, ci: bool) -> Lookup<'_> {
-        Lookup { index: self, ci }
+        Lookup {
+            index: self,
+            ci,
+            routine_ci: ci,
+        }
     }
 
     fn routines(&self, g: &Graph, ci: bool) -> &RoutineIndex {
@@ -4104,9 +4125,28 @@ impl RoutineIndex {
 pub(crate) struct Lookup<'a> {
     index: &'a VertexIndex,
     ci: bool,
+    /// routine 이름 비교의 대소문자 무시 여부다. MySQL은 테이블 이름 규칙과 달리
+    /// routine 이름을 항상 대소문자 무시로 비교한다.
+    routine_ci: bool,
 }
 
 impl Lookup<'_> {
+    /// routine 이름을 대소문자 무시로 비교하는 방언이면 routine 해석에만 켠다.
+    pub(crate) fn fold_routine_names(self, on: bool) -> Self {
+        Lookup {
+            routine_ci: self.routine_ci || on,
+            ..self
+        }
+    }
+
+    /// routine 정점·이름을 찾을 때의 조회 방식이다.
+    fn for_routines(self) -> Self {
+        Lookup {
+            ci: self.routine_ci,
+            ..self
+        }
+    }
+
     /// 이 조회 방식의 비교 규칙으로 이름 키를 만든다.
     fn key(&self, value: &str) -> String {
         if self.ci {
@@ -4591,6 +4631,7 @@ fn apply_call_edges(
     lookup: Lookup<'_>,
 ) {
     let CallNotes { notes, diagnostics } = out;
+    let lookup = lookup.for_routines();
     let schema = namespace.schema;
     for (ref_schema, name) in calls {
         let (target, hit) = match (ref_schema, namespace.search_path) {
