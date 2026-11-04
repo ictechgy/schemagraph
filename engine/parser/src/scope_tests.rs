@@ -1947,6 +1947,27 @@ fn mysql_routine_calls_fold_case_but_tables_do_not_by_default() {
     assert!(!edge(&graph, "s.caller", "s.orders", EdgeKind::Reads));
 }
 
+/// routine 이름의 대소문자 무시는 이름에만 적용된다. DB(스키마) 한정자는 테이블
+/// 이름과 같은 lower_case_table_names 규칙을 따르므로, 규칙을 모르면 정확히 비교한다.
+#[test]
+fn mysql_routine_folding_keeps_database_qualifiers_exact() {
+    let graph = case_doc(
+        "mysql",
+        None,
+        vec![
+            case_routine("caller", "procedure", "BEGIN CALL S.p_helper(); END"),
+            case_routine("other", "procedure", "BEGIN CALL s.P_HELPER(); END"),
+            case_routine("p_helper", "procedure", "BEGIN SELECT 1; END"),
+        ],
+    );
+    assert!(!edge(&graph, "s.caller", "s.p_helper", EdgeKind::Calls));
+    assert!(
+        edge(&graph, "s.other", "s.p_helper", EdgeKind::Calls),
+        "{:?}",
+        graph.limitations()
+    );
+}
+
 /// 대소문자 규칙을 실은 문맥으로 MySQL·SQL Server 문서를 만든다.
 fn case_rule_doc(
     dialect: &str,

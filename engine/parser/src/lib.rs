@@ -4079,6 +4079,7 @@ impl VertexIndex {
             index: self,
             ci,
             routine_ci: ci,
+            schema_ci: ci,
         }
     }
 
@@ -4155,6 +4156,10 @@ pub(crate) struct Lookup<'a> {
     /// routine 이름 비교의 대소문자 무시 여부다. MySQL은 테이블 이름 규칙과 달리
     /// routine 이름을 항상 대소문자 무시로 비교한다.
     routine_ci: bool,
+    /// 스키마(MySQL은 DB) 한정자의 대소문자 무시 여부다. routine 이름 규칙이 아니라
+    /// 테이블 이름 규칙을 따른다 — MySQL lower_case_table_names=0이면 DB 이름은
+    /// 대소문자를 구분한다. routine 조회로 바꿔도 바뀌지 않는다.
+    schema_ci: bool,
 }
 
 impl Lookup<'_> {
@@ -4333,7 +4338,18 @@ fn resolve_routine(g: &Graph, schema: &str, name: &str, lookup: Lookup<'_>) -> R
     // 호출 인자 수를 모르는 이 경로에서 무인자 overload를 임의로 고르면 안
     // 된다. 모든 routine 후보를 먼저 모아 하나일 때만 선택한다.
     let routines = &lookup.index.routines(g, lookup.ci).routines;
-    routine_hit(routines.get(&(lookup.key(schema), lookup.key(name))))
+    let candidates = routines.get(&(lookup.key(schema), lookup.key(name)));
+    if lookup.ci && !lookup.schema_ci {
+        // routine 이름만 접는 방언이다 — 접힌 후보 중 스키마가 정확히 같은 것만 남긴다.
+        let exact: Vec<VertexId> = candidates
+            .into_iter()
+            .flatten()
+            .filter(|id| g.vertex(id).is_some_and(|vertex| vertex.schema == schema))
+            .cloned()
+            .collect();
+        return routine_hit(Some(&exact));
+    }
+    routine_hit(candidates)
 }
 
 /// 한 몸체를 같은 카탈로그·방언·소스 해시로 적용하는 문맥이다。
