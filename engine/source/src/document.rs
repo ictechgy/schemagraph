@@ -40,6 +40,15 @@ pub struct CollectionContext {
     pub schema_filter: Option<Vec<String>>,
     /// 수집기가 카탈로그 참조를 모두 읽었는지 선언한다. 미상은 성공이 아니다.
     pub catalog_complete: bool,
+    /// MySQL·MariaDB 서버의 `@@lower_case_table_names` 원값(0·1·2)이다. 테이블·뷰
+    /// 이름의 대소문자 규칙을 정하므로 수집기는 값을 옮기기만 하고 판정은 엔진이 한다.
+    /// 없으면 규칙을 모르는 것이라 엔진은 이름을 정확히 비교한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lower_case_table_names: Option<u8>,
+    /// SQL Server 데이터베이스 기본 collation 이름 원문이다. 객체 이름 비교의
+    /// 대소문자 규칙을 정한다. 없으면 엔진은 이름을 정확히 비교한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
 }
 
 /// DB 식별자와 이름을 보존하고 엔진이 실제 reader 정점으로 해석하게 한다.
@@ -230,7 +239,14 @@ pub fn unknown_field_paths(doc: &serde_json::Value) -> Vec<String> {
             "triggers" => TRIGGER_KEYS,
             "usage" => USAGE_KEYS,
             "producer" => &["name"],
-            "context" => &["source_id", "database", "schema_filter", "catalog_complete"],
+            "context" => &[
+                "source_id",
+                "database",
+                "schema_filter",
+                "catalog_complete",
+                "lower_case_table_names",
+                "collation",
+            ],
             "dependencies" => &["source", "target", "catalog", "dependency_type"],
             "source" | "target" => &["schema", "name", "kind", "member", "signature", "database"],
             _ => return None,

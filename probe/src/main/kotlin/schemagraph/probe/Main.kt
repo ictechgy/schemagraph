@@ -68,14 +68,14 @@ internal fun runProbe(args: Array<String>, stderr: PrintStream = System.err): In
 private fun probe(args: Array<String>, stderr: PrintStream): Int? {
     val opts = parseArgs(args)
     if (opts.help || opts.url == null) {
-        stderr.println(if (opts.url == null && !opts.help) "error: --url이 필요하다\n$USAGE" else USAGE)
+        stderr.println(if (opts.url == null && !opts.help) "error: --url is required\n$USAGE" else USAGE)
         return if (opts.help) 0 else 2
     }
     val url = opts.url!!
 
     for (name in BUNDLED_DRIVERS) runCatching { Class.forName(name) }
     runCatching { registerDrivers(opts.driverJars, opts.driverClass) }
-        .onFailure { fatal("드라이버 로딩 실패: ${it.message}") }
+        .onFailure { fatal("driver loading failed: ${it.message}") }
 
     val dialect = dialectOf(url)
     if (dialect == "sqlite") sqliteTargetError(url)?.let { fatal(it) }
@@ -93,15 +93,15 @@ private fun probe(args: Array<String>, stderr: PrintStream): Int? {
                 if (target == null) streamDocument(extractor, opts.documentVersion, System.out.bufferedWriter())
                 else writeOutput(target) { writer -> streamDocument(extractor, opts.documentVersion, writer) }
             }
-        }.getOrElse { fatal("추출 실패: ${connectionFailure(it, url, secrets)}") }
+        }.getOrElse { fatal("extraction failed: ${connectionFailure(it, url, secrets)}") }
         return null
     }
-    if (opts.format != "json") fatal("--format은 json|ndjson 중 하나다: ${opts.format}")
+    if (opts.format != "json") fatal("--format must be json or ndjson: ${opts.format}")
     val doc = runCatching {
         DriverManager.getConnection(url, props).use { conn ->
             Extractor(conn, dialect, opts.schemas, opts.catalogDependencies, opts.sourceId).extract()
         }
-    }.getOrElse { fatal("추출 실패: ${connectionFailure(it, url, secrets)}") }
+    }.getOrElse { fatal("extraction failed: ${connectionFailure(it, url, secrets)}") }
 
     val wire = documentWire(doc, opts.documentVersion)
     // 파일은 문자열을 만들지 않고 임시 파일 스트림에 바로 쓴다. stdout은 PrintStream의 인코딩을
@@ -255,7 +255,7 @@ private fun parseArgs(args: Array<String>): Opts {
     val o = Opts()
     var i = 0
     fun next(flag: String): String =
-        args.getOrElse(++i) { fatal("error: ${flag}에 값이 없다\n$USAGE") }
+        args.getOrElse(++i) { fatal("error: ${flag} needs a value\n$USAGE") }
     while (i < args.size) {
         when (val a = args[i]) {
             "--url" -> o.url = next(a)
@@ -271,7 +271,7 @@ private fun parseArgs(args: Array<String>): Opts {
             "--document-version" -> o.documentVersion = next(a).toIntOrNull()?.takeIf { it in 1..2 }
                 ?: fatal("Unsupported document version; choose 1 or 2")
             "-h", "--help" -> o.help = true
-            else -> fatal("error: 알 수 없는 인자 '$a'\n$USAGE")
+            else -> fatal("error: unknown argument '$a'\n$USAGE")
         }
         i++
     }
@@ -322,7 +322,7 @@ private fun registerDrivers(jars: List<String>, driverClass: String?) {
         registered++
     }
     if (registered == 0) {
-        System.err.println("warning: --driver jar에서 Driver 구현을 못 찾았다 — --driver-class를 지정해라")
+        System.err.println("warning: no Driver implementation was found in the --driver jar; pass --driver-class")
     }
 }
 

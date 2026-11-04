@@ -1,5 +1,35 @@
 # HANDOFF.md
 
+## 현재 상태 (2026-11-03)
+
+- 발행본은 **0.9.0**이다. 태그 `v0.9.0` = `fad8e9d`([#58](https://github.com/ictechgy/schemagraph/pull/58)).
+  그 커밋의 [CI](https://github.com/ictechgy/schemagraph/actions/runs/41583763434)·
+  [SQL Server/Oracle](https://github.com/ictechgy/schemagraph/actions/runs/41583763488)·
+  [IBM](https://github.com/ictechgy/schemagraph/actions/runs/41583763549)·
+  [DML](https://github.com/ictechgy/schemagraph/actions/runs/41583763689) 검증이 모두 성공했다.
+- 채널별 게시 현황은 RELEASE-NOTES.md 끝의 "Publication channels" 표가 정본이다.
+  crates.io에는 0.7.1·0.8.0·0.8.1이 없고, Maven Central에는 0.7.1이 없다(2026-11-03 조회).
+  누락 버전은 다시 게시하지 않는다 — 다음 버전이 그 변경을 담는다.
+- isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
+- RELEASE-NOTES `# Unreleased`에 미발행 변경이 있다: facts의 스키마 필터·교환 불가 식별자 범위 공백,
+  COPY 간선, SQLite 수집기 3종 수정(네이티브·Go·JDBC), SQLite 관계·MySQL routine 대소문자 해석,
+  서버 대소문자 규칙 수집(`context.lower_case_table_names`·`collation`), 프로브 메시지 영어화,
+  JDBC 파티션·외부 테이블과 방언별 시스템 스키마, CI의 isthmus 0.14.0 실검증.
+  **`CollectionContext`에 공개 필드가 늘어 다음 crate 릴리스는 0.10.0이어야 한다.**
+
+## Blocker와 열린 질문 (2026-11-03)
+
+- 수집기 사이에 남은 차이는 SUPPORT-MATRIX.md "Known differences between collectors"에 적었다
+  (JDBC는 PK 인덱스를 `indexes`에 싣고, SQLite 인라인 제약 한계를 내지 않는다).
+- isthmus에 relation-decl용 공유 적합성 벡터가 없다. 생기면 벤더링하고 `conformance.lock`으로 기록한다.
+- Docker DB fixture(MySQL·MariaDB·SQL Server·Oracle·IBM)는 컨테이너 데몬이 있는 환경이나 CI에서만 돈다.
+  MySQL `lower_case_table_names`·SQL Server collation 수집의 실서버 확인은 그 job이 맡는다.
+- SQL Server의 대소문자 무시 판정은 ASCII 접기다. 비ASCII 이름의 collation 규칙은 따르지 않고 정확 비교로 남는다.
+
+## 이력
+
+아래는 당시 기록이다. 날짜·버전·"미배포" 표기는 그 시점의 상태다.
+
 ## 0.7.1 릴리스 검증 순서 보강 (2026-10-12 UTC)
 
 - DML accuracy·IBM fixtures·SQL Server/Oracle accuracy의 push를 모든 브랜치로
@@ -60,14 +90,14 @@ _최종 갱신: 2026-09-25 KST · Claude_
   검증하며 private 기본값은 유지한다. Docker가 없는 로컬에서 실행 구성 회귀
   4개와 실제 host CLI 0600 scan/query를 확인했고 컨테이너 end-to-end는 CI에서 확인한다.
 
-## 목표
+## 목표 (v0.6.0 시점)
 
 경쟁 재조사(2026-09-25)에서 정한 보강 네 가지를 구현·리뷰·머지하고 **v0.6.0으로 공개
 배포·설치 검증까지 완료**했다. 남은 승인 작업은 없다. 다음 제품 작업은 미정이다.
 
-## 현재 상태
+## 현재 상태 (v0.6.0 시점)
 
-- 프로젝트: `/Users/jinhongan/Desktop/schemagraph`. main은 깨끗하며 이 문서 갱신 PR 외 진행 중인 브랜치는 없다.
+- 프로젝트: schemagraph 저장소 루트. main은 깨끗하며 이 문서 갱신 PR 외 진행 중인 브랜치는 없다.
 - 공개 버전: [v0.6.0](https://github.com/ictechgy/schemagraph/releases/tag/v0.6.0).
   태그·6개 crate·Go 바이너리의 내장 커밋은 `e5f3b9cdfe453b6c6ee872e1283fd6a18af592b2`
   ([PR #29](https://github.com/ictechgy/schemagraph/pull/29) 머지 커밋).
@@ -155,11 +185,11 @@ _최종 갱신: 2026-09-25 KST · Claude_
 - 과거 상세 이력: [v0.5.0 시점 HANDOFF](https://github.com/ictechgy/schemagraph/blob/739ac6170286d1f768062406ef5c699661f30630/HANDOFF.md),
   [v0.6.0 직후 HANDOFF](https://github.com/ictechgy/schemagraph/blob/c0621814714072715bbc5b2420b648291ac5a0e1/HANDOFF.md). 옛 "미배포" 문구는 당시 상태다.
 
-## Blocker와 열린 질문
+## Blocker와 열린 질문 (v0.6.0 시점)
 
 없음. 추가 게시나 실패 CI 재실행이 남아 있지 않다.
 
-- isthmus persistence 조인이 npm에 배포되면 CI의 `verify-bridge-facts.py`에 `--isthmus`를 붙일 수 있다.
+- (2026-11-03 처리) CI의 `verify-bridge-facts.py`가 isthmus-cli 0.14.0으로 `--isthmus --require-isthmus` 검증을 한다.
 - OpenLineage 출력의 실제 카탈로그(Marquez·DataHub·OpenMetadata) 적재와 MySQL `unused`의 실DB 검증은 하지 않았다.
 
 ## 다음 단계
@@ -179,7 +209,7 @@ _최종 갱신: 2026-09-25 KST · Claude_
 ## 재개 프롬프트
 
 ```text
-/Users/jinhongan/Desktop/schemagraph에서 HANDOFF.md와 AGENTS.md를 읽어줘.
-v0.6.0(search·MCP 확장, lint 규칙, unused, openlineage) 배포·공개 설치 검증은 완료됐어.
-먼저 git 상태를 확인하고 로컬 변경을 보존한 뒤, 내가 추가로 요청하는 작업부터 이어가줘.
+schemagraph 저장소 루트에서 HANDOFF.md와 AGENTS.md를 읽어줘.
+발행본은 0.9.0이고, RELEASE-NOTES의 Unreleased 변경은 아직 발행 전이야(다음 crate 릴리스는 0.10.0).
+먼저 git 상태를 확인하고 로컬 변경을 보존한 뒤, 내가 추가로 요청하는 작업부터 이어가줘. 배포는 반복하지 마.
 ```

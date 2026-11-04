@@ -1196,6 +1196,8 @@ mod tests {
                 database: Some("warehouse".into()),
                 schema_filter: Some(vec!["analytics".into()]),
                 catalog_complete: true,
+                lower_case_table_names: None,
+                collation: None,
             }),
             dependencies: vec![],
         }

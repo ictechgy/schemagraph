@@ -79,7 +79,9 @@
           "type": ["array", "null"],
           "items": {"type": "string"}
         },
-        "catalog_complete": {"type": "boolean"}
+        "catalog_complete": {"type": "boolean"},
+        "lower_case_table_names": {"type": ["integer", "null"], "minimum": 0, "maximum": 2},
+        "collation": {"type": ["string", "null"]}
       },
       "additionalProperties": true
     },

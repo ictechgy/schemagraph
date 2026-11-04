@@ -140,7 +140,7 @@ class PostgresSchemaMetadataTest {
             val document = collect(scripted)
             // 한 번만 묻고, 그 실패를 객체마다 예전 문구로 남긴다. 키는 따로 읽어 그대로 남는다.
             assertEquals(1, scripted.metadataCalls.count { it == "getColumns" })
-            val expected = (0 until 3).map { "SGFIX.T$it: getColumns 실패 — injected schema-wide getColumns failure" }
+            val expected = (0 until 3).map { "SGFIX.T$it: getColumns failed: injected schema-wide getColumns failure" }
             assertTrue(document.limitations.containsAll(expected), "limitations = ${document.limitations}")
             val objects = document.schemas.single().objects
             assertTrue(objects.all { it.columns.isEmpty() && it.constraints.isNotEmpty() }, "objects = $objects")

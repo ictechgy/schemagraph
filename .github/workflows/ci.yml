@@ -291,11 +291,22 @@ jobs:
           "$RUNNER_TEMP/jsonschema-venv/bin/python" Scripts/verify-openlineage.py \
             --engine engine/target/debug/schemagraph --output "$RUNNER_TEMP/openlineage.json"
 
+      # facts의 소비 계약은 실제 isthmus check로만 증명된다. 발행된 소비자 버전을 고정해
+      # 설치하고, 소비 검사를 건너뛴 partial 결과를 통과로 두지 않는다(--require-isthmus).
+      - name: Set up Node for the isthmus consumer
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.18.0"
+
+      - name: Install the pinned isthmus consumer
+        run: npm install --prefix "$RUNNER_TEMP/isthmus" --no-audit --no-fund --ignore-scripts isthmus-cli@0.14.0
+
       - name: Verify isthmus bridge-facts export against real catalogs
         env:
           PGBIN: /usr/lib/postgresql/16/bin
         run: |
           python3 Scripts/verify-bridge-facts.py --engine engine/target/debug/schemagraph \
+            --isthmus "$RUNNER_TEMP/isthmus/node_modules/isthmus-cli/dist/cli/main.js" --require-isthmus \
             --output "$RUNNER_TEMP/bridge-facts.json"
 
       - name: Verify native PostgreSQL, MySQL, and MariaDB TLS modes against real servers

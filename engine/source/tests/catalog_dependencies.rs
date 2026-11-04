@@ -112,6 +112,8 @@ fn document() -> CatalogDocument {
             database: Some("local-db".into()),
             schema_filter: Some(vec!["app".into(), "reporting".into()]),
             catalog_complete: true,
+            lower_case_table_names: None,
+            collation: None,
         }),
         dependencies: vec![],
     }

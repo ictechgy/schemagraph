@@ -57,6 +57,8 @@ pub async fn read_with_dependencies(
         database: Some(database),
         schema_filter: None,
         catalog_complete,
+        lower_case_table_names: None,
+        collation: None,
     });
     if include_dependencies {
         for schema in &doc.schemas {

@@ -32,9 +32,11 @@ cargo install schemagraph-cli --locked
 schemagraph --version
 ```
 
-Cargo와 GitHub 바이너리는 별도로 게시됩니다. 0.8.1 migration helper는
-[설치 안내](INSTALLATION.md)의 같은 버전 바이너리 archive나 source tag를
-사용하고, crate 버전을 고정할 때는 해당 채널의 공개 여부를 먼저 확인하세요.
+Cargo와 GitHub 바이너리는 별도로 게시되며 모든 버전이 모든 채널에 있지는 않습니다.
+crates.io에는 0.7.1·0.8.0·0.8.1이 없습니다(SQLite migration helper와 `merge`·`openlineage`는
+Cargo 사용자에게 0.9.0에서 처음 제공됐습니다). [설치 안내](INSTALLATION.md)의 같은 버전
+바이너리 archive나 source tag를 사용하고, crate 버전을 고정하기 전에
+[RELEASE-NOTES.md](RELEASE-NOTES.md#publication-channels)의 채널 표를 확인하세요.
 
 ### 소스에서 빌드
 
@@ -141,6 +143,7 @@ JDBC 기본 수집 범위는 드라이버가 제공하는 스키마·테이블·
 | --- | --- |
 | `scan <url>` | 카탈로그를 수집해 의존성 그래프를 만듭니다. |
 | `scan --document <path>` | JSON 또는 NDJSON catalog document에서 그래프를 만듭니다. |
+| `import <catalog> --format dbt\|query-log` | 오프라인 dbt compiled SQL이나 관측한 쿼리를 catalog document에 붙입니다([EXTERNAL-SQL.md](EXTERNAL-SQL.md)). |
 | `graph --format mermaid\|json\|dot\|html` | 그래프를 렌더링합니다. `--level schema\|object\|column`으로 단위를 선택합니다. |
 | `search <pattern>` | 대소문자를 구분하지 않는 이름 부분 일치나 `*`/`?` 글롭으로 정점을 찾습니다. `--detail summary`는 종류와 이웃 수를 더합니다. |
 | `query <name> --depth N` | 의존 대상과 의존자를 근거 간선과 함께 조회합니다. |

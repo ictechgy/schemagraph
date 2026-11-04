@@ -36,7 +36,7 @@ type packageMemberSlice struct {
 }
 
 // packageBoundaryNotFound — 그 이름의 정의 헤더를 하나도 확정하지 못한 멤버의 limitation 사유다.
-const packageBoundaryNotFound = "패키지 본문에서 멤버 경계를 못 찾음 — 해당 멤버의 몸체 간선 없음"
+const packageBoundaryNotFound = "package body member boundary not found; member body edges are omitted"
 
 // packageOverloadMismatch — 오버로드 정의의 본문 순서를 카탈로그 순서와 확인하지 못한 사유다.
 const packageOverloadMismatch = "package body member boundary ambiguous " +

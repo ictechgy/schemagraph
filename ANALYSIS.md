@@ -449,6 +449,20 @@ directly to `query` or `impact` (check that `subject.id` equals it) to continue
 into in-database dependents. Graphs and facts from different catalogs do not
 share ids reliably; build both from one `--emit-document` output.
 
+Each relation and column declaration carries a `dataContract` with its catalog
+fields (column type and nullability, a structural hash per constraint) for
+isthmus `diff --contracts`; CHECK expressions, defaults and runtime values are not
+assessed, and the contract's own limitations say which fields were omitted.
+
+`limitations` starting with `catalog-coverage:` tell isthmus that the catalog may
+not list every relation, so it reports undeclared uses as `-unverified` warnings
+instead of errors. `facts` adds one when the collector declared an incomplete
+catalog or no collection context, when the catalog was collected with a schema
+filter (relations outside the requested schemas were not scanned), and when it
+omits declarations whose identifiers are empty or contain control characters
+that the exchange format rejects. These gaps cannot be listed as channels, so
+`facts` adds no `limitationScopes`.
+
 ### Trace several subjects as a language-traversal document
 
 ```sh

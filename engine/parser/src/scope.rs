@@ -127,7 +127,9 @@ impl<'a> CatalogIndex<'a> {
 
     /// 이 enrich의 그래프에서 이름을 찾는 방식. ci면 대소문자 무시 단일 후보도 본다.
     pub(crate) fn lookup(&self, ci: bool) -> super::Lookup<'_> {
-        self.vertices.lookup(ci)
+        self.vertices
+            .lookup(ci)
+            .fold_routine_names(super::routine_names_fold_case(self.dialect))
     }
 
     /// 이 색인이 정규화 규칙으로 쓰는 문서 방언.

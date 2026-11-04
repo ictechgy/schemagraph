@@ -168,7 +168,7 @@
       "body": "PACKAGE BODY p AS\n",
       "expected": [
         {
-          "limitation": "패키지 본문에서 멤버 경계를 못 찾음"
+          "limitation": "package body member boundary not found"
         }
       ],
       "members": [
