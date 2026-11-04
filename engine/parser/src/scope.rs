@@ -12,7 +12,8 @@ use schemagraph_core::{
 use schemagraph_source::document::{CatalogDocument, ObjectDoc, RoutineDoc};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
-    visit_relations, AccessExpr, AssignmentTarget, Expr, GroupByExpr, Ident, JoinConstraint,
+    visit_relations, AccessExpr, AssignmentTarget, CopySource, Expr, GroupByExpr, Ident,
+    JoinConstraint,
     JoinOperator, MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName, ObjectNamePart, Query,
     Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias,
     TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value, Visit, Visitor,
@@ -2182,7 +2183,44 @@ impl DmlAnalyzer<'_, '_> {
                 }
             }
             Statement::Query(query) => self.select_into(query),
+            Statement::Copy {
+                source: CopySource::Table {
+                    table_name,
+                    columns,
+                },
+                to,
+                ..
+            } => self.copy_table(table_name, columns, *to),
             _ => {}
+        }
+    }
+
+    /// `COPY t [(cols)] TO|FROM …`의 컬럼 효과를 남긴다.
+    ///
+    /// 컬럼 목록은 SELECT·INSERT의 컬럼 목록과 같은 근거다 — TO는 그 컬럼을 읽고 FROM은
+    /// 그 컬럼에 쓴다. 목록이 없으면 `SELECT *`처럼 카탈로그가 아는 컬럼 전체가 대상이다.
+    /// FROM의 적재 값은 외부 데이터라 값 계보(DerivesFrom)는 만들지 않는다.
+    fn copy_table(&mut self, name: &ObjectName, names: &[Ident], to: bool) {
+        let relation = self.relation_from_name(name, None);
+        let columns: Vec<VertexId> = if names.is_empty() {
+            self.known_columns(&relation)
+        } else {
+            names
+                .iter()
+                .filter_map(|column| {
+                    let target = AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(column.clone()),
+                    ]));
+                    self.assignment_target(&relation, &target)
+                })
+                .collect()
+        };
+        for column in columns {
+            if to {
+                self.binder.read(column, "copy", None);
+            } else {
+                self.write_only(column);
+            }
         }
     }
 

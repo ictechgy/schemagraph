@@ -1809,6 +1809,24 @@ fn copy_to_alone_keeps_routine_complete() {
     );
 }
 
+/// COPY의 컬럼 목록은 SELECT·INSERT의 컬럼 목록과 같은 근거다. 그 컬럼을 지우면
+/// COPY가 깨지므로 impact가 컬럼에서 이 routine에 닿아야 한다. 목록이 없으면
+/// `SELECT *`처럼 알려진 컬럼 전체를 쓴다.
+#[test]
+fn copy_column_lists_record_column_reads_and_writes() {
+    let graph = scan_routine_with(
+        "BEGIN COPY orders (amount) TO '/tmp/x.csv'; COPY audit (name) FROM '/tmp/a.csv'; COPY customers TO STDOUT; END",
+        "postgres",
+        "plpgsql",
+    );
+    assert!(edge(&graph, "s.mutate", "s.orders.amount", EdgeKind::Reads));
+    assert!(!edge(&graph, "s.mutate", "s.orders.id", EdgeKind::Reads));
+    assert!(edge(&graph, "s.mutate", "s.audit.name", EdgeKind::Writes));
+    assert!(!edge(&graph, "s.mutate", "s.audit.id", EdgeKind::Writes));
+    assert!(edge(&graph, "s.mutate", "s.customers.id", EdgeKind::Reads));
+    assert!(edge(&graph, "s.mutate", "s.customers.name", EdgeKind::Reads));
+}
+
 /// `--sql-dir`의 SQL 파일은 sql 언어 routine으로 붙는다. pg_dump 형식의
 /// `COPY … FROM STDIN;` 데이터 블록도 적재 대상 쓰기로 남는다.
 #[test]

@@ -3526,14 +3526,14 @@ fn collect_trigger_facts(
             candidates: Vec::new(),
         });
     }
-    // COPY FROM의 테이블 쓰기 간선은 write_targets가 남긴다. 적재 값은 외부
-    // 파일·STDIN이라 컬럼별 쓰기 효과를 만들 근거가 없다 — complete로 주장하지
-    // 않도록 부분 분석을 표시한다.
+    // COPY FROM의 테이블 쓰기 간선은 write_targets가, 컬럼 쓰기는 DML 분석이 남긴다.
+    // 적재 값은 외부 파일·STDIN이라 값의 출처(DerivesFrom)를 만들 근거가 없다 —
+    // complete로 주장하지 않도록 부분 분석을 표시한다.
     if copy_from_table(stmt).is_some() {
         parsed.partial = true;
         parsed.diagnostics.push(schemagraph_core::Diagnostic {
             code: "SG_DML_COPY".into(),
-            message: "COPY FROM loads rows from external data; the table write is recorded but per-column write effects are not modeled".into(),
+            message: "COPY FROM loads rows from external data; table and column writes are recorded but the loaded values have no traced source".into(),
             location: None,
             candidates: Vec::new(),
         });
@@ -3651,6 +3651,10 @@ fn is_column_dml_statement(stmt: &Statement) -> bool {
             | Statement::Update { .. }
             | Statement::Merge { .. }
             | Statement::CreateTable(sqlparser::ast::CreateTable { query: Some(_), .. })
+            | Statement::Copy {
+                source: CopySource::Table { .. },
+                ..
+            }
     ) || select_into(stmt).is_some()
 }
 
