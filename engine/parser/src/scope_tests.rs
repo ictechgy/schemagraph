@@ -2032,4 +2032,17 @@ fn mysql_and_sqlserver_fold_relation_case_only_with_collected_rules() {
         Some("SQL_Latin1_General_CP1_CI_AS"),
         sqlserver
     )));
+    // 터키어·아제르바이잔어 CI는 i와 I를 같은 글자로 보지 않는다(ı·İ). ASCII 접기로는
+    // 그 규칙을 낼 수 없으므로 접지 않는다 — `FROM INVOICES`가 invoices에 이어지면 안 된다.
+    for collation in [
+        "Turkish_CI_AS",
+        "Turkish_100_CI_AS",
+        "Azeri_Latin_100_CI_AS",
+        "SQL_Latin1_General_CP1254_CI_AS",
+    ] {
+        assert!(
+            !reads(&case_rule_doc("sqlserver", None, Some(collation), sqlserver)),
+            "{collation}"
+        );
+    }
 }

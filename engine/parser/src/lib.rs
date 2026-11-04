@@ -740,15 +740,21 @@ pub(crate) fn relation_names_fold_case(doc: &CatalogDocument) -> bool {
     }
 }
 
-/// SQL Server collation 이름이 대소문자 무시(`_CI`)인가. 이름은 `_`로 나뉜
-/// 속성 목록(`SQL_Latin1_General_CP1_CI_AS`, `Latin1_General_100_CI_AS_SC_UTF8`)이고
-/// `CS`·`BIN`·`BIN2`는 대소문자를 구분한다. 형식을 모르면 구분하는 쪽으로 본다.
+/// SQL Server collation 이름이 ASCII 대소문자 접기로 비교해도 되는 대소문자 무시(`_CI`)인가.
+///
+/// 이름은 `_`로 나뉜 속성 목록(`SQL_Latin1_General_CP1_CI_AS`,
+/// `Latin1_General_100_CI_AS_SC_UTF8`)이다. `CS`·`BIN`·`BIN2` collation에는 `CI` 속성이
+/// 없으므로 `CI` 속성의 유무만 본다. 터키어·아제르바이잔어(와 코드 페이지 1254 SQL
+/// collation)의 CI는 `i`와 `I`를 같은 글자로 보지 않아(ı·İ가 따로 있다) ASCII 접기가
+/// 거짓 매치를 만든다. 그 규칙은 내지 못하므로 접지 않는다. 형식을 모르면 구분하는 쪽으로 본다.
 fn collation_is_case_insensitive(collation: &str) -> bool {
     let parts: Vec<&str> = collation.split('_').collect();
-    parts.iter().any(|part| part.eq_ignore_ascii_case("CI"))
-        && !parts
+    let dotted_i_rules = parts.iter().any(|part| {
+        ["Turkish", "Azeri", "CP1254"]
             .iter()
-            .any(|part| part.eq_ignore_ascii_case("BIN") || part.eq_ignore_ascii_case("BIN2"))
+            .any(|name| part.eq_ignore_ascii_case(name))
+    });
+    !dotted_i_rules && parts.iter().any(|part| part.eq_ignore_ascii_case("CI"))
 }
 
 /// routine 이름을 대소문자 무시로 비교하는 방언인가. MySQL·MariaDB의 stored
