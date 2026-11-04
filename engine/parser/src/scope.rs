@@ -71,6 +71,9 @@ impl Scope {
 pub(crate) struct CatalogIndex<'a> {
     tables: BTreeMap<(String, String), Vec<(&'a str, &'a ObjectDoc)>>,
     dialect: &'a str,
+    /// 바인더가 대소문자만 다른 단일 관계 후보도 고르는 문서인가(`relation_names_fold_case`).
+    /// 캐시 지문이 바인더와 같은 후보 집합을 담아야 낡은 해석을 재사용하지 않는다.
+    fold_relation_case: bool,
     routines: BTreeSet<(String, String)>,
     database: Option<String>,
     doc: &'a CatalogDocument,
@@ -112,6 +115,7 @@ impl<'a> CatalogIndex<'a> {
         Self {
             tables,
             dialect: &doc.dialect,
+            fold_relation_case: super::relation_names_fold_case(doc),
             routines,
             database: doc
                 .context
@@ -567,6 +571,16 @@ impl<'a> CatalogIndex<'a> {
     ) -> Vec<(&'a str, &'a ObjectDoc)> {
         if matches!(self.dialect, "oracle" | "db2") {
             return index.objects(self.dialect, schema, name);
+        }
+        if self.fold_relation_case {
+            // MySQL(lower_case_table_names≠0)·SQL Server(CI collation)·SQLite는 정확 일치가
+            // 없을 때 대소문자만 다른 단일 후보를 잇는다. 그 변형이 생기거나 사라지면
+            // 해석이 바뀌므로 접힌 변형 전체를 지문에 넣는다.
+            return index
+                .objects
+                .get(&folded_key(schema, name))
+                .cloned()
+                .unwrap_or_default();
         }
         let key = (schema.to_owned(), name.to_owned());
         self.tables.get(&key).cloned().unwrap_or_default()

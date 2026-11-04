@@ -819,6 +819,34 @@ mod tests {
         assert_ne!(first.fingerprint, changed.fingerprint);
     }
 
+    /// MySQL `lower_case_table_names`가 0이 아니면 바인더가 대소문자만 다른 단일 후보로
+    /// 몸체 이름을 잇는다. 그 후보가 생기면 지문이 바뀌어야 낡은 "없음" 결과를 재사용하지 않는다.
+    #[test]
+    fn scoped_context_tracks_case_variants_when_mysql_folds_table_names() {
+        let body = "INSERT INTO Orders(id) VALUES (1)";
+        let document = |objects: serde_json::Value| -> CatalogDocument {
+            serde_json::from_value(serde_json::json!({
+                "version":1,"dialect":"mysql","reader":"test","limitations":[],
+                "context":{"source_id":"t","database":"app","catalog_complete":true,
+                           "lower_case_table_names":1},
+                "schemas":[{"name":"app","objects":objects,
+                    "routines":[{"name":"mutate","kind":"procedure","language":"sql","body":body}]}]
+            }))
+            .unwrap()
+        };
+        let owner = VertexId::routine("app", None, "mutate", None);
+        let before = document(serde_json::json!([]));
+        let graph = schemagraph_source::graph::document_to_graph(&before);
+        let missing = crate::scope::cache_context(&before, &graph, &owner, body);
+        let after = document(serde_json::json!([
+            {"name":"orders","kind":"table","columns":[{"name":"id","data_type":"int","nullable":false,"ordinal":1,"pk_position":1}],"constraints":[],"indexes":[],"triggers":[]}
+        ]));
+        let graph = schemagraph_source::graph::document_to_graph(&after);
+        let created = crate::scope::cache_context(&after, &graph, &owner, body);
+        assert!(missing.trusted && created.trusted);
+        assert_ne!(missing.fingerprint, created.fingerprint);
+    }
+
     #[test]
     fn wrapped_routine_body_uses_conservative_cache_context() {
         let doc: CatalogDocument = serde_json::from_value(serde_json::json!({

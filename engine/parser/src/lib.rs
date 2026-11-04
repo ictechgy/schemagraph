@@ -724,7 +724,7 @@ fn dialect_for(dialect: &str) -> Box<dyn Dialect> {
 /// Oracle·DB2는 미인용 식별자를 대문자로 접고, SQLite는 인용 여부와 무관하게
 /// ASCII 대소문자를 구분하지 않는다. 대소문자를 구분할 수 있는 방언(PG, 설정에 따른
 /// MySQL·SQL Server)에 켜면 다른 객체를 가리킬 수 있어 근거가 있을 때만 켠다.
-fn relation_names_fold_case(doc: &CatalogDocument) -> bool {
+pub(crate) fn relation_names_fold_case(doc: &CatalogDocument) -> bool {
     let context = doc.context.as_ref();
     match doc.dialect.as_str() {
         "oracle" | "db2" | "sqlite" => true,
