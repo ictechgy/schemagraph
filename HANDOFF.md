@@ -30,6 +30,10 @@ GLM 리뷰(`packet-ask`)를 이 세션에서 쓸 수 없어, 같은 체크리스
 - parser: 대소문자 접기 방언(MySQL lctn≠0 포함)의 몸체 캐시 지문, COPY 컬럼 목록 간선, MySQL routine
   접기가 DB 한정자를 접지 않게, 터키어·아제르바이잔어·CP1254 CI collation은 ASCII 접기로 확정하지 않게.
 - probe(JDBC): PostgreSQL·MySQL 시스템 스키마 비교를 네이티브·Go처럼 대소문자 구분으로.
+- 재리뷰 blocker 2건(0c48cc5 기준): SQLite 비ASCII 관계 이름에서 몸체 캐시 지문이 테이블 모양 변화를 놓치던
+  29036a3의 회귀(SQLite는 양쪽에 같은 catalog_key를 쓰는 tables 경로로 되돌림), 예약 관계 사실에 계약이 없어
+  `isthmus diff --contracts`가 같은 문서도 review-required로 판정하던 문제(빈 계약 + 한계를 싣고, 0c48cc5의
+  capture 검사·문서 변경을 되돌림). 후자는 verify-bridge-facts.py의 계약 자기 비교로 검증한다.
 - SQLite 골든: 인라인 제약 완전성 수정의 의도된 결과(FK `complete: true`, `catalog_complete: true`)로 갱신.
 - 문서: 채널 표의 v0.1.0–v0.3.0 바이너리 표기, facts 한계 접두사·예약 관계 설명.
 
@@ -38,6 +42,9 @@ GLM 리뷰(`packet-ask`)를 이 세션에서 쓸 수 없어, 같은 체크리스
 - 스키마 필터가 모든 스키마를 담아도 `catalog-coverage:`가 붙는 보수적 과대 보고는 유지하고 문서화했다.
   정확히 세려면 CatalogDocument에 "필터 밖 스키마 존재" 필드가 필요하다(계약 변경). 네이티브 MySQL reader는
   URL의 DB를 필터로 기록하므로 다른 DB를 `db.table`로 쓰는 경우를 위해 늘 붙는 것이 맞다.
+- `sqlite_schema`·`sqlite_temp_schema`는 SQLite 3.33.0부터 있다. 앱 런타임 버전을 모르므로 늘 선언하고,
+  그 이전 런타임에서는 거짓 match가 된다는 점을 문서화했다. 예약 관계를 쓰지 않는 앱에는 관계마다
+  `relation-decl-without-use` 경고가 나지만 죽은 스키마 후보가 아니다.
 - `sqlite_stat*`는 ANALYZE 이력에 달려 선언하지 않는다. JDBC SQLite 문서는 테이블 DDL이 없어
   `sqlite_sequence`를 판정하지 못한다(`sqlite-system-relations:` 메모로 알린다).
 - MySQL `lower_case_table_names`·SQL Server collation 수집은 단위 테스트로만 검증된다. 실서버 fixture
