@@ -13,11 +13,10 @@ use schemagraph_source::document::{CatalogDocument, ObjectDoc, RoutineDoc};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
     visit_relations, AccessExpr, AssignmentTarget, CopySource, Expr, GroupByExpr, Ident,
-    JoinConstraint,
-    JoinOperator, MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName, ObjectNamePart, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias,
-    TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value, Visit, Visitor,
-    WildcardAdditionalOptions, WindowType,
+    JoinConstraint, JoinOperator, MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName,
+    ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned,
+    Statement, TableAlias, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value,
+    Visit, Visitor, WildcardAdditionalOptions, WindowType,
 };
 use sqlparser::dialect::Dialect;
 
@@ -2184,10 +2183,11 @@ impl DmlAnalyzer<'_, '_> {
             }
             Statement::Query(query) => self.select_into(query),
             Statement::Copy {
-                source: CopySource::Table {
-                    table_name,
-                    columns,
-                },
+                source:
+                    CopySource::Table {
+                        table_name,
+                        columns,
+                    },
                 to,
                 ..
             } => self.copy_table(table_name, columns, *to),
@@ -2208,9 +2208,10 @@ impl DmlAnalyzer<'_, '_> {
             names
                 .iter()
                 .filter_map(|column| {
-                    let target = AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(column.clone()),
-                    ]));
+                    let target =
+                        AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                            column.clone(),
+                        )]));
                     self.assignment_target(&relation, &target)
                 })
                 .collect()

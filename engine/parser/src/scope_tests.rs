@@ -1824,7 +1824,12 @@ fn copy_column_lists_record_column_reads_and_writes() {
     assert!(edge(&graph, "s.mutate", "s.audit.name", EdgeKind::Writes));
     assert!(!edge(&graph, "s.mutate", "s.audit.id", EdgeKind::Writes));
     assert!(edge(&graph, "s.mutate", "s.customers.id", EdgeKind::Reads));
-    assert!(edge(&graph, "s.mutate", "s.customers.name", EdgeKind::Reads));
+    assert!(edge(
+        &graph,
+        "s.mutate",
+        "s.customers.name",
+        EdgeKind::Reads
+    ));
 }
 
 /// `--sql-dir`의 SQL 파일은 sql 언어 routine으로 붙는다. pg_dump 형식의
@@ -2041,7 +2046,12 @@ fn mysql_and_sqlserver_fold_relation_case_only_with_collected_rules() {
         "SQL_Latin1_General_CP1254_CI_AS",
     ] {
         assert!(
-            !reads(&case_rule_doc("sqlserver", None, Some(collation), sqlserver)),
+            !reads(&case_rule_doc(
+                "sqlserver",
+                None,
+                Some(collation),
+                sqlserver
+            )),
             "{collation}"
         );
     }
