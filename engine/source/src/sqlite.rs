@@ -94,6 +94,15 @@ fn declares_inline_constraint(ddl: &str) -> bool {
         .any(|word| word.eq_ignore_ascii_case("unique") || word.eq_ignore_ascii_case("check"))
 }
 
+/// 테이블 DDL이 `AUTOINCREMENT` 키워드 토큰을 쓰는가.
+///
+/// SQLite는 AUTOINCREMENT 테이블을 처음 만들 때 예약 테이블 `sqlite_sequence`를 만든다.
+/// 수집기는 `sqlite_` 접두 객체를 카탈로그에서 빼므로, facts가 그 예약 테이블의 존재를
+/// 이 키워드로만 안다. 문자열·인용 식별자·주석 안의 글자는 키워드가 아니다.
+pub(crate) fn declares_autoincrement(ddl: &str) -> bool {
+    sql_words(ddl).any(|word| word.eq_ignore_ascii_case("autoincrement"))
+}
+
 /// 인용과 주석을 건너뛴 맨 단어(`[A-Za-z0-9_$]+`)를 차례로 낸다.
 fn sql_words(sql: &str) -> impl Iterator<Item = &str> {
     let bytes = sql.as_bytes();
