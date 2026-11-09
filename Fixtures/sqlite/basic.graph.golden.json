@@ -969,7 +969,7 @@
         "target_columns": [
           "main.b.id"
         ],
-        "complete": false
+        "complete": true
       },
       "main.b.b_fk_0": {
         "table": "main.b",
@@ -980,7 +980,7 @@
         "target_columns": [
           "main.a.id"
         ],
-        "complete": false
+        "complete": true
       },
       "main.loop_self.loop_self_fk_0": {
         "table": "main.loop_self",
@@ -991,7 +991,7 @@
         "target_columns": [
           "main.loop_self.id"
         ],
-        "complete": false
+        "complete": true
       },
       "main.order_items.order_items_fk_0": {
         "table": "main.order_items",
@@ -1002,7 +1002,7 @@
         "target_columns": [
           "main.products.id"
         ],
-        "complete": false
+        "complete": true
       },
       "main.order_items.order_items_fk_1": {
         "table": "main.order_items",
@@ -1013,7 +1013,7 @@
         "target_columns": [
           "main.orders.id"
         ],
-        "complete": false
+        "complete": true
       },
       "main.orders.orders_fk_0": {
         "table": "main.orders",
@@ -1024,9 +1024,10 @@
         "target_columns": [
           "main.customers.id"
         ],
-        "complete": false
+        "complete": true
       }
-    }
+    },
+    "catalog_complete": true
   },
   "version": 2,
   "vertices": [
