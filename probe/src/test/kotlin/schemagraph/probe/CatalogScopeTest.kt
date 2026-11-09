@@ -18,6 +18,12 @@ class CatalogScopeTest {
         for (name in listOf("pg_catalog", "pg_toast", "pg_temp_3", "pg_toast_temp_3", "information_schema")) {
             assertTrue(isSystemSchema("postgres", name), "postgres $name")
         }
+        // 네이티브·Go 수집기처럼 대소문자를 구분한다 — 대문자 이름은 만들 수 있는 사용자 스키마다.
+        for (name in listOf("PG_x", "Pg_catalog", "INFORMATION_SCHEMA")) {
+            assertFalse(isSystemSchema("postgres", name), "postgres $name")
+        }
+        assertFalse(isSystemSchema("mysql", "MySQL"))
+        assertFalse(isSystemSchema("mariadb", "SYS"))
         assertTrue(isSystemSchema("mysql", "performance_schema"))
         assertTrue(isSystemSchema("mariadb", "sys"))
         assertFalse(isSystemSchema("mysql", "system"))

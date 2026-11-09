@@ -52,9 +52,13 @@ private val ORACLE_SYSTEM_SCHEMAS =
 internal fun isSystemSchema(dialect: String, schema: String): Boolean {
     val s = schema.lowercase()
     return when (dialect) {
-        // 네이티브 reader와 같은 규칙 — PostgreSQL은 pg_ 접두 스키마를 사용자에게 허용하지 않는다.
-        "postgres" -> s == "information_schema" || s.startsWith("pg_")
-        "mysql", "mariadb" -> s in MYSQL_SYSTEM_SCHEMAS
+        // 네이티브 reader·Go 프로브와 같은 규칙이다. 둘 다 대소문자를 구분해 비교한다 —
+        // PostgreSQL이 예약하는 것은 소문자 pg_ 접두뿐이라 "PG_x"·"INFORMATION_SCHEMA"는
+        // 만들 수 있는 사용자 스키마다.
+        "postgres" -> schema == "information_schema" || schema.startsWith("pg_")
+        // MySQL 시스템 스키마는 소문자로만 존재한다. lower_case_table_names=0 서버의 "MySQL"은
+        // 사용자 DB다(Go 프로브도 정확히 비교한다).
+        "mysql", "mariadb" -> schema in MYSQL_SYSTEM_SCHEMAS
         "sqlserver" -> s in SQLSERVER_SYSTEM_SCHEMAS
         "oracle" -> s in ORACLE_SYSTEM_SCHEMAS || s == "public"
         "h2" -> s == "information_schema"
