@@ -388,6 +388,19 @@ fn sqlite_system_relations(doc: &CatalogDocument) -> (Vec<Value>, Option<String>
     (facts, note)
 }
 
+/// 예약 관계와 그 컬럼의 빈 계약이다.
+///
+/// 카탈로그는 예약 관계의 필드를 수집하지 않으므로 타입·nullability를 지어내지 않는다.
+/// 그래도 계약 자체는 싣는다 — 계약이 없는 선언이 섞이면 isthmus `diff --contracts`가
+/// 같은 문서끼리의 비교도 `contract-unavailable`로 검토 필요라 판정한다.
+fn reserved_relation_contract() -> Value {
+    json!({
+        "version": 1,
+        "fields": [],
+        "limitations": ["reserved SQLite relation: fields were not collected"],
+    })
+}
+
 /// 그래프 정점이 아닌 예약 관계의 선언 사실이다 — usr 없이 qualifiedName만 싣는다.
 fn system_declaration_fact(channel: &str, method: Option<&str>, qualified: &str) -> Value {
     let mut fact = json!({
@@ -395,6 +408,7 @@ fn system_declaration_fact(channel: &str, method: Option<&str>, qualified: &str)
         "channel": channel,
         "dynamic": false,
         "symbol": { "qualifiedName": qualified },
+        "dataContract": reserved_relation_contract(),
     });
     if let Some(column) = method {
         fact["method"] = json!(column);
@@ -880,7 +894,7 @@ mod tests {
             .iter()
             .all(|fact| fact["symbol"].get("usr").is_none()
                 && fact["symbol"]["qualifiedName"].is_string()
-                && fact.get("dataContract").is_none()));
+                && fact["dataContract"] == reserved_relation_contract()));
         assert!(plain["facts"].as_array().unwrap().iter().any(|fact| {
             fact["channel"] == "main.sqlite_master" && fact["method"] == "tbl_name"
         }));

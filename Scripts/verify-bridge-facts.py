@@ -506,6 +506,20 @@ def isthmus_case(node, isthmus, work, complete, restricted, filtered):
             'filtered_issues': len(scoped), 'errors': len(errors)}
 
 
+def isthmus_contract_self_diff(node, isthmus, facts_path):
+    """같은 facts 문서끼리 실제 isthmus `diff --contracts`를 돌려 보고서를 돌려준다.
+
+    바뀐 것이 없으니 모든 선언이 계약을 싣고 있으면 `no-changes-observed`여야 한다.
+    계약 없는 선언이 하나라도 있으면 isthmus는 그 선언을 `contract-unavailable`로 내
+    검토 필요(`review-required`)라 판정한다.
+    """
+    result = subprocess.run([str(node), str(isthmus), 'diff', '--contracts', '--before', str(facts_path),
+                             '--after', str(facts_path)], capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f'isthmus diff --contracts failed ({result.returncode}): {result.stderr[-2000:]}')
+    return json.loads(result.stdout)
+
+
 def sqlite_isthmus_case(node, isthmus, engine, work, version):
     """실제 SQLite 카탈로그의 facts를 isthmus가 거부하지 않고, 예약 관계 사용을 맞히는지 본다."""
     database = work/'consumer.sqlite'
@@ -524,7 +538,12 @@ def sqlite_isthmus_case(node, isthmus, engine, work, version):
     issues = isthmus_check(node, isthmus, work, 'sqlite', document, SQLITE_CALLER_USES)
     errors = {key for key, issue in issues.items() if issue['severity'] == 'error'}
     assert errors == {('relation-use-without-decl', 'missing_table', None)}, sorted(map(str, errors))
-    return {'issues': len(issues), 'errors': len(errors)}
+    # 예약 관계 선언도 (빈) 계약을 실어야 같은 문서끼리의 계약 비교가 변화 없음으로 끝난다.
+    diff = isthmus_contract_self_diff(node, isthmus, work/'consumer.facts.json')
+    reasons = sorted({change['reason'] for change in diff['changes']})
+    assert diff['status'] == 'no-changes-observed' and not diff['changes'], (diff['status'], reasons)
+    assert 'contract-not-collected' not in diff['limitations']['contracts'], diff['limitations']['contracts']
+    return {'issues': len(issues), 'errors': len(errors), 'contract_self_diff': diff['status']}
 
 
 def engine_version(engine):
