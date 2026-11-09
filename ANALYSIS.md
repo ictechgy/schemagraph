@@ -450,7 +450,7 @@ directly to `query` or `impact` (check that `subject.id` equals it) to continue
 into in-database dependents. Graphs and facts from different catalogs do not
 share ids reliably; build both from one `--emit-document` output.
 
-Each relation and column declaration carries a `dataContract` with its catalog
+Each catalog relation and column declaration carries a `dataContract` with its catalog
 fields (column type and nullability, a structural hash per constraint) for
 isthmus `diff --contracts`; CHECK expressions, defaults and runtime values are not
 assessed, and the contract's own limitations say which fields were omitted.
@@ -477,7 +477,8 @@ On SQLite, `facts` also declares the reserved relations the collector leaves out
 the catalog and graph: `sqlite_schema` and `sqlite_master` in every schema,
 `temp.sqlite_temp_schema` and `temp.sqlite_temp_master`, and `sqlite_sequence` when
 a table's DDL uses `AUTOINCREMENT`. They are not graph vertices, so their facts carry
-only `symbol.qualifiedName`; a consumer must not pass them to `impact`. Without
+only `symbol.qualifiedName`; a consumer must not pass them to `impact`. They carry no
+`dataContract` either: the catalog holds no collected fields for them to compare. Without
 collected table DDL (the JDBC probe) `sqlite_sequence` is not declared and a
 `sqlite-system-relations:` limitation says so. `sqlite_stat*` is never declared.
 

@@ -879,7 +879,8 @@ mod tests {
         assert!(reserved
             .iter()
             .all(|fact| fact["symbol"].get("usr").is_none()
-                && fact["symbol"]["qualifiedName"].is_string()));
+                && fact["symbol"]["qualifiedName"].is_string()
+                && fact.get("dataContract").is_none()));
         assert!(plain["facts"].as_array().unwrap().iter().any(|fact| {
             fact["channel"] == "main.sqlite_master" && fact["method"] == "tbl_name"
         }));

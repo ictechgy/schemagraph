@@ -142,7 +142,13 @@ class CaptureTests(unittest.TestCase):
             self.assertIn('email', old_columns)
             self.assertNotIn('email', new_columns)
             self.assertIn('address', new_columns)
-            self.assertTrue(all('dataContract' in f for f in new['facts']))
+            # 카탈로그 객체의 선언만 계약을 싣는다. SQLite 예약 관계(usr 없음)는 수집한 필드가 없어 싣지 않는다.
+            catalog_facts = [f for f in new['facts'] if 'usr' in f['symbol']]
+            reserved_facts = [f for f in new['facts'] if 'usr' not in f['symbol']]
+            self.assertTrue(catalog_facts)
+            self.assertTrue(all('dataContract' in f for f in catalog_facts))
+            self.assertTrue(all(f['channel'].split('.', 1)[1].startswith('sqlite_') for f in reserved_facts))
+            self.assertFalse(any('dataContract' in f for f in reserved_facts))
             with self.assertRaises(FileExistsError):
                 CAPTURE.capture(ENGINE, before, [migration], root / 'capture', root)
 
