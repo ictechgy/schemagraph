@@ -34,6 +34,9 @@ RELATION_KINDS = {'table', 'view', 'materialized-view'}
 TIMESTAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z')
 # isthmus가 수신 측 공백으로 인정해 미선언 진단을 -unverified로 내리는 접두사다.
 COVERAGE_PREFIX = 'catalog-coverage:'
+# 수집기가 카탈로그·그래프에서 빼는 SQLite 예약 관계 중 facts가 선언하는 이름이다.
+# 그래프 정점이 아니라서 usr 없이 qualifiedName만 싣는다.
+SQLITE_RESERVED = {'sqlite_schema', 'sqlite_master', 'sqlite_sequence', 'sqlite_temp_schema', 'sqlite_temp_master'}
 
 # 이름 충돌·escape·대소문자·비관계 객체를 실제 DB에서 만든다.
 # clash의 인덱스 x와 트리거 id는 컬럼 이름과 같아 정점 id 충돌을 유발한다.
@@ -46,6 +49,7 @@ CREATE TABLE clash (id INTEGER, x INTEGER);
 CREATE INDEX x ON clash (id);
 CREATE TRIGGER id AFTER INSERT ON clash BEGIN SELECT 1; END;
 CREATE VIEW active_users AS SELECT id, email FROM users;
+CREATE TABLE tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT);
 '''
 
 # 파티션·materialized view·다른 스키마의 같은 이름·비관계 객체(sequence·type·
@@ -104,6 +108,11 @@ def expected_facts(relations):
     return facts
 
 
+def is_reserved(fact):
+    """SQLite 예약 관계 선언인가 — 채널의 관계 세그먼트로 판정한다."""
+    return fact['channel'].split('.', 1)[-1] in SQLITE_RESERVED
+
+
 def actual_facts(document):
     """문서의 사실을 비교 가능한 (channel, method, qualifiedName) 집합으로 바꾼다."""
     return {(fact['channel'], fact.get('method'), fact['symbol']['qualifiedName']) for fact in document['facts']}
@@ -125,8 +134,10 @@ def check_contract(document, project, version):
     for fact in document['facts']:
         assert fact['kind'] == 'relation-decl' and fact['dynamic'] is False and 'location' not in fact, fact
         # usr는 qualifiedName과 같은 정점 id다 — 다른 키가 섞이면 계약 위반이다.
+        # 예약 관계는 정점이 아니라 usr를 싣지 않는다.
         qualified = fact['symbol']['qualifiedName']
-        assert fact['symbol'] == {'qualifiedName': qualified, 'usr': qualified}, fact
+        expected = {'qualifiedName': qualified} if is_reserved(fact) else {'qualifiedName': qualified, 'usr': qualified}
+        assert fact['symbol'] == expected, fact
     keys = [(fact['channel'], fact.get('method') or '') for fact in document['facts']]
     assert keys == sorted(keys) and len(keys) == len(set(keys)), 'facts must be sorted and unique'
     assert document['limitations'] == sorted(set(document['limitations'])), document['limitations']
@@ -136,11 +147,14 @@ def check_graph_ids(document, graph):
     """모든 usr(= qualifiedName)가 같은 scan 그래프의 관계·컬럼 정점이고, 그 반대도 성립하는지 본다."""
     kinds = {vertex['id']: vertex['kind'] for vertex in graph['vertices']}
     for fact in document['facts']:
+        if is_reserved(fact):
+            assert fact['symbol']['qualifiedName'] not in kinds, f'reserved relation is a vertex: {fact}'
+            continue
         usr = fact['symbol']['usr']
         kind = kinds.get(usr)
         valid = kind == 'column' if fact.get('method') else kind in RELATION_KINDS
         assert valid, f'ghost or wrong-kind usr {usr}: {kind}'
-    declared = {fact['symbol']['usr'] for fact in document['facts']}
+    declared = {fact['symbol']['usr'] for fact in document['facts'] if not is_reserved(fact)}
     graph_ids = {vid for vid, kind in kinds.items() if kind in RELATION_KINDS | {'column'}}
     assert declared == graph_ids, {'graph_only': sorted(graph_ids-declared), 'facts_only': sorted(declared-graph_ids)}
 
@@ -153,7 +167,7 @@ def check_usr_impact(engine, document, graph_path, env):
     정확히 같아야 한다. 결과가 잘리지 않았으면 via가 subject나 목록 안의 한 걸음
     가까운 정점을 가리키는지도 확인한다 — via를 따라가면 subject에 닿아야 한다.
     """
-    usrs = sorted({fact['symbol']['usr'] for fact in document['facts']})
+    usrs = sorted({fact['symbol']['usr'] for fact in document['facts'] if 'usr' in fact['symbol']})
     reports = {}
     for usr in usrs:
         report = json.loads(ACCURACY.run([engine, 'impact', usr, '--graph', graph_path], env=env))
@@ -189,7 +203,8 @@ def check_language_traversal(engine, document, reports, graph_path, work, env):
     graphRevision은 graph.json 바이트의 SHA-256이다.
     """
     usrs = sorted(usr for usr, report in reports.items() if not report['truncated'])
-    relations = {fact['symbol']['usr'] for fact in document['facts'] if 'method' not in fact}
+    relations = {fact['symbol']['usr'] for fact in document['facts']
+                 if 'method' not in fact and 'usr' in fact['symbol']}
     graph_sha = hashlib.sha256(Path(graph_path).read_bytes()).hexdigest()
     compared = 0
     groups = [usrs, [usr for usr in usrs if usr in relations]]
@@ -261,6 +276,22 @@ def sqlite_relations(database):
                 for (name,) in names}
 
 
+def sqlite_reserved_relations(database):
+    """엔진의 판정과 독립적으로 SQLite 자신에게서 예약 관계와 컬럼을 읽는다.
+
+    스키마 테이블은 늘 있고, sqlite_sequence는 실제로 만들어졌을 때만 sqlite_schema에 있다.
+    temp 스키마 테이블은 모든 연결에 있다.
+    """
+    with closing(sqlite3.connect(database)) as connection:
+        def columns(schema, name):
+            return [row[1] for row in connection.execute(f'PRAGMA "{schema}".table_info("{name}")')]
+        relations = {('main', name): columns('main', name) for name in ('sqlite_schema', 'sqlite_master')}
+        if connection.execute("SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_sequence'").fetchone():
+            relations[('main', 'sqlite_sequence')] = columns('main', 'sqlite_sequence')
+        relations.update({('temp', name): columns('temp', name) for name in ('sqlite_temp_schema', 'sqlite_temp_master')})
+        return relations
+
+
 def sqlite_case(engine, work, version):
     """실제 SQLite 파일에서 scan→facts를 독립 기대값·그래프와 대조한다."""
     database = work/'facts.sqlite'
@@ -273,7 +304,9 @@ def sqlite_case(engine, work, version):
     assert not any(note.startswith(COVERAGE_PREFIX) for note in document['limitations']), document['limitations']
     reports = check_usr_impact(engine, document, graph, None)
     traversal = check_language_traversal(engine, document, reports, graph, work, None)
-    return dict(compare('sqlite', document, sqlite_relations(database)), sqlite=sqlite3.sqlite_version,
+    reserved = sqlite_reserved_relations(database)
+    assert ('main', 'sqlite_sequence') in reserved, 'AUTOINCREMENT fixture did not create sqlite_sequence'
+    return dict(compare('sqlite', document, {**sqlite_relations(database), **reserved}), sqlite=sqlite3.sqlite_version,
                 usr_impact_resolved=len(reports), language_traversal_roots=traversal)
 
 
@@ -331,6 +364,28 @@ def missing_schema_case(engine, url, work, env, version):
     assert any(note.startswith(COVERAGE_PREFIX) for note in document['limitations']), document['limitations']
 
 
+def filtered_case(engine, url, work, env, version, complete):
+    """스키마 필터로 일부만 수집한 facts는 필터 밖 관계를 못 봤다고 신고해야 한다.
+
+    catalog_complete는 필터 안에서만 참이다. 신고가 없으면 isthmus가 필터 밖 스키마의
+    관계 사용을 relation-use-without-decl error로 만든다.
+    """
+    catalog = work/'filtered.catalog.json'
+    ACCURACY.run([engine, 'scan', url, '--schema', 'public', '--emit-document', catalog,
+                  '-o', work/'filtered.graph.json'], env=env)
+    document = run_facts(engine, catalog, work/'project', work/'filtered.facts.json', env)
+    check_contract(document, work/'project', version)
+    context = json.loads(catalog.read_text())['context']
+    assert context['catalog_complete'] is True and context['schema_filter'] == ['public'], context
+    coverage = [note for note in document['limitations'] if note.startswith(COVERAGE_PREFIX)]
+    assert any('requested schema' in note and 'public' in note for note in coverage), document['limitations']
+    assert 'limitationScopes' not in document, document.get('limitationScopes')
+    relations = {channel for channel, method, _ in actual_facts(document) if method is None}
+    assert relations and all(channel.startswith('public.') for channel in relations), relations
+    assert relations <= {channel for channel, method, _ in actual_facts(complete) if method is None}, relations
+    return document
+
+
 def check_matview_columns(catalog):
     """MV 컬럼 표기가 같은 컬럼을 가진 원본 테이블의 information_schema 표기와 같은지 본다.
 
@@ -361,9 +416,10 @@ def postgres_case(engine, bindir, work, version):
         summary['usr_impact_resolved'] = len(reports)
         summary['language_traversal_roots'] = check_language_traversal(engine, document, reports, graph, work, env)
         restricted = restricted_case(engine, url, psql, work, env, version, document)
+        filtered = filtered_case(engine, url, work, env, version, document)
         missing_schema_case(engine, url, work, env, version)
         server = ACCURACY.run(psql+['-Atqc', 'SHOW server_version'], env=env).strip()
-        return dict(summary, server_version=server), document, restricted
+        return dict(summary, server_version=server), document, restricted, filtered
 
 
 # 호출 측(Go 생산자 모양) 사용 사실과 isthmus가 내야 할 판정이다. 기대 판정은
@@ -380,21 +436,44 @@ CALLER_USES = [
 ]
 
 
-def caller_document(project):
+# SQLite 소비 사례다. 공백만 있는 컬럼 선언이 하나라도 실리면 isthmus가 문서 전체를
+# 입력 오류(종료 코드 2)로 거부하고, 예약 관계 선언이 없으면 흔한 sqlite_master·
+# sqlite_sequence 사용이 거짓 미선언 error가 된다. 공백만 있는 관계 이름은 `schema.name`
+# 채널로 받아들여지므로 선언이 남아야 한다.
+SQLITE_CONSUMER_DDL = '''
+CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, " " TEXT, "\u00a0" TEXT);
+CREATE TABLE " " (v INTEGER);
+'''
+
+# SQLite 호출 측 사용과 기대 판정이다 — missing_table만 미선언 error여야 한다.
+SQLITE_CALLER_USES = [
+    ('sqlite_master', None),       # 스키마 테이블 → match
+    ('sqlite_master', 'sql'),      # 스키마 테이블의 컬럼 → match
+    ('sqlite_sequence', None),     # AUTOINCREMENT가 만든 예약 테이블 → match
+    ('sqlite_temp_master', None),  # 모든 연결의 temp 스키마 테이블 → match
+    ('users', 'email'),            # 일반 컬럼 → match
+    ('missing_table', None),       # 선언 없음 → relation-use-without-decl
+]
+
+
+def caller_document(project, uses):
     """isthmus 계약의 relation-use 문서다 — 사용 측은 location이 필수다."""
     facts = [{'kind': 'relation-use', 'channel': channel, 'dynamic': False,
               'location': {'path': 'db/access.go', 'line': line, 'column': 1},
               **({'method': method} if method else {})}
-             for line, (channel, method) in enumerate(CALLER_USES, start=1)]
+             for line, (channel, method) in enumerate(uses, start=1)]
     return {'format': 'bridge-facts', 'version': 1, 'tool': {'name': 'verify-bridge-facts', 'version': '1'},
             'generatedAt': '2026-09-24T00:00:00Z', 'platform': 'go', 'target': 'persistence',
             'project': os.path.realpath(project), 'facts': facts, 'limitations': []}
 
 
-def isthmus_check(node, isthmus, work, label, facts_document):
-    """실제 isthmus check에 호출 측 문서와 facts 문서를 넣고 이슈 목록을 돌려준다."""
+def isthmus_check(node, isthmus, work, label, facts_document, uses=CALLER_USES):
+    """실제 isthmus check에 호출 측 문서와 facts 문서를 넣고 이슈 목록을 돌려준다.
+
+    종료 코드 2(입력 문서 거부)는 판정이 아니라 실패다 — 예외로 끝낸다.
+    """
     caller, facts = work/f'{label}.caller.json', work/f'{label}.facts.json'
-    caller.write_text(json.dumps(caller_document(work/'project')))
+    caller.write_text(json.dumps(caller_document(work/'project', uses)))
     facts.write_text(json.dumps(facts_document))
     result = subprocess.run([str(node), str(isthmus), 'check', '--format', 'json', str(caller), str(facts)],
                             capture_output=True, text=True, timeout=120)
@@ -404,7 +483,7 @@ def isthmus_check(node, isthmus, work, label, facts_document):
     return {(issue['code'], issue['channel'], issue.get('method')): issue for issue in report['issues']}
 
 
-def isthmus_case(node, isthmus, work, complete, restricted):
+def isthmus_case(node, isthmus, work, complete, restricted, filtered):
     """완전한 카탈로그는 error로, coverage 공백이 있는 카탈로그는 -unverified 경고로 내려가야 한다."""
     issues = isthmus_check(node, isthmus, work, 'complete', complete)
     errors = {key for key, issue in issues.items() if issue['severity'] == 'error'}
@@ -419,7 +498,52 @@ def isthmus_case(node, isthmus, work, complete, restricted):
     degraded = isthmus_check(node, isthmus, work, 'restricted', restricted)
     assert not any(issue['severity'] == 'error' for issue in degraded.values()), sorted(map(str, degraded))
     assert ('relation-use-without-decl-unverified', 'missing_table', None) in degraded, sorted(map(str, degraded))
-    return {'complete_issues': len(issues), 'restricted_issues': len(degraded), 'errors': len(errors)}
+    # 스키마 필터 수집도 같은 판정 불가로 내려가야 한다 — 필터 밖 관계일 수 있다.
+    scoped = isthmus_check(node, isthmus, work, 'filtered', filtered)
+    assert not any(issue['severity'] == 'error' for issue in scoped.values()), sorted(map(str, scoped))
+    assert ('relation-use-without-decl-unverified', 'missing_table', None) in scoped, sorted(map(str, scoped))
+    return {'complete_issues': len(issues), 'restricted_issues': len(degraded),
+            'filtered_issues': len(scoped), 'errors': len(errors)}
+
+
+def isthmus_contract_self_diff(node, isthmus, facts_path):
+    """같은 facts 문서끼리 실제 isthmus `diff --contracts`를 돌려 보고서를 돌려준다.
+
+    바뀐 것이 없으니 모든 선언이 계약을 싣고 있으면 `no-changes-observed`여야 한다.
+    계약 없는 선언이 하나라도 있으면 isthmus는 그 선언을 `contract-unavailable`로 내
+    검토 필요(`review-required`)라 판정한다.
+    """
+    result = subprocess.run([str(node), str(isthmus), 'diff', '--contracts', '--before', str(facts_path),
+                             '--after', str(facts_path)], capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f'isthmus diff --contracts failed ({result.returncode}): {result.stderr[-2000:]}')
+    return json.loads(result.stdout)
+
+
+def sqlite_isthmus_case(node, isthmus, engine, work, version):
+    """실제 SQLite 카탈로그의 facts를 isthmus가 거부하지 않고, 예약 관계 사용을 맞히는지 본다."""
+    database = work/'consumer.sqlite'
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript(SQLITE_CONSUMER_DDL)
+    catalog, project = work/'consumer.catalog.json', work/'project'
+    ACCURACY.run([engine, 'scan', f'sqlite:{database}', '--emit-document', catalog, '-o', work/'consumer.graph.json'])
+    project.mkdir(exist_ok=True)
+    document = run_facts(engine, catalog, project, work/'consumer.facts.json', None)
+    check_contract(document, project, version)
+    notes = document['limitations']
+    # 공백 컬럼 두 개만 빠진다. 그 이름을 쓰는 유효한 사용이 없으므로 커버리지 공백이 아니다.
+    assert any(note.startswith('unexchangeable-identifiers: 2 ') for note in notes), notes
+    assert not any(note.startswith(COVERAGE_PREFIX) for note in notes), notes
+    assert any(fact['channel'] == 'main. ' for fact in document['facts']), 'blank relation name must stay declared'
+    issues = isthmus_check(node, isthmus, work, 'sqlite', document, SQLITE_CALLER_USES)
+    errors = {key for key, issue in issues.items() if issue['severity'] == 'error'}
+    assert errors == {('relation-use-without-decl', 'missing_table', None)}, sorted(map(str, errors))
+    # 예약 관계 선언도 (빈) 계약을 실어야 같은 문서끼리의 계약 비교가 변화 없음으로 끝난다.
+    diff = isthmus_contract_self_diff(node, isthmus, work/'consumer.facts.json')
+    reasons = sorted({change['reason'] for change in diff['changes']})
+    assert diff['status'] == 'no-changes-observed' and not diff['changes'], (diff['status'], reasons)
+    assert 'contract-not-collected' not in diff['limitations']['contracts'], diff['limitations']['contracts']
+    return {'issues': len(issues), 'errors': len(errors), 'contract_self_diff': diff['status']}
 
 
 def engine_version(engine):
@@ -430,17 +554,21 @@ def engine_version(engine):
 def main():
     """DB 사례를 실행하고 결과를 JSON으로 남긴다.
 
-    isthmus의 persistence 조인은 아직 npm 배포본에 없어 --isthmus가 없으면 소비
-    검사를 건너뛴다. 그때 status는 ok가 아니라 partial이다 — 건너뛴 검사를
-    통과로 읽히게 두지 않는다. 실패는 예외로 끝나 종료 코드가 0이 아니다.
+    --isthmus가 없으면 소비 검사를 건너뛴다. 그때 status는 ok가 아니라 partial이다 —
+    건너뛴 검사를 통과로 읽히게 두지 않는다. CI처럼 소비 검사가 필수인 곳은
+    --require-isthmus로 partial을 실패로 만든다. 실패는 예외로 끝나 종료 코드가 0이 아니다.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', type=Path, required=True)
     parser.add_argument('--postgres-bin', type=Path, default=Path(os.environ.get('PGBIN', '/opt/homebrew/opt/postgresql@16/bin')))
     parser.add_argument('--isthmus', type=Path, help='isthmus dist/cli/main.js with persistence support (optional)')
+    parser.add_argument('--require-isthmus', action='store_true',
+                        help='fail instead of reporting partial when --isthmus is not given')
     parser.add_argument('--node', type=Path, default=Path('node'))
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if args.require_isthmus and not args.isthmus:
+        parser.error('--require-isthmus needs --isthmus <dist/cli/main.js>')
     engine = args.engine.resolve()
     digest = hashlib.sha256(engine.read_bytes()).hexdigest()
     version = engine_version(engine)
@@ -449,12 +577,13 @@ def main():
         result = {'status': 'ok', 'engine_sha256': digest, 'engine_version': version,
                   'verifier_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   'sqlite': sqlite_case(engine, work, version)}
-        result['postgres'], complete, restricted = postgres_case(engine, args.postgres_bin, work, version)
+        result['postgres'], complete, restricted, filtered = postgres_case(engine, args.postgres_bin, work, version)
         if args.isthmus:
-            result['isthmus'] = isthmus_case(args.node, args.isthmus.resolve(), work, complete, restricted)
+            result['isthmus'] = isthmus_case(args.node, args.isthmus.resolve(), work, complete, restricted, filtered)
+            result['isthmus']['sqlite'] = sqlite_isthmus_case(args.node, args.isthmus.resolve(), engine, work, version)
         else:
             result['status'] = 'partial'
-            result['isthmus'] = 'skipped: --isthmus not given (persistence join is unreleased in isthmus 0.9.0)'
+            result['isthmus'] = 'skipped: --isthmus not given'
     assert hashlib.sha256(engine.read_bytes()).hexdigest() == digest, 'engine binary changed during verification'
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2)+'\n')

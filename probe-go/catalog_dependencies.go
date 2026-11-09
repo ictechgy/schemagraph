@@ -17,6 +17,11 @@ type CollectionContext struct {
 	Database        *string   `json:"database,omitempty"`
 	SchemaFilter    *[]string `json:"schema_filter,omitempty"`
 	CatalogComplete bool      `json:"catalog_complete"`
+	// LowerCaseTableNames는 MySQL `@@lower_case_table_names` 원값(0·1·2)이다. 테이블
+	// 이름의 대소문자 규칙 판정은 엔진이 한다. 읽지 못하면 비운다.
+	LowerCaseTableNames *int64 `json:"lower_case_table_names,omitempty"`
+	// Collation은 SQL Server 데이터베이스 기본 collation 이름 원문이다.
+	Collation *string `json:"collation,omitempty"`
 }
 
 // CatalogObjectRef는 DB가 제공한 이름이다. 그래프 id를 프로브에서 만들지 않는다.
@@ -54,6 +59,7 @@ func (h *harvester) prepareCollectionContext() {
 		return
 	}
 	h.contextReady = true
+	h.prepareNameRules()
 	if h.dialect == "sqlite" {
 		value := "main"
 		h.databaseName = &value
@@ -93,7 +99,31 @@ func (h *harvester) collectionContext(complete bool) *CollectionContext {
 		sort.Strings(names)
 		filter = &names
 	}
-	return &CollectionContext{SourceID: h.sourceID, Database: h.databaseName, SchemaFilter: filter, CatalogComplete: complete && !h.catalogIncomplete}
+	return &CollectionContext{
+		SourceID: h.sourceID, Database: h.databaseName, SchemaFilter: filter,
+		CatalogComplete:     complete && !h.catalogIncomplete,
+		LowerCaseTableNames: h.lowerCaseTableNames, Collation: h.collation,
+	}
+}
+
+// prepareNameRules는 서버가 이름을 비교하는 규칙의 원값을 읽는다. 프로브는 값을
+// 옮기기만 하고(AGENTS.md "프로브를 똑똑하게 만들지 마세요"), 대소문자 무시 여부는
+// 엔진이 판정한다. 읽지 못하면 값을 비워 엔진이 정확 비교를 유지하게 한다.
+func (h *harvester) prepareNameRules() {
+	switch h.dialect {
+	case "mysql":
+		var value sql.NullInt64
+		if err := h.db.QueryRow("SELECT CAST(@@lower_case_table_names AS SIGNED)").Scan(&value); err == nil &&
+			value.Valid && value.Int64 >= 0 && value.Int64 <= 2 {
+			h.lowerCaseTableNames = &value.Int64
+		}
+	case "sqlserver":
+		var value sql.NullString
+		if err := h.db.QueryRow("SELECT CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation'))").Scan(&value); err == nil &&
+			value.Valid && value.String != "" {
+			h.collation = &value.String
+		}
+	}
 }
 
 func (h *harvester) readCatalogDependencies(schema string) []CatalogDependency {

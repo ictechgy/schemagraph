@@ -97,8 +97,10 @@ func (h *harvester) sqliteSchemas() []string {
 func (h *harvester) sqliteObjects(schema string) []sqliteObject {
 	objects := []sqliteObject{}
 	inlineConstraints := false
+	// SQLite가 예약한 `sqlite_` 접두(ASCII 대소문자 무시)만 내부 객체다. LIKE의 `_`는
+	// 한 글자 와일드카드라 `sqlitex_users` 같은 사용자 객체까지 걸러서 직접 비교한다.
 	query := fmt.Sprintf(`SELECT name, type, sql, tbl_name FROM %s.sqlite_master
-                         WHERE name NOT LIKE 'sqlite_%%' ORDER BY name`, sqliteQuoteIdent(schema))
+                         WHERE %s ORDER BY name`, sqliteQuoteIdent(schema), sqliteUserObjectPredicate)
 	h.bestEffort("sqlite objects", query, func(rows *sql.Rows) error {
 		v, err := sqliteRow(rows)
 		if err != nil {
@@ -106,9 +108,9 @@ func (h *harvester) sqliteObjects(schema string) []sqliteObject {
 		}
 		name, kind := sqliteString(v, "name"), sqliteString(v, "type")
 		body := sqliteStringPtr(v, "sql")
-		if body != nil {
-			lower := strings.ToLower(*body)
-			inlineConstraints = inlineConstraints || strings.Contains(lower, "unique") || strings.Contains(lower, "check")
+		// 제약은 테이블 DDL에만 있다. 부분 문자열(`checksum`)이 아니라 키워드 토큰만 센다.
+		if kind == "table" && body != nil && sqliteDeclaresInlineConstraint(*body) {
+			inlineConstraints = true
 		}
 		switch kind {
 		case "table", "view":
@@ -118,8 +120,8 @@ func (h *harvester) sqliteObjects(schema string) []sqliteObject {
 		}
 		return nil
 	})
+	// 인라인 제약 미수집은 관계·컬럼 가시성과 무관해 카탈로그 완전성을 낮추지 않는다.
 	if inlineConstraints {
-		h.catalogIncomplete = true
 		h.limitations = append(h.limitations,
 			"inline UNIQUE/CHECK constraints are not exposed by the catalog; inline DDL constraint parsing is unsupported")
 	}
@@ -289,19 +291,21 @@ func (h *harvester) sqliteIndexes(schema, table string) []IndexDoc {
 // sqliteTriggers — master 행은 trigger의 tbl_name만 주므로 이미 수확한
 // 객체에 이름으로 귀속한다. 대상이 없으면 유령 정점을 만들지 않고 limitation만 남긴다.
 func (h *harvester) sqliteTriggers(schema string, objects []ObjectDoc) {
+	// tbl_name은 DDL 철자 그대로다. SQLite 식별자는 ASCII 대소문자를 구분하지 않고,
+	// 한 스키마에 대소문자만 다른 두 테이블은 있을 수 없어 접은 이름으로 귀속한다.
 	byName := map[string]*ObjectDoc{}
 	for i := range objects {
-		byName[objects[i].Name] = &objects[i]
+		byName[sqliteFoldName(objects[i].Name)] = &objects[i]
 	}
 	query := fmt.Sprintf(`SELECT name, tbl_name, sql FROM %s.sqlite_master
-                         WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%%' ORDER BY name`, sqliteQuoteIdent(schema))
+                         WHERE type = 'trigger' AND %s ORDER BY name`, sqliteQuoteIdent(schema), sqliteUserObjectPredicate)
 	h.bestEffort("sqlite triggers", query, func(rows *sql.Rows) error {
 		v, err := sqliteRow(rows)
 		if err != nil {
 			return err
 		}
 		table := sqliteString(v, "tbl_name")
-		obj := byName[table]
+		obj := byName[sqliteFoldName(table)]
 		if obj == nil {
 			h.catalogIncomplete = true
 			h.limitations = append(h.limitations, fmt.Sprintf("trigger %s.%s targets %s, which is missing from the scanned catalog", schema, sqliteString(v, "name"), table))
@@ -398,4 +402,86 @@ func sqliteInt(row map[string]any, name string) int64 {
 
 func sqlitePrimaryPosition(column ColumnDoc) int {
 	return column.PkPosition
+}
+
+// sqliteUserObjectPredicate는 sqlite_master에서 예약 객체가 아닌 행만 고르는 조건이다.
+// 접두 일곱 글자를 ASCII 소문자로 접어 비교하므로 LIKE 와일드카드·PRAGMA
+// case_sensitive_like 설정에 흔들리지 않는다.
+const sqliteUserObjectPredicate = "lower(substr(name, 1, 7)) <> 'sqlite_'"
+
+// sqliteFoldName은 SQLite의 식별자 비교 규칙(ASCII 대소문자만 무시)으로 이름을 접는다.
+func sqliteFoldName(name string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, name)
+}
+
+// sqliteDeclaresInlineConstraint는 DDL에 UNIQUE나 CHECK 키워드 토큰이 있는지 본다.
+// 문자열 리터럴, 인용 식별자(큰따옴표·백틱·대괄호), 주석 안의 글자는 키워드가 아니다.
+// 키워드처럼 보이면 세는 쪽으로 보수성을 유지한다.
+func sqliteDeclaresInlineConstraint(ddl string) bool {
+	for _, word := range sqliteDDLWords(ddl) {
+		if strings.EqualFold(word, "unique") || strings.EqualFold(word, "check") {
+			return true
+		}
+	}
+	return false
+}
+
+// sqliteDDLWords는 인용과 주석을 건너뛴 맨 단어([A-Za-z0-9_$]와 비ASCII 바이트)를 돌려준다.
+func sqliteDDLWords(sql string) []string {
+	words := []string{}
+	for i := 0; i < len(sql); {
+		switch c := sql[i]; {
+		case c == '\'' || c == '"' || c == '`':
+			i = sqliteSkipQuoted(sql, i, c)
+		case c == '[':
+			i = sqliteSkipQuoted(sql, i, ']')
+		case c == '-' && i+1 < len(sql) && sql[i+1] == '-':
+			if end := strings.IndexByte(sql[i:], '\n'); end >= 0 {
+				i += end
+			} else {
+				i = len(sql)
+			}
+		case c == '/' && i+1 < len(sql) && sql[i+1] == '*':
+			if end := strings.Index(sql[i+2:], "*/"); end >= 0 {
+				i += end + 4
+			} else {
+				i = len(sql)
+			}
+		case sqliteWordByte(c):
+			start := i
+			for i < len(sql) && sqliteWordByte(sql[i]) {
+				i++
+			}
+			words = append(words, sql[start:i])
+		default:
+			i++
+		}
+	}
+	return words
+}
+
+// sqliteWordByte는 맨 단어를 이루는 바이트다. 비ASCII 바이트도 이름의 일부로 본다.
+func sqliteWordByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '$' || c >= 0x80
+}
+
+// sqliteSkipQuoted는 start의 여는 인용부터 close까지 건너뛴다. 닫는 문자를 두 번
+// 쓰면 이스케이프다(대괄호 제외). 닫히지 않으면 끝까지 소비한다.
+func sqliteSkipQuoted(sql string, start int, close byte) int {
+	for i := start + 1; i < len(sql); i++ {
+		if sql[i] != close {
+			continue
+		}
+		if close != ']' && i+1 < len(sql) && sql[i+1] == close {
+			i++
+			continue
+		}
+		return i + 1
+	}
+	return len(sql)
 }

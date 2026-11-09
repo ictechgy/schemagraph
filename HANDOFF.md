@@ -1,5 +1,78 @@
 # HANDOFF.md
 
+## 현재 상태 (2026-11-09, PR #59 리뷰 반영 후)
+
+- 발행본은 **0.9.0**이다. 태그 `v0.9.0` = `fad8e9d`([#58](https://github.com/ictechgy/schemagraph/pull/58)).
+  그 커밋의 [CI](https://github.com/ictechgy/schemagraph/actions/runs/41583763434)·
+  [SQL Server/Oracle](https://github.com/ictechgy/schemagraph/actions/runs/41583763488)·
+  [IBM](https://github.com/ictechgy/schemagraph/actions/runs/41583763549)·
+  [DML](https://github.com/ictechgy/schemagraph/actions/runs/41583763689) 검증이 모두 성공했다.
+- [PR #59](https://github.com/ictechgy/schemagraph/pull/59)(브랜치 `ccr-37904670-hxdjsx`)가 미발행 변경을 담고 있다.
+  RELEASE-NOTES `# Unreleased`가 그 목록의 정본이다: facts의 스키마 필터·교환 불가 식별자 범위 공백과
+  SQLite 예약 관계 선언, COPY 테이블·컬럼 간선, SQLite 수집기 3종 수정(네이티브·Go·JDBC), 대소문자 접기
+  방언의 관계·routine 해석과 몸체 캐시 지문, 서버 대소문자 규칙 수집(`context.lower_case_table_names`·
+  `collation`), 프로브 메시지 영어화, JDBC 파티션·외부 테이블과 방언별(대소문자 구분) 시스템 스키마,
+  CI의 isthmus 0.14.0 실검증.
+- 채널별 게시 현황은 RELEASE-NOTES.md 끝의 "Publication channels" 표가 정본이다.
+  crates.io에는 0.7.1·0.8.0·0.8.1이 없고, Maven Central에는 0.7.1이 없다(2026-11-03 조회).
+  GitHub Release v0.1.0–v0.3.0에는 첨부 아카이브가 없다(2026-11-09 조회). 누락 버전은 다시 게시하지 않는다.
+- isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
+
+### PR #59 리뷰에서 처리한 것
+
+GLM 리뷰(`packet-ask`)를 이 세션에서 쓸 수 없어, 같은 체크리스트로 독립된 Claude 리뷰를 대신 돌렸다.
+
+- facts: trim하면 비는 컬럼 이름(공백·NBSP·BOM)이 isthmus 문서 전체를 종료 코드 2로 거부시키던 문제.
+  그 컬럼만 빼고 `unexchangeable-identifiers:`로 센다. 스키마 이름 때문에 뺀 것만 `catalog-coverage:`다.
+- facts: SQLite `sqlite_master`·`sqlite_sequence` 사용이 거짓 미선언 error가 되던 문제. 존재가 확실한
+  예약 관계를 usr 없이 선언한다(그래프 정점이 아니다). 두 건 모두 `Scripts/verify-bridge-facts.py`의
+  실제 isthmus 0.14.0 사례로 검증한다.
+- parser: 대소문자 접기 방언(MySQL lctn≠0 포함)의 몸체 캐시 지문, COPY 컬럼 목록 간선, MySQL routine
+  접기가 DB 한정자를 접지 않게, 터키어·아제르바이잔어·CP1254 CI collation은 ASCII 접기로 확정하지 않게.
+- probe(JDBC): PostgreSQL·MySQL 시스템 스키마 비교를 네이티브·Go처럼 대소문자 구분으로.
+- 재리뷰 blocker 2건(0c48cc5 기준): SQLite 비ASCII 관계 이름에서 몸체 캐시 지문이 테이블 모양 변화를 놓치던
+  29036a3의 회귀(SQLite는 양쪽에 같은 catalog_key를 쓰는 tables 경로로 되돌림), 예약 관계 사실에 계약이 없어
+  `isthmus diff --contracts`가 같은 문서도 review-required로 판정하던 문제(빈 계약 + 한계를 싣고, 0c48cc5의
+  capture 검사·문서 변경을 되돌림). 후자는 verify-bridge-facts.py의 계약 자기 비교로 검증한다.
+- SQLite 골든: 인라인 제약 완전성 수정의 의도된 결과(FK `complete: true`, `catalog_complete: true`)로 갱신.
+- 문서: 채널 표의 v0.1.0–v0.3.0 바이너리 표기, facts 한계 접두사·예약 관계 설명.
+
+### 처리하지 않은 것과 이유
+
+- 스키마 필터가 모든 스키마를 담아도 `catalog-coverage:`가 붙는 보수적 과대 보고는 유지하고 문서화했다.
+  정확히 세려면 CatalogDocument에 "필터 밖 스키마 존재" 필드가 필요하다(계약 변경). 네이티브 MySQL reader는
+  URL의 DB를 필터로 기록하므로 다른 DB를 `db.table`로 쓰는 경우를 위해 늘 붙는 것이 맞다.
+- `sqlite_schema`·`sqlite_temp_schema`는 SQLite 3.33.0부터 있다. 앱 런타임 버전을 모르므로 늘 선언하고,
+  그 이전 런타임에서는 거짓 match가 된다는 점을 문서화했다. 예약 관계를 쓰지 않는 앱에는 관계마다
+  `relation-decl-without-use` 경고가 나지만 죽은 스키마 후보가 아니다.
+- `sqlite_stat*`는 ANALYZE 이력에 달려 선언하지 않는다. JDBC SQLite 문서는 테이블 DDL이 없어
+  `sqlite_sequence`를 판정하지 못한다(`sqlite-system-relations:` 메모로 알린다).
+- MySQL `lower_case_table_names`·SQL Server collation 수집은 단위 테스트로만 검증된다. 실서버 fixture
+  (`Scripts/verify-fixtures.sh`의 Docker 단계)는 이 값을 수집하지만 기대값으로 단언하지는 않는다.
+  단언을 더하려면 Docker 데몬이 있는 환경에서 실제 값을 보고 고정해야 한다.
+- JDBC 프로브의 JUnit 실행은 이 세션에서 Maven Central 429로 의존성을 받지 못해 못 돌렸다.
+  바뀐 `CatalogScopeTest.systemSchemasDependOnTheDialect`만 컴파일된 클래스를 직접 실행해 확인했다(수정 전 실패).
+
+## 머지 뒤 다음 할 일
+
+1. PR #59 머지 뒤 CI·DB fixture job이 main에서 모두 녹색인지 확인한다.
+2. 다음 릴리스는 **0.10.0**이다 — `CollectionContext`에 공개 필드가 늘었다. [RELEASING.md](RELEASING.md) 절차로
+   GitHub Release·crates.io·Maven Central을 **각각** 게시하고, 채널 표를 실제 조회 결과로 갱신한다.
+   crates.io 누락분(0.7.1·0.8.0·0.8.1)은 다시 게시하지 않고 0.10.0이 그 변경을 담는다.
+3. isthmus 쪽 `compatibility.json`의 schemagraph 고정을 올리는 일은 isthmus 저장소에 맡긴다.
+
+## Blocker와 열린 질문 (2026-11-09)
+
+- 수집기 사이에 남은 차이는 SUPPORT-MATRIX.md "Known differences between collectors"에 적었다
+  (JDBC는 PK 인덱스를 `indexes`에 싣고, SQLite 인라인 제약 한계를 내지 않는다).
+- isthmus에 relation-decl용 공유 적합성 벡터가 없다. 생기면 벤더링하고 `conformance.lock`으로 기록한다.
+- Docker DB fixture(MySQL·MariaDB·SQL Server·Oracle·IBM)는 컨테이너 데몬이 있는 환경이나 CI에서만 돈다.
+- SQL Server의 대소문자 무시 판정은 ASCII 접기다. 비ASCII 이름의 collation 규칙은 따르지 않고 정확 비교로 남는다.
+
+## 이력
+
+아래는 당시 기록이다. 날짜·버전·"미배포" 표기는 그 시점의 상태다.
+
 ## 0.7.1 릴리스 검증 순서 보강 (2026-10-12 UTC)
 
 - DML accuracy·IBM fixtures·SQL Server/Oracle accuracy의 push를 모든 브랜치로
@@ -60,14 +133,14 @@ _최종 갱신: 2026-09-25 KST · Claude_
   검증하며 private 기본값은 유지한다. Docker가 없는 로컬에서 실행 구성 회귀
   4개와 실제 host CLI 0600 scan/query를 확인했고 컨테이너 end-to-end는 CI에서 확인한다.
 
-## 목표
+## 목표 (v0.6.0 시점)
 
 경쟁 재조사(2026-09-25)에서 정한 보강 네 가지를 구현·리뷰·머지하고 **v0.6.0으로 공개
 배포·설치 검증까지 완료**했다. 남은 승인 작업은 없다. 다음 제품 작업은 미정이다.
 
-## 현재 상태
+## 현재 상태 (v0.6.0 시점)
 
-- 프로젝트: `/Users/jinhongan/Desktop/schemagraph`. main은 깨끗하며 이 문서 갱신 PR 외 진행 중인 브랜치는 없다.
+- 프로젝트: schemagraph 저장소 루트. main은 깨끗하며 이 문서 갱신 PR 외 진행 중인 브랜치는 없다.
 - 공개 버전: [v0.6.0](https://github.com/ictechgy/schemagraph/releases/tag/v0.6.0).
   태그·6개 crate·Go 바이너리의 내장 커밋은 `e5f3b9cdfe453b6c6ee872e1283fd6a18af592b2`
   ([PR #29](https://github.com/ictechgy/schemagraph/pull/29) 머지 커밋).
@@ -155,11 +228,11 @@ _최종 갱신: 2026-09-25 KST · Claude_
 - 과거 상세 이력: [v0.5.0 시점 HANDOFF](https://github.com/ictechgy/schemagraph/blob/739ac6170286d1f768062406ef5c699661f30630/HANDOFF.md),
   [v0.6.0 직후 HANDOFF](https://github.com/ictechgy/schemagraph/blob/c0621814714072715bbc5b2420b648291ac5a0e1/HANDOFF.md). 옛 "미배포" 문구는 당시 상태다.
 
-## Blocker와 열린 질문
+## Blocker와 열린 질문 (v0.6.0 시점)
 
 없음. 추가 게시나 실패 CI 재실행이 남아 있지 않다.
 
-- isthmus persistence 조인이 npm에 배포되면 CI의 `verify-bridge-facts.py`에 `--isthmus`를 붙일 수 있다.
+- (2026-11-03 처리) CI의 `verify-bridge-facts.py`가 isthmus-cli 0.14.0으로 `--isthmus --require-isthmus` 검증을 한다.
 - OpenLineage 출력의 실제 카탈로그(Marquez·DataHub·OpenMetadata) 적재와 MySQL `unused`의 실DB 검증은 하지 않았다.
 
 ## 다음 단계
@@ -179,7 +252,7 @@ _최종 갱신: 2026-09-25 KST · Claude_
 ## 재개 프롬프트
 
 ```text
-/Users/jinhongan/Desktop/schemagraph에서 HANDOFF.md와 AGENTS.md를 읽어줘.
-v0.6.0(search·MCP 확장, lint 규칙, unused, openlineage) 배포·공개 설치 검증은 완료됐어.
-먼저 git 상태를 확인하고 로컬 변경을 보존한 뒤, 내가 추가로 요청하는 작업부터 이어가줘.
+schemagraph 저장소 루트에서 HANDOFF.md와 AGENTS.md를 읽어줘.
+발행본은 0.9.0이고, RELEASE-NOTES의 Unreleased 변경은 아직 발행 전이야(다음 crate 릴리스는 0.10.0).
+먼저 git 상태를 확인하고 로컬 변경을 보존한 뒤, 내가 추가로 요청하는 작업부터 이어가줘. 배포는 반복하지 마.
 ```

@@ -4,12 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Expr, ObjectName, ObjectNamePart, Query, Statement, Visit, VisitMut, Visitor, VisitorMut,
+    CopySource, Expr, ObjectName, ObjectNamePart, Query, Statement, Visit, VisitMut, Visitor,
+    VisitorMut,
 };
 
 use super::{
-    is_sqlserver_transition_relation, qualified_write_targets, read_exclusions, relation_name_key,
-    relation_name_parts, write_targets_shallow, ParsedTrigger,
+    copy_to_table, is_sqlserver_transition_relation, qualified_write_targets, read_exclusions,
+    relation_name_key, relation_name_parts, write_targets_shallow, ParsedTrigger,
 };
 
 /// 컬럼 해석과 같은 PostgreSQL 인용 규칙을 본문의 관계·호출 이름에도 적용한다.
@@ -45,8 +46,14 @@ pub(super) fn normalize_postgres(statement: &mut Statement) {
             ControlFlow::Continue(())
         }
         fn pre_visit_statement(&mut self, statement: &mut Statement) -> ControlFlow<()> {
-            if let Statement::Call(call) = statement {
-                Self::name(&mut call.name);
+            match statement {
+                Statement::Call(call) => Self::name(&mut call.name),
+                // COPY의 테이블 이름은 관계 방문에서 빠져 따로 접는다.
+                Statement::Copy {
+                    source: CopySource::Table { table_name, .. },
+                    ..
+                } => Self::name(table_name),
+                _ => {}
             }
             ControlFlow::Continue(())
         }
@@ -77,6 +84,11 @@ pub(super) fn collect_reads(
             ));
             self.qualified_writes
                 .push(qualified_write_targets(statement));
+            // COPY TO의 원본 테이블은 visitor가 관계로 방문하지 않는 자리라
+            // 같은 관계 판정을 직접 적용한다.
+            if let Some(source) = copy_to_table(statement) {
+                return self.pre_visit_relation(source);
+            }
             ControlFlow::Continue(())
         }
         fn post_visit_statement(&mut self, _: &Statement) -> ControlFlow<()> {

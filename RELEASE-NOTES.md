@@ -1,5 +1,28 @@
 # Unreleased
 
+- `facts` on a catalog collected with a schema filter (`--schema`, or the probes' schema options) adds a `catalog-coverage:` limitation naming the requested schemas. The collector only proves completeness inside the filter, so isthmus now reports uses of relations in other schemas as `relation-use-without-decl-unverified` warnings instead of errors. No `limitationScopes` entry is added, because the unscanned relations cannot be listed as channels. The limitation is added whenever a filter was recorded, even when the filter names every schema the database has, because the catalog does not record which schemas existed outside it; the native MySQL/MariaDB reader records the database named in the URL as the filter, so its facts always carry the limitation (other databases on the server can be named with `db.table`).
+- `facts` omits relation and column declarations whose schema, object or column name is empty or contains control characters (C0, DEL, C1, U+2028, U+2029), and column declarations whose name is only whitespace (including NBSP and U+FEFF). isthmus rejects such a name with exit 2 for the whole join, so one odd identifier no longer blocks every other declaration. Declarations omitted because of their schema name are counted in a `catalog-coverage:` limitation, because an unqualified use may name them. Declarations omitted because of their own name are counted in an `unexchangeable-identifiers:` limitation, which does not downgrade undeclared-use errors: isthmus applies the same rule to uses, so no valid use can name them. A relation whose name is only whitespace is still declared, because its `schema.name` channel is accepted.
+- `facts` on a SQLite catalog also declares the reserved relations an application can query but the collector leaves out of the catalog and graph: `sqlite_schema` and `sqlite_master` in every schema, `temp.sqlite_temp_schema` and `temp.sqlite_temp_master`, and `sqlite_sequence` in a schema whose table DDL uses `AUTOINCREMENT`. Their facts carry `symbol.qualifiedName` without `symbol.usr`, because they are not graph vertices and must not be passed to `impact`. Each carries an empty `dataContract` (`fields: []`) with the limitation `reserved SQLite relation: fields were not collected`, so `isthmus diff --contracts` of two identical documents still reports `no-changes-observed`. `sqlite_schema` and `sqlite_temp_schema` exist only from SQLite 3.33.0, so an application on an older SQLite runtime gets a false match for them. An application that uses none of the reserved relations gets one `relation-decl-without-use` warning per reserved relation; these are not dead-schema candidates. When tables have no collected DDL (the JDBC probe), `sqlite_sequence` cannot be determined and a `sqlite-system-relations:` limitation says so. `sqlite_stat*` tables depend on `ANALYZE` history and are not declared. Previously isthmus reported every use of `sqlite_master` or `sqlite_sequence` as an undeclared-relation error.
+- The JDBC probe compares PostgreSQL and MySQL/MariaDB system schema names case-sensitively, like the native readers and the Go probe. Before, user schemas such as `"PG_x"`, `"INFORMATION_SCHEMA"` (PostgreSQL) or `MySQL` (MySQL with `lower_case_table_names=0`) were dropped only by the JDBC probe.
+- `COPY t [(columns)] FROM …` in a routine, trigger or `--sql-dir` file records a `writes` edge to `t`, and `COPY t TO …` records a `reads` edge; `COPY (query) TO …` already read the query's relations. A column list (`COPY t (a, b) TO|FROM`) also records column `reads`/`writes` like the column list of a `SELECT` or `INSERT`; without a list every catalog column is the target, as with `SELECT *`. COPY FROM also adds the `SG_DML_COPY` diagnostic and keeps the body `partial`, because the loaded values come from external data and have no traced source. Previously both forms left the body `complete` with no edge, so loaders disappeared from `impact`. `COPY … FROM STDIN` inside PL/pgSQL is not valid SQL there and stays an unextracted statement.
+- The native SQLite reader keeps user objects whose names merely look like the reserved prefix, such as `sqlitex_users` or `SQLiteVersion`. The filter `NOT LIKE 'sqlite_%'` treated `_` as a one-character wildcard (and LIKE ignores ASCII case), so those tables and their triggers disappeared while the catalog was still declared complete. Only names that start with `sqlite_` (ASCII case-insensitively, as SQLite reserves them) are skipped now.
+- The native SQLite reader attaches a trigger to its table when `sqlite_master.tbl_name` uses different ASCII letter case than the table (`CREATE TRIGGER … ON ORDERS` for `orders`), instead of dropping the trigger with a false "missing from the scanned catalog" limitation.
+- The native SQLite `inline UNIQUE/CHECK constraints` limitation is added only when a table's DDL contains a `UNIQUE` or `CHECK` keyword token outside strings, quoted identifiers and comments; a column named `checksum` no longer triggers it. The limitation no longer makes the catalog incomplete, because missing inline constraints do not hide relations or columns; `facts` therefore stops downgrading every undeclared-relation error for such databases.
+- SQLite bodies (views, triggers) resolve relation names to catalog objects that differ only in ASCII letter case, as SQLite compares identifiers. A trigger writing `INSERT INTO AUDIT …` now records the object-level `writes` edge to `audit` instead of a "missing" limitation. As for Oracle, an exact match still wins and several case-only candidates stay unresolved.
+- MySQL and MariaDB routine calls (`CALL P_Helper()`, `FN_TOTAL(x)`) resolve to routines that differ only in letter case, because MySQL routine names are case-insensitive on every platform. A routine called only that way is no longer reported by `dead` as `noDependents`, and `impact` includes its callers. Table and view names still match exactly, because their case rule depends on the server's `lower_case_table_names`.
+- The Go probe applies the same three SQLite fixes as the native reader: reserved-prefix filtering, case-insensitive trigger attachment, and keyword-token detection of inline UNIQUE/CHECK constraints that no longer marks the catalog incomplete.
+- Catalog documents can carry the server's identifier case rules in `context`: `lower_case_table_names` (the raw MySQL/MariaDB `@@lower_case_table_names`, 0–2) and `collation` (the raw SQL Server database collation name). The native MySQL reader, the Go probe (MySQL, SQL Server) and the JDBC probe (MySQL, MariaDB, SQL Server) collect them, and leave them out when the server does not answer. The engine decides what they mean: relation names in bodies match catalog objects that differ only in letter case when `lower_case_table_names` is 1 or 2, or the collation has a `_CI` attribute without `BIN`/`BIN2`. As before, an exact match wins and several case-only candidates stay unresolved. Without these fields (older documents, `lower_case_table_names` 0, case-sensitive collations), names still match exactly and the 0.9.0 case-only limitation explains the gap. Both fields are additive in document versions 1 and 2; older engines report them as unknown fields.
+- Go and JDBC probe messages (limitations, CLI errors and warnings) are English, matching the engine and native readers since 0.9.0. Conditions, counts and the `track_counts=off`, `track_functions=none` and `performance_schema=OFF` prefixes are unchanged; consumers that matched the earlier Korean text must match the English text. These limitations reach `facts` and isthmus, whose users read English output.
+- The JDBC probe collects PostgreSQL partitioned parent tables and foreign tables (pgjdbc reports them as `PARTITIONED TABLE` and `FOREIGN TABLE`), as the native reader and Go probe already did. Their foreign keys, view edges and `facts` declarations no longer depend on which collector scanned the database.
+- The JDBC probe skips only the system schemas of the database it reads. A PostgreSQL schema named `system`, `sys` or `mysql`, for example, was dropped without a limitation because one list covered every dialect. PostgreSQL now skips `information_schema` and `pg_*` like the native reader; MySQL/MariaDB, SQL Server, Oracle and H2 use their own lists; unknown dialects keep the previous combined list.
+- The JDBC probe attaches SQLite triggers whose `tbl_name` differs from the table only in ASCII letter case, matching the native reader and Go probe.
+- CI checks `facts` with the published isthmus-cli 0.14.0 consumer instead of skipping that step as `partial`. `Scripts/verify-bridge-facts.py` adds a schema-filtered case and a `--require-isthmus` flag that turns a skipped consumer check into a failure.
+
+## Breaking
+
+- Go and JDBC probe limitation and error text is now English (see above). Message conditions are unchanged.
+- `schemagraph_source::document::CollectionContext` has two new public fields, `lower_case_table_names` and `collation`. Library code that builds it with a struct literal must set them (`None` keeps the previous meaning), so the next crate release must be a minor version. The document JSON is unchanged when they are absent.
+
 # schemagraph 0.9.0 - 2026-11-03
 
 - PostgreSQL body relations and routine names fold only unquoted identifiers. TRUNCATE and data-modifying CTEs retain write evidence; CTE aliases do not become physical relations.
@@ -585,3 +608,31 @@ control path.
 See [review/Action usage](REVIEW-ACTION.md), [external SQL imports](EXTERNAL-SQL.md),
 [DML evidence](DML-ACCURACY.md), [support](SUPPORT-MATRIX.md), and
 [performance measurements](PERFORMANCE.md).
+
+# Publication channels
+
+Each channel is published and checked separately; a tag or a GitHub Release does
+not imply that the crates or the Maven artifact exist. Checked on 2026-11-03 against
+GitHub Releases, the crates.io API and Maven Central metadata.
+
+| Version | GitHub Release (binaries) | crates.io (`schemagraph-*`) | Maven Central (`io.github.ictechgy:schemagraph-probe`) |
+| --- | --- | --- | --- |
+| 0.9.0 | yes | yes | yes |
+| 0.8.1 | yes | no | yes |
+| 0.8.0 | yes | no | yes |
+| 0.7.1 | yes | no | no |
+| 0.7.0 | yes | yes | yes |
+| 0.6.0 | yes | yes | yes |
+| 0.5.1 | yes | yes | yes |
+| 0.5.0 | yes | yes | yes |
+| 0.4.0–0.4.3 | yes | yes | yes |
+| 0.3.0 | no (notes only) | yes | yes |
+| 0.1.0–0.2.0 | no (notes only) | yes | no |
+
+The 0.1.0–0.3.0 GitHub Releases are release notes without attached archives;
+prebuilt binaries start with 0.4.0 (asset counts checked on 2026-11-09).
+
+Cargo users therefore received the 0.7.1 file-output protection and SQLite
+nullability fixes and the 0.8.x `merge`, `openlineage` and SQLite migration helper
+changes only with 0.9.0. Statements such as "already shipped in 0.8.1" above refer
+to the binary and Maven channels.

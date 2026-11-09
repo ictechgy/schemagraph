@@ -31,6 +31,59 @@ private val INFORMIX_SYSTEM_SCHEMAS = setOf(
     "sysmaster", "sysutils", "sysadmin", "sysuser", "syscdr", "syscdcv1",
 )
 
+/** MySQL·MariaDB가 내보내는 시스템 스키마다. 네이티브 reader·Go 프로브와 같은 목록이다. */
+private val MYSQL_SYSTEM_SCHEMAS = setOf("information_schema", "mysql", "performance_schema", "sys")
+
+/** SQL Server가 사용자 객체와 함께 내보내는 시스템 스키마다. */
+private val SQLSERVER_SYSTEM_SCHEMAS = setOf("information_schema", "sys")
+
+/** Oracle 사전의 시스템 스키마다. 목록이 길어 공통 목록에서 MySQL·PG 이름을 뺀 것으로 둔다. */
+private val ORACLE_SYSTEM_SCHEMAS =
+    SYSTEM_SCHEMAS - setOf("information_schema", "pg_catalog", "pg_toast", "pg_temp_1", "mysql", "performance_schema", "innodb")
+
+/**
+ * 방언별 시스템 스키마 판정이다. 같은 이름이 다른 방언에서는 평범한 사용자 스키마일 수
+ * 있어(PostgreSQL의 `system`·`sys`·`mysql` 스키마 등) 그 방언의 카탈로그가 실제로 내보내는
+ * 시스템 스키마만 뺀다. 가시성 검사는 수집한 스키마에만 돌아 여기서 빠진 스키마는 한계로도
+ * 남지 않으므로, 방언을 모를 때만 예전처럼 모든 방언의 목록을 합쳐 쓴다(보수적).
+ * Oracle의 PUBLIC은 수만 시노님 슈도스키마라 방언 한정으로 억제한다(H2의 PUBLIC은
+ * 사용자 기본 스키마라 억제하면 안 된다).
+ */
+internal fun isSystemSchema(dialect: String, schema: String): Boolean {
+    val s = schema.lowercase()
+    return when (dialect) {
+        // 네이티브 reader·Go 프로브와 같은 규칙이다. 둘 다 대소문자를 구분해 비교한다 —
+        // PostgreSQL이 예약하는 것은 소문자 pg_ 접두뿐이라 "PG_x"·"INFORMATION_SCHEMA"는
+        // 만들 수 있는 사용자 스키마다.
+        "postgres" -> schema == "information_schema" || schema.startsWith("pg_")
+        // MySQL 시스템 스키마는 소문자로만 존재한다. lower_case_table_names=0 서버의 "MySQL"은
+        // 사용자 DB다(Go 프로브도 정확히 비교한다).
+        "mysql", "mariadb" -> schema in MYSQL_SYSTEM_SCHEMAS
+        "sqlserver" -> s in SQLSERVER_SYSTEM_SCHEMAS
+        "oracle" -> s in ORACLE_SYSTEM_SCHEMAS || s == "public"
+        "h2" -> s == "information_schema"
+        "sqlite" -> false
+        "db2" -> s in SYSTEM_SCHEMAS || s in DB2_SYSTEM_SCHEMAS
+        "informix" -> s in SYSTEM_SCHEMAS || s in INFORMIX_SYSTEM_SCHEMAS
+        else -> s in SYSTEM_SCHEMAS
+    }
+}
+
+/** getTables의 TABLE_TYPE을 문서 객체 종류로 바꾼다. 정점이 아닌 종류(SYSTEM TABLE,
+ *  GLOBAL TEMPORARY 등)는 null이다. */
+internal fun tableKindOf(tableType: String): String? {
+    val type = tableType.uppercase()
+    return when {
+        // pgjdbc는 relkind p·f를 PARTITIONED TABLE·FOREIGN TABLE로 준다. 네이티브·Go 수집기는
+        // 둘 다 테이블로 수집하므로(information_schema의 BASE TABLE·FOREIGN) 같은 정점을 만든다.
+        type == "TABLE" || type == "BASE TABLE" || type == "PARTITIONED TABLE" || type == "FOREIGN TABLE" -> "table"
+        type.contains("MATERIALIZED") && type.contains("VIEW") -> "materialized-view"
+        type.contains("VIEW") -> "view"
+        type == "SYNONYM" -> "synonym"
+        else -> null
+    }
+}
+
 /** Oracle 조회의 왕복당 행 수. ALL_SOURCE는 소스 한 줄이 한 행이라 ojdbc 기본값(10행)이면
  *  대형 PL/SQL 스키마의 수집 시간을 왕복 지연이 정한다. 행 최대 약 4KB라 1000행도 버퍼가
  *  작다. LONG 열(ALL_VIEWS.TEXT 등) 조회는 ojdbc가 여전히 행 단위로 받는다 —
@@ -76,6 +129,13 @@ internal fun readImportedKeyRow(rs: ResultSet): ImportedKeyRow {
         referencedColumn = rs.getString("PKCOLUMN_NAME"),
     )
 }
+
+/** MySQL·MariaDB의 테이블 이름 대소문자 규칙 원값 조회다. */
+internal const val LOWER_CASE_TABLE_NAMES_SQL = "SELECT CAST(@@lower_case_table_names AS SIGNED)"
+
+/** SQL Server 현재 데이터베이스의 기본 collation 이름 조회다. */
+internal const val DATABASE_COLLATION_SQL =
+    "SELECT CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation'))"
 
 /** 프로브 추출기 — Connection 하나를 받아 CatalogDocument를 만든다. */
 class Extractor(
@@ -127,19 +187,39 @@ class Extractor(
         database = runCatching { conn.catalog }.getOrNull(),
         schemaFilter = schemaFilter.distinct().sorted().takeIf { it.isNotEmpty() },
         catalogComplete = complete && sessionComplete,
+        lowerCaseTableNames = lowerCaseTableNames,
+        collation = collation,
     )
 
-    /** 시스템 스키마 억제 — Oracle의 PUBLIC은 수만 시노님 슈도스키마라 방언
-     *  한정으로 억제한다(H2의 PUBLIC은 사용자 기본 스키마라 억제하면 안 된다). */
-    private fun isSystem(schema: String): Boolean {
-        val s = schema.lowercase()
-        val dialectSystem = when (dialect) {
-            "db2" -> s in DB2_SYSTEM_SCHEMAS
-            "informix" -> s in INFORMIX_SYSTEM_SCHEMAS
-            else -> false
-        }
-        return s in SYSTEM_SCHEMAS || dialectSystem || (dialect == "oracle" && s == "public")
+    /** 서버의 테이블 이름 대소문자 규칙 원값이다. 문맥을 여러 번 만들어도 한 번만 읽는다. */
+    private val lowerCaseTableNames: Int? by lazy {
+        if (dialect != "mysql" && dialect != "mariadb") null
+        else scalarText(LOWER_CASE_TABLE_NAMES_SQL)?.trim()?.toIntOrNull()?.takeIf { it in 0..2 }
     }
+
+    /** SQL Server 데이터베이스 기본 collation 원문이다. */
+    private val collation: String? by lazy {
+        if (dialect != "sqlserver") null else scalarText(DATABASE_COLLATION_SQL)?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * 한 칸짜리 조회 결과를 문자열로 읽는다. 이름 규칙은 보조 근거라, 읽지 못하면 null로
+     * 두어 엔진이 이름을 정확히 비교하게 한다(규칙을 모르는 상태와 같다). 그래서 실패를
+     * 한계로 올리지 않는다.
+     */
+    private fun scalarText(sql: String): String? = runCatching {
+        conn.createStatement().use { st -> st.executeQuery(sql).use { rs -> if (rs.next()) rs.getString(1) else null } }
+    }.getOrNull()
+
+    private fun isSystem(schema: String): Boolean = isSystemSchema(dialect, schema)
+
+    /**
+     * 트리거를 대상 객체에 귀속하는 이름 키다. SQLite의 sqlite_master.tbl_name은 DDL 철자를
+     * 보존하지만 식별자는 ASCII 대소문자만 무시하고 비교하므로 접는다(`ON ORDERS` → orders).
+     * 한 스키마에 대소문자만 다른 두 테이블은 SQLite에 있을 수 없다. 다른 방언은 카탈로그 이름 그대로다.
+     */
+    private fun triggerTargetKey(name: String): String =
+        if (dialect == "sqlite") name.map { if (it in 'A'..'Z') it + ('a' - 'A') else it }.joinToString("") else name
 
     fun extract(): CatalogDocument {
         // 읽기 전용 힌트 — sqlite-jdbc처럼 연결 후 변경을 거부하는 드라이버는
@@ -154,7 +234,7 @@ class Extractor(
             if (catalogDependencies) dependencies += collectCatalogDependencies(conn, dialect, schema, limitations)
         }
         if (schemas.none { it.objects.isNotEmpty() }) {
-            limitations += "JDBC 메타데이터가 테이블/뷰를 하나도 주지 않았다 — 드라이버 커버리지를 확인해라"
+            limitations += "JDBC metadata returned no tables or views; check the driver's metadata coverage"
         }
         return CatalogDocument(
             version = DOCUMENT_VERSION,
@@ -201,7 +281,7 @@ class Extractor(
             }
         }
         if (!sawObjects) {
-            limitations += "JDBC 메타데이터가 테이블/뷰를 하나도 주지 않았다 — 드라이버 커버리지를 확인해라"
+            limitations += "JDBC metadata returned no tables or views; check the driver's metadata coverage"
         }
         rec("limitations", "data" to limitations.distinct().sorted(), "context" to collectionContext(limitations.size == metadataStart))
     }
@@ -232,7 +312,7 @@ class Extractor(
                         idx.copy(usage = usage.indexes[Triple(schema, raw.name, idx.name)])
                     }
                 else emptyList(),
-                triggers = bodies.triggers[schema to raw.name].orEmpty().sortedBy { it.name },
+                triggers = bodies.triggers[schema to triggerTargetKey(raw.name)].orEmpty().sortedBy { it.name },
                 body = bodies.views[schema to raw.name],
                 usage = usage.tables[schema to raw.name],
             )
@@ -299,14 +379,7 @@ class Extractor(
         meta.getTables(catalog, schema, null, null).use { rs ->
             buildList {
                 while (rs.next()) {
-                    val type = rs.strOrNull("TABLE_TYPE").orEmpty().uppercase()
-                    val kind = when {
-                        type == "TABLE" || type == "BASE TABLE" -> "table"
-                        type.contains("MATERIALIZED") && type.contains("VIEW") -> "materialized-view"
-                        type.contains("VIEW") -> "view"
-                        type == "SYNONYM" -> "synonym"
-                        else -> continue // SYSTEM TABLE, GLOBAL TEMPORARY 등
-                    }
+                    val kind = tableKindOf(rs.strOrNull("TABLE_TYPE").orEmpty()) ?: continue
                     val schemaName = rs.strOrNull("TABLE_SCHEM")
                     val catalogName = rs.strOrNull("TABLE_CAT")
                     // sqlite-jdbc는 둘 다 null로 온다 — SQLite의 유일 스키마는 main이다.
@@ -319,7 +392,7 @@ class Extractor(
             }
         }
     }.getOrElse {
-        limitations += "getTables 실패: ${it.message}"
+        limitations += "getTables failed: ${it.message}"
         emptyList()
     }
 
@@ -339,7 +412,7 @@ class Extractor(
             buildList { while (rs.next()) add(readColumnDoc(rs)) }
         }
     }.getOrElse {
-        limitations += "${obj.schema}.${obj.name}: getColumns 실패 — ${it.message}"
+        limitations += "${obj.schema}.${obj.name}: getColumns failed: ${it.message}"
         emptyList()
     }
 
@@ -361,14 +434,14 @@ class Extractor(
                 ?: batch?.primaryKeysOf(obj.name)
                 ?: meta.getPrimaryKeys(obj.catalog, obj.schemaName, obj.name).use { rs -> readPrimaryKeyRows(rs) }
             addPrimaryKey(obj, rows, out, pkPos)
-        }.onFailure { limitations += "${obj.schema}.${obj.name}: getPrimaryKeys 실패 — ${it.message}" }
+        }.onFailure { limitations += "${obj.schema}.${obj.name}: getPrimaryKeys failed: ${it.message}" }
 
         runCatching {
             val rows = sqliteKeysFor(obj)?.importedKeyRows(obj.name)
                 ?: batch?.importedKeysOf(obj.name)
                 ?: meta.getImportedKeys(obj.catalog, obj.schemaName, obj.name).use { rs -> readImportedKeyRows(rs) }
             addForeignKeys(obj, rows, out)
-        }.onFailure { limitations += "${obj.schema}.${obj.name}: getImportedKeys 실패 — ${it.message}" }
+        }.onFailure { limitations += "${obj.schema}.${obj.name}: getImportedKeys failed: ${it.message}" }
 
         return out.sortedBy { it.name } to pkPos
     }
@@ -441,7 +514,7 @@ class Extractor(
             }.sortedBy { it.name }
         }
     }.getOrElse {
-        limitations += "${obj.schema}.${obj.name}: getIndexInfo 실패 — ${it.message}"
+        limitations += "${obj.schema}.${obj.name}: getIndexInfo failed: ${it.message}"
         emptyList()
     }
     }
@@ -636,7 +709,7 @@ class Extractor(
                 }
                 bestEffort("triggers",
                     "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'") { rs ->
-                    triggers.getOrPut("main" to rs.getString(2)) { mutableListOf() } +=
+                    triggers.getOrPut("main" to triggerTargetKey(rs.getString(2))) { mutableListOf() } +=
                         TriggerDoc(rs.getString(1), rs.getString(3))
                 }
             }
@@ -817,7 +890,7 @@ class Extractor(
                             ?.let { rows += MetaRoutine(it, rs.getString("FUNCTION_NAME"), "function") }
                     }
                 }
-            }.onFailure { limitations += "getFunctions 실패: ${it.message}" }
+            }.onFailure { limitations += "getFunctions failed: ${it.message}" }
             runCatching {
                 meta.getProcedures(null, null, null).use { rs ->
                     while (rs.next()) {
@@ -825,7 +898,7 @@ class Extractor(
                             ?.let { rows += MetaRoutine(it, rs.getString("PROCEDURE_NAME"), "procedure") }
                     }
                 }
-            }.onFailure { limitations += "getProcedures 실패: ${it.message}" }
+            }.onFailure { limitations += "getProcedures failed: ${it.message}" }
         }
         rows
     }
@@ -879,8 +952,8 @@ class Extractor(
             nameCounts[it.name] != 1 && usage.functions.containsKey(schema to it.name)
         }
         if (ambiguous > 0) {
-            limitations += "$schema: 오버로드된 routine ${ambiguous}개는 " +
-                "funcname만으로 귀속 못 해 usage 미수집"
+            limitations += "$schema: usage was not collected for $ambiguous overloaded routine(s) " +
+                "because funcname alone cannot attribute it"
         }
         return rts.map { rt ->
             rt.copy(usage = usage.functions[schema to rt.name].takeIf { nameCounts[rt.name] == 1 })
@@ -923,7 +996,7 @@ class Extractor(
                     }
                 }.getOrNull()
                 if (counting != "on") {
-                    limitations += "track_counts=off — table/index usage 미수집(카운터 비활성, 0행은 관측이 아님)"
+                    limitations += "track_counts=off: table/index usage was not collected (counters are disabled; zero rows are not observations)"
                 } else {
                     // 파티션 부모(relkind p)는 스캔이 리프 파티션에 세어져 항상 0이라 제외한다.
                     bestEffort("table stats",
@@ -955,7 +1028,7 @@ class Extractor(
                     }
                 }.getOrNull()
                 if (tracking == "none") {
-                    limitations += "track_functions=none — routine usage 미수집(함수 통계 비활성)"
+                    limitations += "track_functions=none: routine usage was not collected (function statistics are disabled)"
                 } else {
                     bestEffort("function stats",
                         "SELECT schemaname, funcname, calls, total_time, self_time " +
@@ -982,7 +1055,7 @@ class Extractor(
                     }
                 }.getOrNull()
                 if (pfs == "0" || pfs == "OFF") {
-                    limitations += "performance_schema=OFF — usage 미수집(통계 비활성, MariaDB 기본값)"
+                    limitations += "performance_schema=OFF: usage was not collected (statistics are disabled, the MariaDB default)"
                 } else {
                     // performance_schema·sys는 재시작에 리셋된다 — uptime 역산이 since.
                     val since = runCatching {
@@ -1035,7 +1108,7 @@ class Extractor(
         }.onFailure {
             // 한 줄로 — 줄바꿈이 들어가면 limitation 텍스트가 지저분해진다.
             val msg = it.message?.replace(Regex("\\s+"), " ")
-            limitations += "$label 원문 미수확(${it.javaClass.simpleName}: $msg) — 간선이 빠질 수 있다"
+            limitations += "$label source text was not collected (${it.javaClass.simpleName}: $msg); edges may be missing"
         }
     }
 }

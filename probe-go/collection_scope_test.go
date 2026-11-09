@@ -14,7 +14,7 @@ import (
 
 // emptyOracleCatalog는 Oracle 카탈로그가 테이블·뷰를 하나도 주지 않았을 때의 기존 limitation 원문이다.
 // 기존 문서와 바이트가 같아야 하므로 프로브 상수를 재사용하지 않고 원문으로 단언한다.
-const emptyOracleCatalog = "카탈로그가 테이블/뷰를 하나도 주지 않았다 — 접근 권한을 확인해라"
+const emptyOracleCatalog = "the catalog returned no tables or views; check the account's metadata permissions"
 
 // collectionVerdict는 문서가 스스로 선언한 완전성과 그 근거(limitation)다.
 type collectionVerdict struct {

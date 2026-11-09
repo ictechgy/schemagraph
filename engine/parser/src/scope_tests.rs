@@ -974,6 +974,8 @@ fn matching_database_qualified_relation_is_local_but_mismatch_is_partial() {
                 database: Some("corpus".into()),
                 schema_filter: Some(vec!["public".into()]),
                 catalog_complete: true,
+                lower_case_table_names: None,
+                collation: None,
             }),
             dependencies: Vec::new(),
             version: 1,
@@ -1689,6 +1691,8 @@ fn sqlserver_database_qualifier_matches_the_collected_database_case_insensitivel
                 database: Some("MyDb".into()),
                 schema_filter: Some(vec!["dbo".into()]),
                 catalog_complete: true,
+                lower_case_table_names: None,
+                collation: None,
             }),
             dependencies: Vec::new(),
             version: 1,
@@ -1768,4 +1772,287 @@ fn sqlserver_database_qualifier_matches_the_collected_database_case_insensitivel
     let other = graph("Warehouse.dbo.orders");
     assert!(!edge(&other, "dbo.v", "dbo.orders", EdgeKind::Reads));
     assert!(has_diagnostic(&other, "SG_CROSS_DATABASE"));
+}
+
+/// COPY FROM은 테이블 쓰기는 남기되, 외부 데이터가 채우는 컬럼별 효과는 알 수
+/// 없어 `complete`로 주장하지 않는다. COPY TO는 읽기라 상태를 낮추지 않는다.
+#[test]
+fn copy_from_records_table_write_and_marks_column_effects_partial() {
+    let graph = scan_routine_with(
+        "BEGIN COPY orders (id, amount) FROM '/tmp/orders.csv'; COPY customers TO STDOUT; END",
+        "postgres",
+        "plpgsql",
+    );
+    assert!(edge(&graph, "s.mutate", "s.orders", EdgeKind::Writes));
+    assert!(edge(&graph, "s.mutate", "s.customers", EdgeKind::Reads));
+    assert!(has_diagnostic(&graph, "SG_DML_COPY"));
+    assert_ne!(
+        graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Complete
+    );
+}
+
+#[test]
+fn copy_to_alone_keeps_routine_complete() {
+    let graph = scan_routine_with(
+        "BEGIN COPY (SELECT id FROM orders) TO STDOUT; END",
+        "postgres",
+        "plpgsql",
+    );
+    assert!(edge(&graph, "s.mutate", "s.orders", EdgeKind::Reads));
+    assert!(!has_diagnostic(&graph, "SG_DML_COPY"));
+    assert_eq!(
+        graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Complete,
+        "{:?}",
+        graph.limitations()
+    );
+}
+
+/// COPY의 컬럼 목록은 SELECT·INSERT의 컬럼 목록과 같은 근거다. 그 컬럼을 지우면
+/// COPY가 깨지므로 impact가 컬럼에서 이 routine에 닿아야 한다. 목록이 없으면
+/// `SELECT *`처럼 알려진 컬럼 전체를 쓴다.
+#[test]
+fn copy_column_lists_record_column_reads_and_writes() {
+    let graph = scan_routine_with(
+        "BEGIN COPY orders (amount) TO '/tmp/x.csv'; COPY audit (name) FROM '/tmp/a.csv'; COPY customers TO STDOUT; END",
+        "postgres",
+        "plpgsql",
+    );
+    assert!(edge(&graph, "s.mutate", "s.orders.amount", EdgeKind::Reads));
+    assert!(!edge(&graph, "s.mutate", "s.orders.id", EdgeKind::Reads));
+    assert!(edge(&graph, "s.mutate", "s.audit.name", EdgeKind::Writes));
+    assert!(!edge(&graph, "s.mutate", "s.audit.id", EdgeKind::Writes));
+    assert!(edge(&graph, "s.mutate", "s.customers.id", EdgeKind::Reads));
+    assert!(edge(
+        &graph,
+        "s.mutate",
+        "s.customers.name",
+        EdgeKind::Reads
+    ));
+}
+
+/// `--sql-dir`의 SQL 파일은 sql 언어 routine으로 붙는다. pg_dump 형식의
+/// `COPY … FROM STDIN;` 데이터 블록도 적재 대상 쓰기로 남는다.
+#[test]
+fn sql_file_copy_from_stdin_records_table_write() {
+    for body in [
+        "COPY orders (id, amount) FROM STDIN;\n1\t10\n\\.\n",
+        "COPY orders (id, amount) FROM STDIN;",
+    ] {
+        let graph = scan_routine_with(body, "postgres", "sql");
+        assert!(
+            edge(&graph, "s.mutate", "s.orders", EdgeKind::Writes),
+            "{body:?}: {:?}",
+            graph.limitations()
+        );
+        assert!(has_diagnostic(&graph, "SG_DML_COPY"), "{body:?}");
+    }
+}
+
+/// 대소문자 규칙 회귀를 위한 문서다. `routines`의 첫 항목이 호출자다.
+fn case_doc(dialect: &str, trigger_body: Option<&str>, routines: Vec<RoutineDoc>) -> Graph {
+    let mut orders = object("orders", &["id", "customer_id", "amount"]);
+    if let Some(body) = trigger_body {
+        orders.triggers.push(TriggerDoc {
+            name: "trg".into(),
+            body: Some(body.into()),
+        });
+    }
+    let doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: dialect.into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: "s".into(),
+            objects: vec![orders, object("audit", &["id", "name"])],
+            routines,
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+    for note in notes {
+        graph.add_limitation(note);
+    }
+    graph
+}
+
+fn case_routine(name: &str, kind: &str, body: &str) -> RoutineDoc {
+    RoutineDoc {
+        name: name.into(),
+        kind: kind.into(),
+        language: Some("sql".into()),
+        body: Some(body.into()),
+        signature: None,
+        usage: None,
+        member_of: None,
+        source: None,
+    }
+}
+
+/// SQLite 식별자는 ASCII 대소문자를 구분하지 않는다. 트리거 몸체의 `AUDIT`도
+/// 카탈로그의 audit 테이블 쓰기다.
+#[test]
+fn sqlite_body_relations_fold_ascii_case() {
+    let graph = case_doc(
+        "sqlite",
+        Some("CREATE TRIGGER trg AFTER INSERT ON orders BEGIN INSERT INTO AUDIT(id, name) VALUES (NEW.id, 'x'); END"),
+        vec![],
+    );
+    let trigger = graph
+        .vertices()
+        .find(|vertex| vertex.kind == schemagraph_core::VertexKind::Trigger)
+        .expect("trigger vertex")
+        .id
+        .as_str()
+        .to_owned();
+    assert!(
+        edge(&graph, &trigger, "s.audit", EdgeKind::Writes),
+        "{:?}",
+        graph.limitations()
+    );
+    assert!(
+        !graph.limitations().iter().any(|l| l.contains("AUDIT")),
+        "{:?}",
+        graph.limitations()
+    );
+}
+
+/// MySQL routine 이름은 플랫폼과 무관하게 대소문자를 구분하지 않는다. 테이블
+/// 이름은 lower_case_table_names에 달려 있어 기본으로 접지 않는다.
+#[test]
+fn mysql_routine_calls_fold_case_but_tables_do_not_by_default() {
+    let graph = case_doc(
+        "mysql",
+        None,
+        vec![
+            case_routine(
+                "caller",
+                "procedure",
+                "BEGIN CALL P_Helper(); SELECT FN_TOTAL(id) FROM ORDERS; END",
+            ),
+            case_routine("p_helper", "procedure", "BEGIN SELECT 1; END"),
+            case_routine("fn_total", "function", "RETURN 1"),
+        ],
+    );
+    assert!(
+        edge(&graph, "s.caller", "s.p_helper", EdgeKind::Calls),
+        "{:?}",
+        graph.limitations()
+    );
+    assert!(
+        edge(&graph, "s.caller", "s.fn_total", EdgeKind::Calls),
+        "{:?}",
+        graph.limitations()
+    );
+    // ORDERS ≠ orders: lower_case_table_names=0(리눅스 기본)이면 다른 테이블일 수 있다.
+    assert!(!edge(&graph, "s.caller", "s.orders", EdgeKind::Reads));
+}
+
+/// routine 이름의 대소문자 무시는 이름에만 적용된다. DB(스키마) 한정자는 테이블
+/// 이름과 같은 lower_case_table_names 규칙을 따르므로, 규칙을 모르면 정확히 비교한다.
+#[test]
+fn mysql_routine_folding_keeps_database_qualifiers_exact() {
+    let graph = case_doc(
+        "mysql",
+        None,
+        vec![
+            case_routine("caller", "procedure", "BEGIN CALL S.p_helper(); END"),
+            case_routine("other", "procedure", "BEGIN CALL s.P_HELPER(); END"),
+            case_routine("p_helper", "procedure", "BEGIN SELECT 1; END"),
+        ],
+    );
+    assert!(!edge(&graph, "s.caller", "s.p_helper", EdgeKind::Calls));
+    assert!(
+        edge(&graph, "s.other", "s.p_helper", EdgeKind::Calls),
+        "{:?}",
+        graph.limitations()
+    );
+}
+
+/// 대소문자 규칙을 실은 문맥으로 MySQL·SQL Server 문서를 만든다.
+fn case_rule_doc(
+    dialect: &str,
+    lower_case_table_names: Option<u8>,
+    collation: Option<&str>,
+    body: &str,
+) -> Graph {
+    let doc = CatalogDocument {
+        context: Some(CollectionContext {
+            source_id: "app".into(),
+            database: None,
+            schema_filter: None,
+            catalog_complete: true,
+            lower_case_table_names,
+            collation: collation.map(str::to_owned),
+        }),
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: dialect.into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: "s".into(),
+            objects: vec![object("Orders", &["id"])],
+            routines: vec![case_routine("reader", "procedure", body)],
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+    for note in notes {
+        graph.add_limitation(note);
+    }
+    graph
+}
+
+/// 서버가 알려 준 대소문자 규칙이 있을 때만 관계 이름을 접는다.
+#[test]
+fn mysql_and_sqlserver_fold_relation_case_only_with_collected_rules() {
+    let mysql = "BEGIN SELECT id FROM orders; END";
+    let sqlserver = "SELECT id FROM orders";
+    let reads = |graph: &Graph| edge(graph, "s.reader", "s.Orders", EdgeKind::Reads);
+    assert!(!reads(&case_rule_doc("mysql", None, None, mysql)));
+    assert!(!reads(&case_rule_doc("mysql", Some(0), None, mysql)));
+    assert!(reads(&case_rule_doc("mysql", Some(1), None, mysql)));
+    assert!(reads(&case_rule_doc("mariadb", Some(2), None, mysql)));
+    assert!(!reads(&case_rule_doc("sqlserver", None, None, sqlserver)));
+    assert!(!reads(&case_rule_doc(
+        "sqlserver",
+        None,
+        Some("Latin1_General_CS_AS"),
+        sqlserver
+    )));
+    assert!(!reads(&case_rule_doc(
+        "sqlserver",
+        None,
+        Some("Latin1_General_100_BIN2"),
+        sqlserver
+    )));
+    assert!(reads(&case_rule_doc(
+        "sqlserver",
+        None,
+        Some("SQL_Latin1_General_CP1_CI_AS"),
+        sqlserver
+    )));
+    // 터키어·아제르바이잔어 CI는 i와 I를 같은 글자로 보지 않는다(ı·İ). ASCII 접기로는
+    // 그 규칙을 낼 수 없으므로 접지 않는다 — `FROM INVOICES`가 invoices에 이어지면 안 된다.
+    for collation in [
+        "Turkish_CI_AS",
+        "Turkish_100_CI_AS",
+        "Azeri_Latin_100_CI_AS",
+        "SQL_Latin1_General_CP1254_CI_AS",
+    ] {
+        assert!(
+            !reads(&case_rule_doc(
+                "sqlserver",
+                None,
+                Some(collation),
+                sqlserver
+            )),
+            "{collation}"
+        );
+    }
 }

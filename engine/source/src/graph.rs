@@ -793,6 +793,8 @@ mod tests {
             database: None,
             schema_filter: None,
             catalog_complete: true,
+            lower_case_table_names: None,
+            collation: None,
         });
         doc.schemas[0].objects[1].indexes.push(IndexDoc {
             has_predicate: None,
@@ -851,6 +853,8 @@ mod tests {
             database: None,
             schema_filter: None,
             catalog_complete: true,
+            lower_case_table_names: None,
+            collation: None,
         });
         let graph = document_to_graph(&doc);
         let metadata = graph.schema_metadata().expect("schema metadata");
@@ -869,6 +873,8 @@ mod tests {
             database: None,
             schema_filter: None,
             catalog_complete: true,
+            lower_case_table_names: None,
+            collation: None,
         });
         for object in &mut doc.schemas[0].objects {
             for constraint in &mut object.constraints {

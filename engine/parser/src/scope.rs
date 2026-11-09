@@ -12,11 +12,11 @@ use schemagraph_core::{
 use schemagraph_source::document::{CatalogDocument, ObjectDoc, RoutineDoc};
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
-    visit_relations, AccessExpr, AssignmentTarget, Expr, GroupByExpr, Ident, JoinConstraint,
-    JoinOperator, MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName, ObjectNamePart, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias,
-    TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value, Visit, Visitor,
-    WildcardAdditionalOptions, WindowType,
+    visit_relations, AccessExpr, AssignmentTarget, CopySource, Expr, GroupByExpr, Ident,
+    JoinConstraint, JoinOperator, MergeAction, MergeInsertKind, NamedWindowExpr, ObjectName,
+    ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned,
+    Statement, TableAlias, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind, Value,
+    Visit, Visitor, WildcardAdditionalOptions, WindowType,
 };
 use sqlparser::dialect::Dialect;
 
@@ -71,6 +71,9 @@ impl Scope {
 pub(crate) struct CatalogIndex<'a> {
     tables: BTreeMap<(String, String), Vec<(&'a str, &'a ObjectDoc)>>,
     dialect: &'a str,
+    /// 바인더가 대소문자만 다른 단일 관계 후보도 고르는 문서인가(`relation_names_fold_case`).
+    /// 캐시 지문이 바인더와 같은 후보 집합을 담아야 낡은 해석을 재사용하지 않는다.
+    fold_relation_case: bool,
     routines: BTreeSet<(String, String)>,
     database: Option<String>,
     doc: &'a CatalogDocument,
@@ -112,6 +115,7 @@ impl<'a> CatalogIndex<'a> {
         Self {
             tables,
             dialect: &doc.dialect,
+            fold_relation_case: super::relation_names_fold_case(doc),
             routines,
             database: doc
                 .context
@@ -127,7 +131,9 @@ impl<'a> CatalogIndex<'a> {
 
     /// 이 enrich의 그래프에서 이름을 찾는 방식. ci면 대소문자 무시 단일 후보도 본다.
     pub(crate) fn lookup(&self, ci: bool) -> super::Lookup<'_> {
-        self.vertices.lookup(ci)
+        self.vertices
+            .lookup(ci)
+            .fold_routine_names(super::routine_names_fold_case(self.dialect))
     }
 
     /// 이 색인이 정규화 규칙으로 쓰는 문서 방언.
@@ -565,6 +571,19 @@ impl<'a> CatalogIndex<'a> {
     ) -> Vec<(&'a str, &'a ObjectDoc)> {
         if matches!(self.dialect, "oracle" | "db2") {
             return index.objects(self.dialect, schema, name);
+        }
+        // SQLite는 이 분기를 타지 않는다. 참조 이름이 이미 Unicode 소문자로 접혀
+        // (`name`) 카탈로그 쪽 ASCII 접기 키와 비ASCII 이름에서 어긋난다. 아래
+        // `self.tables`는 양쪽에 같은 `catalog_key`를 써서 대소문자 변형을 모두 담는다.
+        if self.fold_relation_case && self.dialect != "sqlite" {
+            // MySQL(lower_case_table_names≠0)·SQL Server(CI collation)는 정확 일치가
+            // 없을 때 대소문자만 다른 단일 후보를 잇는다. 그 변형이 생기거나 사라지면
+            // 해석이 바뀌므로 접힌 변형 전체를 지문에 넣는다.
+            return index
+                .objects
+                .get(&folded_key(schema, name))
+                .cloned()
+                .unwrap_or_default();
         }
         let key = (schema.to_owned(), name.to_owned());
         self.tables.get(&key).cloned().unwrap_or_default()
@@ -2166,7 +2185,46 @@ impl DmlAnalyzer<'_, '_> {
                 }
             }
             Statement::Query(query) => self.select_into(query),
+            Statement::Copy {
+                source:
+                    CopySource::Table {
+                        table_name,
+                        columns,
+                    },
+                to,
+                ..
+            } => self.copy_table(table_name, columns, *to),
             _ => {}
+        }
+    }
+
+    /// `COPY t [(cols)] TO|FROM …`의 컬럼 효과를 남긴다.
+    ///
+    /// 컬럼 목록은 SELECT·INSERT의 컬럼 목록과 같은 근거다 — TO는 그 컬럼을 읽고 FROM은
+    /// 그 컬럼에 쓴다. 목록이 없으면 `SELECT *`처럼 카탈로그가 아는 컬럼 전체가 대상이다.
+    /// FROM의 적재 값은 외부 데이터라 값 계보(DerivesFrom)는 만들지 않는다.
+    fn copy_table(&mut self, name: &ObjectName, names: &[Ident], to: bool) {
+        let relation = self.relation_from_name(name, None);
+        let columns: Vec<VertexId> = if names.is_empty() {
+            self.known_columns(&relation)
+        } else {
+            names
+                .iter()
+                .filter_map(|column| {
+                    let target =
+                        AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                            column.clone(),
+                        )]));
+                    self.assignment_target(&relation, &target)
+                })
+                .collect()
+        };
+        for column in columns {
+            if to {
+                self.binder.read(column, "copy", None);
+            } else {
+                self.write_only(column);
+            }
         }
     }
 

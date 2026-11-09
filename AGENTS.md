@@ -13,9 +13,18 @@
 
 자매 프로젝트가 바탕화면에 있습니다: [cartograph](../cartograph)(Swift) ·
 [kartograph](../kartograph)(Kotlin/Android) · [dartograph](../dartograph)(Dart/Flutter) ·
+[gartograph](../gartograph)(Go) · [rustograph](../rustograph)(Rust) ·
+[pythograph](../pythograph)(Python) · [tsograph](../tsograph)(TypeScript/JavaScript) ·
 [isthmus](../isthmus)(언어 경계 조인). 이 저장소의 프로브↔엔진 document 계약은
 isthmus의 GRAPH-EXCHANGE와 같은 격입니다. 출력 계약 관례(`query` JSON의
 `state`/`edges`/`limitations` 철학)는 계열과 같게 유지합니다.
+
+`facts`가 내는 `relation-decl` 문서의 소비 계약은 isthmus `docs/GRAPH-EXCHANGE.md`가
+정본입니다. isthmus `conformance/`의 공유 벡터(HTTP 규칙, SQL 텍스트의 relation 이름
+규칙)는 relation-use·route 생산자 대상이라 이 저장소에 벤더링하지 않습니다. 대신
+`Scripts/verify-bridge-facts.py --isthmus … --require-isthmus`가 CI에서 발행된
+isthmus로 실제 조인을 검증합니다. relation-decl 공유 벡터가 생기면 벤더링하고
+`conformance.lock`으로 기록하세요.
 
 ---
 
@@ -71,7 +80,8 @@ DESIGN.md "에이전트 출력 계약" 절이 계약입니다 — `truncated`/`d
 ## 커밋
 
 Conventional Commits, 본문은 한국어. 스코프는 모듈 이름을 씁니다
-(`core`, `parser`, `source`, `analysis`, `export`, `cli`, `probe`, `config`).
+(`core`, `parser`, `source`, `analysis`, `export`, `cli`, `probe`(JDBC), `probe-go`, `config`).
+CI·스크립트만 바꾸면 `ci`를 씁니다.
 
 ```
 feat(analysis): impact 역방향 전이 클로저 구현

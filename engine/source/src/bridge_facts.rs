@@ -10,6 +10,8 @@
 //! 같은 id를 `symbol.usr`에도 싣는다. 계약상 usr는 생산자의 안정 정점
 //! 식별자 자리이고, 다른 생산자 문서도 usr를 impact 질의 id로 쓰므로 소비자가
 //! 플랫폼별 예외 없이 usr를 그대로 `query`·`impact`에 넘길 수 있어야 한다.
+//! 예외는 SQLite 예약 관계(`sqlite_master` 등)다 — 그래프 정점이 아니라서 usr 없이
+//! qualifiedName만 싣는다(`sqlite_system_relations`).
 
 use schemagraph_core::VertexId;
 use serde_json::{json, Value};
@@ -34,9 +36,20 @@ pub fn bridge_facts_document(
     generated_at: &str,
 ) -> Value {
     let mut facts: Vec<Value> = Vec::new();
+    // 소비자가 거부하는 이름의 선언 수 — 빼되 센다.
+    let mut omitted = Omitted::default();
     for schema in &doc.schemas {
+        let schema_safe = is_exchange_safe(&schema.name);
         for object in &schema.objects {
             if !RELATION_KINDS.contains(&object.kind.as_str()) {
+                continue;
+            }
+            if !schema_safe {
+                omitted.schema_named += 1 + object.columns.len();
+                continue;
+            }
+            if !is_exchange_safe(&object.name) {
+                omitted.member_named += 1 + object.columns.len();
                 continue;
             }
             let channel = format!(
@@ -49,6 +62,10 @@ pub fn bridge_facts_document(
             relation["dataContract"] = relation_contract(object);
             facts.push(relation);
             for column in &object.columns {
+                if !is_exchange_safe_member(&column.name) {
+                    omitted.member_named += 1;
+                    continue;
+                }
                 let member = VertexId::member(&schema.name, &object.name, &column.name);
                 let mut fact = declaration_fact(&channel, Some(&column.name), member.as_str());
                 fact["dataContract"] =
@@ -58,6 +75,8 @@ pub fn bridge_facts_document(
             }
         }
     }
+    let (system_facts, system_note) = sqlite_system_relations(doc);
+    facts.extend(system_facts);
     // 카탈로그 수집 순서를 신뢰하지 않고 사실을 정렬한다 — reader가 달라도
     // 같은 선언 집합은 같은 문서가 되어야 diff와 캐시가 유효하다.
     facts.sort_by(|a, b| fact_key(a).cmp(&fact_key(b)));
@@ -74,6 +93,33 @@ pub fn bridge_facts_document(
             "catalog-coverage: no collection context; catalog completeness is unknown".into(),
         ),
     }
+    // catalog_complete는 "필터 안에서" 완전하다는 뜻이다. 필터 밖 스키마는 보지
+    // 않았으므로 거기 있는 관계의 사용을 미선언 error로 만들면 안 된다. 놓친
+    // 관계 이름을 열거할 수 없어 limitationScopes로 좁히지 않는다.
+    if let Some(filter) = doc
+        .context
+        .as_ref()
+        .and_then(|context| context.schema_filter.as_ref())
+        .filter(|filter| !filter.is_empty())
+    {
+        limitations.push(schema_filter_limitation(filter));
+    }
+    // 스키마 이름이 원인이면 비한정 사용이 빠진 선언을 가리킬 수 있어 커버리지
+    // 공백이다. 객체·컬럼 이름이 원인이면 같은 이름을 쓰는 유효한 사용 사실이 있을
+    // 수 없으므로(사용 쪽도 같은 검증을 받는다) 미선언 진단을 낮추지 않고 세기만 한다.
+    if omitted.schema_named > 0 {
+        limitations.push(format!(
+            "catalog-coverage: {} relation or column declaration(s) were omitted because their schema name is empty or contains control characters the exchange format rejects; unqualified uses may name them",
+            omitted.schema_named
+        ));
+    }
+    if omitted.member_named > 0 {
+        limitations.push(format!(
+            "unexchangeable-identifiers: {} relation or column declaration(s) were omitted because the exchange format rejects their names (empty, whitespace-only column names, or control characters); no valid relation-use can name them",
+            omitted.member_named
+        ));
+    }
+    limitations.extend(system_note);
     limitations.sort();
     limitations.dedup();
 
@@ -185,6 +231,191 @@ fn fact_key(fact: &Value) -> (&str, &str) {
     )
 }
 
+/// 한계 문구에 싣는 필터 스키마 이름의 상한이다. 이름 목록은 사람이 확인하는
+/// 단서일 뿐이라, 긴 필터가 한계 문자열을 끝없이 키우지 않게 한다.
+const SCHEMA_FILTER_NAMES_SHOWN: usize = 10;
+
+/// 스키마 필터 수집의 범위 공백 문구다. 이름의 제어문자는 이스케이프해
+/// 한계 문자열 자체가 출력이나 소비자 표시를 깨지 않게 한다.
+fn schema_filter_limitation(filter: &[String]) -> String {
+    let shown: Vec<String> = filter
+        .iter()
+        .take(SCHEMA_FILTER_NAMES_SHOWN)
+        .map(|name| printable(name))
+        .collect();
+    let rest = filter.len().saturating_sub(SCHEMA_FILTER_NAMES_SHOWN);
+    let more = if rest > 0 {
+        format!(" and {rest} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "catalog-coverage: collection was limited to {} requested schema(s) ({}{more}); relations in other schemas were not scanned",
+        filter.len(),
+        shown.join(", ")
+    )
+}
+
+/// 제어문자만 `\u{..}` 형태로 바꾼다 — 나머지 이름은 그대로 읽히게 둔다.
+fn printable(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// isthmus가 채널·컬럼 이름으로 받아들이는 문자열인지 본다.
+///
+/// 소비자는 비어 있거나 C0·DEL·C1 제어문자, U+2028·U+2029가 든 이름을 문서
+/// 전체의 입력 오류로 거부한다(parse.ts `controlCharacterPattern`). 그런 선언
+/// 하나 때문에 조인 전체가 실패하지 않도록 생산자가 먼저 걸러야 한다.
+fn is_exchange_safe(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+}
+
+/// isthmus가 컬럼(`method`) 이름으로 받아들이는 문자열인지 본다.
+///
+/// 채널 세그먼트 규칙에 더해, 소비자는 trim한 뒤 비는 이름(공백·NBSP·BOM만 있는 이름)도
+/// `isNonEmptyString`으로 거부한다. 채널은 `schema.name` 한정 형태라 trim 뒤에도 비지
+/// 않지만 `method`는 컬럼 이름 그 자체라 그런 컬럼 하나가 조인 전체를 실패시킨다.
+fn is_exchange_safe_member(name: &str) -> bool {
+    is_exchange_safe(name) && !is_blank_for_consumer(name)
+}
+
+/// JavaScript `String.prototype.trim`이 모두 지우는 이름인가.
+///
+/// Rust `char::is_whitespace`(Unicode White_Space)에는 JS가 공백으로 보는 U+FEFF(BOM)가
+/// 없어 따로 더한다. 반대로 Rust만 공백으로 보는 U+0085는 제어문자라 이미 거부된다.
+fn is_blank_for_consumer(name: &str) -> bool {
+    name.chars().all(|c| c.is_whitespace() || c == '\u{feff}')
+}
+
+/// 교환 형식이 거부해 뺀 선언 수를 원인별로 센다.
+#[derive(Default)]
+struct Omitted {
+    /// 스키마 이름이 원인인 선언 수다. 비한정 사용이 가리킬 수 있어 커버리지 공백이다.
+    schema_named: usize,
+    /// 객체·컬럼 이름이 원인인 선언 수다. 같은 이름의 유효한 사용이 있을 수 없다.
+    member_named: usize,
+}
+
+/// SQLite가 모든 스키마에 두는 스키마 테이블의 이름이다(sqlite.org/schematab.html).
+const SQLITE_SCHEMA_TABLES: [&str; 2] = ["sqlite_schema", "sqlite_master"];
+
+/// 모든 연결에 있는 temp 스키마의 스키마 테이블 이름이다.
+const SQLITE_TEMP_SCHEMA_TABLES: [&str; 2] = ["sqlite_temp_schema", "sqlite_temp_master"];
+
+/// SQLite 스키마 테이블의 컬럼이다.
+const SQLITE_SCHEMA_COLUMNS: [&str; 5] = ["type", "name", "tbl_name", "rootpage", "sql"];
+
+/// AUTOINCREMENT 테이블이 있으면 SQLite가 만드는 `sqlite_sequence`의 컬럼이다.
+const SQLITE_SEQUENCE_COLUMNS: [&str; 2] = ["name", "seq"];
+
+/// SQLite 문서에서 존재가 확실한 예약 관계의 선언 사실과, 판정하지 못한 공백을 만든다.
+///
+/// 수집기는 `sqlite_` 접두 객체를 카탈로그와 그래프에서 뺀다 — 그래프 의미론의 대상이
+/// 아니다. 그러나 애플리케이션은 `sqlite_master`·`sqlite_sequence`를 흔히 쓰므로,
+/// 선언이 없으면 isthmus가 그 사용을 미선언 error로 만든다. 존재가 확실한 것만
+/// 선언한다. 스키마 테이블은 모든 스키마에 있고, `sqlite_sequence`는 그 스키마의 테이블
+/// DDL에 AUTOINCREMENT가 있을 때만 있다. `sqlite_stat*`는 ANALYZE 이력에 달려 선언하지
+/// 않는다. 그래프 정점이 아니므로 usr 없이 qualifiedName만 싣는다 — usr를 받은 소비자가
+/// impact로 넘기는 체인에 정점 없는 id가 들어가지 않게 한다.
+fn sqlite_system_relations(doc: &CatalogDocument) -> (Vec<Value>, Option<String>) {
+    if doc.dialect != "sqlite" {
+        return (Vec::new(), None);
+    }
+    let mut relations: Vec<(&str, &str, &[&str])> = Vec::new();
+    let mut undetermined = 0usize;
+    for schema in doc
+        .schemas
+        .iter()
+        .filter(|schema| is_exchange_safe(&schema.name))
+    {
+        for table in SQLITE_SCHEMA_TABLES {
+            relations.push((&schema.name, table, &SQLITE_SCHEMA_COLUMNS));
+        }
+        let tables: Vec<&ObjectDoc> = schema
+            .objects
+            .iter()
+            .filter(|object| object.kind == "table")
+            .collect();
+        let autoincrement = tables.iter().any(|table| {
+            table
+                .body
+                .as_deref()
+                .is_some_and(crate::sqlite::declares_autoincrement)
+        });
+        if autoincrement {
+            relations.push((&schema.name, "sqlite_sequence", &SQLITE_SEQUENCE_COLUMNS));
+        } else {
+            undetermined += tables.iter().filter(|table| table.body.is_none()).count();
+        }
+    }
+    for table in SQLITE_TEMP_SCHEMA_TABLES {
+        relations.push(("temp", table, &SQLITE_SCHEMA_COLUMNS));
+    }
+    let mut facts = Vec::new();
+    for (schema, name, columns) in relations {
+        let channel = format!(
+            "{}.{}",
+            escape_channel_segment(schema),
+            escape_channel_segment(name)
+        );
+        let relation = VertexId::object(schema, name);
+        facts.push(system_declaration_fact(&channel, None, relation.as_str()));
+        for column in columns {
+            let member = VertexId::member(schema, name, column);
+            facts.push(system_declaration_fact(
+                &channel,
+                Some(column),
+                member.as_str(),
+            ));
+        }
+    }
+    let note = (undetermined > 0).then(|| {
+        format!(
+            "sqlite-system-relations: {undetermined} table(s) had no collected DDL, so the reserved sqlite_sequence table was not declared; uses of it may be reported as undeclared"
+        )
+    });
+    (facts, note)
+}
+
+/// 예약 관계와 그 컬럼의 빈 계약이다.
+///
+/// 카탈로그는 예약 관계의 필드를 수집하지 않으므로 타입·nullability를 지어내지 않는다.
+/// 그래도 계약 자체는 싣는다 — 계약이 없는 선언이 섞이면 isthmus `diff --contracts`가
+/// 같은 문서끼리의 비교도 `contract-unavailable`로 검토 필요라 판정한다.
+fn reserved_relation_contract() -> Value {
+    json!({
+        "version": 1,
+        "fields": [],
+        "limitations": ["reserved SQLite relation: fields were not collected"],
+    })
+}
+
+/// 그래프 정점이 아닌 예약 관계의 선언 사실이다 — usr 없이 qualifiedName만 싣는다.
+fn system_declaration_fact(channel: &str, method: Option<&str>, qualified: &str) -> Value {
+    let mut fact = json!({
+        "kind": "relation-decl",
+        "channel": channel,
+        "dynamic": false,
+        "symbol": { "qualifiedName": qualified },
+        "dataContract": reserved_relation_contract(),
+    });
+    if let Some(column) = method {
+        fact["method"] = json!(column);
+    }
+    fact
+}
+
 /// channel의 한 세그먼트를 escape한다 — `%`를 먼저 escape해야 생산자가
 /// 받은 이름과 escape된 이름이 충돌하지 않는다. 계약의 구분자는 `.`다.
 fn escape_channel_segment(segment: &str) -> String {
@@ -276,6 +507,8 @@ mod tests {
                 database: None,
                 schema_filter: None,
                 catalog_complete: true,
+                lower_case_table_names: None,
+                collation: None,
             }),
             dependencies: vec![],
         }
@@ -478,5 +711,236 @@ mod tests {
             .map(|l| l.as_str().unwrap_or_default())
             .collect();
         assert_eq!(limitations, ["a-limit", "z-limit"]);
+    }
+
+    /// 스키마 필터로 일부만 수집한 카탈로그는 필터 안에서만 완전하다. 필터 밖
+    /// 관계를 쓰는 코드가 isthmus에서 error가 되지 않도록 범위 공백을 신고한다.
+    #[test]
+    fn schema_filtered_collection_reports_coverage_gap() {
+        let mut doc = catalog();
+        doc.context.as_mut().unwrap().schema_filter = Some(vec!["public".into()]);
+        let value = bridge_facts_document(&doc, "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        let limitations = value["limitations"].as_array().unwrap();
+        assert_eq!(limitations.len(), 1, "{limitations:?}");
+        let message = limitations[0].as_str().unwrap();
+        assert!(message.starts_with("catalog-coverage:"), "{message}");
+        assert!(message.contains("1 requested schema"), "{message}");
+        assert!(message.contains("public"), "{message}");
+        // 이 공백은 채널 집합으로 증명할 수 없어 스코프를 붙이지 않는다.
+        assert!(value.get("limitationScopes").is_none());
+    }
+
+    /// 필터 이름 목록은 상한이 있고 제어문자를 그대로 싣지 않는다.
+    #[test]
+    fn schema_filter_coverage_message_is_bounded_and_printable() {
+        let mut doc = catalog();
+        let mut names: Vec<String> = (0..30).map(|i| format!("s{i:02}")).collect();
+        names.push("bad\nname".into());
+        doc.context.as_mut().unwrap().schema_filter = Some(names);
+        let value = bridge_facts_document(&doc, "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        let message = value["limitations"][0].as_str().unwrap();
+        assert!(message.contains("31 requested schema"), "{message}");
+        assert!(message.contains("and 21 more"), "{message}");
+        assert!(!message.chars().any(char::is_control), "{message}");
+    }
+
+    /// isthmus는 제어문자가 든 채널·컬럼 하나로 문서 전체를 거부한다. 그 선언만
+    /// 뺀다. 객체·컬럼 이름이 원인이면 그 이름을 쓰는 유효한 사용이 없으므로 미선언
+    /// 진단을 낮추는 커버리지 공백이 아니라 계수로 남긴다.
+    #[test]
+    fn identifiers_with_control_characters_are_omitted_and_counted() {
+        let mut doc = catalog();
+        let mut odd = doc.schemas[0].objects[0].clone();
+        odd.name = "weird\nname".into();
+        doc.schemas[0].objects.push(odd);
+        let mut column = doc.schemas[0].objects[0].columns[0].clone();
+        column.name = "bad\u{2028}col".into();
+        doc.schemas[0].objects[0].columns.push(column);
+        let value = bridge_facts_document(&doc, "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        let facts = value["facts"].as_array().unwrap();
+        // users+id+events만 남는다. weird 테이블(관계+컬럼)과 bad 컬럼은 빠진다.
+        assert_eq!(facts.len(), 3, "{facts:?}");
+        for fact in facts {
+            for key in ["channel", "method"] {
+                if let Some(text) = fact[key].as_str() {
+                    assert!(is_exchange_safe(text), "{text:?}");
+                }
+            }
+        }
+        let limitations = value["limitations"].as_array().unwrap();
+        assert!(
+            limitations.iter().any(|l| l.as_str().unwrap().starts_with(
+                "unexchangeable-identifiers: 3 relation or column declaration(s) were omitted"
+            )),
+            "{limitations:?}"
+        );
+        assert!(
+            !limitations
+                .iter()
+                .any(|l| l.as_str().unwrap().starts_with("catalog-coverage:")),
+            "{limitations:?}"
+        );
+    }
+
+    /// isthmus는 trim한 뒤 비는 컬럼 이름(공백·NBSP·BOM만)도 문서 전체의 입력 오류로
+    /// 거부한다. 그런 컬럼만 빼고 센다. 공백만 있는 관계 이름은 `schema.name` 채널로는
+    /// 받아들여지므로 그대로 선언한다.
+    #[test]
+    fn blank_column_names_are_omitted_but_blank_relations_are_declared() {
+        let mut doc = catalog();
+        let template = doc.schemas[0].objects[0].columns[0].clone();
+        for name in [" ", "\u{00a0}", "\u{feff}", "\t "] {
+            let mut column = template.clone();
+            column.name = name.into();
+            doc.schemas[0].objects[0].columns.push(column);
+        }
+        let mut blank = doc.schemas[0].objects[1].clone();
+        blank.name = " ".into();
+        doc.schemas[0].objects.push(blank);
+        let value = bridge_facts_document(&doc, "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        let facts = value["facts"].as_array().unwrap();
+        assert!(facts
+            .iter()
+            .all(|fact| fact["method"].as_str().is_none_or(|column| !column
+                .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+                .is_empty())));
+        assert!(
+            facts.iter().any(|fact| fact["channel"] == "public. "),
+            "{facts:?}"
+        );
+        let limitations = value["limitations"].as_array().unwrap();
+        assert!(
+            limitations.iter().any(|l| l.as_str().unwrap().starts_with(
+                "unexchangeable-identifiers: 4 relation or column declaration(s) were omitted"
+            )),
+            "{limitations:?}"
+        );
+    }
+
+    /// 스키마 이름 때문에 뺀 선언은 비한정 사용이 가리킬 수 있어 커버리지 공백이다.
+    #[test]
+    fn unsafe_schema_names_are_a_coverage_gap() {
+        let mut doc = catalog();
+        doc.schemas[0].name = "bad\nschema".into();
+        let value = bridge_facts_document(&doc, "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        assert_eq!(value["facts"], json!([]));
+        let limitations = value["limitations"].as_array().unwrap();
+        assert!(
+            limitations.iter().any(|l| l.as_str().unwrap().starts_with(
+                "catalog-coverage: 3 relation or column declaration(s) were omitted because their schema name"
+            )),
+            "{limitations:?}"
+        );
+    }
+
+    fn sqlite_catalog(tables: &[(&str, Option<&str>)]) -> CatalogDocument {
+        let mut doc = catalog();
+        doc.dialect = "sqlite".into();
+        doc.schemas[0].name = "main".into();
+        doc.schemas[0].objects = tables
+            .iter()
+            .map(|(name, body)| ObjectDoc {
+                name: (*name).into(),
+                kind: "table".into(),
+                columns: vec![],
+                constraints: vec![],
+                indexes: vec![],
+                triggers: vec![],
+                body: body.map(str::to_owned),
+                usage: None,
+            })
+            .collect();
+        doc
+    }
+
+    fn channels(value: &Value) -> Vec<String> {
+        value["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|fact| fact.get("method").is_none())
+            .map(|fact| fact["channel"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// 수집기가 뺀 SQLite 예약 관계 중 존재가 확실한 것만 선언한다. 정점이 아니라
+    /// usr 없이 qualifiedName만 싣고, 다른 방언에는 붙지 않는다.
+    #[test]
+    fn sqlite_reserved_relations_are_declared_without_usr() {
+        let plain = bridge_facts_document(
+            &sqlite_catalog(&[("users", Some("CREATE TABLE users (id INTEGER PRIMARY KEY)"))]),
+            "/repo",
+            "0.5.0",
+            "2026-01-01T00:00:00Z",
+        );
+        assert_eq!(
+            channels(&plain),
+            [
+                "main.sqlite_master",
+                "main.sqlite_schema",
+                "main.users",
+                "temp.sqlite_temp_master",
+                "temp.sqlite_temp_schema"
+            ]
+        );
+        let reserved: Vec<&Value> = plain["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|fact| fact["channel"].as_str().unwrap().contains(".sqlite_"))
+            .collect();
+        assert_eq!(reserved.len(), 4 * 6, "{reserved:?}");
+        assert!(reserved
+            .iter()
+            .all(|fact| fact["symbol"].get("usr").is_none()
+                && fact["symbol"]["qualifiedName"].is_string()
+                && fact["dataContract"] == reserved_relation_contract()));
+        assert!(plain["facts"].as_array().unwrap().iter().any(|fact| {
+            fact["channel"] == "main.sqlite_master" && fact["method"] == "tbl_name"
+        }));
+        assert!(
+            plain["limitations"].as_array().unwrap().is_empty(),
+            "{plain}"
+        );
+
+        // AUTOINCREMENT 테이블이 있을 때만 sqlite_sequence가 있다. 인용 이름 안의 글자는 아니다.
+        let sequenced = bridge_facts_document(
+            &sqlite_catalog(&[
+                (
+                    "a",
+                    Some("CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT)"),
+                ),
+                ("b", Some("CREATE TABLE b (\"autoincrement\" TEXT)")),
+            ]),
+            "/repo",
+            "0.5.0",
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(channels(&sequenced).contains(&"main.sqlite_sequence".to_owned()));
+        let quoted = bridge_facts_document(
+            &sqlite_catalog(&[("b", Some("CREATE TABLE b (\"autoincrement\" TEXT)"))]),
+            "/repo",
+            "0.5.0",
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(!channels(&quoted).contains(&"main.sqlite_sequence".to_owned()));
+
+        // DDL을 모으지 않은 수집기 문서는 sqlite_sequence 존재를 모른다고 알린다.
+        let unknown = bridge_facts_document(
+            &sqlite_catalog(&[("a", None)]),
+            "/repo",
+            "0.5.0",
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(!channels(&unknown).contains(&"main.sqlite_sequence".to_owned()));
+        assert!(unknown["limitations"].as_array().unwrap().iter().any(|l| l
+            .as_str()
+            .unwrap()
+            .starts_with("sqlite-system-relations: 1 table(s)")));
+
+        let postgres = bridge_facts_document(&catalog(), "/repo", "0.5.0", "2026-01-01T00:00:00Z");
+        assert!(!channels(&postgres)
+            .iter()
+            .any(|channel| channel.contains("sqlite_")));
     }
 }

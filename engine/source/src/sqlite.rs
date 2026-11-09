@@ -68,9 +68,107 @@ pub async fn read(url: &str) -> Result<CatalogDocument, SourceError> {
         source_id: String::new(),
         database: Some("main".into()),
         schema_filter: None,
-        catalog_complete: doc.limitations.is_empty(),
+        // 인라인 제약 미수집은 관계·컬럼 가시성과 무관하다. 그것만으로 카탈로그를
+        // 불완전하다고 하면 facts가 모든 미선언 진단을 판정 불가로 낮춘다.
+        catalog_complete: doc
+            .limitations
+            .iter()
+            .all(|limitation| limitation == INLINE_CONSTRAINTS_LIMITATION),
+        lower_case_table_names: None,
+        collation: None,
     });
     Ok(doc)
+}
+
+/// 인라인 UNIQUE/CHECK 제약을 읽지 못했다는 한계 문구다. 카탈로그 완전성 판정이
+/// 이 문구만 예외로 두므로 한 곳에서 정의한다.
+const INLINE_CONSTRAINTS_LIMITATION: &str =
+    "inline UNIQUE/CHECK constraints are not exposed by the catalog; inline DDL constraint parsing is unsupported";
+
+/// DDL에 `UNIQUE`나 `CHECK` 키워드 토큰이 있는지 본다.
+///
+/// 문자열 리터럴, 인용 식별자(`"…"`, `` `…` ``, `[…]`), 주석 안의 글자는 키워드가
+/// 아니다. 판정을 넓게 잡는 쪽(키워드처럼 보이면 센다)으로 보수성을 유지한다.
+fn declares_inline_constraint(ddl: &str) -> bool {
+    sql_words(ddl)
+        .any(|word| word.eq_ignore_ascii_case("unique") || word.eq_ignore_ascii_case("check"))
+}
+
+/// 테이블 DDL이 `AUTOINCREMENT` 키워드 토큰을 쓰는가.
+///
+/// SQLite는 AUTOINCREMENT 테이블을 처음 만들 때 예약 테이블 `sqlite_sequence`를 만든다.
+/// 수집기는 `sqlite_` 접두 객체를 카탈로그에서 빼므로, facts가 그 예약 테이블의 존재를
+/// 이 키워드로만 안다. 문자열·인용 식별자·주석 안의 글자는 키워드가 아니다.
+pub(crate) fn declares_autoincrement(ddl: &str) -> bool {
+    sql_words(ddl).any(|word| word.eq_ignore_ascii_case("autoincrement"))
+}
+
+/// 인용과 주석을 건너뛴 맨 단어(`[A-Za-z0-9_$]+`)를 차례로 낸다.
+fn sql_words(sql: &str) -> impl Iterator<Item = &str> {
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        while index < bytes.len() {
+            let start = index;
+            match bytes[index] {
+                b'\'' | b'"' | b'`' => index = skip_quoted(bytes, index, bytes[index]),
+                b'[' => index = skip_quoted(bytes, index, b']'),
+                b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                    index = memchr_from(bytes, index, b'\n');
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    index = find_from(bytes, index + 2, b"*/").map_or(bytes.len(), |end| end + 2);
+                }
+                byte if is_word_byte(byte) => {
+                    while index < bytes.len() && is_word_byte(bytes[index]) {
+                        index += 1;
+                    }
+                    return Some(&sql[start..index]);
+                }
+                _ => index += 1,
+            }
+        }
+        None
+    })
+}
+
+/// 맨 단어를 이루는 바이트다. 비ASCII 바이트도 이름의 일부로 본다.
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80
+}
+
+/// `start`의 여는 인용부터 닫는 `close`까지 건너뛴다. 닫는 문자를 두 번 쓰면
+/// 이스케이프다. 닫히지 않으면 끝까지 소비한다.
+fn skip_quoted(bytes: &[u8], start: usize, close: u8) -> usize {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == close {
+            if close != b']' && bytes.get(index + 1) == Some(&close) {
+                index += 2;
+                continue;
+            }
+            return index + 1;
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+/// `from`부터 `needle` 바이트의 위치를, 없으면 끝을 돌려준다.
+fn memchr_from(bytes: &[u8], from: usize, needle: u8) -> usize {
+    bytes[from..]
+        .iter()
+        .position(|byte| *byte == needle)
+        .map_or(bytes.len(), |offset| from + offset)
+}
+
+/// `from`부터 `needle` 열의 시작 위치를 찾는다.
+fn find_from(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    bytes
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| from + offset)
 }
 
 /// CLI가 SQLite 입력 파일을 출력으로 덮어쓰지 않도록 실제 접속과 같은 경로를 돌려준다.
@@ -152,10 +250,12 @@ async fn read_schema(
     limitations: &mut Vec<String>,
 ) -> Result<SchemaDoc, SourceError> {
     // sqlite_master는 테이블·뷰·트리거·인덱스를 한 데 담는다.
-    // sqlite_% 접두는 내부 객체(autoincrement 시퀀스 등)라 제외한다.
+    // SQLite가 예약한 `sqlite_` 접두(ASCII 대소문자 무시)만 내부 객체다. LIKE의
+    // `_`는 한 글자 와일드카드라 `sqlitex_users` 같은 사용자 객체까지 걸러서,
+    // 접두 일곱 글자를 직접 비교한다.
     let rows = sqlx::query(&format!(
         "SELECT name, type, sql, tbl_name FROM {schema}.sqlite_master \
-         WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+         WHERE lower(substr(name, 1, 7)) <> 'sqlite_' ORDER BY name",
         schema = qi(schema)
     ))
     .fetch_all(pool)
@@ -176,12 +276,10 @@ async fn read_schema(
         match kind.as_str() {
             "table" | "view" => {
                 // UNIQUE/CHECK는 DDL 안에 박혀 있어 PRAGMA로 못 읽는다.
-                // 엔진의 몸체 파서가 보강할 때까지 한계로 남긴다.
-                if let Some(ddl) = &sql {
-                    let lower = ddl.to_lowercase();
-                    if lower.contains("unique") || lower.contains("check") {
-                        inline_constraints = true;
-                    }
+                // 엔진의 몸체 파서가 보강할 때까지 한계로 남긴다. 부분 문자열이
+                // 아니라 실제 키워드 토큰일 때만 센다(`checksum` 컬럼은 제약이 아니다).
+                if kind == "table" && sql.as_deref().is_some_and(declares_inline_constraint) {
+                    inline_constraints = true;
                 }
                 // 한 번 읽은 컬럼·index_list를 제약·인덱스 수집에 넘겨 같은 PRAGMA를 다시 보내지 않는다.
                 let (columns, index_list) = read_columns(pool, schema, &name).await?;
@@ -210,7 +308,12 @@ async fn read_schema(
     }
 
     for (tbl, name, sql) in pending_triggers {
-        if let Some(obj) = objects.iter_mut().find(|o| o.name == tbl) {
+        // tbl_name은 DDL 철자 그대로다. SQLite 식별자는 ASCII 대소문자를 구분하지
+        // 않고, 같은 스키마에 대소문자만 다른 두 테이블은 존재할 수 없다.
+        if let Some(obj) = objects
+            .iter_mut()
+            .find(|o| o.name.eq_ignore_ascii_case(&tbl))
+        {
             obj.triggers.push(TriggerDoc { name, body: sql });
         } else {
             limitations.push(format!(
@@ -220,10 +323,7 @@ async fn read_schema(
     }
 
     if inline_constraints {
-        limitations.push(
-            "inline UNIQUE/CHECK constraints are not exposed by the catalog; inline DDL constraint parsing is unsupported"
-                .to_owned(),
-        );
+        limitations.push(INLINE_CONSTRAINTS_LIMITATION.to_owned());
     }
 
     objects.sort_by(|a, b| a.name.cmp(&b.name));
@@ -502,6 +602,101 @@ mod tests {
             .unwrap();
         assert_eq!(view.kind, "view");
         assert!(view.body.as_ref().unwrap().contains("SELECT"));
+    }
+
+    /// `sqlite_` 예약 접두만 내부 객체다. LIKE의 `_`는 한 글자 와일드카드라
+    /// 이스케이프 없이 쓰면 `sqlitex_users` 같은 사용자 테이블까지 빠졌다.
+    #[tokio::test]
+    async fn only_the_reserved_sqlite_prefix_is_internal() {
+        let doc = fixture_doc(
+            "CREATE TABLE users(id INTEGER PRIMARY KEY);
+             CREATE TABLE sqlitex_users(id INTEGER PRIMARY KEY);
+             CREATE TABLE SQLiteVersion(id INTEGER PRIMARY KEY);
+             CREATE TABLE auto(id INTEGER PRIMARY KEY AUTOINCREMENT);
+             CREATE TRIGGER sqlitex_trg AFTER INSERT ON users BEGIN SELECT 1; END",
+        )
+        .await;
+        let mut names: Vec<&str> = doc.schemas[0]
+            .objects
+            .iter()
+            .map(|o| o.name.as_str())
+            .collect();
+        names.sort();
+        // AUTOINCREMENT가 만드는 sqlite_sequence는 예약 객체라 빠진다.
+        assert_eq!(names, ["SQLiteVersion", "auto", "sqlitex_users", "users"]);
+        let users = doc.schemas[0]
+            .objects
+            .iter()
+            .find(|o| o.name == "users")
+            .unwrap();
+        assert_eq!(users.triggers.len(), 1);
+        assert!(
+            doc.context.as_ref().unwrap().catalog_complete,
+            "{:?}",
+            doc.limitations
+        );
+    }
+
+    /// sqlite_master.tbl_name은 DDL에 쓴 철자를 그대로 둔다. SQLite 식별자는
+    /// ASCII 대소문자를 구분하지 않으므로 `ON ORDERS` 트리거도 orders에 붙는다.
+    #[tokio::test]
+    async fn trigger_target_matches_table_case_insensitively() {
+        let doc = fixture_doc(
+            "CREATE TABLE orders(id INTEGER PRIMARY KEY);
+             CREATE TRIGGER t_upper AFTER INSERT ON ORDERS BEGIN SELECT 1; END",
+        )
+        .await;
+        let orders = doc.schemas[0]
+            .objects
+            .iter()
+            .find(|o| o.name == "orders")
+            .unwrap();
+        assert_eq!(orders.triggers.len(), 1, "{:?}", doc.limitations);
+        assert!(doc.limitations.is_empty(), "{:?}", doc.limitations);
+    }
+
+    /// 인라인 UNIQUE/CHECK 한계는 실제 제약 키워드가 있을 때만 붙는다. 그리고
+    /// 관계 가시성과 무관하므로 카탈로그 완전성을 낮추지 않는다.
+    #[tokio::test]
+    async fn inline_constraint_notice_needs_a_keyword_and_keeps_catalog_complete() {
+        let substring_only = fixture_doc(
+            "CREATE TABLE files(id INTEGER PRIMARY KEY, checksum TEXT, \"check\" TEXT, uniqueness TEXT DEFAULT 'unique check')",
+        )
+        .await;
+        assert!(
+            substring_only.limitations.is_empty(),
+            "{:?}",
+            substring_only.limitations
+        );
+        assert!(substring_only.context.as_ref().unwrap().catalog_complete);
+
+        for ddl in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER CHECK (n > 0))",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, CONSTRAINT c CHECK(n>0))",
+        ] {
+            let doc = fixture_doc(ddl).await;
+            assert_eq!(doc.limitations.len(), 1, "{ddl}: {:?}", doc.limitations);
+            assert!(doc.limitations[0].contains("inline UNIQUE/CHECK"), "{ddl}");
+            assert!(doc.context.as_ref().unwrap().catalog_complete, "{ddl}");
+        }
+    }
+
+    /// 키워드 토큰 판정은 인용·주석·문자열을 건너뛴다(Go 프로브와 같은 사례).
+    #[test]
+    fn ddl_keyword_scan_skips_quotes_and_comments() {
+        for (ddl, want) in [
+            ("CREATE TABLE a(x UNIQUE)", true),
+            ("create table a(x int check(x>0))", true),
+            ("CREATE TABLE a(checksum TEXT)", false),
+            ("CREATE TABLE a(\"unique\" TEXT, [check] TEXT)", false),
+            ("CREATE TABLE a(x TEXT DEFAULT 'unique''check')", false),
+            ("CREATE TABLE a(x TEXT) -- unique\n", false),
+            ("CREATE TABLE a(x TEXT /* check */)", false),
+            ("CREATE TABLE a(`check` TEXT)", false),
+        ] {
+            assert_eq!(declares_inline_constraint(ddl), want, "{ddl}");
+        }
     }
 
     #[tokio::test]

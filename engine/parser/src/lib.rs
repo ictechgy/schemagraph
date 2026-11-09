@@ -14,8 +14,8 @@ use std::ops::ControlFlow;
 use schemagraph_core::{Edge, EdgeKind, Evidence, EvidenceLayer, Graph, VertexId, VertexKind};
 use schemagraph_source::document::{CatalogDocument, ObjectDoc, RoutineDoc};
 use sqlparser::ast::{
-    visit_expressions, visit_statements, Expr, ObjectName, Statement, TableFactor, TableObject,
-    TableWithJoins, UpdateTableFromKind,
+    visit_expressions, visit_statements, CopySource, Expr, ObjectName, Statement, TableFactor,
+    TableObject, TableWithJoins, UpdateTableFromKind,
 };
 use sqlparser::dialect::{
     Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
@@ -55,7 +55,7 @@ pub fn enrich_with_cache(
     // Oracle의 미인용 식별자는 대문자로 접힌다 — 카탈로그는 ORDERS인데 몸체는
     // orders라 정확 일치가 없다. 대소문자 구분 방언(PG 등)에 켜면 다른
     // 객체를 잘못 가리키므로 접힘 의미론이 확실한 방언에만 켠다.
-    let ci = matches!(doc.dialect.as_str(), "oracle" | "db2");
+    let ci = relation_names_fold_case(doc);
     let format_shadowed = matches!(doc.dialect.as_str(), "postgres" | "postgresql")
         && doc
             .schemas
@@ -716,6 +716,52 @@ fn dialect_for(dialect: &str) -> Box<dyn Dialect> {
         "sqlserver" | "mssql" => Box::new(MsSqlDialect {}),
         _ => Box::new(GenericDialect {}),
     }
+}
+
+/// 몸체의 관계 이름을 카탈로그와 대소문자 무시로 맞춰도 되는 문서인가.
+///
+/// 정확 일치가 먼저이고, 없을 때 대소문자만 다른 후보가 하나일 때만 잇는다.
+/// Oracle·DB2는 미인용 식별자를 대문자로 접고, SQLite는 인용 여부와 무관하게
+/// ASCII 대소문자를 구분하지 않는다. 대소문자를 구분할 수 있는 방언(PG, 설정에 따른
+/// MySQL·SQL Server)에 켜면 다른 객체를 가리킬 수 있어 근거가 있을 때만 켠다.
+pub(crate) fn relation_names_fold_case(doc: &CatalogDocument) -> bool {
+    let context = doc.context.as_ref();
+    match doc.dialect.as_str() {
+        "oracle" | "db2" | "sqlite" => true,
+        // 1은 소문자로 저장·비교, 2는 저장 철자를 두고 소문자로 비교한다. 0(리눅스
+        // 기본)은 대소문자를 구분한다. 값이 없으면 규칙을 모르므로 정확히 비교한다.
+        "mysql" | "mariadb" => context
+            .and_then(|context| context.lower_case_table_names)
+            .is_some_and(|value| value != 0),
+        "sqlserver" | "mssql" => context
+            .and_then(|context| context.collation.as_deref())
+            .is_some_and(collation_is_case_insensitive),
+        _ => false,
+    }
+}
+
+/// SQL Server collation 이름이 ASCII 대소문자 접기로 비교해도 되는 대소문자 무시(`_CI`)인가.
+///
+/// 이름은 `_`로 나뉜 속성 목록(`SQL_Latin1_General_CP1_CI_AS`,
+/// `Latin1_General_100_CI_AS_SC_UTF8`)이다. `CS`·`BIN`·`BIN2` collation에는 `CI` 속성이
+/// 없으므로 `CI` 속성의 유무만 본다. 터키어·아제르바이잔어(와 코드 페이지 1254 SQL
+/// collation)의 CI는 `i`와 `I`를 같은 글자로 보지 않아(ı·İ가 따로 있다) ASCII 접기가
+/// 거짓 매치를 만든다. 그 규칙은 내지 못하므로 접지 않는다. 형식을 모르면 구분하는 쪽으로 본다.
+fn collation_is_case_insensitive(collation: &str) -> bool {
+    let parts: Vec<&str> = collation.split('_').collect();
+    let dotted_i_rules = parts.iter().any(|part| {
+        ["Turkish", "Azeri", "CP1254"]
+            .iter()
+            .any(|name| part.eq_ignore_ascii_case(name))
+    });
+    !dotted_i_rules && parts.iter().any(|part| part.eq_ignore_ascii_case("CI"))
+}
+
+/// routine 이름을 대소문자 무시로 비교하는 방언인가. MySQL·MariaDB의 stored
+/// routine 이름은 플랫폼·`lower_case_table_names`와 무관하게 대소문자를 구분하지
+/// 않는다.
+pub(crate) fn routine_names_fold_case(dialect: &str) -> bool {
+    matches!(dialect, "mysql" | "mariadb")
 }
 
 /// sqlparser에 전용 방언이 없어 일부러 Generic으로 읽는 이름. 엔진이 이 이름들로
@@ -3486,6 +3532,18 @@ fn collect_trigger_facts(
             candidates: Vec::new(),
         });
     }
+    // COPY FROM의 테이블 쓰기 간선은 write_targets가, 컬럼 쓰기는 DML 분석이 남긴다.
+    // 적재 값은 외부 파일·STDIN이라 값의 출처(DerivesFrom)를 만들 근거가 없다 —
+    // complete로 주장하지 않도록 부분 분석을 표시한다.
+    if copy_from_table(stmt).is_some() {
+        parsed.partial = true;
+        parsed.diagnostics.push(schemagraph_core::Diagnostic {
+            code: "SG_DML_COPY".into(),
+            message: "COPY FROM loads rows from external data; table and column writes are recorded but the loaded values have no traced source".into(),
+            location: None,
+            candidates: Vec::new(),
+        });
+    }
     // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
     // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
     let write_targets = write_targets(stmt);
@@ -3599,6 +3657,10 @@ fn is_column_dml_statement(stmt: &Statement) -> bool {
             | Statement::Update { .. }
             | Statement::Merge { .. }
             | Statement::CreateTable(sqlparser::ast::CreateTable { query: Some(_), .. })
+            | Statement::Copy {
+                source: CopySource::Table { .. },
+                ..
+            }
     ) || select_into(stmt).is_some()
 }
 
@@ -3744,6 +3806,10 @@ fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
             TableObject::TableName(name) => relation_name_parts(name).into_iter().collect(),
             _ => vec![],
         },
+        Statement::Copy { .. } => copy_from_table(stmt)
+            .and_then(relation_name_parts)
+            .into_iter()
+            .collect(),
         Statement::CreateTable(create) if create.query.is_some() => {
             relation_name_parts(&create.name).into_iter().collect()
         }
@@ -3857,12 +3923,41 @@ fn qualified_write_targets(stmt: &Statement) -> Vec<ObjectName> {
                 names.push(into.name.clone());
             }
         }
+        Statement::Copy { .. } => names.extend(copy_from_table(stmt).cloned()),
         _ => {}
     }
     names
         .into_iter()
         .filter(|name| name.0.iter().filter_map(|part| part.as_ident()).count() == 3)
         .collect()
+}
+
+/// `COPY t [(cols)] FROM …`의 적재 대상 테이블이다.
+///
+/// sqlparser의 visitor는 `CopySource::Table` 이름을 관계로 방문하지 않는다. 그래서
+/// 쓰기 대상과 읽기 원본을 문장 모양에서 직접 꺼낸다. `COPY (query) TO`의 질의는
+/// visitor가 그대로 내려가므로 여기서 다루지 않는다.
+fn copy_from_table(stmt: &Statement) -> Option<&ObjectName> {
+    match stmt {
+        Statement::Copy {
+            source: CopySource::Table { table_name, .. },
+            to: false,
+            ..
+        } => Some(table_name),
+        _ => None,
+    }
+}
+
+/// `COPY t TO …`의 내보내기 원본 테이블이다. 테이블 원본만 읽기 대상이다.
+fn copy_to_table(stmt: &Statement) -> Option<&ObjectName> {
+    match stmt {
+        Statement::Copy {
+            source: CopySource::Table { table_name, .. },
+            to: true,
+            ..
+        } => Some(table_name),
+        _ => None,
+    }
 }
 
 fn promoted_update_factor<'a>(
@@ -3986,7 +4081,12 @@ pub(crate) struct VertexIndex {
 impl VertexIndex {
     /// 정확 일치만 볼지, 대소문자 무시 단일 후보까지 볼지 정한 조회 방식.
     pub(crate) fn lookup(&self, ci: bool) -> Lookup<'_> {
-        Lookup { index: self, ci }
+        Lookup {
+            index: self,
+            ci,
+            routine_ci: ci,
+            schema_ci: ci,
+        }
     }
 
     fn routines(&self, g: &Graph, ci: bool) -> &RoutineIndex {
@@ -4059,9 +4159,32 @@ impl RoutineIndex {
 pub(crate) struct Lookup<'a> {
     index: &'a VertexIndex,
     ci: bool,
+    /// routine 이름 비교의 대소문자 무시 여부다. MySQL은 테이블 이름 규칙과 달리
+    /// routine 이름을 항상 대소문자 무시로 비교한다.
+    routine_ci: bool,
+    /// 스키마(MySQL은 DB) 한정자의 대소문자 무시 여부다. routine 이름 규칙이 아니라
+    /// 테이블 이름 규칙을 따른다 — MySQL lower_case_table_names=0이면 DB 이름은
+    /// 대소문자를 구분한다. routine 조회로 바꿔도 바뀌지 않는다.
+    schema_ci: bool,
 }
 
 impl Lookup<'_> {
+    /// routine 이름을 대소문자 무시로 비교하는 방언이면 routine 해석에만 켠다.
+    pub(crate) fn fold_routine_names(self, on: bool) -> Self {
+        Lookup {
+            routine_ci: self.routine_ci || on,
+            ..self
+        }
+    }
+
+    /// routine 정점·이름을 찾을 때의 조회 방식이다.
+    fn for_routines(self) -> Self {
+        Lookup {
+            ci: self.routine_ci,
+            ..self
+        }
+    }
+
     /// 이 조회 방식의 비교 규칙으로 이름 키를 만든다.
     fn key(&self, value: &str) -> String {
         if self.ci {
@@ -4221,7 +4344,18 @@ fn resolve_routine(g: &Graph, schema: &str, name: &str, lookup: Lookup<'_>) -> R
     // 호출 인자 수를 모르는 이 경로에서 무인자 overload를 임의로 고르면 안
     // 된다. 모든 routine 후보를 먼저 모아 하나일 때만 선택한다.
     let routines = &lookup.index.routines(g, lookup.ci).routines;
-    routine_hit(routines.get(&(lookup.key(schema), lookup.key(name))))
+    let candidates = routines.get(&(lookup.key(schema), lookup.key(name)));
+    if lookup.ci && !lookup.schema_ci {
+        // routine 이름만 접는 방언이다 — 접힌 후보 중 스키마가 정확히 같은 것만 남긴다.
+        let exact: Vec<VertexId> = candidates
+            .into_iter()
+            .flatten()
+            .filter(|id| g.vertex(id).is_some_and(|vertex| vertex.schema == schema))
+            .cloned()
+            .collect();
+        return routine_hit(Some(&exact));
+    }
+    routine_hit(candidates)
 }
 
 /// 한 몸체를 같은 카탈로그·방언·소스 해시로 적용하는 문맥이다。
@@ -4546,6 +4680,7 @@ fn apply_call_edges(
     lookup: Lookup<'_>,
 ) {
     let CallNotes { notes, diagnostics } = out;
+    let lookup = lookup.for_routines();
     let schema = namespace.schema;
     for (ref_schema, name) in calls {
         let (target, hit) = match (ref_schema, namespace.search_path) {
@@ -6094,6 +6229,54 @@ mod tests {
         assert!(g.edges().iter().any(|e| e.kind == EdgeKind::Writes
             && e.from.as_str() == "public.touch_customer"
             && e.to.as_str() == "public.customers"));
+    }
+
+    /// COPY FROM은 대상 테이블에 쓰고 COPY TO는 원본 관계를 읽는다. 둘 다
+    /// 놓치면 ETL 적재기가 impact에서 조용히 사라진다.
+    #[test]
+    fn plpgsql의_copy_from은_writes_copy_to는_reads가_된다() {
+        let doc = doc_with_routine(
+            vec![
+                routine(
+                    "load_orders",
+                    Some("plpgsql"),
+                    "BEGIN COPY orders FROM '/tmp/orders.csv' WITH (FORMAT csv); END",
+                ),
+                routine(
+                    "dump_customers",
+                    Some("plpgsql"),
+                    "BEGIN COPY customers TO '/tmp/customers.csv'; END",
+                ),
+                routine(
+                    "dump_join",
+                    Some("plpgsql"),
+                    "BEGIN COPY (SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id) \
+                     TO STDOUT; END",
+                ),
+            ],
+            "",
+        );
+        let (g, notes) = build(&doc);
+        assert!(notes.is_empty(), "notes: {notes:?}");
+        let has = |kind: EdgeKind, from: &str, to: &str| {
+            g.edges()
+                .iter()
+                .any(|e| e.kind == kind && e.from.as_str() == from && e.to.as_str() == to)
+        };
+        assert!(has(EdgeKind::Writes, "public.load_orders", "public.orders"));
+        assert!(!has(EdgeKind::Reads, "public.load_orders", "public.orders"));
+        assert!(has(
+            EdgeKind::Reads,
+            "public.dump_customers",
+            "public.customers"
+        ));
+        assert!(!has(
+            EdgeKind::Writes,
+            "public.dump_customers",
+            "public.customers"
+        ));
+        assert!(has(EdgeKind::Reads, "public.dump_join", "public.orders"));
+        assert!(has(EdgeKind::Reads, "public.dump_join", "public.customers"));
     }
 
     #[test]
