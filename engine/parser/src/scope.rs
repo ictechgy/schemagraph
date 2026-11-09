@@ -572,8 +572,11 @@ impl<'a> CatalogIndex<'a> {
         if matches!(self.dialect, "oracle" | "db2") {
             return index.objects(self.dialect, schema, name);
         }
-        if self.fold_relation_case {
-            // MySQL(lower_case_table_names≠0)·SQL Server(CI collation)·SQLite는 정확 일치가
+        // SQLite는 이 분기를 타지 않는다. 참조 이름이 이미 Unicode 소문자로 접혀
+        // (`name`) 카탈로그 쪽 ASCII 접기 키와 비ASCII 이름에서 어긋난다. 아래
+        // `self.tables`는 양쪽에 같은 `catalog_key`를 써서 대소문자 변형을 모두 담는다.
+        if self.fold_relation_case && self.dialect != "sqlite" {
+            // MySQL(lower_case_table_names≠0)·SQL Server(CI collation)는 정확 일치가
             // 없을 때 대소문자만 다른 단일 후보를 잇는다. 그 변형이 생기거나 사라지면
             // 해석이 바뀌므로 접힌 변형 전체를 지문에 넣는다.
             return index

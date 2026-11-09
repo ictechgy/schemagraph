@@ -847,6 +847,35 @@ mod tests {
         assert_ne!(missing.fingerprint, created.fingerprint);
     }
 
+    /// SQLite 참조 이름은 Unicode 소문자로 접힌다(`Ärzte` → `ärzte`). 대소문자 후보 색인이
+    /// 카탈로그 쪽만 ASCII 대문자로 접으면 비ASCII 이름의 키가 어긋나 후보를 못 찾는다.
+    /// 그러면 참조 테이블에 컬럼이 생겨도 지문이 그대로라 낡은 `SELECT *` 결과를 재사용한다.
+    #[test]
+    fn scoped_context_tracks_non_ascii_sqlite_table_shape() {
+        let body = "SELECT * FROM Ärzte";
+        let document = |columns: serde_json::Value| -> CatalogDocument {
+            serde_json::from_value(serde_json::json!({
+                "version":1,"dialect":"sqlite","reader":"test","limitations":[],
+                "context":{"source_id":"t","catalog_complete":true},
+                "schemas":[{"name":"main","routines":[],"objects":[
+                    {"name":"Ärzte","kind":"table","columns":columns,"constraints":[],"indexes":[],"triggers":[]},
+                    {"name":"v","kind":"view","body":body,"columns":[],"constraints":[],"indexes":[],"triggers":[]}
+                ]}]
+            }))
+            .unwrap()
+        };
+        let column = |name: &str, ordinal: u32| serde_json::json!({"name":name,"data_type":"INTEGER","nullable":true,"ordinal":ordinal,"pk_position":0});
+        let owner = VertexId::object("main", "v");
+        let before = document(serde_json::json!([column("id", 1)]));
+        let graph = schemagraph_source::graph::document_to_graph(&before);
+        let original = crate::scope::cache_context(&before, &graph, &owner, body);
+        let after = document(serde_json::json!([column("id", 1), column("extra", 2)]));
+        let graph = schemagraph_source::graph::document_to_graph(&after);
+        let widened = crate::scope::cache_context(&after, &graph, &owner, body);
+        assert!(original.trusted && widened.trusted);
+        assert_ne!(original.fingerprint, widened.fingerprint);
+    }
+
     #[test]
     fn wrapped_routine_body_uses_conservative_cache_context() {
         let doc: CatalogDocument = serde_json::from_value(serde_json::json!({
