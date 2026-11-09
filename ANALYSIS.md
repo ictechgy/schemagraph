@@ -443,7 +443,8 @@ schemagraph impact "$(jq -r '.facts[0].symbol.usr' schema.facts.json)" --graph g
 `facts` writes an isthmus bridge-facts v1 document (`platform: "sql"`,
 `target: "persistence"`) with one `relation-decl` per table, view, materialized
 view, and column. Each fact's `symbol.qualifiedName` and `symbol.usr` hold the
-same value: the vertex id in the graph built from the same catalog. A consumer
+same value: the vertex id in the graph built from the same catalog (SQLite
+reserved relations, described below, are the exception). A consumer
 that joins code-side relation uses to these declarations can pass `symbol.usr`
 directly to `query` or `impact` (check that `subject.id` equals it) to continue
 into in-database dependents. Graphs and facts from different catalogs do not
@@ -459,9 +460,26 @@ not list every relation, so it reports undeclared uses as `-unverified` warnings
 instead of errors. `facts` adds one when the collector declared an incomplete
 catalog or no collection context, when the catalog was collected with a schema
 filter (relations outside the requested schemas were not scanned), and when it
-omits declarations whose identifiers are empty or contain control characters
-that the exchange format rejects. These gaps cannot be listed as channels, so
-`facts` adds no `limitationScopes`.
+omits declarations because their schema name is empty or contains control
+characters that the exchange format rejects. These gaps cannot be listed as
+channels, so `facts` adds no `limitationScopes`. The filter limitation is added
+whenever a filter was recorded, even if it happens to name every schema: the
+catalog does not record which schemas existed outside it. The native MySQL/MariaDB
+reader records the database named in the URL as the filter, so those facts always
+carry it.
+
+Relation and column declarations whose own name isthmus rejects (empty, control
+characters, or a column name that is only whitespace) are omitted and counted in
+an `unexchangeable-identifiers:` limitation. It does not downgrade undeclared-use
+errors, because isthmus validates uses the same way and no valid use can name them.
+
+On SQLite, `facts` also declares the reserved relations the collector leaves out of
+the catalog and graph: `sqlite_schema` and `sqlite_master` in every schema,
+`temp.sqlite_temp_schema` and `temp.sqlite_temp_master`, and `sqlite_sequence` when
+a table's DDL uses `AUTOINCREMENT`. They are not graph vertices, so their facts carry
+only `symbol.qualifiedName`; a consumer must not pass them to `impact`. Without
+collected table DDL (the JDBC probe) `sqlite_sequence` is not declared and a
+`sqlite-system-relations:` limitation says so. `sqlite_stat*` is never declared.
 
 ### Trace several subjects as a language-traversal document
 
