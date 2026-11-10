@@ -1,14 +1,16 @@
 # HANDOFF.md
 
-## 현재 상태 (2026-11-09, PR #59 리뷰 반영 후)
+## 현재 상태 (2026-11-10, PR #59 머지 이후)
 
 - 발행본은 **0.9.0**이다. 태그 `v0.9.0` = `fad8e9d`([#58](https://github.com/ictechgy/schemagraph/pull/58)).
   그 커밋의 [CI](https://github.com/ictechgy/schemagraph/actions/runs/41583763434)·
   [SQL Server/Oracle](https://github.com/ictechgy/schemagraph/actions/runs/41583763488)·
   [IBM](https://github.com/ictechgy/schemagraph/actions/runs/41583763549)·
   [DML](https://github.com/ictechgy/schemagraph/actions/runs/41583763689) 검증이 모두 성공했다.
-- [PR #59](https://github.com/ictechgy/schemagraph/pull/59)(브랜치 `ccr-37904670-hxdjsx`)가 미발행 변경을 담고 있다.
-  RELEASE-NOTES `# Unreleased`가 그 목록의 정본이다: facts의 스키마 필터·교환 불가 식별자 범위 공백과
+- [PR #59](https://github.com/ictechgy/schemagraph/pull/59)는 2026-11-09에 `main`으로 스쿼시 머지됐다(`bdac8a6`).
+  아직 발행하지 않았다. `main` `bdac8a6`의 push 워크플로 4개(CI·SQL Server/Oracle·IBM·DML, DB fixture 포함)가
+  모두 성공했다(2026-11-10 확인).
+  RELEASE-NOTES `# Unreleased`가 미발행 변경 목록의 정본이다: facts의 스키마 필터·교환 불가 식별자 범위 공백과
   SQLite 예약 관계 선언, COPY 테이블·컬럼 간선, SQLite 수집기 3종 수정(네이티브·Go·JDBC), 대소문자 접기
   방언의 관계·routine 해석과 몸체 캐시 지문, 서버 대소문자 규칙 수집(`context.lower_case_table_names`·
   `collation`), 프로브 메시지 영어화, JDBC 파티션·외부 테이블과 방언별(대소문자 구분) 시스템 스키마,
@@ -21,6 +23,7 @@
 ### PR #59 리뷰에서 처리한 것
 
 GLM 리뷰(`packet-ask`)를 이 세션에서 쓸 수 없어, 같은 체크리스트로 독립된 Claude 리뷰를 대신 돌렸다.
+PR #59는 GLM 리뷰 없이 머지됐다.
 
 - facts: trim하면 비는 컬럼 이름(공백·NBSP·BOM)이 isthmus 문서 전체를 종료 코드 2로 거부시키던 문제.
   그 컬럼만 빼고 `unexchangeable-identifiers:`로 센다. 스키마 이름 때문에 뺀 것만 `catalog-coverage:`다.
@@ -53,13 +56,16 @@ GLM 리뷰(`packet-ask`)를 이 세션에서 쓸 수 없어, 같은 체크리스
 - JDBC 프로브의 JUnit 실행은 이 세션에서 Maven Central 429로 의존성을 받지 못해 못 돌렸다.
   바뀐 `CatalogScopeTest.systemSchemasDependOnTheDialect`만 컴파일된 클래스를 직접 실행해 확인했다(수정 전 실패).
 
-## 머지 뒤 다음 할 일
+## 다음 할 일 (PR #59 머지 이후)
 
-1. PR #59 머지 뒤 CI·DB fixture job이 main에서 모두 녹색인지 확인한다.
-2. 다음 릴리스는 **0.10.0**이다 — `CollectionContext`에 공개 필드가 늘었다. [RELEASING.md](RELEASING.md) 절차로
+1. 다음 릴리스는 **0.10.0**이다 — `CollectionContext`에 공개 필드가 늘었다. [RELEASING.md](RELEASING.md) 절차로
    GitHub Release·crates.io·Maven Central을 **각각** 게시하고, 채널 표를 실제 조회 결과로 갱신한다.
    crates.io 누락분(0.7.1·0.8.0·0.8.1)은 다시 게시하지 않고 0.10.0이 그 변경을 담는다.
-3. isthmus 쪽 `compatibility.json`의 schemagraph 고정을 올리는 일은 isthmus 저장소에 맡긴다.
+2. isthmus 쪽 `compatibility.json`의 schemagraph 고정을 올리는 일은 isthmus 저장소에 맡긴다.
+3. 후속 후보: SQLite 관계 이름의 비ASCII 거짓 match. SQLite는 ASCII 대소문자만 무시하는데
+   `scope.rs`의 `catalog_key`·`name()`은 SQLite에서 유니코드 규칙(`to_lowercase`)으로 접어 `ÉTUDIANTS`와
+   `étudiants`를 같은 관계로 본다. PR #59 리뷰가 확인했고 0.9.0(`fad8e9d`)에도 있던 문제다.
+   제안은 ASCII 접기(`to_ascii_lowercase`)다. 몸체 캐시 지문도 같은 키를 쓰므로 함께 확인한다.
 
 ## Blocker와 열린 질문 (2026-11-09)
 
@@ -190,7 +196,9 @@ _최종 갱신: 2026-09-25 KST · Claude_
 - 전제는 먼저 실제 DB로 확인했다(예: `pg_stat_user_tables`에서 빈 테이블 seq_scan 3·seq_tup_read 0,
   파티션 부모 카운터 0, JDBC의 serial 표기). 추측으로 정한 기대값은 여러 번 틀렸다.
 - 회귀 검사는 옛 동작으로 잠시 되돌려 실패하는지 확인했다(예: `serve`의 cwd 설정 파일 회귀).
-- 기능마다 `/code-review high` → 지적 검증 → 반영/보류 근거를 PR 코멘트로 남김 → CI → merge commit.
+- 기능마다 `/code-review high` → 지적 검증 → 반영/보류 근거를 PR 코멘트로 남김 → CI → 머지.
+  지금은 squash merge다: PR #53–#59는 `main`의 first-parent 이력에 PR당 단일 부모 커밋 하나로 들어갔다
+  (#51·#52와 그 전 PR 다수는 merge commit이었다). `git log --first-parent origin/main`으로 확인한다.
   리뷰가 실제 결함(과대 귀속, strict 호환성, 튜플/스캔 혼동)을 여러 번 잡았다.
 - 목적이 섞인 변경은 전체본을 보관한 뒤 중간 상태를 만들어 커밋을 나누고, 커밋마다 테스트를 돌렸다.
 - 릴리스는 v0.5.1 절차를 그대로 재사용했다(아래 다음 단계 4번).
@@ -244,7 +252,7 @@ _최종 갱신: 2026-09-25 KST · Claude_
 3. 수집기(native·Go·JDBC)를 바꾸면 세 수집기 검증(`verify-collection-scope.py`, `verify-schema-lint.py`,
    `verify-unused.py`)과 Docker fixture(`verify-fixtures.sh`, Colima 필요 — 끝나면 다시 끈다)를 함께 돌리고,
    golden 차이는 줄마다 검토한 뒤 갱신한다.
-4. 릴리스 절차: 버전·RELEASE-NOTES PR → CI → merge commit 머지 → 병합 트리 = PR 헤드 확인 → 병합 커밋 main CI →
+4. 릴리스 절차: 버전·RELEASE-NOTES PR → CI → squash 머지 → 병합 트리 = PR 헤드 확인 → 병합 커밋 main CI →
    lightweight 태그 push(GitHub Release, 본문을 RELEASE-NOTES 항목으로 교체) → `cargo publish --workspace --locked`
    (별도 target) → `verify-crates.py` → registry 설치 + `verify-installed.py` → Pages → Central → repo1 조회 →
    `verify-public.py`(openjdk@17을 PATH에) → 근거 정리 → HANDOFF 완료 PR.
