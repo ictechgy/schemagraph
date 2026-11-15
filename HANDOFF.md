@@ -1,6 +1,6 @@
 # HANDOFF.md
 
-## 현재 상태 (2026-11-10, PR #59 머지 이후)
+## 현재 상태 (2026-11-15, SQLite ASCII 접기 작업 이후)
 
 - 발행본은 **0.9.0**이다. 태그 `v0.9.0` = `fad8e9d`([#58](https://github.com/ictechgy/schemagraph/pull/58)).
   그 커밋의 [CI](https://github.com/ictechgy/schemagraph/actions/runs/41583763434)·
@@ -19,6 +19,34 @@
   crates.io에는 0.7.1·0.8.0·0.8.1이 없고, Maven Central에는 0.7.1이 없다(2026-11-03 조회).
   GitHub Release v0.1.0–v0.3.0에는 첨부 아카이브가 없다(2026-11-09 조회). 누락 버전은 다시 게시하지 않는다.
 - isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
+- 브랜치 `ccr-37904670-hxdjsx`(`origin/main` `ea1bd11` 기준)에 아래 SQLite ASCII 접기 작업이 커밋돼 있다.
+  push·PR은 하지 않았다.
+
+### SQLite 식별자 ASCII 접기 (2026-11-15, `1299676`)
+
+PR #59 리뷰가 남긴 후속 후보를 처리했다. 근거와 결과의 정본은 RELEASE-NOTES `# Unreleased`의 해당 항목이다.
+
+- 근거: SQLite는 식별자를 `sqlite3_stricmp`와 같은 규칙으로 비교한다([c3ref/stricmp.html](https://www.sqlite.org/c3ref/stricmp.html)
+  — 'the same definition of "case independence" that SQLite uses internally when comparing identifiers').
+  그 비교는 US-ASCII 글자만 접는다(SQLite 소스의 `sqlite3UpperToLower` 주석). 이 세션은 sqlite.org에 닿지 못해
+  (프록시 403·DNS 실패) 페이지 원문을 그 페이지를 생성하는 공식 헤더(`sqlite3.h` 3.45.1, CAPI3REF "String
+  Comparison")와 amalgamation 3.46.0 소스로 확인했고, Python sqlite3 3.53.1로 실제 동작을 확인했다
+  (`ÉTUDIANTS`만 있으면 `étudiants`는 `no such table`, 켈빈 기호 테이블과 `k`는 다른 이름, `Prénom` 컬럼에
+  `PRÉNOM`은 `no such column`, `ÉTUDIANTS`와 `étudiants`는 한 스키마에 함께 만들 수 있다).
+- parser: `scope.rs`의 `catalog_key`·`name()`·`column_key`가 SQLite에서 `to_ascii_lowercase`로 접는다. 관계·컬럼·
+  별칭·CTE·routine 이름과 몸체 캐시 지문(같은 키의 `tables` 색인)이 한 규칙을 쓴다. 객체 단위(`vertex_hit`)는
+  이미 ASCII였다. MySQL/MariaDB 컬럼 이름과 다른 방언은 바꾸지 않았다. 수집기 3종은 이미 ASCII다.
+- 회귀 테스트(수정 전 7개 모두 실패 확인): 리뷰 사례 3종(`ÉTUDIANTS`/`étudiants`, 켈빈 기호, 트리거의 객체·컬럼
+  단위 불일치), 두 변형 공존 시 정확한 테이블로 해석, 컬럼·routine 이름, ASCII 변형은 계속 일치, 캐시 cold/warm
+  일치와 지문(무관한 `ÉTUDIANTS` 변화는 지문 불변, 진짜 후보 `étudiants` 생성은 지문 변화).
+  `catalog_key`·`name()`·`column_key`를 하나씩 되돌린 부분 변이도 각각 테스트가 잡는다.
+- 실제 SQLite 대조: 엔진 간선을 SQLite authorizer가 보고한 테이블·컬럼 접근과 몸체 11개(뷰·트리거·`--sql-dir`)에서
+  비교했다. 수정 전 9개가 어긋났고(거짓 reads 4건: 앱 SQL `étudiants`·`k`, 트리거 컬럼 단위 read·write / 두 변형
+  공존 시 뷰 5개 간선 누락) 수정 후 11개 모두 일치한다. CLI `--cache-dir`의 cold/warm 출력도 카탈로그 변화 3단계에서
+  바이트 단위로 같았다. SQLite 골든(`Fixtures/sqlite`)은 식별자가 ASCII라 바뀌지 않았다(Python sqlite3로 재생성해 diff 0).
+- 좁힘: 거짓 간선 제거는 SQLite 문서 의미론에 근거한 좁힘이다. `impact`가 줄고, `dead`(뷰·routine 대상)는 그런
+  간선으로만 의존받던 뷰를 새로 보고할 수 있다. 반대로 두 변형 공존 사례는 간선이 늘어 보고가 줄 수 있다.
+  SQLite 카탈로그에는 사용 통계가 없어 `unused`는 영향이 없다.
 
 ### PR #59 리뷰에서 처리한 것
 
@@ -56,16 +84,22 @@ PR #59는 GLM 리뷰 없이 머지됐다.
 - JDBC 프로브의 JUnit 실행은 이 세션에서 Maven Central 429로 의존성을 받지 못해 못 돌렸다.
   바뀐 `CatalogScopeTest.systemSchemasDependOnTheDialect`만 컴파일된 클래스를 직접 실행해 확인했다(수정 전 실패).
 
-## 다음 할 일 (PR #59 머지 이후)
+## 다음 할 일 (2026-11-15)
 
 1. 다음 릴리스는 **0.10.0**이다 — `CollectionContext`에 공개 필드가 늘었다. [RELEASING.md](RELEASING.md) 절차로
    GitHub Release·crates.io·Maven Central을 **각각** 게시하고, 채널 표를 실제 조회 결과로 갱신한다.
    crates.io 누락분(0.7.1·0.8.0·0.8.1)은 다시 게시하지 않고 0.10.0이 그 변경을 담는다.
 2. isthmus 쪽 `compatibility.json`의 schemagraph 고정을 올리는 일은 isthmus 저장소에 맡긴다.
-3. 후속 후보: SQLite 관계 이름의 비ASCII 거짓 match. SQLite는 ASCII 대소문자만 무시하는데
-   `scope.rs`의 `catalog_key`·`name()`은 SQLite에서 유니코드 규칙(`to_lowercase`)으로 접어 `ÉTUDIANTS`와
-   `étudiants`를 같은 관계로 본다. PR #59 리뷰가 확인했고 0.9.0(`fad8e9d`)에도 있던 문제다.
-   제안은 ASCII 접기(`to_ascii_lowercase`)다. 몸체 캐시 지문도 같은 키를 쓰므로 함께 확인한다.
+3. SQLite ASCII 접기 브랜치(`ccr-37904670-hxdjsx`)를 리뷰·CI 후 머지한다. 이 세션에서 돌리지 못한 검증:
+   Docker DB fixture, `verify-bridge-facts.py`의 PostgreSQL 사례(PostgreSQL 바이너리 없음 — SQLite 사례만
+   isthmus 0.14.0으로 실행), GLM 리뷰.
+4. 후속 후보(이번 작업에서 관찰, 고치지 않음):
+   - 네이티브 SQLite reader는 없는 테이블을 읽는 뷰가 하나라도 있으면 `PRAGMA table_info` 오류로 scan 전체가
+     종료 코드 2로 끝난다(`catalog read failed: … no such table`). SQLite는 그런 뷰의 생성을 허용한다.
+   - SQLite routine 호출의 마지막 정점 조회는 정확 비교(`lookup(false)`)라 `ÉCHO` routine을 `Écho(...)`로 부르면
+     잇지 못한다. 수집기는 SQLite routine을 내지 않고(경로 이름의 query routine뿐) 실사용 영향은 없다고 봤다.
+   - CATALOG.md의 SQL Server 문단은 아직 "documents do not carry it"라고 쓴다. PR #59가 `context.collation`을
+     더했으므로 갱신이 필요하다.
 
 ## Blocker와 열린 질문 (2026-11-09)
 
