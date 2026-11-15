@@ -389,6 +389,9 @@ fn is_sqlite_error_code(code: Option<&str>) -> bool {
 /// 한계 문구에 이름을 적는 컴파일 불가 뷰의 최대 수. 나머지는 수로만 남긴다.
 const UNCOMPILABLE_VIEWS_LISTED: usize = 10;
 
+/// 한계 문구에 싣는 뷰 이름·SQLite 메시지 한 조각의 최대 글자 수다.
+const NOTICE_PART_CHARS: usize = 120;
+
 /// 컬럼을 읽지 못한 뷰를 스키마마다 센 한계 문구다.
 ///
 /// 이 한계는 카탈로그 완전성을 낮춘다. 뷰는 선언되지만 컬럼이 없으므로, 그 컬럼을 쓰는
@@ -398,7 +401,7 @@ fn uncompilable_views_notice(schema: &str, views: &[(String, String)]) -> String
     let listed: Vec<String> = views
         .iter()
         .take(UNCOMPILABLE_VIEWS_LISTED)
-        .map(|(name, reason)| format!("{name} ({reason})"))
+        .map(|(name, reason)| format!("{} ({})", notice_part(name), notice_part(reason)))
         .collect();
     let more = views.len().saturating_sub(UNCOMPILABLE_VIEWS_LISTED);
     let more = if more > 0 {
@@ -412,6 +415,18 @@ fn uncompilable_views_notice(schema: &str, views: &[(String, String)]) -> String
         views.len(),
         listed.join(", ")
     )
+}
+
+/// 뷰 이름이나 SQLite 메시지를 한계 문구의 한 조각으로 만든다.
+///
+/// 둘 다 DB가 정한 임의의 문자열이다. 줄바꿈·ESC 같은 제어문자가 그대로 실리면 터미널과
+/// 리뷰 출력에 가짜 줄이나 색 제어가 생기므로 facts 한계와 같은 `printable`로 바꾸고, 긴
+/// 값이 한계 문자열을 끝없이 키우지 않게 글자 수로 자른 뒤 `…`로 표시한다.
+fn notice_part(text: &str) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(NOTICE_PART_CHARS).collect();
+    let cut = if chars.next().is_some() { "…" } else { "" };
+    format!("{}{cut}", crate::bridge_facts::printable(&head))
 }
 
 /// 컬럼과 그 테이블의 index_list 행을 함께 읽는다.
@@ -828,6 +843,34 @@ mod tests {
         assert!(notice.contains("v09 (no such table: main.gone)"));
         assert!(!notice.contains("v10 ("));
         assert!(notice.ends_with(", and 2 more"), "{notice}");
+    }
+
+    /// 뷰 이름과 SQLite 메시지는 DB가 정한 임의의 문자열이다. 줄바꿈·ESC가 한계 문구에 그대로
+    /// 실리면 터미널과 리뷰 출력이 깨진다. 제어문자는 이스케이프하고, 긴 조각은 잘라 `…`로 표시한다.
+    #[test]
+    fn uncompilable_view_notice_escapes_and_truncates_parts() {
+        let long = "x".repeat(NOTICE_PART_CHARS + 5);
+        let views = [
+            (
+                "evil\nname\u{1b}[31m".to_owned(),
+                "no such table: main.gone\ntable\u{1b}[0m".to_owned(),
+            ),
+            (long.clone(), format!("no such table: main.{long}")),
+        ];
+        let notice = uncompilable_views_notice("main", &views);
+        assert!(!notice.chars().any(char::is_control), "{notice:?}");
+        assert!(
+            notice
+                .contains(r"evil\u{a}name\u{1b}[31m (no such table: main.gone\u{a}table\u{1b}[0m)"),
+            "{notice}"
+        );
+        let kept = "x".repeat(NOTICE_PART_CHARS);
+        assert!(
+            notice.contains(&format!(", {kept}… (no such table: main.")),
+            "{notice}"
+        );
+        assert!(!notice.contains(&long), "{notice}");
+        assert!(notice.ends_with("…)"), "{notice}");
     }
 
     /// 정의 컴파일 실패는 SQLITE_ERROR(1) 계열뿐이다. 확장 코드(없는 collation의 257)도 그 계열이다.
