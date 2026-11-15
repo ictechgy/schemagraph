@@ -989,11 +989,16 @@ fn parse_trigger_body(
                     "procedural variables or dynamic SQL require statement extraction".to_owned(),
                 );
             }
+            let rules = CollectRules {
+                sqlserver_trigger,
+                sqlite_trigger,
+                sqlite: dialect.is::<SQLiteDialect>(),
+            };
             for mut stmt in stmts {
                 if dialect.is::<PostgreSqlDialect>() {
                     body_relations::normalize_postgres(&mut stmt);
                 }
-                collect_trigger_stmt(stmt, &mut parsed, sqlserver_trigger, sqlite_trigger);
+                collect_trigger_stmt(stmt, &mut parsed, rules);
             }
             invalidate_temp_state_if_unsafe(&mut parsed, body, 0);
             Ok(parsed)
@@ -1997,6 +2002,10 @@ fn parse_procedural_body(
             candidates: Vec::new(),
         });
     }
+    let rules = CollectRules {
+        sqlite: dialect.is::<SQLiteDialect>(),
+        ..CollectRules::default()
+    };
     for stmt in &stmts {
         match parse_limits::parse_sql(dialect, stmt) {
             Ok(list) => {
@@ -2004,7 +2013,7 @@ fn parse_procedural_body(
                     if dialect.is::<PostgreSqlDialect>() {
                         body_relations::normalize_postgres(&mut s);
                     }
-                    collect_trigger_stmt(s, &mut parsed, false, false);
+                    collect_trigger_stmt(s, &mut parsed, rules);
                 }
             }
             // 추출기가 SQL이 아닌 조각을 문장으로 오인한 경우 — 하나의
@@ -3460,34 +3469,39 @@ fn is_query_text(s: &str) -> bool {
         || s.trim_start().starts_with('(')
 }
 
+/// 몸체 문장을 모을 때 방언과 몸체 종류에 따라 달라지는 판정이다.
+///
+/// 문장 수집은 재귀로 내려가며 같은 판정을 넘긴다. 위치 인자 bool을 늘리면 호출부에서
+/// 어느 값이 어느 판정인지 읽히지 않아 이름 붙은 필드로 묶는다.
+#[derive(Clone, Copy, Default)]
+struct CollectRules {
+    /// SQL Server trigger — `inserted`·`deleted`는 물리 관계가 아니라 전이 관계다.
+    sqlserver_trigger: bool,
+    /// SQLite trigger — `RAISE(...)`는 함수 호출이 아니라 trigger 전용 구문이다.
+    sqlite_trigger: bool,
+    /// SQLite 몸체(trigger·DML 쿼리 파일) — CTE 이름을 SQLite처럼 ASCII 대소문자만 접어
+    /// 비교한다. 컬럼 단위 Binder(`scope::name`)와 같은 규칙이다.
+    sqlite: bool,
+}
+
 /// 소유한 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
 ///
 /// 컬럼 DML은 복제하지 않고 옮겨 보관하고, 절차형 블록(IF/WHILE/CASE)은 안쪽 문장을
 /// 꺼내 같은 규칙으로 모은다. 컬럼 DML에는 안쪽 문장이 없으므로 처음 나온 순서가
 /// 참조로 훑던 때와 같다.
-fn collect_trigger_stmt(
-    stmt: Statement,
-    parsed: &mut ParsedTrigger,
-    sqlserver_trigger: bool,
-    sqlite_trigger: bool,
-) {
-    collect_trigger_facts(&stmt, parsed, sqlserver_trigger, sqlite_trigger);
+fn collect_trigger_stmt(stmt: Statement, parsed: &mut ParsedTrigger, rules: CollectRules) {
+    collect_trigger_facts(&stmt, parsed, rules);
     if is_column_dml_statement(&stmt) {
         parsed.retain_dml_statement(stmt);
         return;
     }
     for nested in into_nested_statements(stmt) {
-        collect_trigger_stmt(nested, parsed, sqlserver_trigger, sqlite_trigger);
+        collect_trigger_stmt(nested, parsed, rules);
     }
 }
 
 /// 문장 하나의 관계·식·호출 참조를 모은다. 안쪽 문장은 호출자가 따로 넘긴다.
-fn collect_trigger_facts(
-    stmt: &Statement,
-    parsed: &mut ParsedTrigger,
-    sqlserver_trigger: bool,
-    sqlite_trigger: bool,
-) {
+fn collect_trigger_facts(stmt: &Statement, parsed: &mut ParsedTrigger, rules: CollectRules) {
     if let Statement::CreateTable(create) = stmt {
         let local = create.temporary
             || create
@@ -3561,7 +3575,7 @@ fn collect_trigger_facts(
             parsed.writes.push(t.clone());
         }
     }
-    body_relations::collect_reads(stmt, parsed, sqlserver_trigger);
+    body_relations::collect_reads(stmt, parsed, rules);
     let _ = visit_expressions(stmt, |e| {
         match e {
             Expr::CompoundIdentifier(parts) => {
@@ -3595,7 +3609,7 @@ fn collect_trigger_facts(
             Expr::Function(f) => {
                 // SQLite RAISE는 trigger 전용 구문이다. visitor는 계속 내려가므로
                 // 오류 메시지의 서브쿼리·사용자 함수·NEW/OLD 읽기는 그대로 남는다.
-                if sqlite_trigger && sqlite::raise_action(f).is_some() {
+                if rules.sqlite_trigger && sqlite::raise_action(f).is_some() {
                     return ControlFlow::<()>::Continue(());
                 }
                 let t = object_name_parts(&f.name);

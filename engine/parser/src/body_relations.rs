@@ -10,7 +10,7 @@ use sqlparser::ast::{
 
 use super::{
     copy_to_table, is_sqlserver_transition_relation, qualified_write_targets, read_exclusions,
-    relation_name_key, relation_name_parts, write_targets_shallow, ParsedTrigger,
+    relation_name_key, relation_name_parts, write_targets_shallow, CollectRules, ParsedTrigger,
 };
 
 /// 컬럼 해석과 같은 PostgreSQL 인용 규칙을 본문의 관계·호출 이름에도 적용한다.
@@ -65,15 +65,26 @@ pub(super) fn normalize_postgres(statement: &mut Statement) {
 pub(super) fn collect_reads(
     statement: &Statement,
     parsed: &mut ParsedTrigger,
-    sqlserver_trigger: bool,
+    rules: CollectRules,
 ) {
     struct Relations<'a> {
         parsed: &'a mut ParsedTrigger,
-        sqlserver_trigger: bool,
+        rules: CollectRules,
         ctes: Vec<BTreeSet<String>>,
         definitions: BTreeMap<usize, BTreeSet<String>>,
         exclusions: Vec<Vec<(Option<String>, String)>>,
         qualified_writes: Vec<Vec<ObjectName>>,
+    }
+    impl Relations<'_> {
+        /// CTE 이름의 비교 키다. SQLite는 CTE 이름도 다른 식별자처럼 ASCII 대소문자만
+        /// 무시하므로 `WITH Recent … FROM recent`가 같은 이름의 실제 테이블이 아니라 CTE를 읽는다.
+        fn cte_key(&self, name: &str) -> String {
+            if self.rules.sqlite {
+                name.to_ascii_lowercase()
+            } else {
+                name.to_owned()
+            }
+        }
     }
     impl Visitor for Relations<'_> {
         type Break = ();
@@ -104,14 +115,15 @@ pub(super) fn collect_reads(
             if let Some(with) = &query.with {
                 // RECURSIVE는 뒤 형제 CTE 참조도 허용한다. 비재귀는 이전 별칭만 보인다.
                 if with.recursive {
-                    visible.extend(
-                        with.cte_tables
-                            .iter()
-                            .map(|cte| cte.alias.name.value.clone()),
-                    );
+                    let names: Vec<String> = with
+                        .cte_tables
+                        .iter()
+                        .map(|cte| self.cte_key(&cte.alias.name.value))
+                        .collect();
+                    visible.extend(names);
                 }
                 for cte in &with.cte_tables {
-                    let name = cte.alias.name.value.clone();
+                    let name = self.cte_key(&cte.alias.name.value);
                     self.definitions
                         .insert(cte.query.as_ref() as *const Query as usize, visible.clone());
                     visible.insert(name);
@@ -141,11 +153,12 @@ pub(super) fn collect_reads(
                     .insert(relation_name_key(name));
                 return ControlFlow::Continue(());
             };
+            let cte_key = self.cte_key(&target.1);
             let cte = target.0.is_none()
                 && self
                     .ctes
                     .last()
-                    .is_some_and(|scope| scope.contains(&target.1));
+                    .is_some_and(|scope| scope.contains(&cte_key));
             let excluded = self
                 .exclusions
                 .last()
@@ -153,7 +166,7 @@ pub(super) fn collect_reads(
             if target.1.is_empty()
                 || cte
                 || excluded
-                || (self.sqlserver_trigger && is_sqlserver_transition_relation(&target))
+                || (self.rules.sqlserver_trigger && is_sqlserver_transition_relation(&target))
                 || self.parsed.local_relations.contains(&target)
                 || self.parsed.reads.contains(&target)
             {
@@ -167,7 +180,7 @@ pub(super) fn collect_reads(
         statement,
         &mut Relations {
             parsed,
-            sqlserver_trigger,
+            rules,
             ctes: Vec::new(),
             definitions: BTreeMap::new(),
             exclusions: Vec::new(),

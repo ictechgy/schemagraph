@@ -2277,6 +2277,35 @@ fn sqlite_trigger_transition_table_keeps_its_letter_case() {
     );
 }
 
+/// SQLite CTE 이름도 ASCII 대소문자만 무시한다. `WITH Recent AS (…) … FROM recent`의 `recent`는
+/// 같은 이름의 실제 테이블이 있어도 CTE다(실제 SQLite도 CTE 값을 넣는다). 트리거와 DML 쿼리
+/// 파일의 객체 단위 수집이 CTE 이름을 정확히 비교하면 실제 테이블로 가는 거짓 `reads`가 났다.
+#[test]
+fn sqlite_dml_cte_names_fold_ascii_case() {
+    let body =
+        "INSERT INTO log(n) SELECT id FROM (WITH Recent AS (SELECT 7 AS id) SELECT id FROM recent)";
+    let mut orders = object("orders", &["id"]);
+    orders.triggers.push(TriggerDoc {
+        name: "t_cte".into(),
+        body: Some(format!(
+            "CREATE TRIGGER t_cte AFTER INSERT ON orders BEGIN {body}; END"
+        )),
+    });
+    let mut query = case_routine("dml_cte", "query", body);
+    query.language = None;
+    query.source = Some("dml/cte.sql".into());
+    let graph = sqlite_doc(
+        vec![orders, object("log", &["n"]), object("recent", &["id"])],
+        vec![query],
+    );
+    let trigger = trigger_id(&graph);
+    for owner in [trigger.as_str(), "s.dml_cte"] {
+        let detail = format!("{owner}: {:?} {:?}", graph.edges(), graph.limitations());
+        assert!(edge(&graph, owner, "s.log", EdgeKind::Writes), "{detail}");
+        assert!(!touches(&graph, owner, "s.recent"), "{detail}");
+    }
+}
+
 /// MySQL routine 이름은 플랫폼과 무관하게 대소문자를 구분하지 않는다. 테이블
 /// 이름은 lower_case_table_names에 달려 있어 기본으로 접지 않는다.
 #[test]
