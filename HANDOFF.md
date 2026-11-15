@@ -1,6 +1,6 @@
 # HANDOFF.md
 
-## 현재 상태 (2026-11-15, SQLite ASCII 접기 작업 이후)
+## 현재 상태 (2026-11-15, SQLite ASCII 접기·컴파일 불가 뷰 작업 이후)
 
 - 발행본은 **0.9.0**이다. 태그 `v0.9.0` = `fad8e9d`([#58](https://github.com/ictechgy/schemagraph/pull/58)).
   그 커밋의 [CI](https://github.com/ictechgy/schemagraph/actions/runs/41583763434)·
@@ -19,8 +19,8 @@
   crates.io에는 0.7.1·0.8.0·0.8.1이 없고, Maven Central에는 0.7.1이 없다(2026-11-03 조회).
   GitHub Release v0.1.0–v0.3.0에는 첨부 아카이브가 없다(2026-11-09 조회). 누락 버전은 다시 게시하지 않는다.
 - isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
-- 브랜치 `ccr-37904670-hxdjsx`(`origin/main` `ea1bd11` 기준)에 아래 SQLite ASCII 접기 작업이 커밋돼 있다.
-  push·PR은 하지 않았다.
+- 브랜치 `ccr-37904670-hxdjsx`(`origin/main` `ea1bd11` 기준)에 아래 세 작업이 커밋돼 있다: SQLite ASCII 접기
+  (`1299676`), 컴파일되지 않는 SQLite 뷰(`dfdeecd`), CATALOG.md SQL Server 문단(`bb4c916`). push·PR은 하지 않았다.
 
 ### SQLite 식별자 ASCII 접기 (2026-11-15, `1299676`)
 
@@ -47,6 +47,29 @@ PR #59 리뷰가 남긴 후속 후보를 처리했다. 근거와 결과의 정�
 - 좁힘: 거짓 간선 제거는 SQLite 문서 의미론에 근거한 좁힘이다. `impact`가 줄고, `dead`(뷰·routine 대상)는 그런
   간선으로만 의존받던 뷰를 새로 보고할 수 있다. 반대로 두 변형 공존 사례는 간선이 늘어 보고가 줄 수 있다.
   SQLite 카탈로그에는 사용 통계가 없어 `unused`는 영향이 없다.
+
+### 컴파일되지 않는 SQLite 뷰 (2026-11-15, `dfdeecd`)
+
+- 문제: SQLite는 없는 테이블·컬럼을 읽거나 앱이 등록하는 함수를 부르는 뷰의 생성을 허용하지만 그 뷰를
+  컴파일하지 못한다. 네이티브 reader는 그 뷰의 `PRAGMA table_xinfo` 오류를 그대로 올려 scan 전체가 종료 코드 2로
+  끝났다(ASCII 접기 작업의 실제 SQLite 대조 중 발견).
+- 수정: 뷰의 table_xinfo가 SQLite 데이터베이스 오류(`sqlx::Error::Database`)로 실패할 때만 뷰와 원문을 두고 컬럼을
+  비운다. 테이블·연결 오류는 그대로 scan을 끝낸다. 스키마마다 한계 하나가 뷰 수와 `이름 (SQLite 이유)`를 최대
+  10개 적는다. 이 한계는 카탈로그를 불완전으로 만들어 facts에 `catalog-coverage:`가 붙고, isthmus 0.14.0은 그 뷰의
+  컬럼 사용을 `column-use-without-decl-unverified` 경고로 낸다(확인함).
+- 검증: 회귀 테스트(`uncompilable_views_are_kept_without_columns_and_counted`, 수정 전 `no such function: app_fn`로
+  read 실패 확인), 문구 상한 테스트, CLI scan 종료 코드 0과 graph limitations 노출, 실제 SQLite 대조에 깨진 뷰 사례
+  3개 추가(14개 몸체 모두 일치).
+- 다른 수집기: Go 프로브(`bestEffort`)와 JDBC 프로브(`getColumns failed`)는 같은 DB에서 이미 뷰를 남기고 카탈로그를
+  불완전으로 표시했다(이 세션에서 Go 프로브를 빌드하고 JDBC jar을 Gradle `--offline`으로 다시 만들어 실행해 확인).
+  문구 차이는 SUPPORT-MATRIX 수집기 차이 표에 적었다. Go 문구는 뷰 이름을 적지 않고 "source text was not collected"라
+  사실과 어긋나지만 실패가 아니라 이번 범위에 넣지 않았다.
+
+### CATALOG.md SQL Server 문단 (2026-11-15, `bb4c916`)
+
+- "documents do not carry it" 문구를 PR #59 이후 동작으로 고치고 context 필드 목록에 `lower_case_table_names`·
+  `collation`을 더했다. 문구는 `--document`로 만든 SQL Server(CI collation)·MySQL(lctn=1) 문서를 scan해 확인한
+  실제 동작을 적는다(아래 후속 후보 참고).
 
 ### PR #59 리뷰에서 처리한 것
 
@@ -90,16 +113,19 @@ PR #59는 GLM 리뷰 없이 머지됐다.
    GitHub Release·crates.io·Maven Central을 **각각** 게시하고, 채널 표를 실제 조회 결과로 갱신한다.
    crates.io 누락분(0.7.1·0.8.0·0.8.1)은 다시 게시하지 않고 0.10.0이 그 변경을 담는다.
 2. isthmus 쪽 `compatibility.json`의 schemagraph 고정을 올리는 일은 isthmus 저장소에 맡긴다.
-3. SQLite ASCII 접기 브랜치(`ccr-37904670-hxdjsx`)를 리뷰·CI 후 머지한다. 이 세션에서 돌리지 못한 검증:
-   Docker DB fixture, `verify-bridge-facts.py`의 PostgreSQL 사례(PostgreSQL 바이너리 없음 — SQLite 사례만
-   isthmus 0.14.0으로 실행), GLM 리뷰.
+3. 브랜치 `ccr-37904670-hxdjsx`를 리뷰·CI 후 머지한다. 이 세션에서 돌리지 못한 검증: Docker DB fixture,
+   `verify-bridge-facts.py`의 PostgreSQL 사례(PostgreSQL 바이너리 없음 — SQLite 사례만 isthmus 0.14.0으로 실행),
+   JDBC 프로브 JUnit·Go 프로브 테스트(프로브 코드는 바꾸지 않았다), GLM 리뷰.
 4. 후속 후보(이번 작업에서 관찰, 고치지 않음):
-   - 네이티브 SQLite reader는 없는 테이블을 읽는 뷰가 하나라도 있으면 `PRAGMA table_info` 오류로 scan 전체가
-     종료 코드 2로 끝난다(`catalog read failed: … no such table`). SQLite는 그런 뷰의 생성을 허용한다.
+   - 대소문자 접기 방언(MySQL `lower_case_table_names` 1·2, SQL Server `_CI` collation)은 routine·trigger 몸체의
+     객체 단위 간선만 대소문자만 다른 관계로 잇는다. 뷰 몸체와 컬럼 단위 간선(Binder)은 정확 비교라 같은 참조가
+     뷰에서는 간선 없이, routine에서는 테이블 간선만 있고 컬럼 간선 없이 남는다. SQL Server 미해석 메시지는 CI
+     collation이 있어도 "a case-insensitive collation is not assumed"라고 쓴다. RELEASE-NOTES `# Unreleased`의
+     PR #59 항목("relation names in bodies match …")은 이 범위를 과장한다. 고치려면 Binder(`scope.rs`의
+     `CatalogIndex::tables`·`relation_key`)가 같은 단일 후보 규칙을 따르게 하고 지문을 함께 확인해야 한다.
    - SQLite routine 호출의 마지막 정점 조회는 정확 비교(`lookup(false)`)라 `ÉCHO` routine을 `Écho(...)`로 부르면
      잇지 못한다. 수집기는 SQLite routine을 내지 않고(경로 이름의 query routine뿐) 실사용 영향은 없다고 봤다.
-   - CATALOG.md의 SQL Server 문단은 아직 "documents do not carry it"라고 쓴다. PR #59가 `context.collation`을
-     더했으므로 갱신이 필요하다.
+   - Go 프로브의 컴파일 불가 뷰 한계는 뷰 이름 없이 "sqlite columns source text was not collected (…)"라고 쓴다.
 
 ## Blocker와 열린 질문 (2026-11-09)
 
