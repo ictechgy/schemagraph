@@ -572,9 +572,9 @@ impl<'a> CatalogIndex<'a> {
         if matches!(self.dialect, "oracle" | "db2") {
             return index.objects(self.dialect, schema, name);
         }
-        // SQLite는 이 분기를 타지 않는다. 참조 이름이 이미 Unicode 소문자로 접혀
-        // (`name`) 카탈로그 쪽 ASCII 접기 키와 비ASCII 이름에서 어긋난다. 아래
-        // `self.tables`는 양쪽에 같은 `catalog_key`를 써서 대소문자 변형을 모두 담는다.
+        // SQLite는 이 분기를 타지 않는다. 아래 `self.tables`는 Binder가 관계를 찾는 바로 그
+        // 색인이다 — 참조 이름(`name`)과 카탈로그 이름(`catalog_key`)을 같은 ASCII 규칙으로
+        // 접으므로, SQLite가 같은 객체로 보는 대소문자 변형만 후보가 된다.
         if self.fold_relation_case && self.dialect != "sqlite" {
             // MySQL(lower_case_table_names≠0)·SQL Server(CI collation)는 정확 일치가
             // 없을 때 대소문자만 다른 단일 후보를 잇는다. 그 변형이 생기거나 사라지면
@@ -738,9 +738,15 @@ pub(crate) fn is_select(dialect: &dyn Dialect, body: &str) -> bool {
     })
 }
 
+/// 카탈로그 쪽 스키마·관계·routine 이름을 `name`과 같은 규칙의 키로 만든다.
+///
+/// SQLite는 식별자를 `sqlite3_stricmp`와 같은 규칙으로 비교하고, 그 규칙은 ASCII 26자만
+/// 접는다(<https://www.sqlite.org/c3ref/stricmp.html>, 소스의 `sqlite3UpperToLower`). Unicode
+/// 규칙으로 접으면 `ÉTUDIANTS`와 `étudiants`, 켈빈 기호와 `k`처럼 SQLite가 다른 객체로 보는
+/// 이름이 한 키가 된다.
 fn catalog_key(dialect: &str, value: &str) -> String {
     if dialect == "sqlite" {
-        value.to_lowercase()
+        value.to_ascii_lowercase()
     } else {
         value.to_owned()
     }
@@ -763,16 +769,25 @@ fn database_ident_key(dialect: &str, ident: &Ident) -> String {
 
 /// 컬럼 이름은 방언의 열 비교 규칙으로만 정규화한다. 테이블·스키마·테이블
 /// 별칭은 같은 규칙을 공유하지 않으므로 `name`을 그대로 사용해야 한다.
+///
+/// SQLite 컬럼도 다른 식별자처럼 ASCII 대소문자만 무시한다(`catalog_key`). MySQL·MariaDB
+/// 컬럼 이름 규칙은 SQLite와 따로 정해지므로 기존 Unicode 접기를 그대로 둔다.
 fn column_key(dialect: &str, value: &str) -> String {
     match dialect {
-        "sqlite" | "mysql" | "mariadb" => value.to_lowercase(),
+        "sqlite" => value.to_ascii_lowercase(),
+        "mysql" | "mariadb" => value.to_lowercase(),
         _ => value.to_owned(),
     }
 }
 
+/// 몸체 식별자를 방언의 비교 규칙으로 정규화한다.
+///
+/// SQLite는 인용 여부와 무관하게 ASCII 대소문자만 무시한다 — 카탈로그 키(`catalog_key`)와
+/// 객체 단위 해석(`vertex_hit`의 ASCII 접기)이 같은 규칙이어야 한 몸체의 객체 간선과 컬럼
+/// 간선이 같은 대상을 가리킨다.
 pub(super) fn name(dialect: &str, ident: &Ident) -> String {
     if dialect == "sqlite" {
-        return ident.value.to_lowercase();
+        return ident.value.to_ascii_lowercase();
     }
     if ident.quote_style.is_some() {
         return ident.value.clone();

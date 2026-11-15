@@ -96,6 +96,14 @@ generic dialect, and the graph then carries the limitation
 `dialect '<name>' is not recognized; generic SQL parsing used for N
 body/default text(s)`, counting the bodies and column defaults it read.
 
+SQLite names in view, trigger and SQL-file bodies are compared the way SQLite
+compares identifiers: letter case is ignored for the 26 ASCII letters only,
+whether or not the name is quoted
+([`sqlite3_stricmp`](https://www.sqlite.org/c3ref/stricmp.html)). `ORDERS`
+matches a table `orders`, but `étudiants` does not match `ÉTUDIANTS`, and the
+Kelvin sign `K` (U+212A) does not match `k`. The rule covers relation, column,
+alias and routine names.
+
 SQL Server names are compared exactly, because case sensitivity depends on the
 database collation and documents do not carry it. When a body names a relation
 that exists only with different letter case, the unresolved-relation message

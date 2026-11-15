@@ -1921,6 +1921,285 @@ fn sqlite_body_relations_fold_ascii_case() {
     );
 }
 
+/// SQLite 대소문자 규칙 회귀용 문서다. 스키마 `s` 하나에 객체와 routine을 담는다.
+fn sqlite_doc(objects: Vec<ObjectDoc>, routines: Vec<RoutineDoc>) -> Graph {
+    let doc = CatalogDocument {
+        context: None,
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: "sqlite".into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: "s".into(),
+            objects,
+            routines,
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+    for note in notes {
+        graph.add_limitation(note);
+    }
+    for edge in graph.edges() {
+        assert!(graph.vertex(&edge.from).is_some());
+        assert!(graph.vertex(&edge.to).is_some());
+    }
+    graph
+}
+
+fn sqlite_view(name: &str, outputs: &[&str], body: &str) -> ObjectDoc {
+    let mut view = object(name, outputs);
+    view.kind = "view".into();
+    view.body = Some(body.into());
+    view
+}
+
+/// `from`에서 `target` 객체나 그 컬럼으로 가는 간선이 하나라도 있는가.
+fn touches(g: &Graph, from: &str, target: &str) -> bool {
+    let member = format!("{target}.");
+    g.edges().iter().any(|e| {
+        e.from.as_str() == from && (e.to.as_str() == target || e.to.as_str().starts_with(&member))
+    })
+}
+
+fn trigger_id(g: &Graph) -> String {
+    g.vertices()
+        .find(|vertex| vertex.kind == schemagraph_core::VertexKind::Trigger)
+        .expect("trigger vertex")
+        .id
+        .as_str()
+        .to_owned()
+}
+
+/// SQLite는 식별자의 ASCII 대소문자만 무시한다(`sqlite3_stricmp`의 정의,
+/// https://www.sqlite.org/c3ref/stricmp.html). 실제 SQLite에서 `SELECT * FROM étudiants`는
+/// `ÉTUDIANTS`만 있으면 `no such table`이고, ASCII 글자만 다른 `Étudiants`는 같은 테이블이다.
+/// Unicode 소문자로 접으면 앞의 몸체에 거짓 reads 간선이 생긴다.
+#[test]
+fn sqlite_relation_names_fold_only_ascii_case() {
+    let graph = sqlite_doc(
+        vec![
+            object("ÉTUDIANTS", &["id"]),
+            sqlite_view("v_unicode", &["id"], "SELECT id FROM étudiants"),
+            sqlite_view("v_ascii", &["id"], "SELECT ID FROM Étudiants"),
+        ],
+        vec![],
+    );
+    assert!(
+        !touches(&graph, "s.v_unicode", "s.ÉTUDIANTS"),
+        "{:?}",
+        graph.edges()
+    );
+    assert!(
+        graph
+            .limitations()
+            .iter()
+            .any(|l| l.contains("relation 's.étudiants' is missing")),
+        "{:?}",
+        graph.limitations()
+    );
+    assert!(edge(&graph, "s.v_ascii", "s.ÉTUDIANTS", EdgeKind::Reads));
+    assert!(edge(&graph, "s.v_ascii", "s.ÉTUDIANTS.id", EdgeKind::Reads));
+    assert!(edge(
+        &graph,
+        "s.v_ascii.id",
+        "s.ÉTUDIANTS.id",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+/// 켈빈 기호(U+212A)는 Unicode 소문자 규칙으로 `k`가 되지만 SQLite에서는 다른 이름이다.
+/// 실제 SQLite도 `"K"` 테이블에 `SELECT * FROM k`를 `no such table`로 거절한다.
+#[test]
+fn sqlite_kelvin_sign_is_not_the_letter_k() {
+    let kelvin = "\u{212A}";
+    let graph = sqlite_doc(
+        vec![
+            object(kelvin, &["id"]),
+            sqlite_view("v", &["id"], "SELECT id FROM k"),
+        ],
+        vec![],
+    );
+    assert!(
+        !touches(&graph, "s.v", &format!("s.{kelvin}")),
+        "{:?}",
+        graph.edges()
+    );
+    let graph = sqlite_doc(
+        vec![
+            object("k", &["id"]),
+            sqlite_view("v", &["id"], &format!("SELECT id FROM \"{kelvin}\"")),
+        ],
+        vec![],
+    );
+    assert!(!touches(&graph, "s.v", "s.k"), "{:?}", graph.edges());
+    // ASCII `K`는 같은 테이블이다.
+    let graph = sqlite_doc(
+        vec![
+            object("k", &["id"]),
+            sqlite_view("v", &["id"], "SELECT ID FROM K"),
+        ],
+        vec![],
+    );
+    assert!(edge(&graph, "s.v", "s.k", EdgeKind::Reads));
+    assert!(edge(&graph, "s.v", "s.k.id", EdgeKind::Reads));
+}
+
+/// SQLite 스키마에는 `ÉTUDIANTS`와 `étudiants`가 함께 있을 수 있고, 몸체의 `étudiants`는
+/// 뒤의 테이블만 읽는다. Unicode로 접으면 두 후보가 되어 해석을 포기했다.
+#[test]
+fn sqlite_unicode_case_variants_resolve_to_their_own_table() {
+    let graph = sqlite_doc(
+        vec![
+            object("ÉTUDIANTS", &["id"]),
+            object("étudiants", &["id"]),
+            sqlite_view("v", &["id"], "SELECT id FROM étudiants"),
+        ],
+        vec![],
+    );
+    assert!(
+        edge(&graph, "s.v", "s.étudiants", EdgeKind::Reads),
+        "{:?}",
+        graph.limitations()
+    );
+    assert!(edge(&graph, "s.v", "s.étudiants.id", EdgeKind::Reads));
+    assert!(
+        !touches(&graph, "s.v", "s.ÉTUDIANTS"),
+        "{:?}",
+        graph.edges()
+    );
+}
+
+/// 트리거의 객체 단위 쓰기(`vertex_hit`의 ASCII 접기)와 컬럼 단위 쓰기(Binder)는 같은
+/// 규칙을 따라야 한다. 컬럼 단위만 Unicode로 접어 `étudiants_log`가 `ÉTUDIANTS_LOG`
+/// 테이블 쓰기는 "없음"인데 그 컬럼 쓰기는 남았다.
+#[test]
+fn sqlite_trigger_object_and_column_writes_agree_on_case() {
+    for (target, resolves) in [("étudiants_log(n)", false), ("Étudiants_LOG(N)", true)] {
+        let mut orders = object("orders", &["id"]);
+        orders.triggers.push(TriggerDoc {
+            name: "trg".into(),
+            body: Some(format!(
+                "CREATE TRIGGER trg AFTER INSERT ON orders BEGIN INSERT INTO {target} VALUES (NEW.id); END"
+            )),
+        });
+        let graph = sqlite_doc(vec![orders, object("ÉTUDIANTS_LOG", &["n"])], vec![]);
+        let trigger = trigger_id(&graph);
+        let detail = format!("{target}: {:?} {:?}", graph.edges(), graph.limitations());
+        assert_eq!(
+            edge(&graph, &trigger, "s.ÉTUDIANTS_LOG", EdgeKind::Writes),
+            resolves,
+            "{detail}"
+        );
+        assert_eq!(
+            edge(&graph, &trigger, "s.ÉTUDIANTS_LOG.n", EdgeKind::Writes),
+            resolves,
+            "{detail}"
+        );
+        assert_eq!(
+            touches(&graph, &trigger, "s.ÉTUDIANTS_LOG"),
+            resolves,
+            "{detail}"
+        );
+        if !resolves {
+            assert!(
+                graph
+                    .limitations()
+                    .iter()
+                    .any(|l| l.contains("references s.étudiants_log, which is missing")),
+                "{detail}"
+            );
+        }
+    }
+}
+
+/// SQLite 컬럼 이름도 ASCII 대소문자만 무시한다. 실제 SQLite는 `Prénom` 컬럼에
+/// `SELECT PRÉNOM`을 `no such column`으로 거절하고 `SELECT PRéNOM`은 받는다.
+#[test]
+fn sqlite_column_names_fold_only_ascii_case() {
+    let graph = sqlite_doc(
+        vec![
+            object("personnes", &["Prénom"]),
+            sqlite_view("v_unicode", &["p"], "SELECT PRÉNOM AS p FROM personnes"),
+            sqlite_view("v_ascii", &["p"], "SELECT PRéNOM AS p FROM personnes"),
+        ],
+        vec![],
+    );
+    assert!(
+        !touches(&graph, "s.v_unicode", "s.personnes.Prénom"),
+        "{:?}",
+        graph.edges()
+    );
+    assert!(
+        !edge(
+            &graph,
+            "s.v_unicode.p",
+            "s.personnes.Prénom",
+            EdgeKind::DerivesFrom
+        ),
+        "{:?}",
+        graph.edges()
+    );
+    assert!(
+        graph
+            .limitations()
+            .iter()
+            .any(|l| l.starts_with("view s.v_unicode")
+                && l.contains("SG_COLUMN_UNRESOLVED")
+                && l.contains("column 'prÉnom'")),
+        "{:?}",
+        graph.limitations()
+    );
+    assert!(edge(
+        &graph,
+        "s.v_ascii",
+        "s.personnes.Prénom",
+        EdgeKind::Reads
+    ));
+    assert!(edge(
+        &graph,
+        "s.v_ascii.p",
+        "s.personnes.Prénom",
+        EdgeKind::DerivesFrom
+    ));
+}
+
+/// SQLite 몸체의 routine 호출도 카탈로그 routine 키와 같은 ASCII 규칙으로 비교한다.
+/// `écho`와 `Écho`는 SQLite에서 다른 이름이라 함께 있을 수 있다. `ÉCHO(...)`는 ASCII만
+/// 접으면 `Écho`이고, `éCHO(...)`는 `écho`다. Unicode로 접으면 둘 다 `écho`로 갔다.
+#[test]
+fn sqlite_routine_names_fold_only_ascii_case() {
+    let graph = sqlite_doc(
+        vec![
+            object("t", &["id"]),
+            sqlite_view("v_upper", &["x"], "SELECT ÉCHO(id) AS x FROM t"),
+            sqlite_view("v_lower", &["x"], "SELECT éCHO(id) AS x FROM t"),
+        ],
+        vec![
+            case_routine("écho", "function", "SELECT 1"),
+            case_routine("Écho", "function", "SELECT 1"),
+        ],
+    );
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(
+        edge(&graph, "s.v_upper", "s.Écho", EdgeKind::Calls),
+        "{detail}"
+    );
+    assert!(
+        !edge(&graph, "s.v_upper", "s.écho", EdgeKind::Calls),
+        "{detail}"
+    );
+    assert!(
+        edge(&graph, "s.v_lower", "s.écho", EdgeKind::Calls),
+        "{detail}"
+    );
+    assert!(
+        !edge(&graph, "s.v_lower", "s.Écho", EdgeKind::Calls),
+        "{detail}"
+    );
+}
+
 /// MySQL routine 이름은 플랫폼과 무관하게 대소문자를 구분하지 않는다. 테이블
 /// 이름은 lower_case_table_names에 달려 있어 기본으로 접지 않는다.
 #[test]

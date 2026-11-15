@@ -847,9 +847,9 @@ mod tests {
         assert_ne!(missing.fingerprint, created.fingerprint);
     }
 
-    /// SQLite 참조 이름은 Unicode 소문자로 접힌다(`Ärzte` → `ärzte`). 대소문자 후보 색인이
-    /// 카탈로그 쪽만 ASCII 대문자로 접으면 비ASCII 이름의 키가 어긋나 후보를 못 찾는다.
-    /// 그러면 참조 테이블에 컬럼이 생겨도 지문이 그대로라 낡은 `SELECT *` 결과를 재사용한다.
+    /// 비ASCII 글자가 든 SQLite 관계(`Ärzte`)도 Binder가 찾은 후보의 모양이 지문에 들어야 한다.
+    /// 참조 쪽과 카탈로그 쪽 키를 다른 규칙으로 접으면(29036a3) 후보를 못 찾아, 참조 테이블에
+    /// 컬럼이 생겨도 지문이 그대로라 낡은 `SELECT *` 결과를 재사용한다.
     #[test]
     fn scoped_context_tracks_non_ascii_sqlite_table_shape() {
         let body = "SELECT * FROM Ärzte";
@@ -874,6 +874,83 @@ mod tests {
         let widened = crate::scope::cache_context(&after, &graph, &owner, body);
         assert!(original.trusted && widened.trusted);
         assert_ne!(original.fingerprint, widened.fingerprint);
+    }
+
+    /// SQLite 지문은 Binder와 같은 ASCII 접기 키로 관계 후보를 담는다. `étudiants`를 읽는
+    /// 뷰에게 `ÉTUDIANTS`는 다른 테이블이라 그 모양이 바뀌어도 지문은 그대로이고, 진짜 후보
+    /// `étudiants`가 생기면 지문이 바뀐다. 어느 단계에서도 warm 실행은 cold 실행과 같다.
+    #[test]
+    fn sqlite_unicode_case_variants_keep_warm_results_equal_to_cold() {
+        let body = "SELECT id FROM étudiants";
+        let column = |name: &str, ordinal: usize| serde_json::json!({"name":name,"data_type":"INTEGER","nullable":true,"ordinal":ordinal,"pk_position":0});
+        let object = |name: &str, kind: &str, columns: &[&str]| {
+            let mut value = serde_json::json!({
+                "name":name,"kind":kind,"constraints":[],"indexes":[],"triggers":[],
+                "columns":columns.iter().enumerate().map(|(i, c)| column(c, i + 1)).collect::<Vec<_>>()
+            });
+            if kind == "view" {
+                value["body"] = serde_json::json!(body);
+            }
+            value
+        };
+        let document = |objects: Vec<serde_json::Value>| -> CatalogDocument {
+            serde_json::from_value(serde_json::json!({
+                "version":1,"dialect":"sqlite","reader":"test","limitations":[],
+                "context":{"source_id":"t","catalog_complete":true},
+                "schemas":[{"name":"main","routines":[],"objects":objects}]
+            }))
+            .unwrap()
+        };
+        let view = object("v", "view", &["id"]);
+        let documents = [
+            document(vec![object("ÉTUDIANTS", "table", &["id"]), view.clone()]),
+            document(vec![
+                object("ÉTUDIANTS", "table", &["id", "extra"]),
+                view.clone(),
+            ]),
+            document(vec![
+                object("ÉTUDIANTS", "table", &["id", "extra"]),
+                object("étudiants", "table", &["id"]),
+                view,
+            ]),
+        ];
+        let owner = VertexId::object("main", "v");
+        let contexts: Vec<CacheContext> = documents
+            .iter()
+            .map(|doc| {
+                let graph = schemagraph_source::graph::document_to_graph(doc);
+                crate::scope::cache_context(doc, &graph, &owner, body)
+            })
+            .collect();
+        assert!(contexts.iter().all(|context| context.trusted));
+        assert_eq!(contexts[0].fingerprint, contexts[1].fingerprint);
+        assert_ne!(contexts[1].fingerprint, contexts[2].fingerprint);
+
+        let mut cache = ScopedMemoryCache::default();
+        for (step, doc) in documents.iter().enumerate() {
+            let mut cold = schemagraph_source::graph::document_to_graph(doc);
+            let cold_result = crate::enrich_from_document(&mut cold, doc);
+            let mut warm = schemagraph_source::graph::document_to_graph(doc);
+            let warm_result = crate::enrich_with_cache(&mut warm, doc, Some(&mut cache));
+            assert_eq!(warm_result, cold_result, "step {step}");
+            assert_eq!(warm.edges(), cold.edges(), "step {step}");
+            assert_eq!(warm.analysis(), cold.analysis(), "step {step}");
+            assert_eq!(warm.origins(), cold.origins(), "step {step}");
+            assert!(
+                !cold.edges().iter().any(|edge| {
+                    edge.from.as_str().starts_with("main.v")
+                        && edge.to.as_str().starts_with("main.ÉTUDIANTS")
+                }),
+                "step {step}: {:?}",
+                cold.edges()
+            );
+            let reads_real_table = cold.edges().iter().any(|edge| {
+                edge.from == owner
+                    && edge.to.as_str() == "main.étudiants"
+                    && edge.kind == EdgeKind::Reads
+            });
+            assert_eq!(reads_real_table, step == 2, "step {step}");
+        }
     }
 
     #[test]
