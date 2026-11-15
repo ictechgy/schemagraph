@@ -1923,11 +1923,17 @@ fn sqlite_body_relations_fold_ascii_case() {
 
 /// SQLite 대소문자 규칙 회귀용 문서다. 스키마 `s` 하나에 객체와 routine을 담는다.
 fn sqlite_doc(objects: Vec<ObjectDoc>, routines: Vec<RoutineDoc>) -> Graph {
+    dialect_doc("sqlite", objects, routines)
+}
+
+/// `sqlite_doc`과 같은 모양을 다른 방언으로 만든다. SQLite 전용 규칙이 다른 방언으로
+/// 번지지 않는지 같은 입력으로 비교하는 데 쓴다.
+fn dialect_doc(dialect: &str, objects: Vec<ObjectDoc>, routines: Vec<RoutineDoc>) -> Graph {
     let doc = CatalogDocument {
         context: None,
         dependencies: Vec::new(),
         version: 1,
-        dialect: "sqlite".into(),
+        dialect: dialect.into(),
         reader: "fixture".into(),
         limitations: vec![],
         schemas: vec![SchemaDoc {
@@ -2198,6 +2204,47 @@ fn sqlite_routine_names_fold_only_ascii_case() {
         !edge(&graph, "s.v_lower", "s.Écho", EdgeKind::Calls),
         "{detail}"
     );
+}
+
+/// SQLite 테이블·뷰는 컬럼이 0개일 수 없다. 컬럼 없는 SQLite 객체는 수집기가 컬럼을 읽지
+/// 못한 것(SQLite가 컴파일하지 못한 뷰)이다. 그 위의 `*`가 아무것도 펼치지 않는다고 확정하면
+/// 깨진 뷰를 읽는 몸체가 진단 없이 `complete`가 된다.
+#[test]
+fn sqlite_object_without_columns_is_an_unknown_relation() {
+    let graph = sqlite_doc(
+        vec![
+            sqlite_view("v_broken", &[], "SELECT id FROM gone"),
+            sqlite_view("v_on_broken", &[], "SELECT * FROM v_broken"),
+        ],
+        vec![],
+    );
+    let analysis = &graph.analysis()[&VertexId::from_raw("s.v_on_broken")];
+    let detail = format!("{:?} {:?}", analysis.diagnostics, graph.limitations());
+    assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SG_WILDCARD_UNKNOWN"),
+        "{detail}"
+    );
+    assert!(edge(&graph, "s.v_on_broken", "s.v_broken", EdgeKind::Reads));
+}
+
+/// PostgreSQL은 컬럼 없는 테이블(`CREATE TABLE t()`)을 허용한다. 그 `*`는 실제로 아무것도
+/// 펼치지 않으므로, SQLite의 "컬럼 없음 = 모름" 규칙이 다른 방언으로 번지면 안 된다.
+#[test]
+fn postgres_table_without_columns_stays_a_known_relation() {
+    let graph = dialect_doc(
+        "postgres",
+        vec![
+            object("empty", &[]),
+            sqlite_view("v", &[], "SELECT * FROM empty"),
+        ],
+        vec![],
+    );
+    complete(&graph);
+    assert!(edge(&graph, "s.v", "s.empty", EdgeKind::Reads));
 }
 
 /// MySQL routine 이름은 플랫폼과 무관하게 대소문자를 구분하지 않는다. 테이블

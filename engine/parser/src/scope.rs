@@ -767,6 +767,16 @@ fn database_ident_key(dialect: &str, ident: &Ident) -> String {
     }
 }
 
+/// 카탈로그 객체의 컬럼 목록을 모른다고 봐야 하는가.
+///
+/// SQLite 테이블·뷰는 컬럼이 0개일 수 없다. 컬럼 없는 SQLite 객체는 수집기가 컬럼을 읽지
+/// 못한 것(SQLite가 컴파일하지 못한 뷰)이라, 그 위의 `*`가 아무것도 펼치지 않는다고 확정하면
+/// 깨진 뷰를 읽는 몸체가 진단 없이 완전 분석이 된다. PostgreSQL처럼 컬럼 없는 테이블을 허용하는
+/// 방언에서는 빈 목록도 사실이다.
+fn columns_unknown(dialect: &str, object: &ObjectDoc) -> bool {
+    dialect == "sqlite" && object.columns.is_empty()
+}
+
 /// 컬럼 이름은 방언의 열 비교 규칙으로만 정규화한다. 테이블·스키마·테이블
 /// 별칭은 같은 규칙을 공유하지 않으므로 `name`을 그대로 사용해야 한다.
 ///
@@ -1870,6 +1880,7 @@ impl Binder<'_, '_> {
             .collect();
         Relation {
             columns,
+            unknown: columns_unknown(self.catalog.dialect, object),
             ..Relation::default()
         }
     }
