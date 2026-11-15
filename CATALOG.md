@@ -104,10 +104,23 @@ matches a table `orders`, but `étudiants` does not match `ÉTUDIANTS`, and the
 Kelvin sign `K` (U+212A) does not match `k`. The rule covers relation, column,
 alias and routine names.
 
-SQL Server names are compared exactly, because case sensitivity depends on the
-database collation and documents do not carry it. When a body names a relation
-that exists only with different letter case, the unresolved-relation message
-names that variant (or counts several) and no edge is created.
+SQL Server relation names follow the database collation when the document
+carries it in `context.collation` (the Go and JDBC probes collect it). With a
+collation that has a `_CI` attribute, a relation name in a routine or trigger
+body that matches no catalog relation exactly gets an object-level `reads` or
+`writes` edge to the single relation that differs only in ASCII letter case;
+several such relations get none. View bodies and column-level edges still
+compare relation names exactly, so such a reference leaves a view without edges
+and a routine or trigger without column edges. Turkish, Azeri and code page 1254
+collations are not folded, because their `i`/`I` rules differ from ASCII
+folding, and letters outside ASCII are compared exactly. Without `collation`,
+or with a case-sensitive or binary collation, names are compared exactly. When
+a SQL Server relation stays unresolved, the unresolved-relation message names a
+variant that differs only by letter case (or counts several) and no edge is
+created. MySQL and MariaDB table and view names use
+`context.lower_case_table_names` the same way: `1` and `2` resolve a single
+ASCII case-only variant at object level, while `0` or a missing value compares
+exactly. MySQL routine names always match regardless of ASCII letter case.
 
 A PostgreSQL routine `body` that is a full definition, as `pg_get_functiondef`
 returns it, keeps the routine's `SET search_path` line; a hand-written
@@ -146,10 +159,13 @@ When the collection context declares `catalog_complete`, the graph also carries
 readers fill `pk_position` from the primary-key constraint's key order.
 
 `context` identifies a collection with `source_id`, optional `database` and
-`schema_filter`, and `catalog_complete`. `dependencies` carries source and
-target object references, catalog name, and dependency type. These fields are
-structural input to document comparison and source-aware merge; a consumer must
-not infer a cross-database target when zero or multiple collected sources match.
+`schema_filter`, and `catalog_complete`. It may also carry the server's raw
+identifier case rules, `lower_case_table_names` (MySQL/MariaDB) and `collation`
+(SQL Server); producers omit them when the server does not answer.
+`dependencies` carries source and target object references, catalog name, and
+dependency type. These fields are structural input to document comparison and
+source-aware merge; a consumer must not infer a cross-database target when zero
+or multiple collected sources match.
 
 To emit a document from a live scan, use the CLI option that writes the raw
 catalog alongside the graph:
