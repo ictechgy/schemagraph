@@ -121,7 +121,8 @@ PR #59는 GLM 리뷰 없이 머지됐다.
      객체 단위 간선만 대소문자만 다른 관계로 잇는다. 뷰 몸체와 컬럼 단위 간선(Binder)은 정확 비교라 같은 참조가
      뷰에서는 간선 없이, routine에서는 테이블 간선만 있고 컬럼 간선 없이 남는다. SQL Server 미해석 메시지는 CI
      collation이 있어도 "a case-insensitive collation is not assumed"라고 쓴다. RELEASE-NOTES `# Unreleased`의
-     PR #59 항목("relation names in bodies match …")은 이 범위를 과장한다. 고치려면 Binder(`scope.rs`의
+     PR #59 항목은 과장("relation names in bodies match …")을 고쳐 지금 범위를 적었다. 엔진 수정은 별도 PR로 한다
+     (지문이 미묘해 지난 라운드 blocker가 났다). 고치려면 Binder(`scope.rs`의
      `CatalogIndex::tables`·`relation_key`)가 같은 단일 후보 규칙을 따르게 하고 지문을 함께 확인해야 한다.
    - SQLite routine 호출의 마지막 정점 조회는 정확 비교(`lookup(false)`)라 `ÉCHO` routine을 `Écho(...)`로 부르면
      잇지 못한다. 수집기는 SQLite routine을 내지 않고(경로 이름의 query routine뿐) 실사용 영향은 없다고 봤다.
