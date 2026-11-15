@@ -76,6 +76,7 @@ not hidden by any comparison step:
 | PostgreSQL primary-key index | Not listed in `indexes` (`NOT indisprimary`) | Not listed | Listed (pgjdbc `getIndexInfo` includes it) |
 | MySQL/MariaDB `PRIMARY` index | Not listed | Not listed | Listed (`getIndexInfo` path) |
 | SQLite inline UNIQUE/CHECK notice | Limitation when the DDL has the keyword | Same | Not reported; unique constraints are still visible as unique indexes |
+| SQLite view that SQLite cannot compile (missing table or column, application-defined function) | Kept without columns; one limitation per schema counts the views and lists them with SQLite's reason | Kept without columns; one generic `sqlite columns source text was not collected (…)` limitation per view that carries SQLite's reason but not the view name | Kept without columns; `getColumns failed` and `getPrimaryKeys failed` limitations per view |
 | Server case rules in `context` | MySQL `lower_case_table_names` | MySQL, SQL Server collation | MySQL, MariaDB, SQL Server collation |
 | System schemas skipped | Per database | Per database | Per dialect; unknown dialects use the combined list |
 

@@ -265,6 +265,8 @@ async fn read_schema(
     let mut objects: Vec<ObjectDoc> = Vec::new();
     let mut pending_triggers: Vec<(String, String, Option<String>)> = Vec::new();
     let mut inline_constraints = false;
+    // 컬럼을 읽지 못한 뷰와 SQLite가 알려 준 이유. 스키마마다 한 번 세어 알린다.
+    let mut uncompilable_views: Vec<(String, String)> = Vec::new();
 
     for row in &rows {
         let (name, kind, sql, tbl_name): (String, String, Option<String>, Option<String>) = (
@@ -282,7 +284,17 @@ async fn read_schema(
                     inline_constraints = true;
                 }
                 // 한 번 읽은 컬럼·index_list를 제약·인덱스 수집에 넘겨 같은 PRAGMA를 다시 보내지 않는다.
-                let (columns, index_list) = read_columns(pool, schema, &name).await?;
+                let (columns, index_list) = match read_columns(pool, schema, &name).await {
+                    Ok(read) => read,
+                    // 뷰의 컬럼은 SQLite가 정의를 컴파일해야 나온다. 없는 테이블·컬럼이나 앱이
+                    // 연결마다 등록하는 함수를 쓰는 뷰는 만들 수 있어도 컴파일되지 않는다. 그 뷰
+                    // 하나로 scan 전체를 끝내지 않고, 뷰와 원문은 두되 컬럼은 비워 알린다.
+                    Err(SourceError::Query(sqlx::Error::Database(error))) if kind == "view" => {
+                        uncompilable_views.push((name.clone(), error.message().to_owned()));
+                        (Vec::new(), Vec::new())
+                    }
+                    Err(error) => return Err(error),
+                };
                 let constraints = read_constraints(pool, schema, &name, &columns).await?;
                 let indexes = read_indexes(pool, schema, &index_list).await?;
                 objects.push(ObjectDoc {
@@ -322,6 +334,9 @@ async fn read_schema(
         }
     }
 
+    if !uncompilable_views.is_empty() {
+        limitations.push(uncompilable_views_notice(schema, &uncompilable_views));
+    }
     if inline_constraints {
         limitations.push(INLINE_CONSTRAINTS_LIMITATION.to_owned());
     }
@@ -338,6 +353,34 @@ async fn read_schema(
         objects,
         routines: Vec::new(),
     })
+}
+
+/// 한계 문구에 이름을 적는 컴파일 불가 뷰의 최대 수. 나머지는 수로만 남긴다.
+const UNCOMPILABLE_VIEWS_LISTED: usize = 10;
+
+/// 컬럼을 읽지 못한 뷰를 스키마마다 센 한계 문구다.
+///
+/// 이 한계는 카탈로그 완전성을 낮춘다. 뷰는 선언되지만 컬럼이 없으므로, 그 컬럼을 쓰는
+/// 사용을 "선언 없음"으로 확정하면 안 된다. 뷰마다 SQLite가 알려 준 이유(`no such table`,
+/// `no such function` 등)를 함께 적어 원인을 찾게 한다.
+fn uncompilable_views_notice(schema: &str, views: &[(String, String)]) -> String {
+    let listed: Vec<String> = views
+        .iter()
+        .take(UNCOMPILABLE_VIEWS_LISTED)
+        .map(|(name, reason)| format!("{name} ({reason})"))
+        .collect();
+    let more = views.len().saturating_sub(UNCOMPILABLE_VIEWS_LISTED);
+    let more = if more > 0 {
+        format!(", and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "{schema}: columns of {} view(s) were not collected because SQLite could not compile \
+         their definitions; the views are kept without columns: {}{more}",
+        views.len(),
+        listed.join(", ")
+    )
 }
 
 /// 컬럼과 그 테이블의 index_list 행을 함께 읽는다.
@@ -697,6 +740,63 @@ mod tests {
         ] {
             assert_eq!(declares_inline_constraint(ddl), want, "{ddl}");
         }
+    }
+
+    /// SQLite는 없는 테이블·컬럼이나 앱이 등록하는 함수를 쓰는 뷰의 생성을 허용하지만,
+    /// 그 뷰는 컴파일하지 못해 `PRAGMA table_xinfo`가 실패한다. 뷰 하나 때문에 scan 전체가
+    /// 끝나면 안 된다 — 뷰와 원문은 남기고 컬럼만 비운 뒤, 센 한계로 알리고 카탈로그를
+    /// 불완전으로 표시한다. 나머지 객체는 평소대로 읽힌다.
+    #[tokio::test]
+    async fn uncompilable_views_are_kept_without_columns_and_counted() {
+        let doc = fixture_doc(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY);
+             CREATE VIEW v_ok AS SELECT id FROM t;
+             CREATE VIEW v_table AS SELECT id FROM missing_t;
+             CREATE VIEW v_fn AS SELECT app_fn(id) AS x FROM t;
+             CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END",
+        )
+        .await;
+        let object = |name: &str| {
+            doc.schemas[0]
+                .objects
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("{name} must stay in the catalog"))
+        };
+        assert_eq!(object("t").columns.len(), 1);
+        assert_eq!(object("t").triggers.len(), 1);
+        assert_eq!(object("v_ok").columns.len(), 1);
+        for name in ["v_table", "v_fn"] {
+            let view = object(name);
+            assert_eq!(view.kind, "view");
+            assert!(view.columns.is_empty(), "{name}: {:?}", view.columns);
+            assert!(view
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("SELECT")));
+        }
+        assert_eq!(
+            doc.limitations,
+            [
+                "main: columns of 2 view(s) were not collected because SQLite could not compile \
+                 their definitions; the views are kept without columns: \
+                 v_fn (no such function: app_fn), v_table (no such table: main.missing_t)"
+            ]
+        );
+        assert!(!doc.context.as_ref().unwrap().catalog_complete);
+    }
+
+    /// 한계 문구의 뷰 목록은 길이가 정해져 있다. 나머지는 수로만 남긴다.
+    #[test]
+    fn uncompilable_view_notice_is_bounded() {
+        let views: Vec<(String, String)> = (0..12)
+            .map(|i| (format!("v{i:02}"), "no such table: main.gone".to_owned()))
+            .collect();
+        let notice = uncompilable_views_notice("main", &views);
+        assert!(notice.starts_with("main: columns of 12 view(s) were not collected"));
+        assert!(notice.contains("v09 (no such table: main.gone)"));
+        assert!(!notice.contains("v10 ("));
+        assert!(notice.ends_with(", and 2 more"), "{notice}");
     }
 
     #[tokio::test]
