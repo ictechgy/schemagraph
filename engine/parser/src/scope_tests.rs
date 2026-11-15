@@ -2247,6 +2247,36 @@ fn postgres_table_without_columns_stays_a_known_relation() {
     assert!(edge(&graph, "s.v", "s.empty", EdgeKind::Reads));
 }
 
+/// SQLite 트리거의 NEW/OLD는 소유 테이블이다. 그 이름에 대문자가 있으면(`"Pedidos"`, EF Core의
+/// `Blogs`) Binder 색인과 같은 `catalog_key`로 찾아야 한다. 원래 철자로 찾으면 거짓
+/// `relation 's.Pedidos' is missing`·`transition column 'new.qty'` 진단이 나고, 객체 단위
+/// `reads`는 있는데 `derives-from` 간선이 빠졌다.
+#[test]
+fn sqlite_trigger_transition_table_keeps_its_letter_case() {
+    let mut pedidos = object("Pedidos", &["qty"]);
+    pedidos.triggers.push(TriggerDoc {
+        name: "trg_p".into(),
+        body: Some(
+            "CREATE TRIGGER trg_p AFTER INSERT ON \"Pedidos\" BEGIN INSERT INTO log(n) VALUES (NEW.qty); END"
+                .into(),
+        ),
+    });
+    let graph = sqlite_doc(vec![pedidos, object("log", &["n"])], vec![]);
+    let trigger = trigger_id(&graph);
+    let analysis = &graph.analysis()[&VertexId::from_raw(&trigger)];
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert_eq!(analysis.state, AnalysisState::Complete, "{detail}");
+    assert!(analysis.diagnostics.is_empty(), "{detail}");
+    assert!(
+        edge(&graph, "s.log.n", "s.Pedidos.qty", EdgeKind::DerivesFrom),
+        "{detail}"
+    );
+    assert!(
+        edge(&graph, &trigger, "s.log.n", EdgeKind::Writes),
+        "{detail}"
+    );
+}
+
 /// MySQL routine 이름은 플랫폼과 무관하게 대소문자를 구분하지 않는다. 테이블
 /// 이름은 lower_case_table_names에 달려 있어 기본으로 접지 않는다.
 #[test]

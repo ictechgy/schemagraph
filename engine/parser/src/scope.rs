@@ -2103,15 +2103,22 @@ pub(crate) fn apply_dml_column_effects(
         locations_trusted: options.locations_trusted,
     };
     if let Some((transition_table, transition_names)) = options.transition {
-        let relation = analyzer.binder.table(&[transition_table.to_owned()], None);
+        // 소유 테이블 이름은 카탈로그 철자 그대로다. Binder 색인은 `catalog_key`로 접혀 있어
+        // (SQLite `"Pedidos"` → `pedidos`) 같은 규칙으로 찾아야 NEW/OLD가 테이블에 닿는다.
+        let dialect = analyzer.binder.catalog.dialect;
+        let relation = analyzer
+            .binder
+            .table(&[catalog_key(dialect, transition_table)], None);
         for name in transition_names {
             analyzer
                 .binder
                 .pseudo_relations
                 .insert(procedural_symbol_key(name), relation.clone());
-            let normalized = match analyzer.binder.catalog.dialect {
+            let normalized = match dialect {
                 "oracle" | "db2" => name.to_uppercase(),
-                "postgres" | "postgresql" | "sqlite" => name.to_lowercase(),
+                "postgres" | "postgresql" => name.to_lowercase(),
+                // SQLite 식별자는 ASCII 대소문자만 접는다(`catalog_key`와 같은 규칙).
+                "sqlite" => name.to_ascii_lowercase(),
                 _ => (*name).to_owned(),
             };
             analyzer
