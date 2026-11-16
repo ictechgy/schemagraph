@@ -105,8 +105,10 @@ Kelvin sign `K` (U+212A) does not match `k`. The rule covers relation, column,
 alias and CTE names, at the object level (`reads`/`writes`) and at the column
 level. A routine call folds its own name the same way but is linked only to a
 routine whose catalog name is spelled exactly that way, so `ECHO(x)` reaches a
-routine `echo` while `echo(x)` does not reach a routine `ECHO`; the collectors
-report no SQLite routines, so this matters only for hand-written documents. A
+routine `echo` while neither `echo(x)` nor `ECHO(x)` reaches a routine `ECHO`
+(a routine whose catalog name has an ASCII capital is reached by no call); the
+collectors report no SQLite routines, so this matters only for hand-written
+documents. A
 SQLite table or view whose `columns` list is empty is read as a relation with
 unknown columns, because SQLite objects always have at least one column: the
 native reader writes such a view when SQLite cannot compile its definition, and

@@ -21,7 +21,7 @@
 - isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
 - 브랜치 `ccr-37904670-hxdjsx`(`origin/main` `ea1bd11` 기준)는 [PR #61](https://github.com/ictechgy/schemagraph/pull/61)이다.
   아래 세 작업(SQLite ASCII 접기 `1299676`, 컴파일되지 않는 SQLite 뷰 `dfdeecd`, CATALOG.md SQL Server 문단 `bb4c916`)과
-  독립 리뷰(r2) 반영 커밋이 있다. 리뷰 반영 커밋은 이 세션에서 push하지 않았다.
+  독립 리뷰(r2) 반영 커밋이 있다. 리뷰 반영 커밋(`734a4a9`까지)은 push했고, 증분 재검증(r3)에서 머지 가능 판정을 받았다.
 
 ### SQLite 식별자 ASCII 접기 (2026-11-15, `1299676`)
 
@@ -155,7 +155,7 @@ PR #59는 GLM 리뷰 없이 머지됐다.
    GitHub Release·crates.io·Maven Central을 **각각** 게시하고, 채널 표를 실제 조회 결과로 갱신한다.
    crates.io 누락분(0.7.1·0.8.0·0.8.1)은 다시 게시하지 않고 0.10.0이 그 변경을 담는다.
 2. isthmus 쪽 `compatibility.json`의 schemagraph 고정을 올리는 일은 isthmus 저장소에 맡긴다.
-3. PR #61: 리뷰 반영 커밋을 push하고 CI를 확인한 뒤 머지한다. 이 세션에서 돌리지 못한 검증: Docker DB fixture,
+3. PR #61: CI를 확인한 뒤 머지한다. 이 세션에서 돌리지 못한 검증: Docker DB fixture,
    `verify-bridge-facts.py`의 PostgreSQL 사례(PostgreSQL 바이너리 없음 — SQLite 사례만 isthmus 0.14.0으로 실행),
    JDBC 프로브 JUnit·Go 프로브 테스트(프로브 코드는 바꾸지 않았다), GLM 리뷰.
 4. 후속 후보(이번 작업에서 관찰, 고치지 않음):
@@ -168,8 +168,12 @@ PR #59는 GLM 리뷰 없이 머지됐다.
      `CatalogIndex::tables`·`relation_key`)가 같은 단일 후보 규칙을 따르게 하고 지문을 함께 확인해야 한다.
    - SQLite routine 호출의 마지막 정점 조회는 정확 비교(`lookup(false)`)라, 호출 이름을 ASCII 소문자로 접은 철자가
      카탈로그 이름과 같을 때만 잇는다. `ECHO` routine을 `echo(...)`로, `ÉCHO`를 `Écho(...)`로 부르면 잇지 못한다
-     (`ECHO(...)`로 `echo`는 잇는다). 수집기는 SQLite routine을 내지 않고(경로 이름의 query routine뿐) 실사용 영향은
+     (`ECHO(...)`로 `echo`는 잇지만, ASCII 대문자가 든 이름의 routine `ECHO`는 `ECHO(...)`로도 잇지 못한다 — r3 재검증에서 확인). 수집기는 SQLite routine을 내지 않고(경로 이름의 query routine뿐) 실사용 영향은
      없다고 봤다. CATALOG.md·RELEASE-NOTES는 이 범위로 적었다.
+   - `734a4a9`의 Release binaries `Build aarch64-apple-darwin binaries`가 `Scripts/verify-cancellation.py`에서 한 번
+     `cancellation process regression failed: [Errno 32] Broken pipe`로 실패했고(job 133006619519), 같은 job을 한 번
+     다시 돌리자 통과했다. 같은 커밋의 Linux job은 통과했고 이 PR은 취소·입출력 경로를 바꾸지 않았다. 어느 검사에서
+     파이프가 끊겼는지 스크립트가 알려 주지 않아 원인은 모른다. 다시 나오면 검사 이름을 함께 출력하게 고친다.
    - 앱이 등록하는 가상 테이블 모듈을 쓰는 SQLite 가상 테이블(`no such module: …`, SQLITE_ERROR)은 kind가 table이라
      여전히 scan 전체를 종료 코드 2로 끝낸다(리뷰 r2 nit 5, writable_schema로 만든 DB로 확인). 컴파일 불가 뷰
      규칙은 뷰에만 적용했다. 고치려면 `CREATE VIRTUAL TABLE` 테이블만 같은 규칙으로 남기고 한계를 따로 세야 한다.
