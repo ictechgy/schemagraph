@@ -265,6 +265,8 @@ async fn read_schema(
     let mut objects: Vec<ObjectDoc> = Vec::new();
     let mut pending_triggers: Vec<(String, String, Option<String>)> = Vec::new();
     let mut inline_constraints = false;
+    // 컬럼을 읽지 못한 뷰와 SQLite가 알려 준 이유. 스키마마다 한 번 세어 알린다.
+    let mut uncompilable_views: Vec<(String, String)> = Vec::new();
 
     for row in &rows {
         let (name, kind, sql, tbl_name): (String, String, Option<String>, Option<String>) = (
@@ -282,7 +284,19 @@ async fn read_schema(
                     inline_constraints = true;
                 }
                 // 한 번 읽은 컬럼·index_list를 제약·인덱스 수집에 넘겨 같은 PRAGMA를 다시 보내지 않는다.
-                let (columns, index_list) = read_columns(pool, schema, &name).await?;
+                let (columns, index_list) = match read_columns(pool, schema, &name).await {
+                    Ok(read) => read,
+                    // 뷰의 컬럼은 SQLite가 정의를 컴파일해야 나온다. 없는 테이블·컬럼이나 앱이
+                    // 연결마다 등록하는 함수를 쓰는 뷰는 만들 수 있어도 컴파일되지 않는다. 그 뷰
+                    // 하나로 scan 전체를 끝내지 않고, 뷰와 원문은 두되 컬럼은 비워 알린다.
+                    Err(error) => match uncompilable_view_reason(&kind, &error) {
+                        Some(reason) => {
+                            uncompilable_views.push((name.clone(), reason));
+                            (Vec::new(), Vec::new())
+                        }
+                        None => return Err(error),
+                    },
+                };
                 let constraints = read_constraints(pool, schema, &name, &columns).await?;
                 let indexes = read_indexes(pool, schema, &index_list).await?;
                 objects.push(ObjectDoc {
@@ -322,6 +336,9 @@ async fn read_schema(
         }
     }
 
+    if !uncompilable_views.is_empty() {
+        limitations.push(uncompilable_views_notice(schema, &uncompilable_views));
+    }
     if inline_constraints {
         limitations.push(INLINE_CONSTRAINTS_LIMITATION.to_owned());
     }
@@ -338,6 +355,78 @@ async fn read_schema(
         objects,
         routines: Vec::new(),
     })
+}
+
+/// SQLite 주 결과 코드 SQLITE_ERROR. 확장 결과 코드는 하위 8비트에 주 코드를 담는다
+/// (<https://www.sqlite.org/rescode.html>).
+const SQLITE_ERROR: i32 = 1;
+
+/// 컬럼 읽기 실패가 "SQLite가 이 뷰의 정의를 컴파일하지 못했다"는 사실이면 그 이유를 돌려준다.
+///
+/// 뷰만 대상이다 — 테이블 컬럼은 정의를 컴파일하지 않고 나오므로 그 실패는 DB 자체의 문제다.
+/// 오류도 SQLITE_ERROR 계열만이다. sqlx는 0이 아닌 SQLite 결과 코드를 모두
+/// `sqlx::Error::Database`로 올리므로 BUSY·LOCKED·IOERR·CORRUPT·NOMEM·CANTOPEN·NOTADB까지
+/// 삼키면, 잠금 경합 한 번에 멀쩡한 뷰의 컬럼이 비고 실행마다 다른 뷰가 "컴파일 불가"로
+/// 보고된다. 그런 오류는 테이블처럼 scan을 끝내야 한다.
+fn uncompilable_view_reason(kind: &str, error: &SourceError) -> Option<String> {
+    let SourceError::Query(sqlx::Error::Database(error)) = error else {
+        return None;
+    };
+    (kind == "view" && is_sqlite_error_code(error.code().as_deref()))
+        .then(|| error.message().to_owned())
+}
+
+/// sqlx가 십진 문자열로 싣는 SQLite 확장 결과 코드가 SQLITE_ERROR(1)이나 그 확장 코드
+/// (예: 없는 collation의 SQLITE_ERROR_MISSING_COLLSEQ 257)인가.
+///
+/// 정의 컴파일 실패(없는 테이블·컬럼·함수·collation·모듈)는 모두 이 계열이다. 코드가 없거나
+/// 읽을 수 없으면 컴파일 실패라고 확정하지 않는다.
+fn is_sqlite_error_code(code: Option<&str>) -> bool {
+    code.and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| code & 0xff == SQLITE_ERROR)
+}
+
+/// 한계 문구에 이름을 적는 컴파일 불가 뷰의 최대 수. 나머지는 수로만 남긴다.
+const UNCOMPILABLE_VIEWS_LISTED: usize = 10;
+
+/// 한계 문구에 싣는 뷰 이름·SQLite 메시지 한 조각의 최대 글자 수다.
+const NOTICE_PART_CHARS: usize = 120;
+
+/// 컬럼을 읽지 못한 뷰를 스키마마다 센 한계 문구다.
+///
+/// 이 한계는 카탈로그 완전성을 낮춘다. 뷰는 선언되지만 컬럼이 없으므로, 그 컬럼을 쓰는
+/// 사용을 "선언 없음"으로 확정하면 안 된다. 뷰마다 SQLite가 알려 준 이유(`no such table`,
+/// `no such function` 등)를 함께 적어 원인을 찾게 한다.
+fn uncompilable_views_notice(schema: &str, views: &[(String, String)]) -> String {
+    let listed: Vec<String> = views
+        .iter()
+        .take(UNCOMPILABLE_VIEWS_LISTED)
+        .map(|(name, reason)| format!("{} ({})", notice_part(name), notice_part(reason)))
+        .collect();
+    let more = views.len().saturating_sub(UNCOMPILABLE_VIEWS_LISTED);
+    let more = if more > 0 {
+        format!(", and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "{schema}: columns of {} view(s) were not collected because SQLite could not compile \
+         their definitions; the views are kept without columns: {}{more}",
+        views.len(),
+        listed.join(", ")
+    )
+}
+
+/// 뷰 이름이나 SQLite 메시지를 한계 문구의 한 조각으로 만든다.
+///
+/// 둘 다 DB가 정한 임의의 문자열이다. 줄바꿈·ESC 같은 제어문자가 그대로 실리면 터미널과
+/// 리뷰 출력에 가짜 줄이나 색 제어가 생기므로 facts 한계와 같은 `printable`로 바꾸고, 긴
+/// 값이 한계 문자열을 끝없이 키우지 않게 글자 수로 자른 뒤 `…`로 표시한다.
+fn notice_part(text: &str) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(NOTICE_PART_CHARS).collect();
+    let cut = if chars.next().is_some() { "…" } else { "" };
+    format!("{}{cut}", crate::bridge_facts::printable(&head))
 }
 
 /// 컬럼과 그 테이블의 index_list 행을 함께 읽는다.
@@ -697,6 +786,229 @@ mod tests {
         ] {
             assert_eq!(declares_inline_constraint(ddl), want, "{ddl}");
         }
+    }
+
+    /// SQLite는 없는 테이블·컬럼이나 앱이 등록하는 함수를 쓰는 뷰의 생성을 허용하지만,
+    /// 그 뷰는 컴파일하지 못해 `PRAGMA table_xinfo`가 실패한다. 뷰 하나 때문에 scan 전체가
+    /// 끝나면 안 된다 — 뷰와 원문은 남기고 컬럼만 비운 뒤, 센 한계로 알리고 카탈로그를
+    /// 불완전으로 표시한다. 나머지 객체는 평소대로 읽힌다.
+    #[tokio::test]
+    async fn uncompilable_views_are_kept_without_columns_and_counted() {
+        let doc = fixture_doc(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY);
+             CREATE VIEW v_ok AS SELECT id FROM t;
+             CREATE VIEW v_table AS SELECT id FROM missing_t;
+             CREATE VIEW v_fn AS SELECT app_fn(id) AS x FROM t;
+             CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END",
+        )
+        .await;
+        let object = |name: &str| {
+            doc.schemas[0]
+                .objects
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("{name} must stay in the catalog"))
+        };
+        assert_eq!(object("t").columns.len(), 1);
+        assert_eq!(object("t").triggers.len(), 1);
+        assert_eq!(object("v_ok").columns.len(), 1);
+        for name in ["v_table", "v_fn"] {
+            let view = object(name);
+            assert_eq!(view.kind, "view");
+            assert!(view.columns.is_empty(), "{name}: {:?}", view.columns);
+            assert!(view
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("SELECT")));
+        }
+        assert_eq!(
+            doc.limitations,
+            [
+                "main: columns of 2 view(s) were not collected because SQLite could not compile \
+                 their definitions; the views are kept without columns: \
+                 v_fn (no such function: app_fn), v_table (no such table: main.missing_t)"
+            ]
+        );
+        assert!(!doc.context.as_ref().unwrap().catalog_complete);
+    }
+
+    /// 한계 문구의 뷰 목록은 길이가 정해져 있다. 나머지는 수로만 남긴다.
+    #[test]
+    fn uncompilable_view_notice_is_bounded() {
+        let views: Vec<(String, String)> = (0..12)
+            .map(|i| (format!("v{i:02}"), "no such table: main.gone".to_owned()))
+            .collect();
+        let notice = uncompilable_views_notice("main", &views);
+        assert!(notice.starts_with("main: columns of 12 view(s) were not collected"));
+        assert!(notice.contains("v09 (no such table: main.gone)"));
+        assert!(!notice.contains("v10 ("));
+        assert!(notice.ends_with(", and 2 more"), "{notice}");
+    }
+
+    /// 뷰 이름과 SQLite 메시지는 DB가 정한 임의의 문자열이다. 줄바꿈·ESC가 한계 문구에 그대로
+    /// 실리면 터미널과 리뷰 출력이 깨진다. 제어문자는 이스케이프하고, 긴 조각은 잘라 `…`로 표시한다.
+    #[test]
+    fn uncompilable_view_notice_escapes_and_truncates_parts() {
+        let long = "x".repeat(NOTICE_PART_CHARS + 5);
+        let views = [
+            (
+                "evil\nname\u{1b}[31m".to_owned(),
+                "no such table: main.gone\ntable\u{1b}[0m".to_owned(),
+            ),
+            (long.clone(), format!("no such table: main.{long}")),
+        ];
+        let notice = uncompilable_views_notice("main", &views);
+        assert!(!notice.chars().any(char::is_control), "{notice:?}");
+        assert!(
+            notice
+                .contains(r"evil\u{a}name\u{1b}[31m (no such table: main.gone\u{a}table\u{1b}[0m)"),
+            "{notice}"
+        );
+        let kept = "x".repeat(NOTICE_PART_CHARS);
+        assert!(
+            notice.contains(&format!(", {kept}… (no such table: main.")),
+            "{notice}"
+        );
+        assert!(!notice.contains(&long), "{notice}");
+        assert!(notice.ends_with("…)"), "{notice}");
+    }
+
+    /// 정의 컴파일 실패는 SQLITE_ERROR(1) 계열뿐이다. 확장 코드(없는 collation의 257)도 그 계열이다.
+    /// BUSY(5)·LOCKED(6)·NOMEM(7)·IOERR(10)·CORRUPT(11)·CANTOPEN(14)·NOTADB(26)와 그 확장 코드는
+    /// DB 상태의 실패라 테이블처럼 scan을 끝내야 한다.
+    #[test]
+    fn only_sqlite_error_codes_mark_a_view_uncompilable() {
+        for code in ["1", "257"] {
+            assert!(is_sqlite_error_code(Some(code)), "{code}");
+        }
+        // 261 = BUSY_RECOVERY, 262 = LOCKED_SHAREDCACHE, 266 = IOERR_READ, 267 = CORRUPT_VTAB.
+        for code in [
+            "5", "6", "7", "10", "11", "14", "26", "261", "262", "266", "267",
+        ] {
+            assert!(!is_sqlite_error_code(Some(code)), "{code}");
+        }
+        assert!(!is_sqlite_error_code(None));
+        assert!(!is_sqlite_error_code(Some("SQLITE_ERROR")));
+    }
+
+    /// 실제 SQLite 오류로 판정 경계를 본다. 같은 SQLITE_ERROR라도 뷰만 컴파일 불가로 남기고,
+    /// 테이블이나 sqlx 자체 오류는 scan을 끝내는 쪽으로 돌려보낸다.
+    #[tokio::test]
+    async fn uncompilable_view_reason_needs_a_view_and_a_sqlite_error() {
+        // 메모리 DB는 연결마다 따로라 뷰를 만든 연결 하나로만 묻는다.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE VIEW v AS SELECT id FROM gone")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = pragma(&pool, "PRAGMA table_xinfo(v)")
+            .await
+            .err()
+            .expect("a view on a missing table does not compile");
+        assert_eq!(
+            uncompilable_view_reason("view", &error).as_deref(),
+            Some("no such table: main.gone")
+        );
+        assert_eq!(uncompilable_view_reason("table", &error), None);
+        let timeout = SourceError::Query(sqlx::Error::PoolTimedOut);
+        assert_eq!(uncompilable_view_reason("view", &timeout), None);
+    }
+
+    /// 없는 collation을 쓰는 뷰는 확장 코드 SQLITE_ERROR_MISSING_COLLSEQ(257)로 실패한다. 주 코드가
+    /// SQLITE_ERROR이므로 다른 컴파일 불가 뷰와 같은 문구로 남는다.
+    #[tokio::test]
+    async fn views_with_a_missing_collation_are_kept_without_columns() {
+        let doc = fixture_doc(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE VIEW v_coll AS SELECT name COLLATE app_coll AS n FROM t",
+        )
+        .await;
+        assert_eq!(
+            doc.limitations,
+            [
+                "main: columns of 1 view(s) were not collected because SQLite could not compile \
+                 their definitions; the views are kept without columns: \
+                 v_coll (no such collation sequence: app_coll)"
+            ]
+        );
+        let view = doc.schemas[0]
+            .objects
+            .iter()
+            .find(|object| object.name == "v_coll")
+            .expect("the view stays in the catalog");
+        assert!(view.columns.is_empty());
+    }
+
+    /// 뷰의 컬럼 읽기가 잠금(SQLITE_BUSY)으로 실패하면 정의가 아니라 DB 상태의 실패다. 테이블처럼
+    /// scan을 끝내야 한다 — 삼키면 멀쩡한 뷰의 컬럼이 비고, 어느 뷰가 걸리는지가 잠금 시점에 달려
+    /// 출력이 실행마다 달라진다.
+    ///
+    /// 다른 연결이 그 뷰의 `table_xinfo` 직전에만 EXCLUSIVE 잠금을 쥐어, 앞선 `sqlite_master`
+    /// 읽기는 성공하고 뷰 읽기만 실패하게 한다. busy_timeout 0이라 기다리지 않는다.
+    #[tokio::test]
+    async fn a_locked_view_read_still_ends_the_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.db");
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let setup = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        sqlx::raw_sql("CREATE VIEW v AS SELECT 1 AS x")
+            .execute(&setup)
+            .await
+            .unwrap();
+        setup.close().await;
+
+        // 잠금을 쥔 연결은 테스트가 끝날 때까지 살아 있어야 한다. 훅 밖에서 소유한다.
+        let locker = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            <sqlx::SqliteConnection as sqlx::Connection>::connect(&url)
+                .await
+                .unwrap(),
+        )));
+        let hook_locker = std::sync::Arc::clone(&locker);
+        let view_columns = r#"PRAGMA "main".table_xinfo("v")"#;
+        let options = connect_options(&path.display().to_string())
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            // pragma()는 문장을 기록한 뒤 연결을 얻는다. 마지막 기록이 뷰의 table_xinfo일 때만 잠근다.
+            .before_acquire(move |_, _| {
+                let locker = std::sync::Arc::clone(&hook_locker);
+                Box::pin(async move {
+                    let next_reads_view = PRAGMA_STATEMENTS.with(|statements| {
+                        statements.borrow().last().map(String::as_str) == Some(view_columns)
+                    });
+                    let idle = if next_reads_view {
+                        locker.lock().unwrap().take()
+                    } else {
+                        None
+                    };
+                    if let Some(mut connection) = idle {
+                        sqlx::Executor::execute(&mut connection, "BEGIN EXCLUSIVE").await?;
+                        *locker.lock().unwrap() = Some(connection);
+                    }
+                    Ok(true)
+                })
+            })
+            .connect_with(options)
+            .await
+            .unwrap();
+        take_pragma_statements();
+
+        let error = read_schema(&pool, "main", &mut Vec::new())
+            .await
+            .expect_err("a locked view read must end the scan");
+        let SourceError::Query(sqlx::Error::Database(database)) = &error else {
+            panic!("expected a SQLite error, got {error}");
+        };
+        assert_eq!(database.code().as_deref(), Some("5"), "{error}");
+        assert_eq!(
+            take_pragma_statements().last().map(String::as_str),
+            Some(view_columns)
+        );
     }
 
     #[tokio::test]

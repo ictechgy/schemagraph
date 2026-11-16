@@ -1,6 +1,6 @@
 # HANDOFF.md
 
-## 현재 상태 (2026-11-10, PR #59 머지 이후)
+## 현재 상태 (2026-11-15, PR #61 독립 리뷰 반영 이후)
 
 - 발행본은 **0.9.0**이다. 태그 `v0.9.0` = `fad8e9d`([#58](https://github.com/ictechgy/schemagraph/pull/58)).
   그 커밋의 [CI](https://github.com/ictechgy/schemagraph/actions/runs/41583763434)·
@@ -19,6 +19,99 @@
   crates.io에는 0.7.1·0.8.0·0.8.1이 없고, Maven Central에는 0.7.1이 없다(2026-11-03 조회).
   GitHub Release v0.1.0–v0.3.0에는 첨부 아카이브가 없다(2026-11-09 조회). 누락 버전은 다시 게시하지 않는다.
 - isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
+- 브랜치 `ccr-37904670-hxdjsx`(`origin/main` `ea1bd11` 기준)는 [PR #61](https://github.com/ictechgy/schemagraph/pull/61)이다.
+  아래 세 작업(SQLite ASCII 접기 `1299676`, 컴파일되지 않는 SQLite 뷰 `dfdeecd`, CATALOG.md SQL Server 문단 `bb4c916`)과
+  독립 리뷰(r2) 반영 커밋이 있다. 리뷰 반영 커밋(`734a4a9`까지)은 push했고, 증분 재검증(r3)에서 머지 가능 판정을 받았다.
+
+### SQLite 식별자 ASCII 접기 (2026-11-15, `1299676`)
+
+PR #59 리뷰가 남긴 후속 후보를 처리했다. 근거와 결과의 정본은 RELEASE-NOTES `# Unreleased`의 해당 항목이다.
+
+- 근거: SQLite는 식별자를 `sqlite3_stricmp`와 같은 규칙으로 비교한다([c3ref/stricmp.html](https://www.sqlite.org/c3ref/stricmp.html)
+  — 'the same definition of "case independence" that SQLite uses internally when comparing identifiers').
+  그 비교는 US-ASCII 글자만 접는다(SQLite 소스의 `sqlite3UpperToLower` 주석). 이 세션은 sqlite.org에 닿지 못해
+  (프록시 403·DNS 실패) 페이지 원문을 그 페이지를 생성하는 공식 헤더(`sqlite3.h` 3.45.1, CAPI3REF "String
+  Comparison")와 amalgamation 3.46.0 소스로 확인했고, Python sqlite3 3.53.1로 실제 동작을 확인했다
+  (`ÉTUDIANTS`만 있으면 `étudiants`는 `no such table`, 켈빈 기호 테이블과 `k`는 다른 이름, `Prénom` 컬럼에
+  `PRÉNOM`은 `no such column`, `ÉTUDIANTS`와 `étudiants`는 한 스키마에 함께 만들 수 있다).
+- parser: `scope.rs`의 `catalog_key`·`name()`·`column_key`가 SQLite에서 `to_ascii_lowercase`로 접는다. 관계·컬럼·
+  별칭·CTE 이름과 몸체 캐시 지문(같은 키의 `tables` 색인)이 한 규칙을 쓴다. 객체 단위(`vertex_hit`)는
+  이미 ASCII였다. 트리거·DML 쿼리 파일의 객체 단위 CTE 비교는 리뷰 반영에서 맞췄다(아래 절). routine 호출은
+  접힌 이름과 카탈로그 철자가 정확히 같을 때만 잇는다(후속 후보). MySQL/MariaDB 컬럼 이름과 다른 방언은 바꾸지 않았다. 수집기 3종은 이미 ASCII다.
+- 회귀 테스트(수정 전 7개 모두 실패 확인): 리뷰 사례 3종(`ÉTUDIANTS`/`étudiants`, 켈빈 기호, 트리거의 객체·컬럼
+  단위 불일치), 두 변형 공존 시 정확한 테이블로 해석, 컬럼·routine 이름, ASCII 변형은 계속 일치, 캐시 cold/warm
+  일치와 지문(무관한 `ÉTUDIANTS` 변화는 지문 불변, 진짜 후보 `étudiants` 생성은 지문 변화).
+  `catalog_key`·`name()`·`column_key`를 하나씩 되돌린 부분 변이도 각각 테스트가 잡는다.
+- 실제 SQLite 대조: 엔진 간선을 SQLite authorizer가 보고한 테이블·컬럼 접근과 몸체 11개(뷰·트리거·`--sql-dir`)에서
+  비교했다. 수정 전 9개가 어긋났고(거짓 reads 4건: 앱 SQL `étudiants`·`k`, 트리거 컬럼 단위 read·write / 두 변형
+  공존 시 뷰 5개 간선 누락) 수정 후 11개 모두 일치한다. CLI `--cache-dir`의 cold/warm 출력도 카탈로그 변화 3단계에서
+  바이트 단위로 같았다. SQLite 골든(`Fixtures/sqlite`)은 식별자가 ASCII라 바뀌지 않았다(Python sqlite3로 재생성해 diff 0).
+- 좁힘: 거짓 간선 제거는 SQLite 문서 의미론에 근거한 좁힘이다. `impact`가 줄고, `dead`(뷰·routine 대상)는 그런
+  간선으로만 의존받던 뷰를 새로 보고할 수 있다. 반대로 두 변형 공존 사례는 간선이 늘어 보고가 줄 수 있다.
+  SQLite 카탈로그에는 사용 통계가 없어 `unused`는 영향이 없다.
+
+### 컴파일되지 않는 SQLite 뷰 (2026-11-15, `dfdeecd`)
+
+- 문제: SQLite는 없는 테이블·컬럼을 읽거나 앱이 등록하는 함수를 부르는 뷰의 생성을 허용하지만 그 뷰를
+  컴파일하지 못한다. 네이티브 reader는 그 뷰의 `PRAGMA table_xinfo` 오류를 그대로 올려 scan 전체가 종료 코드 2로
+  끝났다(ASCII 접기 작업의 실제 SQLite 대조 중 발견).
+- 수정: 뷰의 table_xinfo가 SQLITE_ERROR 계열(주 결과 코드 1과 그 확장 코드, 예: 없는 collation의 257)로 실패할 때만
+  뷰와 원문을 두고 컬럼을 비운다. BUSY·LOCKED·IOERR·CORRUPT·NOMEM·CANTOPEN·NOTADB 등 다른 SQLite 오류와 테이블·연결
+  오류는 그대로 scan을 끝낸다(종료 코드 2). 처음 커밋(`dfdeecd`)은 모든 `sqlx::Error::Database`를 삼켜 잠금 경합에서
+  멀쩡한 뷰의 컬럼을 비웠다 — 리뷰 r2 blocker로 좁혔다(아래 절). 스키마마다 한계 하나가 뷰 수와
+  `이름 (SQLite 이유)`를 최대 10개 적는다(제어문자 이스케이프, 조각마다 120자 절단). 이 한계는 카탈로그를 불완전으로
+  만들어 facts에 `catalog-coverage:`가 붙고, isthmus 0.14.0은 그 뷰의 컬럼 사용을
+  `column-use-without-decl-unverified` 경고로 낸다. 부작용으로 그 DB의 다른 미선언 관계 사용도 모두
+  `relation-use-without-decl-unverified` 경고로 낮아진다(둘 다 isthmus 0.14.0으로 확인).
+- 검증: 회귀 테스트(`uncompilable_views_are_kept_without_columns_and_counted`, 수정 전 `no such function: app_fn`로
+  read 실패 확인), 문구 상한 테스트, CLI scan 종료 코드 0과 graph limitations 노출, 실제 SQLite 대조에 깨진 뷰 사례
+  3개 추가(14개 몸체 모두 일치).
+- 다른 수집기: Go 프로브(`bestEffort`)와 JDBC 프로브(`getColumns failed`)는 같은 DB에서 이미 뷰를 남기고 카탈로그를
+  불완전으로 표시했다(이 세션에서 Go 프로브를 빌드하고 JDBC jar을 Gradle `--offline`으로 다시 만들어 실행해 확인).
+  문구 차이는 SUPPORT-MATRIX 수집기 차이 표에 적었다. Go 문구는 뷰 이름을 적지 않고 "source text was not collected"라
+  사실과 어긋나지만 실패가 아니라 이번 범위에 넣지 않았다.
+
+### PR #61 독립 리뷰(r2) 반영 (2026-11-15)
+
+리뷰 원문은 모델 출력이라 주장마다 실제 SQLite·CLI·테스트로 재현한 뒤 반영했다. 회귀 테스트는 모두 수정 전에
+실패하는 것을 확인했다. 커밋: `09230ac`(분류), `5463012`(문구 이스케이프), `25418a7`(컬럼 없는 객체),
+`3240f30`(전이 테이블), `453cb8b`(CTE), `6bd2cef`(RELEASE-NOTES·CATALOG.md), 그리고 이 HANDOFF.
+
+- blocker 1(분류): `sqlite.rs` `uncompilable_view_reason`·`is_sqlite_error_code`가 뷰 + SQLITE_ERROR 계열만 컴파일
+  불가로 본다. 테스트: 코드 분류(1·257 참, 5·6·7·10·11·14·26과 확장 코드 261·262·266·267 거짓), 실제 SQLite 오류로
+  뷰/테이블/sqlx 오류 경계, 없는 collation 뷰(257)가 같은 문구로 남음, 그리고 `a_locked_view_read_still_ends_the_scan`
+  — 다른 연결이 그 뷰의 table_xinfo 직전에만 EXCLUSIVE 잠금을 쥐는 결정적 통합 테스트(풀 `before_acquire` 훅,
+  busy_timeout 0). 분류를 되돌리면 이 테스트가 실패한다. 리뷰의 CLI 재현(뷰 4000개, 6.5초 잠금)은 수정 후 2/2
+  종료 코드 2(`code: 5`)다. 기존 컴파일 불가 테스트 문구는 그대로 통과한다.
+- should-fix 2: `scope.rs` `columns_unknown` — SQLite 객체의 컬럼이 0개면 Binder가 알 수 없는 관계로 본다(SQLite
+  테이블·뷰는 컬럼 0개가 불가능). 깨진 뷰를 읽는 `SELECT *`는 `partial` + `SG_WILDCARD_UNKNOWN`이 된다. PostgreSQL
+  0컬럼 테이블은 그대로 완전 분석인지 같은 입력으로 함께 검사한다.
+- should-fix 3·nit 3: 트리거 전이 테이블(NEW/OLD)을 `catalog_key`로 찾는다. `"Pedidos"` 트리거의 거짓
+  `relation 's.Pedidos' is missing`과 빠진 `derives-from`이 고쳐진다. SQLite NEW/OLD 이름 정규화도 ASCII로 맞췄다.
+- should-fix 4: `lib.rs` `CollectRules`에 `sqlite`(방언 판정)를 두고 `body_relations::collect_reads`가 CTE 이름을
+  ASCII로 접어 비교한다. 리뷰가 제안한 trigger 전용 플래그(`sqlite_trigger`)로는 DML 쿼리 파일이 고쳐지지 않는다 —
+  수정 전 테스트에서 쿼리 파일도 `Reads s.recent` 거짓 간선을 냈다. 실제 SQLite에서 그 트리거는 CTE 값(7)을 넣는다.
+- nit 1: 한계 문구의 뷰 이름·SQLite 메시지를 `bridge_facts::printable`(재사용, `pub(crate)`로 연다)로 이스케이프하고
+  조각마다 120자에서 자른다.
+- nit 2·nit 4·문서: RELEASE-NOTES(컴파일 불가 뷰 항목, PR #59 대소문자 항목, CTE·전이 테이블 항목), CATALOG.md
+  (SQLite·SQL Server 문단). nit 2의 두 주장(CI collation 다중 후보에서도 "a case-insensitive collation is not assumed",
+  lctn=1에서 SELECT 쿼리 파일은 정확 비교·DML 쿼리 파일만 객체 단위로 접힘)은 SQL Server·MySQL 문서로 확인했다.
+  CATALOG의 "routine 이름도 접힌다"는 과장이라 좁혔다(아래 후속 후보).
+- 골든·캐시: `Fixtures/sqlite/basic.sql`을 Python sqlite3로 다시 만들어 scan한 결과가 골든과 diff 0. CLI
+  `--cache-dir` cold/warm 출력이 캐시 없는 scan과 카탈로그 4단계(깨진 뷰가 컴파일됐다가 다시 깨짐 포함)에서
+  바이트 단위로 같다.
+- 검증: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, 워크스페이스
+  테스트 707개 통과(parser 216+20+9+7, source 122+7+6+7, cli 통합 78 + bin 70, core 91, analysis 29, export 45 —
+  디스크 때문에 cli 통합 테스트는 바이너리 하나씩 돌리고 지웠다), `verify-document-versions.py`(SQLite 문서),
+  `test-capture-migration.py`(7개), `verify-sqlite-nullability.py --engine`, `verify-bridge-facts.py`의 SQLite 두
+  사례(isthmus-cli 0.14.0, 계약 자기 비교 `no-changes-observed`). PostgreSQL 사례·Docker fixture·프로브 테스트·GLM
+  리뷰는 이번에도 돌리지 못했다.
+
+### CATALOG.md SQL Server 문단 (2026-11-15, `bb4c916`)
+
+- "documents do not carry it" 문구를 PR #59 이후 동작으로 고치고 context 필드 목록에 `lower_case_table_names`·
+  `collation`을 더했다. 문구는 `--document`로 만든 SQL Server(CI collation)·MySQL(lctn=1) 문서를 scan해 확인한
+  실제 동작을 적는다(아래 후속 후보 참고).
 
 ### PR #59 리뷰에서 처리한 것
 
@@ -56,16 +149,38 @@ PR #59는 GLM 리뷰 없이 머지됐다.
 - JDBC 프로브의 JUnit 실행은 이 세션에서 Maven Central 429로 의존성을 받지 못해 못 돌렸다.
   바뀐 `CatalogScopeTest.systemSchemasDependOnTheDialect`만 컴파일된 클래스를 직접 실행해 확인했다(수정 전 실패).
 
-## 다음 할 일 (PR #59 머지 이후)
+## 다음 할 일 (2026-11-15)
 
 1. 다음 릴리스는 **0.10.0**이다 — `CollectionContext`에 공개 필드가 늘었다. [RELEASING.md](RELEASING.md) 절차로
    GitHub Release·crates.io·Maven Central을 **각각** 게시하고, 채널 표를 실제 조회 결과로 갱신한다.
    crates.io 누락분(0.7.1·0.8.0·0.8.1)은 다시 게시하지 않고 0.10.0이 그 변경을 담는다.
 2. isthmus 쪽 `compatibility.json`의 schemagraph 고정을 올리는 일은 isthmus 저장소에 맡긴다.
-3. 후속 후보: SQLite 관계 이름의 비ASCII 거짓 match. SQLite는 ASCII 대소문자만 무시하는데
-   `scope.rs`의 `catalog_key`·`name()`은 SQLite에서 유니코드 규칙(`to_lowercase`)으로 접어 `ÉTUDIANTS`와
-   `étudiants`를 같은 관계로 본다. PR #59 리뷰가 확인했고 0.9.0(`fad8e9d`)에도 있던 문제다.
-   제안은 ASCII 접기(`to_ascii_lowercase`)다. 몸체 캐시 지문도 같은 키를 쓰므로 함께 확인한다.
+3. PR #61: CI를 확인한 뒤 머지한다. 이 세션에서 돌리지 못한 검증: Docker DB fixture,
+   `verify-bridge-facts.py`의 PostgreSQL 사례(PostgreSQL 바이너리 없음 — SQLite 사례만 isthmus 0.14.0으로 실행),
+   JDBC 프로브 JUnit·Go 프로브 테스트(프로브 코드는 바꾸지 않았다), GLM 리뷰.
+4. 후속 후보(이번 작업에서 관찰, 고치지 않음):
+   - 대소문자 접기 방언(MySQL `lower_case_table_names` 1·2, SQL Server `_CI` collation)은 routine·trigger 몸체의
+     객체 단위 간선만 대소문자만 다른 관계로 잇는다. 뷰 몸체와 컬럼 단위 간선(Binder)은 정확 비교라 같은 참조가
+     뷰에서는 간선 없이, routine에서는 테이블 간선만 있고 컬럼 간선 없이 남는다. SQL Server 미해석 메시지는 CI
+     collation이 있어도 "a case-insensitive collation is not assumed"라고 쓴다. RELEASE-NOTES `# Unreleased`의
+     PR #59 항목은 과장("relation names in bodies match …")을 고쳐 지금 범위를 적었다. 엔진 수정은 별도 PR로 한다
+     (지문이 미묘해 지난 라운드 blocker가 났다). 고치려면 Binder(`scope.rs`의
+     `CatalogIndex::tables`·`relation_key`)가 같은 단일 후보 규칙을 따르게 하고 지문을 함께 확인해야 한다.
+   - SQLite routine 호출의 마지막 정점 조회는 정확 비교(`lookup(false)`)라, 호출 이름을 ASCII 소문자로 접은 철자가
+     카탈로그 이름과 같을 때만 잇는다. `ECHO` routine을 `echo(...)`로, `ÉCHO`를 `Écho(...)`로 부르면 잇지 못한다
+     (`ECHO(...)`로 `echo`는 잇지만, ASCII 대문자가 든 이름의 routine `ECHO`는 `ECHO(...)`로도 잇지 못한다 — r3 재검증에서 확인). 수집기는 SQLite routine을 내지 않고(경로 이름의 query routine뿐) 실사용 영향은
+     없다고 봤다. CATALOG.md·RELEASE-NOTES는 이 범위로 적었다.
+   - `734a4a9`의 Release binaries `Build aarch64-apple-darwin binaries`가 `Scripts/verify-cancellation.py`에서 한 번
+     `cancellation process regression failed: [Errno 32] Broken pipe`로 실패했고(job 133006619519), 같은 job을 한 번
+     다시 돌리자 통과했다. 같은 커밋의 Linux job은 통과했고 이 PR은 취소·입출력 경로를 바꾸지 않았다. 어느 검사에서
+     파이프가 끊겼는지 스크립트가 알려 주지 않아 원인은 모른다. 다시 나오면 검사 이름을 함께 출력하게 고친다.
+   - 앱이 등록하는 가상 테이블 모듈을 쓰는 SQLite 가상 테이블(`no such module: …`, SQLITE_ERROR)은 kind가 table이라
+     여전히 scan 전체를 종료 코드 2로 끝낸다(리뷰 r2 nit 5, writable_schema로 만든 DB로 확인). 컴파일 불가 뷰
+     규칙은 뷰에만 적용했다. 고치려면 `CREATE VIRTUAL TABLE` 테이블만 같은 규칙으로 남기고 한계를 따로 세야 한다.
+   - 범위 밖(모든 방언): `--sql-dir`의 `WITH x AS (…) INSERT INTO log …`는 `is_select`가 참이라 SELECT 경로로 가서
+     `SG_SET_UNSUPPORTED`만 남고 `writes log` 간선이 없다(`lib.rs` `is_column_dml_statement`가 `Query { body: Insert }`를
+     보지 않는다). SQLite 문서로 확인했다. 이슈로 올릴 후보다.
+   - Go 프로브의 컴파일 불가 뷰 한계는 뷰 이름 없이 "sqlite columns source text was not collected (…)"라고 쓴다.
 
 ## Blocker와 열린 질문 (2026-11-09)
 

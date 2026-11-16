@@ -257,7 +257,9 @@ fn schema_filter_limitation(filter: &[String]) -> String {
 }
 
 /// 제어문자만 `\u{..}` 형태로 바꾼다 — 나머지 이름은 그대로 읽히게 둔다.
-fn printable(name: &str) -> String {
+///
+/// DB가 정한 이름을 한계 문구에 싣는 다른 reader(SQLite 컴파일 불가 뷰)도 같은 규칙을 쓴다.
+pub(crate) fn printable(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
