@@ -116,6 +116,31 @@ such a virtual table when SQLite cannot connect its module (`no such module: …
 `SELECT *` over either is reported as `SG_WILDCARD_UNKNOWN` instead of expanding
 to nothing.
 
+PostgreSQL names in bodies (routines, views, `--sql-dir` and imported query
+files, column defaults) follow PostgreSQL's identifier rule for a database with a
+multi-byte encoding such as UTF8: a double-quoted name is compared exactly, and an
+unquoted name has only its 26 ASCII letters lower-cased before it is compared
+exactly with the catalog name (`downcase_identifier` in PostgreSQL's
+`src/backend/parser/scansup.c`). Letters outside ASCII are kept as written:
+`Orders` matches a table `orders`, `Été` matches a table `Été` (PostgreSQL stores
+`CREATE TABLE Été` under that name) but not `été`, `ÉTÉ` names `ÉtÉ`, and `ΑΣ`
+matches `ΑΣ` but not `ας`, although Unicode lower-casing with its Greek
+final-sigma rule maps one to the other. The rule covers relation, column, alias,
+CTE and routine names at the object level (`reads`/`writes`/`calls`) and at the
+column level, the schema and table parts of names qualified with the collected
+database (`context.database`), and unquoted entries of a routine's
+`SET search_path` clause (`SET search_path TO ÉCOLE` names the schema `École`).
+View definitions, column defaults and `SET search_path` lines collected from
+PostgreSQL (`pg_get_viewdef`, `information_schema.columns.column_default`,
+`pg_get_functiondef`) already double-quote every name outside lower-case ASCII,
+so the rule matters for routine source text, query files and hand-written
+documents. The document does not record the database encoding, so
+the multi-byte rule is always used. In a database with a single-byte encoding
+(such as `LATIN1`), PostgreSQL also passes letters outside ASCII to the C
+library's `tolower()` under the database's `LC_CTYPE`; with the `C` locale that
+changes nothing, but with a locale that maps those letters a reference that
+PostgreSQL resolves through such a fold stays unresolved here.
+
 SQL Server relation names follow the database collation when the document
 carries it in `context.collation` (the Go and JDBC probes collect it). With a
 collation that has a `_CI` attribute, a relation name in a routine, trigger or
