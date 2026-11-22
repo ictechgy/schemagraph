@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 type sqliteObject struct {
@@ -322,8 +323,24 @@ func (h *harvester) sqliteTriggers(schema string, objects []ObjectDoc) {
 // sqliteObjectLabel — 객체 하나에 대한 PRAGMA 실패 문구의 머리다. 객체 이름이 없으면
 // 같은 SQLite 메시지로 실패한 뷰 여러 개가 한 문구로 합쳐져(limitations는 중복을 뺀다)
 // 어느 객체가 몇 개 빠졌는지 알 수 없다. JDBC 프로브의 `schema.object: …`와 같은 모양이다.
+// 이름은 DB가 정한 임의의 문자열이라 제어문자를 이스케이프한다.
 func sqliteObjectLabel(schema, object, label string) string {
-	return fmt.Sprintf("%s.%s: %s", schema, object, label)
+	return fmt.Sprintf("%s.%s: %s", printableName(schema), printableName(object), label)
+}
+
+// printableName — 제어문자(C0·DEL·C1)와 U+2028·U+2029만 엔진 문구와 같은 `\u{..}` 꼴로
+// 바꾼다. 줄바꿈·ESC가 그대로 실리면 한계 목록에 가짜 줄이나 터미널 색 제어가 생긴다.
+// 나머지 글자는 그대로 둔다.
+func printableName(name string) string {
+	var out strings.Builder
+	for _, r := range name {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			fmt.Fprintf(&out, `\u{%x}`, r)
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
 }
 
 // sqliteQuoteIdent는 PRAGMA에도 사용할 수 있는 SQLite 식별자 인용이다.

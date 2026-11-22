@@ -131,3 +131,16 @@ func TestSQLiteColumnFailuresNameTheObject(t *testing.T) {
 		}
 	}
 }
+
+// 객체 이름의 제어문자는 엔진 문구와 같은 `\u{..}`로 바뀐다. 그대로 실리면 한계 목록에 다른
+// 객체의 가짜 문구가 생긴다.
+func TestSQLiteObjectLabelEscapesControlCharacters(t *testing.T) {
+	got := sqliteObjectLabel("main", "v\nmain.ok: fake\u001b[31m ", "sqlite columns")
+	want := `main.v\u{a}main.ok: fake\u{1b}[31m\u{2028}: sqlite columns`
+	if got != want {
+		t.Fatalf("label = %q, want %q", got, want)
+	}
+	if plain := sqliteObjectLabel("main", "Pedidos ñ", "sqlite columns"); plain != "main.Pedidos ñ: sqlite columns" {
+		t.Fatalf("plain label = %q", plain)
+	}
+}
