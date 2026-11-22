@@ -265,8 +265,8 @@ async fn read_schema(
     let mut objects: Vec<ObjectDoc> = Vec::new();
     let mut pending_triggers: Vec<(String, String, Option<String>)> = Vec::new();
     let mut inline_constraints = false;
-    // 컬럼을 읽지 못한 뷰와 SQLite가 알려 준 이유. 스키마마다 한 번 세어 알린다.
-    let mut uncompilable_views: Vec<(String, String)> = Vec::new();
+    // 컬럼을 읽지 못한 채 남긴 뷰·가상 테이블과 SQLite가 알려 준 이유. 스키마마다 한 번 세어 알린다.
+    let mut unreadable = UnreadableColumns::default();
 
     for row in &rows {
         let (name, kind, sql, tbl_name): (String, String, Option<String>, Option<String>) = (
@@ -286,16 +286,12 @@ async fn read_schema(
                 // 한 번 읽은 컬럼·index_list를 제약·인덱스 수집에 넘겨 같은 PRAGMA를 다시 보내지 않는다.
                 let (columns, index_list) = match read_columns(pool, schema, &name).await {
                     Ok(read) => read,
-                    // 뷰의 컬럼은 SQLite가 정의를 컴파일해야 나온다. 없는 테이블·컬럼이나 앱이
-                    // 연결마다 등록하는 함수를 쓰는 뷰는 만들 수 있어도 컴파일되지 않는다. 그 뷰
-                    // 하나로 scan 전체를 끝내지 않고, 뷰와 원문은 두되 컬럼은 비워 알린다.
-                    Err(error) => match uncompilable_view_reason(&kind, &error) {
-                        Some(reason) => {
-                            uncompilable_views.push((name.clone(), reason));
-                            (Vec::new(), Vec::new())
-                        }
-                        None => return Err(error),
-                    },
+                    // 컴파일되지 않는 뷰·모듈이 없는 가상 테이블 하나로 scan 전체를 끝내지 않고,
+                    // 객체와 원문은 두되 컬럼은 비워 알린다. 그 밖의 실패는 그대로 올린다.
+                    Err(error) => {
+                        unreadable.keep(&kind, sql.as_deref(), &name, error)?;
+                        (Vec::new(), Vec::new())
+                    }
                 };
                 let constraints = read_constraints(pool, schema, &name, &columns).await?;
                 let indexes = read_indexes(pool, schema, &index_list).await?;
@@ -336,9 +332,7 @@ async fn read_schema(
         }
     }
 
-    if !uncompilable_views.is_empty() {
-        limitations.push(uncompilable_views_notice(schema, &uncompilable_views));
-    }
+    limitations.extend(unreadable.notices(schema));
     if inline_constraints {
         limitations.push(INLINE_CONSTRAINTS_LIMITATION.to_owned());
     }
@@ -357,6 +351,53 @@ async fn read_schema(
     })
 }
 
+/// 컬럼을 읽지 못해도 scan을 끝내지 않고 남긴 객체와 SQLite가 알려 준 이유다.
+///
+/// 뷰와 가상 테이블은 원인이 달라 한계 문구를 따로 센다. 둘 다 카탈로그 완전성을 낮춘다 —
+/// 객체는 선언되지만 컬럼이 없어, 그 컬럼을 쓰는 사용을 "선언 없음"으로 확정하면 안 된다.
+#[derive(Default)]
+struct UnreadableColumns {
+    /// SQLite가 정의를 컴파일하지 못한 뷰.
+    views: Vec<(String, String)>,
+    /// SQLite가 모듈에 연결하지 못한 가상 테이블.
+    virtual_tables: Vec<(String, String)>,
+}
+
+impl UnreadableColumns {
+    /// 컬럼 읽기 실패가 남길 수 있는 실패면 기록하고, 아니면 scan을 끝내도록 오류를 돌려준다.
+    fn keep(
+        &mut self,
+        kind: &str,
+        ddl: Option<&str>,
+        name: &str,
+        error: SourceError,
+    ) -> Result<(), SourceError> {
+        if let Some(reason) = uncompilable_view_reason(kind, &error) {
+            self.views.push((name.to_owned(), reason));
+        } else if let Some(reason) = unconnected_virtual_table_reason(kind, ddl, &error) {
+            self.virtual_tables.push((name.to_owned(), reason));
+        } else {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 스키마마다 종류별로 한 번씩 내는 한계 문구다. 남긴 객체가 없는 종류는 문구가 없다.
+    fn notices(&self, schema: &str) -> Vec<String> {
+        let mut notices = Vec::new();
+        if !self.views.is_empty() {
+            notices.push(uncompilable_views_notice(schema, &self.views));
+        }
+        if !self.virtual_tables.is_empty() {
+            notices.push(unconnected_virtual_tables_notice(
+                schema,
+                &self.virtual_tables,
+            ));
+        }
+        notices
+    }
+}
+
 /// SQLite 주 결과 코드 SQLITE_ERROR. 확장 결과 코드는 하위 8비트에 주 코드를 담는다
 /// (<https://www.sqlite.org/rescode.html>).
 const SQLITE_ERROR: i32 = 1;
@@ -369,11 +410,49 @@ const SQLITE_ERROR: i32 = 1;
 /// 삼키면, 잠금 경합 한 번에 멀쩡한 뷰의 컬럼이 비고 실행마다 다른 뷰가 "컴파일 불가"로
 /// 보고된다. 그런 오류는 테이블처럼 scan을 끝내야 한다.
 fn uncompilable_view_reason(kind: &str, error: &SourceError) -> Option<String> {
+    if kind != "view" {
+        return None;
+    }
+    sqlite_error_message(error)
+}
+
+/// 컬럼 읽기 실패가 "SQLite가 이 가상 테이블의 모듈에 연결하지 못했다"는 사실이면 그 이유를
+/// 돌려준다.
+///
+/// 가상 테이블(`CREATE VIRTUAL TABLE … USING module(…)`)의 컬럼은 모듈이 연결될 때 선언한다.
+/// 앱이 연결마다 등록하는 모듈(sqlite-vec의 `vec0`, 앱 전용 모듈)은 다른 프로세스에서
+/// `no such module`로 열리지 않는다. 분류는 뷰와 같다 — SQLITE_ERROR 계열만 남기고, 정의를
+/// 컴파일하지 않는 일반 테이블의 실패는 DB 자체의 문제라 scan을 끝낸다.
+fn unconnected_virtual_table_reason(
+    kind: &str,
+    ddl: Option<&str>,
+    error: &SourceError,
+) -> Option<String> {
+    if kind != "table" || !ddl.is_some_and(declares_virtual_table) {
+        return None;
+    }
+    sqlite_error_message(error)
+}
+
+/// SQLITE_ERROR 계열 오류의 SQLite 메시지다. 다른 결과 코드나 sqlx 자체 오류는 `None`이다.
+fn sqlite_error_message(error: &SourceError) -> Option<String> {
     let SourceError::Query(sqlx::Error::Database(error)) = error else {
         return None;
     };
-    (kind == "view" && is_sqlite_error_code(error.code().as_deref()))
-        .then(|| error.message().to_owned())
+    is_sqlite_error_code(error.code().as_deref()).then(|| error.message().to_owned())
+}
+
+/// 테이블 DDL이 `CREATE VIRTUAL TABLE`로 시작하는가.
+///
+/// SQLite는 가상 테이블의 `sqlite_schema.sql`을 이 세 키워드로 시작하게 저장한다. 인용과
+/// 주석을 건너뛴 맨 단어로 비교해, 이름이나 컬럼의 일부인 `virtual`을 키워드로 보지 않는다.
+fn declares_virtual_table(ddl: &str) -> bool {
+    let mut words = sql_words(ddl);
+    ["create", "virtual", "table"].iter().all(|keyword| {
+        words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+    })
 }
 
 /// sqlx가 십진 문자열로 싣는 SQLite 확장 결과 코드가 SQLITE_ERROR(1)이나 그 확장 코드
@@ -386,10 +465,10 @@ fn is_sqlite_error_code(code: Option<&str>) -> bool {
         .is_some_and(|code| code & 0xff == SQLITE_ERROR)
 }
 
-/// 한계 문구에 이름을 적는 컴파일 불가 뷰의 최대 수. 나머지는 수로만 남긴다.
-const UNCOMPILABLE_VIEWS_LISTED: usize = 10;
+/// 한계 문구에 이름을 적는 컴파일 불가 뷰·연결 불가 가상 테이블의 최대 수. 나머지는 수로만 남긴다.
+const UNREADABLE_OBJECTS_LISTED: usize = 10;
 
-/// 한계 문구에 싣는 뷰 이름·SQLite 메시지 한 조각의 최대 글자 수다.
+/// 한계 문구에 싣는 객체 이름·SQLite 메시지 한 조각의 최대 글자 수다.
 const NOTICE_PART_CHARS: usize = 120;
 
 /// 컬럼을 읽지 못한 뷰를 스키마마다 센 한계 문구다.
@@ -398,26 +477,43 @@ const NOTICE_PART_CHARS: usize = 120;
 /// 사용을 "선언 없음"으로 확정하면 안 된다. 뷰마다 SQLite가 알려 준 이유(`no such table`,
 /// `no such function` 등)를 함께 적어 원인을 찾게 한다.
 fn uncompilable_views_notice(schema: &str, views: &[(String, String)]) -> String {
-    let listed: Vec<String> = views
-        .iter()
-        .take(UNCOMPILABLE_VIEWS_LISTED)
-        .map(|(name, reason)| format!("{} ({})", notice_part(name), notice_part(reason)))
-        .collect();
-    let more = views.len().saturating_sub(UNCOMPILABLE_VIEWS_LISTED);
-    let more = if more > 0 {
-        format!(", and {more} more")
-    } else {
-        String::new()
-    };
     format!(
         "{schema}: columns of {} view(s) were not collected because SQLite could not compile \
-         their definitions; the views are kept without columns: {}{more}",
+         their definitions; the views are kept without columns: {}",
         views.len(),
-        listed.join(", ")
+        listed_objects(views)
     )
 }
 
-/// 뷰 이름이나 SQLite 메시지를 한계 문구의 한 조각으로 만든다.
+/// 모듈에 연결하지 못한 가상 테이블을 스키마마다 센 한계 문구다.
+///
+/// 뷰 문구와 같은 모양이다. 가상 테이블마다 SQLite가 알려 준 이유(`no such module: …` 등)를
+/// 적어 어느 모듈을 등록해야 하는지 찾게 한다.
+fn unconnected_virtual_tables_notice(schema: &str, tables: &[(String, String)]) -> String {
+    format!(
+        "{schema}: columns of {} virtual table(s) were not collected because SQLite could not \
+         connect their modules; the tables are kept without columns: {}",
+        tables.len(),
+        listed_objects(tables)
+    )
+}
+
+/// `이름 (이유)` 목록을 최대 `UNREADABLE_OBJECTS_LISTED`개까지 적고 나머지는 수로 남긴다.
+fn listed_objects(objects: &[(String, String)]) -> String {
+    let listed: Vec<String> = objects
+        .iter()
+        .take(UNREADABLE_OBJECTS_LISTED)
+        .map(|(name, reason)| format!("{} ({})", notice_part(name), notice_part(reason)))
+        .collect();
+    let more = objects.len().saturating_sub(UNREADABLE_OBJECTS_LISTED);
+    if more > 0 {
+        format!("{}, and {more} more", listed.join(", "))
+    } else {
+        listed.join(", ")
+    }
+}
+
+/// 객체 이름이나 SQLite 메시지를 한계 문구의 한 조각으로 만든다.
 ///
 /// 둘 다 DB가 정한 임의의 문자열이다. 줄바꿈·ESC 같은 제어문자가 그대로 실리면 터미널과
 /// 리뷰 출력에 가짜 줄이나 색 제어가 생기므로 facts 한계와 같은 `printable`로 바꾸고, 긴
@@ -830,6 +926,118 @@ mod tests {
             ]
         );
         assert!(!doc.context.as_ref().unwrap().catalog_complete);
+    }
+
+    /// 앱이 연결마다 등록하는 모듈(sqlite-vec의 `vec0`, 앱 전용 모듈)을 쓰는 가상 테이블은 다른
+    /// 프로세스에서 `no such module`(SQLITE_ERROR)로 열리지 않는다. Go·JDBC 프로브처럼 테이블과
+    /// DDL은 남기고 컬럼만 비운 뒤 센 한계로 알린다. 그 테이블을 읽는 뷰도 같은 이유로 컴파일되지
+    /// 않아 컴파일 불가 뷰로 남는다. 앱이 모듈을 등록한 채 만든 DB를 흉내 내려고 `writable_schema`로
+    /// 스키마 행을 직접 넣는다(가상 테이블의 rootpage는 0이다).
+    #[tokio::test]
+    async fn unconnected_virtual_tables_are_kept_without_columns_and_counted() {
+        let doc = fixture_doc(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY);
+             CREATE VIEW v_vt AS SELECT a FROM vt;
+             PRAGMA writable_schema = ON;
+             INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+             VALUES ('table', 'vt', 'vt', 0, 'CREATE VIRTUAL TABLE vt USING app_mod(a, b)');
+             PRAGMA writable_schema = OFF",
+        )
+        .await;
+        let object = |name: &str| {
+            doc.schemas[0]
+                .objects
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("{name} must stay in the catalog"))
+        };
+        assert_eq!(object("t").columns.len(), 1);
+        let table = object("vt");
+        assert_eq!(table.kind, "table");
+        assert!(table.columns.is_empty(), "{:?}", table.columns);
+        assert_eq!(
+            table.body.as_deref(),
+            Some("CREATE VIRTUAL TABLE vt USING app_mod(a, b)")
+        );
+        assert!(object("v_vt").columns.is_empty());
+        assert_eq!(
+            doc.limitations,
+            [
+                "main: columns of 1 view(s) were not collected because SQLite could not compile \
+                 their definitions; the views are kept without columns: \
+                 v_vt (no such module: app_mod)",
+                "main: columns of 1 virtual table(s) were not collected because SQLite could not \
+                 connect their modules; the tables are kept without columns: \
+                 vt (no such module: app_mod)",
+            ]
+        );
+        assert!(!doc.context.as_ref().unwrap().catalog_complete);
+    }
+
+    /// 가상 테이블 판정은 DDL의 첫 세 키워드다. SQLite는 저장할 때 그 키워드를 대문자로 바꾸지만,
+    /// 손으로 넣은 스키마 행도 있어 ASCII 대소문자·공백·주석을 가리지 않는다. 인용 식별자나 이름의
+    /// 일부인 `virtual`은 키워드가 아니다.
+    #[test]
+    fn virtual_tables_are_recognized_by_their_leading_keywords() {
+        for ddl in [
+            "CREATE VIRTUAL TABLE vt USING app_mod(a)",
+            "create  virtual\ttable vt using app_mod(a)",
+            "/* app */ CREATE -- note\n VIRTUAL TABLE vt USING m",
+        ] {
+            assert!(declares_virtual_table(ddl), "{ddl}");
+        }
+        for ddl in [
+            "CREATE TABLE virtual_t(a)",
+            "CREATE TABLE \"VIRTUAL\"(a)",
+            "CREATE TABLE t(virtual TEXT)",
+            "CREATE VIEW v AS SELECT 1",
+        ] {
+            assert!(!declares_virtual_table(ddl), "{ddl}");
+        }
+    }
+
+    /// 실제 SQLite 오류로 판정 경계를 본다. SQLITE_ERROR라도 DDL이 가상 테이블인 테이블만 남기고,
+    /// 일반 테이블·뷰·DDL 없음·sqlx 자체 오류는 이 규칙으로 남기지 않는다.
+    #[tokio::test]
+    async fn unconnected_virtual_table_reason_needs_a_virtual_table_and_a_sqlite_error() {
+        // 직접 넣은 스키마 행은 새 연결이 스키마를 다시 읽어야 보인다. 파일 DB로 연결을 바꾼다.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", tmp.path().join("t.db").display());
+        let setup = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        sqlx::raw_sql(
+            "PRAGMA writable_schema = ON;
+             INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+             VALUES ('table', 'vt', 'vt', 0, 'CREATE VIRTUAL TABLE vt USING app_mod(a)');
+             PRAGMA writable_schema = OFF",
+        )
+        .execute(&setup)
+        .await
+        .unwrap();
+        setup.close().await;
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        let error = pragma(&pool, "PRAGMA table_xinfo(vt)")
+            .await
+            .err()
+            .expect("a virtual table without its module cannot be connected");
+        let ddl = Some("CREATE VIRTUAL TABLE vt USING app_mod(a)");
+        assert_eq!(
+            unconnected_virtual_table_reason("table", ddl, &error).as_deref(),
+            Some("no such module: app_mod")
+        );
+        assert_eq!(
+            unconnected_virtual_table_reason("table", Some("CREATE TABLE vt(a)"), &error),
+            None
+        );
+        assert_eq!(
+            unconnected_virtual_table_reason("table", None, &error),
+            None
+        );
+        assert_eq!(unconnected_virtual_table_reason("view", ddl, &error), None);
+        let timeout = SourceError::Query(sqlx::Error::PoolTimedOut);
+        assert_eq!(
+            unconnected_virtual_table_reason("table", ddl, &timeout),
+            None
+        );
     }
 
     /// 한계 문구의 뷰 목록은 길이가 정해져 있다. 나머지는 수로만 남긴다.

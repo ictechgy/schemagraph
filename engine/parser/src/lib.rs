@@ -24,6 +24,7 @@ use sqlparser::dialect::{
 mod body_relations;
 mod cache;
 mod constant_sql;
+mod cte_target;
 mod defaults;
 mod parse_limits;
 pub use cache::{BodyCache, BodyResult, CacheContext};
@@ -870,6 +871,9 @@ fn relation_name_key(name: &ObjectName) -> String {
 struct ParsedTrigger {
     /// INSERT/UPDATE/DELETE의 쓰기 대상 (스키마?, 테이블).
     writes: Vec<(Option<String>, String)>,
+    /// 앞에 WITH가 붙은 DML이 그 WITH의 CTE 이름으로 쓰는 대상. 적용 단계에서 문서의
+    /// 대소문자 규칙으로 CTE인지 가린 뒤에야 `writes`로 옮기거나 진단으로 센다.
+    cte_writes: Vec<CteWrite>,
     /// 쓰기 대상을 제외한 관계 — 조인·서브쿼리의 읽기 대상.
     reads: Vec<(Option<String>, String)>,
     /// NEW./OLD.로 읽은 발사 테이블의 컬럼.
@@ -906,6 +910,7 @@ impl ParsedTrigger {
     /// "읽을 게 없던 몸체"를 구분하는 기준이다.
     fn has_edges(&self) -> bool {
         !(self.writes.is_empty()
+            && self.cte_writes.is_empty()
             && self.reads.is_empty()
             && self.fired_columns.is_empty()
             && self.calls.is_empty()
@@ -963,6 +968,7 @@ fn parse_trigger_body(
     let statements = parse_limits::parse_sql(dialect, inner.trim());
     let mut parsed = ParsedTrigger {
         writes: Vec::new(),
+        cte_writes: Vec::new(),
         reads: Vec::new(),
         fired_columns: Vec::new(),
         calls,
@@ -1070,6 +1076,7 @@ fn catalog_routine_language_allowed(dialect: &str, language: Option<&str>) -> bo
 fn empty_parsed_trigger() -> ParsedTrigger {
     ParsedTrigger {
         writes: Vec::new(),
+        cte_writes: Vec::new(),
         reads: Vec::new(),
         fired_columns: Vec::new(),
         calls: Vec::new(),
@@ -1975,6 +1982,7 @@ fn parse_procedural_body(
         extract_procedural_statements(&inner, &mut state, starts_in_declare);
     let mut parsed = ParsedTrigger {
         writes: Vec::new(),
+        cte_writes: Vec::new(),
         reads: Vec::new(),
         fired_columns: Vec::new(),
         calls: Vec::new(),
@@ -3484,6 +3492,88 @@ struct CollectRules {
     sqlite: bool,
 }
 
+/// 앞에 WITH가 붙은 DML에서 그 WITH의 CTE와 이름이 같은 한정자 없는 쓰기 대상이다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CteWrite {
+    /// 쓰기 대상 — `ParsedTrigger::writes`와 같은 모양이다.
+    target: (Option<String>, String),
+    /// 가장 가까운 CTE 이름과 일치 정도. 철자가 다르면 문서의 비교 규칙으로 판정한다.
+    candidate: cte_target::Candidate,
+}
+
+/// 문장과 안쪽 문장의 쓰기 대상을 모으되, 앞에 WITH가 붙은 DML이 그 WITH의 CTE 이름으로 쓰는
+/// 대상은 따로 돌려준다.
+///
+/// 그 대상이 CTE인지는 방언과 대소문자 규칙에 달려 적용 단계(`settle_cte_writes`)가 판정한다.
+/// 절차형 블록(`IF 1 = 1 WITH c AS (…) UPDATE c …`) 안의 문장도 부모 문장이 안쪽 대상을 모으므로
+/// 여기서 함께 가른다. visitor는 부모를 자식보다 먼저 방문하므로, WITH로 감싼 문장을 만나면 안쪽
+/// DML의 주소와 CTE 이름을 기억해 두었다가 그 DML을 방문할 때 쓴다.
+fn split_write_targets(stmt: &Statement) -> (Vec<(Option<String>, String)>, Vec<CteWrite>) {
+    let mut writes = Vec::new();
+    let mut cte_writes = Vec::new();
+    let mut wrapped: Vec<(*const Statement, Vec<String>)> = Vec::new();
+    let _ = visit_statements(stmt, |statement| {
+        if let Some(found) = cte_wrapped_dml(statement) {
+            wrapped.push(found);
+        }
+        let names = wrapped
+            .iter()
+            .find(|(dml, _)| std::ptr::eq(*dml, statement))
+            .map(|(_, names)| names.as_slice());
+        for target in write_targets_shallow(statement) {
+            match names.and_then(|names| cte_write(&target, names)) {
+                Some(write) => cte_writes.push(write),
+                None => writes.push(target),
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    (writes, cte_writes)
+}
+
+/// 앞에 WITH가 붙은 DML이면 안쪽 DML 문장의 주소와 그 WITH의 CTE 이름을 돌려준다.
+fn cte_wrapped_dml(statement: &Statement) -> Option<(*const Statement, Vec<String>)> {
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    let with = query.with.as_ref()?;
+    let dml = query_dml_statement(query)?;
+    let names = with
+        .cte_tables
+        .iter()
+        .map(|cte| cte.alias.name.value.clone())
+        .collect();
+    Some((dml as *const Statement, names))
+}
+
+/// 한정자 없는 대상이 어떤 CTE 이름의 후보(`cte_target::name_match`)이면 그 일치를 돌려준다.
+fn cte_write(target: &(Option<String>, String), names: &[String]) -> Option<CteWrite> {
+    if target.0.is_some() {
+        return None;
+    }
+    cte_target::name_match(&target.1, names).map(|candidate| CteWrite {
+        target: target.clone(),
+        candidate,
+    })
+}
+
+/// 파싱 단계에서 가른 CTE 이름 쓰기 대상을 방언과 대소문자 규칙으로 판정한다(`cte_target`).
+///
+/// 대상이 CTE로 증명되면 간선 대신 진단을 남기고, 증명되지 않으면 쓰기 간선은 이전처럼 남기되
+/// 진단으로 부분 분석을 표시하며, 실제 테이블이면 평범한 쓰기로 `writes`에 옮긴다.
+fn settle_cte_writes(parsed: &mut ParsedTrigger, context: cte_target::Context<'_>) {
+    for write in std::mem::take(&mut parsed.cte_writes) {
+        let outcome = cte_target::outcome(context.rule, context.case, write.candidate.matched);
+        if let Some(message) = context.message(&write.target.1, &write.candidate, outcome) {
+            cte_target::push_diagnostic(&mut parsed.diagnostics, &message);
+            parsed.partial = true;
+        }
+        if outcome != cte_target::Outcome::Cte && !parsed.writes.contains(&write.target) {
+            parsed.writes.push(write.target);
+        }
+    }
+}
+
 /// 소유한 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
 ///
 /// 컬럼 DML은 복제하지 않고 옮겨 보관하고, 절차형 블록(IF/WHILE/CASE)은 안쪽 문장을
@@ -3491,7 +3581,7 @@ struct CollectRules {
 /// 참조로 훑던 때와 같다.
 fn collect_trigger_stmt(stmt: Statement, parsed: &mut ParsedTrigger, rules: CollectRules) {
     collect_trigger_facts(&stmt, parsed, rules);
-    if is_column_dml_statement(&stmt) {
+    if retains_for_column_analysis(&stmt) {
         parsed.retain_dml_statement(stmt);
         return;
     }
@@ -3558,9 +3648,14 @@ fn collect_trigger_facts(stmt: &Statement, parsed: &mut ParsedTrigger, rules: Co
             candidates: Vec::new(),
         });
     }
-    // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
+    // 쓰기 대상은 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
     // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
-    let write_targets = write_targets(stmt);
+    let (write_targets, cte_writes) = split_write_targets(stmt);
+    for write in cte_writes {
+        if !parsed.cte_writes.contains(&write) {
+            parsed.cte_writes.push(write);
+        }
+    }
     let qualified_writes = qualified_write_targets(stmt);
     for target in &qualified_writes {
         if !parsed.qualified_writes.contains(target) {
@@ -3665,6 +3760,11 @@ fn into_nested_statements(stmt: Statement) -> Vec<Statement> {
 }
 
 fn is_column_dml_statement(stmt: &Statement) -> bool {
+    if let Statement::Query(query) = stmt {
+        if let Some(dml) = query_dml_statement(query) {
+            return is_column_dml_statement(dml);
+        }
+    }
     matches!(
         stmt,
         Statement::Insert(_)
@@ -3676,6 +3776,30 @@ fn is_column_dml_statement(stmt: &Statement) -> bool {
                 ..
             }
     ) || select_into(stmt).is_some()
+}
+
+/// 컬럼 분석기(`DmlAnalyzer`)로 보낼 문장인가.
+///
+/// 컬럼 DML에 더해, 앞에 WITH가 붙은 DELETE도 보낸다 — CTE 몸체가 읽는 컬럼은 사실이고, 읽기
+/// 경로로 보내던 때에도 남았다. DELETE 자체는 컬럼 DML이 아니므로 절차형 블록 판정
+/// (`SG_DML_CONTROL_FLOW`)에는 WITH 없는 DELETE처럼 세지 않는다.
+fn retains_for_column_analysis(stmt: &Statement) -> bool {
+    is_column_dml_statement(stmt)
+        || matches!(stmt, Statement::Query(query)
+            if query.with.is_some() && query_dml_statement(query).is_some())
+}
+
+/// `WITH … INSERT|UPDATE|DELETE …`의 DML 문장이다.
+///
+/// sqlparser는 앞에 WITH가 붙은 DML을 `Statement::Query`로 감싸고 DML을 그 몸체
+/// (`SetExpr::Insert`·`Update`·`Delete`)에 둔다. 이 모양을 SELECT로 보면 쓰기 대상이
+/// 읽기 전용 경로로 가서 `writes` 간선이 빠진다.
+fn query_dml_statement(query: &sqlparser::ast::Query) -> Option<&Statement> {
+    use sqlparser::ast::SetExpr;
+    match query.body.as_ref() {
+        SetExpr::Insert(dml) | SetExpr::Update(dml) | SetExpr::Delete(dml) => Some(dml),
+        _ => None,
+    }
 }
 
 fn select_into(stmt: &Statement) -> Option<&sqlparser::ast::SelectInto> {
@@ -3764,17 +3888,6 @@ fn is_builtin_function(name: &str) -> bool {
     )
 }
 
-/// DML 문장의 쓰기 대상 — 절차형 블록 안의 문장까지 재귀로 본다.
-/// SELECT-only 문장은 빈 벡터다.
-fn write_targets(stmt: &Statement) -> Vec<(Option<String>, String)> {
-    let mut targets = Vec::new();
-    let _ = visit_statements(stmt, |statement| {
-        targets.extend(write_targets_shallow(statement));
-        ControlFlow::<()>::Continue(())
-    });
-    targets
-}
-
 /// 절차형 블록(IF/ELSEIF/ELSE, WHILE, CASE) 안에 중첩된 문장들.
 /// T-SQL 몸체는 도매 파싱이 성공해도 DML이 블록 안에 들어간다.
 fn nested_statements(stmt: &Statement) -> Vec<&Statement> {
@@ -3831,26 +3944,75 @@ fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
             .and_then(|into| relation_name_parts(&into.name))
             .into_iter()
             .collect(),
-        Statement::Delete(delete) => {
-            if !delete.tables.is_empty() {
-                delete
-                    .tables
-                    .iter()
-                    .filter_map(relation_name_parts)
-                    .collect()
-            } else {
-                // DELETE FROM t — from 절이 쓰기 대상이다.
-                let tables: &[sqlparser::ast::TableWithJoins] = match &delete.from {
-                    sqlparser::ast::FromTable::WithFromKeyword(t)
-                    | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
-                };
-                tables
-                    .iter()
-                    .filter_map(|twj| table_factor_name(&twj.relation))
-                    .collect()
-            }
-        }
+        Statement::Delete(delete) => delete_write_targets(delete),
         _ => vec![],
+    }
+}
+
+/// DELETE의 쓰기 대상이다.
+///
+/// `DELETE FROM t`는 FROM 절이 대상이다. FROM 앞에 대상 목록이 있는 다중 테이블 DELETE
+/// (`DELETE c FROM audit c JOIN orders o …`, MySQL·SQL Server)에서 목록의 이름은 FROM 절 관계를
+/// 가리키는 참조다 — SQL Server 문서의 *table_alias*는 "The alias specified in the FROM
+/// table_source clause representing the table or view from which the rows are to be deleted"이고,
+/// mysql-server 8.0 `Query_block::add_table_to_list`는 그 목록(`TL_OPTION_ALIAS`)을 CTE로 찾지
+/// 않는다("those are only references into the FROM list, and any CTEs referenced by the aliases will
+/// be resolved when we later resolve the FROM list"). 그래서 `UPDATE` 승격(`promoted_update_target`)
+/// 처럼 FROM 절의 별칭이 가리키는 관계로 먼저 바꾸고, 그 관계 이름으로 CTE 이름 판정을 한다.
+fn delete_write_targets(delete: &sqlparser::ast::Delete) -> Vec<(Option<String>, String)> {
+    let from: &[TableWithJoins] = match &delete.from {
+        sqlparser::ast::FromTable::WithFromKeyword(tables)
+        | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+    };
+    if delete.tables.is_empty() {
+        return from
+            .iter()
+            .filter_map(|twj| table_factor_name(&twj.relation))
+            .collect();
+    }
+    let sources: Vec<&TableFactor> = from
+        .iter()
+        .flat_map(|twj| {
+            std::iter::once(&twj.relation).chain(twj.joins.iter().map(|join| &join.relation))
+        })
+        .collect();
+    delete
+        .tables
+        .iter()
+        .filter_map(|target| {
+            single_ident(target)
+                .and_then(|alias| aliased_relation(alias, sources.iter().copied()))
+                .or_else(|| relation_name_parts(target))
+        })
+        .collect()
+}
+
+/// 한 부분짜리 이름의 식별자 철자다.
+fn single_ident(name: &ObjectName) -> Option<&str> {
+    let [part] = name.0.as_slice() else {
+        return None;
+    };
+    Some(part.as_ident()?.value.as_str())
+}
+
+/// `alias`(ASCII 대소문자 무시)로 선언된 물리 관계가 `factors` 가운데 하나뿐이면 그 관계 이름이다.
+fn aliased_relation<'a>(
+    alias: &str,
+    factors: impl Iterator<Item = &'a TableFactor>,
+) -> Option<(Option<String>, String)> {
+    let matches: Vec<_> = factors
+        .filter_map(|factor| match factor {
+            TableFactor::Table {
+                alias: Some(declared),
+                args: None,
+                ..
+            } if declared.name.value.eq_ignore_ascii_case(alias) => table_factor_name(factor),
+            _ => None,
+        })
+        .collect();
+    match matches.as_slice() {
+        [target] => Some(target.clone()),
+        _ => None,
     }
 }
 
@@ -3882,25 +4044,10 @@ fn promoted_update_target(
     else {
         return None;
     };
-    let [target_name] = name.0.as_slice() else {
-        return None;
-    };
-    let target_name = target_name.as_ident()?.value.as_str();
-    let matches: Vec<_> = from
-        .iter()
-        .filter_map(|table| match &table.relation {
-            factor @ TableFactor::Table {
-                alias: Some(alias),
-                args: None,
-                ..
-            } if alias.name.value.eq_ignore_ascii_case(target_name) => table_factor_name(factor),
-            _ => None,
-        })
-        .collect();
-    match matches.as_slice() {
-        [target] => Some(target.clone()),
-        _ => None,
-    }
+    aliased_relation(
+        single_ident(name)?,
+        from.iter().map(|table| &table.relation),
+    )
 }
 
 fn qualified_write_targets(stmt: &Statement) -> Vec<ObjectName> {
@@ -3932,7 +4079,11 @@ fn qualified_write_targets(stmt: &Statement) -> Vec<ObjectName> {
             }
         }
         Statement::CreateTable(create) if create.query.is_some() => names.push(create.name.clone()),
-        Statement::Query(_) => {
+        Statement::Query(query) => {
+            // 앞에 WITH가 붙은 DML의 대상은 감싼 문장 안에 있다.
+            if let Some(dml) = query_dml_statement(query) {
+                return qualified_write_targets(dml);
+            }
             if let Some(into) = select_into(stmt) {
                 names.push(into.name.clone());
             }
@@ -4593,6 +4744,7 @@ fn apply_dml_edges(
     notes: &mut Vec<String>,
     ci: bool,
 ) {
+    settle_cte_writes(parsed, catalog.cte_context());
     for (kind, targets) in [
         (EdgeKind::Writes, &parsed.writes),
         (EdgeKind::Reads, &parsed.reads),

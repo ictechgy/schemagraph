@@ -11,10 +11,12 @@ import selectors
 import signal
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
+import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 ACK = b"Cancellation requested; press Ctrl+C again to exit immediately.\n"
@@ -683,6 +685,60 @@ def check_mcp(engine: Path, work: Path) -> None:
             process.stderr.close()
 
 
+CHECKS: tuple[Callable[[Path, Path], None], ...] = (
+    check_cli_queries,
+    check_inherited_sigint_ignore,
+    check_review,
+    check_second_interrupt,
+    check_closed_stderr,
+    check_blocked_stderr,
+    check_mcp,
+)
+
+
+class CheckFailure(Exception):
+    """실패한 검사 이름과 원래 오류를 함께 실어 main이 어느 검사인지 알리게 한다."""
+
+    def __init__(self, check: str, error: BaseException) -> None:
+        super().__init__(check, error)
+        self.check = check
+        self.error = error
+
+
+STANDARD_LIBRARY = Path(sysconfig.get_paths()["stdlib"]).resolve()
+
+
+def in_standard_library(filename: str) -> bool:
+    """traceback 프레임의 파일이 이 Python의 표준 라이브러리 안에 있는가."""
+    return Path(filename).resolve().is_relative_to(STANDARD_LIBRARY)
+
+
+def raised_at(error: BaseException) -> str:
+    """오류가 난 가장 안쪽 위치를 돌려준다.
+
+    한 검사 안에서도 FIFO·stdin·stderr 쓰기가 여러 곳이라 `[Errno 32] Broken pipe`만으로는
+    어느 쓰기가 끊겼는지 알 수 없다. 표준 라이브러리 밖의 프레임을 고르고 `fail` 자신은
+    건너뛴다 — `subprocess`의 stdin 쓰기 안에서 난 오류라도 고칠 곳은 검사에서 그 호출이 일어난
+    줄이다. 그런 프레임이 없으면 파일 이름을 붙여 다른 파일의 줄임을 밝힌다.
+    """
+    frames = traceback.extract_tb(error.__traceback__)
+    own = [frame for frame in frames if frame.name != "fail" and not in_standard_library(frame.filename)]
+    if own:
+        return f"{own[-1].name} line {own[-1].lineno}"
+    if frames:
+        return f"{Path(frames[-1].filename).name} line {frames[-1].lineno} in {frames[-1].name}"
+    return "unknown location"
+
+
+def run_checks(engine: Path, work: Path, checks: tuple[Callable[[Path, Path], None], ...]) -> None:
+    """검사를 차례로 돌리고, 실패하면 그 검사 이름을 붙여 다시 올린다."""
+    for check in checks:
+        try:
+            check(engine, work)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise CheckFailure(check.__name__, error) from error
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run process-level cancellation regression checks.")
     parser.add_argument("--engine", required=True, type=Path, help="path to an executable schemagraph binary")
@@ -694,18 +750,26 @@ def main() -> int:
     if not engine.is_file() or not engine.stat().st_mode & 0o111:
         print(f"error: engine is not an executable file: {engine}", file=sys.stderr)
         return 2
+    failure: CheckFailure | None = None
+    cleanup = ""
     try:
         with tempfile.TemporaryDirectory(prefix="schemagraph-cancellation-") as directory:
-            work = Path(directory)
-            check_cli_queries(engine, work)
-            check_inherited_sigint_ignore(engine, work)
-            check_review(engine, work)
-            check_second_interrupt(engine, work)
-            check_closed_stderr(engine, work)
-            check_blocked_stderr(engine, work)
-            check_mcp(engine, work)
-    except (OSError, RuntimeError, ValueError) as error:
-        print(f"cancellation process regression failed: {error}", file=sys.stderr)
+            try:
+                run_checks(engine, Path(directory), CHECKS)
+            except CheckFailure as error:
+                failure = error
+    except OSError as error:
+        # 임시 디렉터리 생성·정리의 실패다. 검사가 먼저 실패했으면 그 검사 이름을 잃지 않는다.
+        if failure is None:
+            print(f"cancellation process regression failed outside the checks: {error}", file=sys.stderr)
+            return 1
+        cleanup = f"; temporary directory cleanup also failed: {error}"
+    if failure is not None:
+        print(
+            f"cancellation process regression failed in {failure.check} "
+            f"({raised_at(failure.error)}): {failure.error}{cleanup}",
+            file=sys.stderr,
+        )
         return 1
     print("cancellation process regression: ok")
     return 0

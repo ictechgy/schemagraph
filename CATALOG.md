@@ -112,8 +112,9 @@ documents. A
 SQLite table or view whose `columns` list is empty is read as a relation with
 unknown columns, because SQLite objects always have at least one column: the
 native reader writes such a view when SQLite cannot compile its definition, and
-`SELECT *` over it is reported as `SG_WILDCARD_UNKNOWN` instead of expanding to
-nothing.
+such a virtual table when SQLite cannot connect its module (`no such module: …`).
+`SELECT *` over either is reported as `SG_WILDCARD_UNKNOWN` instead of expanding
+to nothing.
 
 SQL Server relation names follow the database collation when the document
 carries it in `context.collation` (the Go and JDBC probes collect it). With a
@@ -135,6 +136,20 @@ table and view names use `context.lower_case_table_names` the same way: `1` and
 `2` resolve a single ASCII case-only variant at object level, while `0` or a
 missing value compares exactly. MySQL routine names always match regardless of
 ASCII letter case.
+
+The names of a statement's own `WITH` queries are a different matter. MySQL's
+`lower_case_table_names` also decides them (`0` compares bytes, `1` and `2`
+lower-case both names), but SQL Server's `context.collation` does not: SQL
+Server documents the collation of database object identifiers (the database
+collation) and of variables, GOTO labels and temporary tables (the instance
+collation, or the catalog collation of a contained database), not of `WITH`
+query names. In SQL Server and MySQL, where a DML target spelled like a `WITH`
+query names that query, a target that differs from the `WITH` query name only
+in letter case (SQL Server, or MySQL without `lower_case_table_names`), or in
+characters outside ASCII (unless `lower_case_table_names` is `0`), is therefore
+reported as undecided: an `SG_DML_TARGET_SHAPE` diagnostic, the object-level
+write kept, no column effects. PostgreSQL and SQLite targets are always the
+catalog table. See RELEASE-NOTES.md.
 
 A PostgreSQL routine `body` that is a full definition, as `pg_get_functiondef`
 returns it, keeps the routine's `SET search_path` line; a hand-written

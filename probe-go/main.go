@@ -23,6 +23,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"unicode"
 
 	_ "github.com/microsoft/go-mssqldb"
 	_ "github.com/sijms/go-ora/v2"
@@ -206,8 +207,25 @@ func (h *harvester) checkRequestedSchemas(discovered []string) {
 	}
 }
 
+// oneLine — 오류 문구를 한 줄로 만든다. 공백 문자(줄바꿈 포함)는 한 칸으로 접고, 남은 제어문자는
+// `printableText`로 이스케이프한다. DB가 정한 이름(`no such table: main.gone\x1b[31m`)이 오류에
+// 그대로 실리면 한계 목록과 터미널에 색 제어나 가짜 문구가 생긴다.
 func oneLine(s string) string {
-	return strings.Join(strings.Fields(s), " ")
+	return printableText(strings.Join(strings.Fields(s), " "))
+}
+
+// printableText — 제어문자(C0·DEL·C1)와 U+2028·U+2029만 엔진 문구와 같은 `\u{..}` 꼴로 바꾼다.
+// 나머지 글자는 그대로 둔다.
+func printableText(text string) string {
+	var out strings.Builder
+	for _, r := range text {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			fmt.Fprintf(&out, `\u{%x}`, r)
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
 }
 
 func (h *harvester) keepSchema(s string) bool {

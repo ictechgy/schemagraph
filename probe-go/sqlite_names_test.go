@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 )
@@ -104,5 +105,61 @@ func TestSQLiteDDLWordsSkipQuotesAndComments(t *testing.T) {
 		if got := sqliteDeclaresInlineConstraint(ddl); got != want {
 			t.Errorf("%q: got %v want %v", ddl, got, want)
 		}
+	}
+}
+
+// 컴파일되지 않는 뷰의 컬럼 실패 문구는 뷰 이름을 적는다. 이름이 없으면 같은 SQLite 메시지로
+// 실패한 뷰 여러 개가 중복 제거로 한 문구가 되어, 어느 뷰가 몇 개 빠졌는지 사라졌다.
+func TestSQLiteColumnFailuresNameTheObject(t *testing.T) {
+	h, doc := sqliteNamesTestDoc(t,
+		"CREATE TABLE t(id INTEGER PRIMARY KEY)",
+		"CREATE VIEW v_a AS SELECT id FROM gone",
+		"CREATE VIEW v_b AS SELECT id FROM gone",
+	)
+	for _, name := range []string{"v_a", "v_b"} {
+		if view := sqliteTestObject(t, doc.Schemas[0].Objects, name); len(view.Columns) != 0 {
+			t.Fatalf("%s columns = %#v", name, view.Columns)
+		}
+	}
+	limitations := sortedDistinct(doc.Limitations)
+	if len(limitations) != 2 || !h.catalogIncomplete {
+		t.Fatalf("incomplete=%v limitations=%q", h.catalogIncomplete, limitations)
+	}
+	for i, name := range []string{"main.v_a", "main.v_b"} {
+		prefix := name + ": sqlite columns source text was not collected ("
+		if !strings.HasPrefix(limitations[i], prefix) || !strings.Contains(limitations[i], "no such table: main.gone") {
+			t.Fatalf("limitation %d = %q, want prefix %q", i, limitations[i], prefix)
+		}
+	}
+}
+
+// 객체 이름의 제어문자는 엔진 문구와 같은 `\u{..}`로 바뀐다. 그대로 실리면 한계 목록에 다른
+// 객체의 가짜 문구가 생긴다.
+func TestSQLiteObjectLabelEscapesControlCharacters(t *testing.T) {
+	got := sqliteObjectLabel("main", "v\nmain.ok: fake\u001b[31m ", "sqlite columns")
+	want := `main.v\u{a}main.ok: fake\u{1b}[31m\u{2028}: sqlite columns`
+	if got != want {
+		t.Fatalf("label = %q, want %q", got, want)
+	}
+	if plain := sqliteObjectLabel("main", "Pedidos ñ", "sqlite columns"); plain != "main.Pedidos ñ: sqlite columns" {
+		t.Fatalf("plain label = %q", plain)
+	}
+}
+
+// SQLite가 알려 준 이유에 DB가 정한 이름이 실린다. 그 안의 ESC도 이름과 같이 이스케이프해야
+// 한계 목록에 터미널 색 제어가 생기지 않는다(네이티브 reader도 이유를 이스케이프한다).
+func TestSQLiteColumnFailureReasonEscapesControlCharacters(t *testing.T) {
+	_, doc := sqliteNamesTestDoc(t, "CREATE VIEW \"v\x1b[31mred\" AS SELECT id FROM \"gone\x1b[31m\"")
+	limitations := sortedDistinct(doc.Limitations)
+	if len(limitations) != 1 {
+		t.Fatalf("limitations = %q", limitations)
+	}
+	for _, r := range limitations[0] {
+		if unicode.IsControl(r) {
+			t.Fatalf("raw control character %U in %q", r, limitations[0])
+		}
+	}
+	if !strings.Contains(limitations[0], `main.v\u{1b}[31mred: sqlite columns`) || !strings.Contains(limitations[0], `gone\u{1b}[31m`) {
+		t.Fatalf("limitation = %q", limitations[0])
 	}
 }
