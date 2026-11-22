@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 )
@@ -142,5 +143,23 @@ func TestSQLiteObjectLabelEscapesControlCharacters(t *testing.T) {
 	}
 	if plain := sqliteObjectLabel("main", "Pedidos ñ", "sqlite columns"); plain != "main.Pedidos ñ: sqlite columns" {
 		t.Fatalf("plain label = %q", plain)
+	}
+}
+
+// SQLite가 알려 준 이유에 DB가 정한 이름이 실린다. 그 안의 ESC도 이름과 같이 이스케이프해야
+// 한계 목록에 터미널 색 제어가 생기지 않는다(네이티브 reader도 이유를 이스케이프한다).
+func TestSQLiteColumnFailureReasonEscapesControlCharacters(t *testing.T) {
+	_, doc := sqliteNamesTestDoc(t, "CREATE VIEW \"v\x1b[31mred\" AS SELECT id FROM \"gone\x1b[31m\"")
+	limitations := sortedDistinct(doc.Limitations)
+	if len(limitations) != 1 {
+		t.Fatalf("limitations = %q", limitations)
+	}
+	for _, r := range limitations[0] {
+		if unicode.IsControl(r) {
+			t.Fatalf("raw control character %U in %q", r, limitations[0])
+		}
+	}
+	if !strings.Contains(limitations[0], `main.v\u{1b}[31mred: sqlite columns`) || !strings.Contains(limitations[0], `gone\u{1b}[31m`) {
+		t.Fatalf("limitation = %q", limitations[0])
 	}
 }
