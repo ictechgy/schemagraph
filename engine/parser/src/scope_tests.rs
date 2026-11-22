@@ -1826,6 +1826,134 @@ fn a_lone_trailing_end_is_dropped_for_views_and_query_files() {
     );
 }
 
+/// 다중 테이블 DELETE의 대상이 별칭과 대소문자만 다르면 문서가 증명하는 별칭 규칙을 따른다. MySQL은
+/// 별칭을 `table_alias_charset`으로 비교하고(`multi_delete_table_match`), 그 charset은
+/// `lower_case_table_names`=0이면 바이트 비교, 1·2면 대소문자 무시다(`mysqld.cc`). 0에서 `DELETE FROM C
+/// USING audit c`는 `ER_UNKNOWN_TABLE`로 실패해 쓰기가 없다. 규칙을 모르는 문서(lctn 없음, SQL Server —
+/// CTE 이름과 같이 어느 collation이 별칭을 비교하는지 문서가 없다, MariaDB)는 쓰기를 남기되 진단과
+/// 부분 분석이다. 이전에는 어느 문서에서나 대소문자를 무시해 `complete`로 풀었다.
+#[test]
+fn delete_alias_case_follows_the_documented_alias_rule() {
+    let bodies = [
+        "DELETE FROM C USING audit c JOIN orders o ON c.id = o.id",
+        "DELETE C FROM audit c JOIN orders o ON c.id = o.id",
+    ];
+    let mutate = VertexId::from_raw("s.mutate");
+    for body in bodies {
+        let sensitive = scan_routine_in_context(
+            body,
+            "mysql",
+            "sql",
+            "procedure",
+            Some(naming_context(None, Some(0))),
+        );
+        let detail = format!("{body}: {:?}", sensitive.edges());
+        assert!(
+            !edge(&sensitive, "s.mutate", "s.audit", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert_eq!(
+            sensitive.analysis()[&mutate].state,
+            AnalysisState::Partial,
+            "{detail}"
+        );
+        for lctn in [1, 2] {
+            let folded = scan_routine_in_context(
+                body,
+                "mysql",
+                "sql",
+                "procedure",
+                Some(naming_context(None, Some(lctn))),
+            );
+            let detail = format!(
+                "{body} {lctn}: {:?} {:?}",
+                folded.edges(),
+                folded.limitations()
+            );
+            assert!(
+                edge(&folded, "s.mutate", "s.audit", EdgeKind::Writes),
+                "{detail}"
+            );
+            assert_eq!(
+                folded.analysis()[&mutate].state,
+                AnalysisState::Complete,
+                "{detail}"
+            );
+        }
+        let mut unknown_rules = vec![
+            ("mysql", None),
+            ("mariadb", Some(naming_context(None, Some(1)))),
+        ];
+        // USING 형식은 MySQL·MariaDB 문법이다. SQL Server는 대상 목록 형식만 쓴다.
+        if body.starts_with("DELETE C FROM") {
+            unknown_rules.extend([
+                (
+                    "sqlserver",
+                    Some(naming_context(Some("Latin1_General_CS_AS"), None)),
+                ),
+                (
+                    "sqlserver",
+                    Some(naming_context(Some("SQL_Latin1_General_CP1_CI_AS"), None)),
+                ),
+                ("sqlserver", None),
+            ]);
+        }
+        for (dialect, context) in unknown_rules {
+            let unknown =
+                scan_routine_in_context(body, dialect, "sql", "procedure", context.clone());
+            let detail = format!("{body} {dialect} {context:?}: {:?}", unknown.analysis());
+            assert!(
+                edge(&unknown, "s.mutate", "s.audit", EdgeKind::Writes),
+                "{detail}"
+            );
+            let analysis = &unknown.analysis()[&mutate];
+            assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+            assert!(
+                analysis.diagnostics.iter().any(|diagnostic| diagnostic.code
+                    == "SG_DML_TARGET_SHAPE"
+                    && diagnostic.message.starts_with(
+                        "DML target 'C' names the alias 'c' only if letter case is ignored"
+                    )),
+                "{detail}"
+            );
+        }
+    }
+    // 철자가 같은 별칭은 어느 규칙에서나 그 관계다.
+    let exact = scan_routine_in_context(
+        "DELETE FROM c USING audit c JOIN orders o ON c.id = o.id",
+        "mysql",
+        "sql",
+        "procedure",
+        Some(naming_context(None, Some(0))),
+    );
+    assert!(edge(&exact, "s.mutate", "s.audit", EdgeKind::Writes));
+    assert_eq!(exact.analysis()[&mutate].state, AnalysisState::Complete);
+}
+
+/// MySQL USING 형식의 FROM 목록 별칭은 그 자리만 읽기에서 뺀다. 하위 질의가 같은 이름의 실제 테이블
+/// `c`를 읽는 것은 읽기다.
+#[test]
+fn mysql_using_alias_exclusion_does_not_hide_a_real_table_read() {
+    let graph = scan_routine_with_objects(
+        "DELETE FROM c USING audit c WHERE c.id IN (SELECT id FROM c)",
+        "mysql",
+        "sql",
+        "procedure",
+        Some(naming_context(None, Some(0))),
+        vec![object("c", &["id"])],
+    );
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(
+        edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(edge(&graph, "s.mutate", "s.c", EdgeKind::Reads), "{detail}");
+    assert!(
+        !edge(&graph, "s.mutate", "s.c", EdgeKind::Writes),
+        "{detail}"
+    );
+}
+
 /// 앞에 WITH가 붙은 DELETE도 CTE 몸체가 읽는 컬럼을 남긴다. 읽기 경로로 보내던 때에는 그
 /// 컬럼 읽기가 남았는데, DML 경로로 옮기면서 DELETE를 컬럼 분석기로 보내지 않아 사라졌다.
 #[test]

@@ -39,14 +39,15 @@ pub(crate) fn rule(dialect: &str) -> Rule {
     }
 }
 
-/// 문서가 증명하는 CTE 이름의 비교 규칙이다.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 문서가 증명하는 CTE 이름(과 다중 테이블 DELETE 별칭)의 비교 규칙이다.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum NameCase {
     /// 철자를 바이트 그대로 비교한다 — ASCII 밖 글자의 차이도 다른 이름이다.
     Sensitive,
     /// ASCII 대소문자를 무시한다. ASCII 밖 글자를 어떻게 접는지는 증명하지 않는다.
     Insensitive,
     /// 문서로 알 수 없다.
+    #[default]
     Unknown,
 }
 
@@ -261,7 +262,7 @@ pub(crate) fn push_diagnostic(diagnostics: &mut Vec<Diagnostic>, message: &str) 
 
 /// 진단 문구에 싣는 이름의 제어문자를 `\u{..}`로 바꾼다. 줄바꿈·ESC가 그대로 실리면 한계 목록에
 /// 가짜 줄이나 터미널 색 제어가 생긴다(네이티브 reader 한계 문구의 `printable`과 같은 규칙).
-fn printable(name: &str) -> String {
+pub(crate) fn printable(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {

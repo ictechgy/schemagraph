@@ -57,6 +57,9 @@ pub fn enrich_with_cache(
     // orders라 정확 일치가 없다. 대소문자 구분 방언(PG 등)에 켜면 다른
     // 객체를 잘못 가리키므로 접힘 의미론이 확실한 방언에만 켠다.
     let ci = relation_names_fold_case(doc);
+    // 다중 테이블 DELETE의 대상이 별칭과 대소문자만 다를 때의 비교 규칙. MySQL 별칭은 CTE 이름과
+    // 같은 `lower_case_table_names` 경계로 비교하고, 다른 방언은 문서로 알 수 없다(`aliased_relation`).
+    let alias_case = cte_target::name_case(doc);
     let format_shadowed = matches!(doc.dialect.as_str(), "postgres" | "postgresql")
         && doc
             .schemas
@@ -188,6 +191,7 @@ pub fn enrich_with_cache(
                         body,
                         doc.dialect == "sqlserver" || doc.dialect == "mssql",
                         doc.dialect == "sqlite",
+                        alias_case,
                     ),
                 };
                 match parsed_body {
@@ -383,74 +387,77 @@ pub fn enrich_with_cache(
                 match routine.language.as_deref() {
                     // SQL 언어 함수는 몸체가 그대로 SQL이라 파싱 가능 — 나머지
                     // 언어는 몸체 문법이 SQL이 아니라 미지원으로 보고한다.
-                    Some("sql") | None => match parse_routine_body(dialect.as_ref(), body) {
-                        Ok(mut parsed) => {
-                            let partial = apply_routine(
-                                g,
-                                BodyContext {
-                                    catalog: &catalog_index,
-                                    schema: &schema.name,
-                                    ci,
-                                    body_hash: scope::body_hash(body),
-                                    sqlserver_trigger: false,
-                                    search_path: search_path.as_ref(),
-                                },
-                                &owner,
-                                &mut parsed,
-                                &mut notes,
-                            );
-                            if partial {
-                                state = schemagraph_core::AnalysisState::Partial;
-                            }
-                            record_body_diagnostics = parsed.diagnostics.clone();
-                            enriched += 1;
-                        }
-                        Err(msg) => {
-                            // 도매 파싱이 실패한 몸체 — T-SQL의 DECLARE/IF/TRY
-                            // 같은 절차형 구문이 섞이면 sqlparser가 문장 목록째
-                            // 거부한다. 문장 추출로 부분 복구해 파싱된 문장의
-                            // 간선만 취하고, 미추출은 limitation으로 센다.
-                            let (mut parsed, unextracted) = parse_procedural_body(
-                                dialect.as_ref(),
-                                body,
-                                constant_sql::dialect(&doc.dialect),
-                                format_shadowed,
-                            );
-                            if parsed.has_edges() || unextracted > 0 {
-                                if parsed.has_edges() {
-                                    let partial = apply_routine(
-                                        g,
-                                        BodyContext {
-                                            catalog: &catalog_index,
-                                            schema: &schema.name,
-                                            ci,
-                                            body_hash: scope::body_hash(body),
-                                            sqlserver_trigger: false,
-                                            search_path: search_path.as_ref(),
-                                        },
-                                        &owner,
-                                        &mut parsed,
-                                        &mut notes,
-                                    );
-                                    if partial {
-                                        state = schemagraph_core::AnalysisState::Partial;
-                                    }
+                    Some("sql") | None => {
+                        match parse_routine_body(dialect.as_ref(), body, alias_case) {
+                            Ok(mut parsed) => {
+                                let partial = apply_routine(
+                                    g,
+                                    BodyContext {
+                                        catalog: &catalog_index,
+                                        schema: &schema.name,
+                                        ci,
+                                        body_hash: scope::body_hash(body),
+                                        sqlserver_trigger: false,
+                                        search_path: search_path.as_ref(),
+                                    },
+                                    &owner,
+                                    &mut parsed,
+                                    &mut notes,
+                                );
+                                if partial {
+                                    state = schemagraph_core::AnalysisState::Partial;
                                 }
                                 record_body_diagnostics = parsed.diagnostics.clone();
-                                // 미추출 0건은 완전 복구 — 한계가 아니므로 조용히 둔다.
-                                if unextracted > 0 {
-                                    notes.push(format!(
+                                enriched += 1;
+                            }
+                            Err(msg) => {
+                                // 도매 파싱이 실패한 몸체 — T-SQL의 DECLARE/IF/TRY
+                                // 같은 절차형 구문이 섞이면 sqlparser가 문장 목록째
+                                // 거부한다. 문장 추출로 부분 복구해 파싱된 문장의
+                                // 간선만 취하고, 미추출은 limitation으로 센다.
+                                let (mut parsed, unextracted) = parse_procedural_body(
+                                    dialect.as_ref(),
+                                    body,
+                                    constant_sql::dialect(&doc.dialect),
+                                    format_shadowed,
+                                    alias_case,
+                                );
+                                if parsed.has_edges() || unextracted > 0 {
+                                    if parsed.has_edges() {
+                                        let partial = apply_routine(
+                                            g,
+                                            BodyContext {
+                                                catalog: &catalog_index,
+                                                schema: &schema.name,
+                                                ci,
+                                                body_hash: scope::body_hash(body),
+                                                sqlserver_trigger: false,
+                                                search_path: search_path.as_ref(),
+                                            },
+                                            &owner,
+                                            &mut parsed,
+                                            &mut notes,
+                                        );
+                                        if partial {
+                                            state = schemagraph_core::AnalysisState::Partial;
+                                        }
+                                    }
+                                    record_body_diagnostics = parsed.diagnostics.clone();
+                                    // 미추출 0건은 완전 복구 — 한계가 아니므로 조용히 둔다.
+                                    if unextracted > 0 {
+                                        notes.push(format!(
                                         "routine {owner}: {unextracted} body statement(s) not extracted \
                                      (procedural syntax); body edges incomplete ({msg})"
                                     ));
+                                    }
+                                    enriched += 1;
+                                } else {
+                                    state = schemagraph_core::AnalysisState::Unsupported;
+                                    notes.push(format!("routine {owner} body parse failed: {msg}"));
                                 }
-                                enriched += 1;
-                            } else {
-                                state = schemagraph_core::AnalysisState::Unsupported;
-                                notes.push(format!("routine {owner} body parse failed: {msg}"));
                             }
                         }
-                    },
+                    }
                     // plpgsql·plsql은 문장 단위 추출기로 SQL 문장만 꺼내 파싱한다.
                     // 꺼내지 못한 문장(동적 SQL 등)은 수를 세어 limitation으로 남긴다.
                     Some("plpgsql" | "plsql" | "pl/sql") => {
@@ -459,6 +466,7 @@ pub fn enrich_with_cache(
                             body,
                             constant_sql::dialect(&doc.dialect),
                             format_shadowed,
+                            alias_case,
                         );
                         let partial = apply_routine(
                             g,
@@ -960,6 +968,7 @@ fn parse_trigger_body(
     body: &str,
     sqlserver_trigger: bool,
     sqlite_trigger: bool,
+    alias_case: cte_target::NameCase,
 ) -> Result<ParsedTrigger, String> {
     let calls = extract_execute_targets(body);
     let inner = extract_trigger_inner(body).unwrap_or(body);
@@ -1003,6 +1012,7 @@ fn parse_trigger_body(
                 sqlite_trigger,
                 sqlite: dialect.is::<SQLiteDialect>(),
                 mysql: dialect.is::<MySqlDialect>(),
+                alias_case,
             };
             for mut stmt in stmts {
                 if dialect.is::<PostgreSqlDialect>() {
@@ -1059,11 +1069,15 @@ fn needs_procedural_recovery(body: &str) -> bool {
 
 /// routine 몸체 파싱 — CREATE FUNCTION 전문이 들어오면 AS 뒤의 몸체만
 /// 꺼내고, 나머지는 trigger와 같은 문장 수집 골격으로 파싱한다.
-fn parse_routine_body(dialect: &dyn Dialect, body: &str) -> Result<ParsedTrigger, String> {
+fn parse_routine_body(
+    dialect: &dyn Dialect,
+    body: &str,
+    alias_case: cte_target::NameCase,
+) -> Result<ParsedTrigger, String> {
     let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
     let transformed =
         inner.as_ref().len() != body.len() || !std::ptr::eq(inner.as_ref().as_ptr(), body.as_ptr());
-    let mut parsed = parse_trigger_body(dialect, &inner, false, false)?;
+    let mut parsed = parse_trigger_body(dialect, &inner, false, false, alias_case)?;
     parsed
         .scalar_symbols
         .extend(routine_parameter_symbols(body));
@@ -1086,6 +1100,7 @@ fn parse_catalog_routine_body(dialect_name: &str, body: &str) -> (ParsedTrigger,
         inner,
         constant_sql::dialect(dialect_name),
         false,
+        cte_target::NameCase::Unknown,
     )
 }
 
@@ -1238,9 +1253,15 @@ fn parse_informix_trigger_body(dialect: &dyn Dialect, body: &str) -> Result<Pars
         .unwrap_or(body);
     if let Some(alias) = informix_new_alias(body) {
         let normalized = replace_trigger_alias(inner, &alias);
-        return parse_trigger_body(dialect, &normalized, false, false);
+        return parse_trigger_body(
+            dialect,
+            &normalized,
+            false,
+            false,
+            cte_target::NameCase::Unknown,
+        );
     }
-    parse_trigger_body(dialect, inner, false, false)
+    parse_trigger_body(dialect, inner, false, false, cte_target::NameCase::Unknown)
 }
 
 fn informix_new_alias(body: &str) -> Option<String> {
@@ -1295,7 +1316,7 @@ fn is_identifier_byte(byte: u8) -> bool {
 
 fn parse_db2_trigger_body(dialect: &dyn Dialect, body: &str) -> Result<ParsedTrigger, String> {
     let inner = strip_catalog_trigger_header("db2", body).unwrap_or(body);
-    parse_trigger_body(dialect, inner, false, false)
+    parse_trigger_body(dialect, inner, false, false, cte_target::NameCase::Unknown)
 }
 
 fn strip_catalog_trigger_header<'a>(dialect: &str, body: &'a str) -> Option<&'a str> {
@@ -1995,6 +2016,7 @@ fn parse_procedural_body(
     body: &str,
     text_dialect: constant_sql::TextDialect,
     format_shadowed: bool,
+    alias_case: cte_target::NameCase,
 ) -> (ParsedTrigger, usize) {
     let extracted = extract_as_body(body);
     let starts_in_declare = extracted
@@ -2031,6 +2053,7 @@ fn parse_procedural_body(
         rules: CollectRules {
             sqlite: dialect.is::<SQLiteDialect>(),
             mysql: dialect.is::<MySqlDialect>(),
+            alias_case,
             ..CollectRules::default()
         },
         text_dialect,
@@ -3693,6 +3716,9 @@ struct CollectRules {
     /// 삭제할 관계가 아니라 USING 관계(의 별칭)를 가리키는 참조다. PostgreSQL의
     /// `DELETE FROM t USING …`도 같은 AST지만 FROM의 `t`가 삭제 대상 테이블 자체라 방언으로 가른다.
     mysql: bool,
+    /// 문서가 증명하는 별칭의 대소문자 규칙 — 다중 테이블 DELETE의 대상이 별칭과 대소문자만 다를 때
+    /// 그 별칭으로 풀어도 되는가(`delete_target_names`).
+    alias_case: cte_target::NameCase,
 }
 
 /// 앞에 WITH가 붙은 DML에서 그 WITH의 CTE와 이름이 같은 한정자 없는 쓰기 대상이다.
@@ -3857,6 +3883,10 @@ fn collect_trigger_facts(stmt: &Statement, parsed: &mut ParsedTrigger, rules: Co
     // 쓰기 대상은 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
     // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
     let (write_targets, cte_writes) = split_write_targets(stmt, rules);
+    for message in alias_case_messages(stmt, rules) {
+        cte_target::push_diagnostic(&mut parsed.diagnostics, &message);
+        parsed.partial = true;
+    }
     for write in cte_writes {
         if !parsed.cte_writes.contains(&write) {
             parsed.cte_writes.push(write);
@@ -4191,30 +4221,110 @@ fn delete_target_names(delete: &sqlparser::ast::Delete, rules: CollectRules) -> 
         return delete
             .tables
             .iter()
-            .map(|target| alias_target(target, from).unwrap_or(target))
+            .map(|target| alias_target(target, from, rules).map_or(target, |hit| hit.relation))
             .collect();
     }
-    let using = delete.using.as_deref().filter(|_| rules.mysql);
     from.iter()
         .filter_map(|twj| match &twj.relation {
-            TableFactor::Table { name, alias, .. } => Some(
-                using
-                    .filter(|_| alias.is_none())
-                    .and_then(|using| alias_target(name, using))
-                    .unwrap_or(name),
+            TableFactor::Table { name, .. } => Some(
+                using_alias_target(delete, &twj.relation, rules).map_or(name, |hit| hit.relation),
             ),
             _ => None,
         })
         .collect()
 }
 
+/// MySQL `DELETE FROM c USING audit c …`에서 FROM 목록의 별칭 없는 한 항목이 가리키는 USING 관계다.
+fn using_alias_target<'a>(
+    delete: &'a sqlparser::ast::Delete,
+    factor: &'a TableFactor,
+    rules: CollectRules,
+) -> Option<AliasHit<'a>> {
+    let using = delete.using.as_deref().filter(|_| rules.mysql)?;
+    match factor {
+        TableFactor::Table {
+            name, alias: None, ..
+        } => alias_target(name, using, rules),
+        _ => None,
+    }
+}
+
+/// 대상 이름을 별칭으로 푼 결과다.
+#[derive(Clone, Copy)]
+struct AliasHit<'a> {
+    /// 별칭이 가리키는 관계 이름.
+    relation: &'a ObjectName,
+    /// 선언된 별칭 철자. 대상 철자와 다르면 대소문자만 다르다.
+    alias: &'a str,
+}
+
 /// 한 부분짜리 대상 이름이 `tables`(조인한 관계 포함)에서 별칭으로 선언된 물리 관계를 가리키면
-/// 그 관계의 이름이다.
-fn alias_target<'a>(target: &ObjectName, tables: &'a [TableWithJoins]) -> Option<&'a ObjectName> {
+/// 그 관계다.
+fn alias_target<'a>(
+    target: &ObjectName,
+    tables: &'a [TableWithJoins],
+    rules: CollectRules,
+) -> Option<AliasHit<'a>> {
     let factors = tables.iter().flat_map(|twj| {
         std::iter::once(&twj.relation).chain(twj.joins.iter().map(|join| &join.relation))
     });
-    aliased_relation(single_ident(target)?, factors)
+    aliased_relation(single_ident(target)?, factors, rules.alias_case)
+}
+
+/// DELETE의 대상이 대소문자만 다른 별칭으로 풀렸는데 문서가 별칭의 대소문자 규칙을 증명하지 않을 때의
+/// 진단 문구다. 그 쓰기는 MySQL `lower_case_table_names`=0이나 대소문자를 구분하는 collation에서는
+/// 일어나지 않는다(`ER_UNKNOWN_TABLE`) — 간선은 이전처럼 남기되 `complete`를 주장하지 않는다.
+fn alias_case_messages(stmt: &Statement, rules: CollectRules) -> Vec<String> {
+    if rules.alias_case != cte_target::NameCase::Unknown {
+        return Vec::new();
+    }
+    let mut messages = Vec::new();
+    let _ = visit_statements(stmt, |statement| {
+        if let Statement::Delete(delete) = statement {
+            for (target, hit) in delete_alias_hits(delete, rules) {
+                if hit.alias != target {
+                    messages.push(format!(
+                        "DML target '{}' names the alias '{}' only if letter case is ignored, and the document does not prove the alias case rule; the write edge to the aliased relation is kept",
+                        cte_target::printable(target),
+                        cte_target::printable(hit.alias)
+                    ));
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    messages
+}
+
+/// DELETE 대상 가운데 별칭으로 풀린 것과 그 풀이다.
+fn delete_alias_hits<'a>(
+    delete: &'a sqlparser::ast::Delete,
+    rules: CollectRules,
+) -> Vec<(&'a str, AliasHit<'a>)> {
+    let from: &[TableWithJoins] = match &delete.from {
+        sqlparser::ast::FromTable::WithFromKeyword(tables)
+        | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+    };
+    let targets: Vec<(&ObjectName, Option<AliasHit<'a>>)> = if delete.tables.is_empty() {
+        from.iter()
+            .filter_map(|twj| match &twj.relation {
+                TableFactor::Table { name, .. } => {
+                    Some((name, using_alias_target(delete, &twj.relation, rules)))
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        delete
+            .tables
+            .iter()
+            .map(|target| (target, alias_target(target, from, rules)))
+            .collect()
+    };
+    targets
+        .into_iter()
+        .filter_map(|(target, hit)| Some((single_ident(target)?, hit?)))
+        .collect()
 }
 
 /// 한 부분짜리 이름의 식별자 철자다.
@@ -4225,72 +4335,90 @@ fn single_ident(name: &ObjectName) -> Option<&str> {
     Some(part.as_ident()?.value.as_str())
 }
 
-/// `alias`로 선언된 물리 관계가 `factors` 가운데 하나뿐이면 그 관계 이름이다.
+/// `alias`로 선언된 물리 관계가 `factors` 가운데 하나뿐이면 그 관계와 선언된 별칭 철자다.
 ///
-/// 철자가 정확히 같은 별칭을 먼저 찾고, 없을 때만 ASCII 대소문자를 무시한다. 별칭의 대소문자를
-/// 구분하는 설정(SQL Server CS collation, MySQL `lower_case_table_names=0`)에서는 `c`와 `C`가 다른
+/// 철자가 정확히 같은 별칭을 먼저 찾는다. 별칭의 대소문자를 구분하는 설정에서는 `c`와 `C`가 다른
 /// 별칭이고, 무시하는 설정에서는 둘을 함께 선언할 수 없다(오류). 그래서 정확한 철자가 하나면 그
-/// 관계가 어느 설정에서나 맞다. 이름을 부분으로 나누지 않는다 — 별칭이 세 부분 이름의 관계를
-/// 가리켜도 후보에서 빠지지 않아야 별칭 철자를 관계 이름으로 오인하지 않는다.
+/// 관계가 어느 설정에서나 맞다. 정확한 철자가 없으면 문서의 규칙(`case`)으로 ASCII 대소문자만 다른
+/// 별칭을 찾는다 — MySQL은 별칭을 `table_alias_charset`으로 비교하고(mysql-server 8.0
+/// `parse_tree_nodes.cc` `multi_delete_table_match`), 그 charset은 `lower_case_table_names`=0이면
+/// `my_charset_bin`, 아니면 `my_charset_utf8mb3_tolower_ci`다(`mysqld.cc`). 규칙이 대소문자를
+/// 구분하면 풀지 않고, 모르면 풀되 호출자가 진단을 단다(`alias_case_messages`). 이름을 부분으로
+/// 나누지 않는다 — 별칭이 세 부분 이름의 관계를 가리켜도 후보에서 빠지지 않아야 별칭 철자를 관계
+/// 이름으로 오인하지 않는다.
 fn aliased_relation<'a>(
     alias: &str,
     factors: impl Iterator<Item = &'a TableFactor>,
-) -> Option<&'a ObjectName> {
-    let declared: Vec<(&str, &ObjectName)> = factors
+    case: cte_target::NameCase,
+) -> Option<AliasHit<'a>> {
+    let declared: Vec<AliasHit<'a>> = factors
         .filter_map(|factor| match factor {
             TableFactor::Table {
                 name,
                 alias: Some(declared),
                 args: None,
                 ..
-            } if declared.name.value.eq_ignore_ascii_case(alias) => {
-                Some((declared.name.value.as_str(), name))
-            }
+            } if declared.name.value.eq_ignore_ascii_case(alias) => Some(AliasHit {
+                relation: name,
+                alias: declared.name.value.as_str(),
+            }),
             _ => None,
         })
         .collect();
-    let exact: Vec<&ObjectName> = declared
+    let exact: Vec<AliasHit<'a>> = declared
         .iter()
-        .filter(|(spelling, _)| *spelling == alias)
-        .map(|(_, name)| *name)
+        .copied()
+        .filter(|hit| hit.alias == alias)
         .collect();
-    let candidates = if exact.is_empty() {
-        declared.iter().map(|(_, name)| *name).collect()
-    } else {
-        exact
+    let candidates = match (exact.is_empty(), case) {
+        (false, _) => exact,
+        (true, cte_target::NameCase::Sensitive) => Vec::new(),
+        (true, _) => declared,
     };
     match candidates.as_slice() {
-        [target] => Some(*target),
+        [hit] => Some(*hit),
         _ => None,
     }
 }
 
-/// 한 문장에서 읽기로 세지 않을 관계 이름이다 — 쓰기 대상과, 대상을 별칭으로 적은 자리의 철자.
-///
-/// `UPDATE c … FROM audit c`의 `c`와 MySQL `DELETE FROM c USING audit c …`의 FROM 목록 `c`는
-/// visitor가 관계로 방문하지만 실제로는 별칭 참조라, 읽기로 세면 없는 관계 `s.c`가 된다.
+/// 한 문장에서 읽기로 세지 않을 관계 이름이다 — 쓰기 대상과, `UPDATE c … FROM audit c`의 `c`.
 fn read_exclusions(
     stmt: &Statement,
     write_targets: &[(Option<String>, String)],
-    rules: CollectRules,
 ) -> Vec<(Option<String>, String)> {
     let mut exclusions = write_targets.to_vec();
-    let aliased: Vec<&TableFactor> = match stmt {
-        Statement::Update { table, .. } => vec![&table.relation],
-        Statement::Delete(delete) if rules.mysql && delete.using.is_some() => match &delete.from {
-            sqlparser::ast::FromTable::WithFromKeyword(tables)
-            | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
-                tables.iter().map(|twj| &twj.relation).collect()
+    if let Statement::Update { table, .. } = stmt {
+        if let Some(target) = table_factor_name(&table.relation) {
+            if !exclusions.contains(&target) {
+                exclusions.push(target);
             }
-        },
-        _ => Vec::new(),
-    };
-    for target in aliased.into_iter().filter_map(table_factor_name) {
-        if !exclusions.contains(&target) {
-            exclusions.push(target);
         }
     }
     exclusions
+}
+
+/// MySQL `DELETE FROM c USING audit c …`의 FROM 목록 이름 자리다.
+///
+/// visitor가 그 자리를 관계로 방문하지만 실제로는 USING 관계를 가리키는 참조라, 읽기로 세면 없는
+/// 관계 `s.c`가 된다. 같은 철자를 문장 전체에서 빼면 하위 질의가 실제 테이블 `c`를 읽는 것까지
+/// 지워지므로, 그 이름 노드의 주소만 돌려준다.
+fn using_alias_references(stmt: &Statement, rules: CollectRules) -> Vec<*const ObjectName> {
+    let Statement::Delete(delete) = stmt else {
+        return Vec::new();
+    };
+    if !rules.mysql || delete.using.is_none() {
+        return Vec::new();
+    }
+    match &delete.from {
+        sqlparser::ast::FromTable::WithFromKeyword(tables)
+        | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables
+            .iter()
+            .filter_map(|twj| match &twj.relation {
+                TableFactor::Table { name, .. } => Some(name as *const ObjectName),
+                _ => None,
+            })
+            .collect(),
+    }
 }
 
 /// 데이터베이스까지 한정한 세 부분 쓰기 대상이다(`app.dbo.audit`).
@@ -7653,7 +7781,8 @@ mod tests {
     fn dml_문장_중복_확인은_해시가_같은_후보와만_비교한다() {
         let body = repeated_insert_body(2_000, &[7, 1_999]);
         work::take_compared_statements();
-        let parsed = parse_routine_body(&GenericDialect {}, &body).expect("INSERT만 있는 몸체");
+        let parsed = parse_routine_body(&GenericDialect {}, &body, cte_target::NameCase::Unknown)
+            .expect("INSERT만 있는 몸체");
         // 위치만 다른 사본은 합쳐지고 처음 나온 순서가 그대로 남는다.
         assert_eq!(parsed.dml_statements.len(), 2_000);
         let leading: Vec<String> = parsed
@@ -7709,7 +7838,8 @@ mod tests {
             .map(|row| format!("SELECT {row} FROM customers"))
             .collect();
         let body = format!("INSERT INTO orders (id) {}", rows.join(" UNION ALL "));
-        let parsed = parse_routine_body(&GenericDialect {}, &body).expect("INSERT SELECT");
+        let parsed = parse_routine_body(&GenericDialect {}, &body, cte_target::NameCase::Unknown)
+            .expect("INSERT SELECT");
         assert_eq!(parsed.dml_statements.len(), 1);
         assert_eq!(parsed.writes, [(None, "orders".to_owned())]);
         assert_eq!(parsed.reads, [(None, "customers".to_owned())]);
