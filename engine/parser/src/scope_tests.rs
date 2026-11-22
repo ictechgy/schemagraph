@@ -2162,6 +2162,69 @@ fn tsql_cut_points_match_the_semicolon_version() {
     assert!(!cte.iter().any(|edge| edge.contains("s.cte")), "{cte:?}");
 }
 
+/// 세미콜론 없는 T-SQL에서 `SET`은 우변·설정 뒤에 붙은 다음 문장 머리에서 끝난다. 이전에는 `SET` 갈래가
+/// 조각 끝까지를 우변으로 삼아, `PRINT 'x' SET @n = 1 UPDATE audit …`(5b11c7a에서 `SET`을 끊기 머리로 더한 뒤)와
+/// 맨 앞의 `SET @n = 1 UPDATE audit …`(main부터)가 `UPDATE`를 소리 없이 잃고 `complete`였다. 세미콜론을 붙인
+/// 같은 몸체와 같은 간선·상태여야 한다.
+#[test]
+fn set_statements_end_at_the_next_statement_head() {
+    let facts = |body: &str| {
+        let graph = scan_routine_kind(body, "sqlserver", "sql", "procedure");
+        let mut edges: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.from.as_str() == "s.mutate")
+            .map(|edge| format!("{:?} {}", edge.kind, edge.to))
+            .collect();
+        edges.sort();
+        (
+            edges,
+            graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        )
+    };
+    for (without, with, written) in [
+        (
+            "DECLARE @n int; UPDATE orders SET amount = 1; PRINT 'x' SET @n = 1 UPDATE audit SET name = 'x'",
+            "DECLARE @n int; UPDATE orders SET amount = 1; PRINT 'x'; SET @n = 1; UPDATE audit SET name = 'x'",
+            "Writes s.audit",
+        ),
+        (
+            "DECLARE @c int; EXEC mutate SET @c = 3 UPDATE audit SET name = 'x'",
+            "DECLARE @c int; EXEC mutate; SET @c = 3; UPDATE audit SET name = 'x'",
+            "Writes s.audit",
+        ),
+        (
+            "BEGIN TRY UPDATE orders SET amount = 1 END TRY BEGIN CATCH PRINT ERROR_MESSAGE() SET @n = 1 INSERT INTO audit (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE orders SET amount = 1; END TRY BEGIN CATCH PRINT ERROR_MESSAGE(); SET @n = 1; INSERT INTO audit (id) VALUES (1); END CATCH",
+            "Writes s.audit",
+        ),
+        (
+            "DECLARE @c int; PRINT 'x' SET NOCOUNT ON UPDATE orders SET amount = 1",
+            "DECLARE @c int; PRINT 'x'; SET NOCOUNT ON; UPDATE orders SET amount = 1",
+            "Writes s.orders",
+        ),
+        (
+            "DECLARE @c int; PRINT 'x' SET XACT_ABORT ON INSERT INTO audit (id) VALUES (1)",
+            "DECLARE @c int; PRINT 'x'; SET XACT_ABORT ON; INSERT INTO audit (id) VALUES (1)",
+            "Writes s.audit",
+        ),
+        (
+            "DECLARE @c int; WAITFOR DELAY '00:00:01' SET @c = 3 UPDATE audit SET name = 'x'",
+            "DECLARE @c int; WAITFOR DELAY '00:00:01'; SET @c = 3; UPDATE audit SET name = 'x'",
+            "Writes s.audit",
+        ),
+        (
+            "DECLARE @n int; SET @n = 1 UPDATE audit SET name = 'x'",
+            "DECLARE @n int; SET @n = 1; UPDATE audit SET name = 'x'",
+            "Writes s.audit",
+        ),
+    ] {
+        let (edges, state) = facts(without);
+        assert!(edges.iter().any(|edge| edge == written), "{without}: {edges:?}");
+        assert_eq!((edges, state), facts(with), "{without}");
+    }
+}
+
 /// MySQL USING 형식의 FROM 목록 별칭은 그 자리만 읽기에서 뺀다. 하위 질의가 같은 이름의 실제 테이블
 /// `c`를 읽는 것은 읽기다.
 #[test]

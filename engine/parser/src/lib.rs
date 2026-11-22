@@ -2357,8 +2357,11 @@ fn extract_procedural_statements(
                     // T-SQL `SET @v = <expr>`은 변수 대입 — 우변에 질의가
                     // 있으면 살린다. `SET NOCOUNT ON` 같은 환경 설정은
                     // 문장째 파서에 넘겨 성공하면 간선 없음, 실패하면
-                    // 미추출로 세게 둔다.
-                    let tail = rest[wlen..].trim_start();
+                    // 미추출로 세게 둔다. 세미콜론 없는 T-SQL 조각에서는 우변·설정 뒤에
+                    // 다음 문장이 붙으므로(`SET @n = 1 UPDATE audit …`) 그 앞에서 끝내고 계속 꺼낸다.
+                    let end = tsql_statement_end(&rest[wlen..], state).map(|at| wlen + at);
+                    let statement = &rest[..end.unwrap_or(rest.len())];
+                    let tail = statement[wlen..].trim_start();
                     if tail.starts_with('@') {
                         if let Some(eq) = find_top_level(tail, "=", false) {
                             let rhs = tail[eq + 1..].trim();
@@ -2371,9 +2374,12 @@ fn extract_procedural_statements(
                             }
                         }
                     } else {
-                        stmts.push(rest.trim().to_owned());
+                        stmts.push(statement.trim().to_owned());
                     }
-                    break;
+                    let Some(end) = end else {
+                        break;
+                    };
+                    rest = &rest[end..];
                 }
                 "EXIT" | "CONTINUE" | "ASSERT" => {
                     strip_tail_condition(rest, wlen, &mut stmts);
