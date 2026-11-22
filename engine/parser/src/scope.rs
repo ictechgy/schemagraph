@@ -741,12 +741,9 @@ pub(crate) fn is_select(dialect: &dyn Dialect, body: &str) -> bool {
     })
 }
 
-/// DML 대상 이름을 WITH의 CTE보다 카탈로그 테이블로 먼저 찾는 방언인가.
-///
-/// 객체 단위 수집(`lib.rs`의 같은 이름 함수)과 같은 판정이다. PostgreSQL 16·SQLite 3.53.1에서
-/// `WITH audit AS (…) INSERT|UPDATE|DELETE … audit`가 실제 `audit`를 바꾸는 것을 확인했다.
+/// DML 대상 이름을 WITH의 CTE보다 카탈로그 테이블로 먼저 찾는 방언인가(`CteTargetRule::Table`).
 fn dml_target_ignores_ctes(dialect: &str) -> bool {
-    matches!(dialect, "postgres" | "postgresql" | "sqlite")
+    super::cte_target_rule(dialect) == super::CteTargetRule::Table
 }
 
 /// 카탈로그 쪽 스키마·관계·routine 이름을 `name`과 같은 규칙의 키로 만든다.
@@ -2264,21 +2261,27 @@ impl DmlAnalyzer<'_, '_> {
         }
     }
 
-    /// `WITH … INSERT|UPDATE …`를 그 CTE가 보이는 상태로 분석한다.
+    /// `WITH … INSERT|UPDATE|DELETE …`를 그 CTE가 보이는 상태로 분석한다.
     ///
-    /// CTE는 DML의 원천에서만 보인다. 대상이 CTE 이름이면 방언마다 뜻이 다르다 —
-    /// PostgreSQL·SQLite는 같은 이름의 실제 테이블에 쓰고(`dml_target_ignores_ctes`), SQL
-    /// Server는 CTE를 통해 원본 테이블에 쓴다. 앞의 둘은 대상을 CTE 없이 찾고, 나머지는 대상
-    /// 컬럼을 추측하지 않고 부분 분석으로 남긴다.
+    /// CTE 몸체가 읽는 컬럼은 DELETE에서도 사실이라 먼저 해석한다(DELETE 자체의 컬럼 효과는
+    /// WITH가 없는 DELETE처럼 남기지 않는다).
+    ///
+    /// CTE는 DML의 원천에서만 보인다. 대상이 CTE 이름이면 방언마다 뜻이 다르다
+    /// (`CteTargetRule`) — PostgreSQL·SQLite는 같은 이름의 실제 테이블에 쓰므로 대상을 CTE 없이
+    /// 찾는다. SQL Server·MySQL은 CTE를 가리키고, 나머지 방언은 확인하지 않았으므로 대상 컬럼을
+    /// 추측하지 않고 부분 분석으로 남긴다.
     fn with_statement(&mut self, query: &Query, dml: &Statement) {
         let ctes = self
             .binder
             .bind_ctes(query.with.as_ref(), &Ctes::new(), None);
-        if !dml_target_ignores_ctes(self.binder.catalog.dialect)
-            && self.dml_target_names_cte(dml, &ctes)
-        {
-            // 객체 단위 수집이 같은 문구를 이미 남겼으면 다시 쌓지 않는다.
-            self.note_once("SG_DML_TARGET_SHAPE", super::CTE_TARGET_MESSAGE);
+        if let Some(target) = self.dml_target_naming_cte(dml, &ctes) {
+            // 객체 단위 적용이 같은 대상의 진단을 이미 남겼으면 다시 쌓지 않는다.
+            let rule = super::cte_target_rule(self.binder.catalog.dialect);
+            self.partial = true;
+            super::push_cte_target_diagnostic(
+                self.diagnostics,
+                &super::cte_target_message(&target, rule),
+            );
             return;
         }
         let previous = std::mem::replace(&mut self.ctes, ctes);
@@ -2286,7 +2289,7 @@ impl DmlAnalyzer<'_, '_> {
         self.ctes = previous;
     }
 
-    /// UPDATE·MERGE 대상을 찾을 때 보이는 CTE다.
+    /// UPDATE 대상을 찾을 때 보이는 CTE다.
     ///
     /// PostgreSQL·SQLite의 대상은 같은 이름의 CTE가 있어도 실제 테이블이라 CTE를 빼고 찾는다.
     /// 다른 방언은 `with_statement`가 CTE 이름 대상을 미리 걸렀으므로 문장의 CTE를 그대로 둔다
@@ -2299,17 +2302,21 @@ impl DmlAnalyzer<'_, '_> {
         }
     }
 
-    /// INSERT·UPDATE 대상이 한정자 없는 CTE 이름인가.
+    /// INSERT·UPDATE 대상이 한정자 없는 CTE 이름이면 그 대상의 원래 철자를 돌려준다.
     ///
-    /// SQL Server의 `UPDATE b … FROM big b`는 별칭이 가리키는 FROM 관계가 대상이므로
-    /// `update`와 같은 승격 규칙으로 대상을 고른 뒤 비교한다. 비교는 ASCII 대소문자를
-    /// 무시한다 — 대소문자를 무시하는 collation에서 `Recent`와 `recent`는 같은 CTE이고,
-    /// 더 많이 잡을수록 대상 컬럼이 빠질 뿐 거짓 간선은 생기지 않는다.
-    fn dml_target_names_cte(&self, dml: &Statement, ctes: &Ctes) -> bool {
+    /// PostgreSQL·SQLite는 대상을 늘 실제 테이블로 찾으므로(`dml_target_ignores_ctes`) 비교하지
+    /// 않는다. SQL Server의 `UPDATE b … FROM big b`는 별칭이 가리키는 FROM 관계가 대상이므로
+    /// `update`와 같은 승격 규칙으로 대상을 고른 뒤 비교한다. 대소문자만 다른 이름은 관계 이름을
+    /// 대소문자 무시로 비교하는 문서(`fold_relation_case`)에서만 같은 CTE다 — 객체 단위
+    /// `settle_cte_writes`와 같은 규칙이다.
+    fn dml_target_naming_cte(&self, dml: &Statement, ctes: &Ctes) -> Option<String> {
+        if dml_target_ignores_ctes(self.binder.catalog.dialect) {
+            return None;
+        }
         let name = match dml {
             Statement::Insert(insert) => match &insert.table {
                 TableObject::TableName(name) => name,
-                TableObject::TableFunction(_) => return false,
+                TableObject::TableFunction(_) => return None,
             },
             Statement::Update { table, from, .. } => {
                 let from_tables: &[TableWithJoins] = match from {
@@ -2321,15 +2328,18 @@ impl DmlAnalyzer<'_, '_> {
                     .unwrap_or(&table.relation)
                 {
                     TableFactor::Table { name, .. } => name,
-                    _ => return false,
+                    _ => return None,
                 }
             }
-            _ => return false,
+            _ => return None,
         };
-        match self.binder.parts(name).as_slice() {
-            [single] => ctes.keys().any(|key| key.eq_ignore_ascii_case(single)),
-            _ => false,
-        }
+        let [single] = self.binder.parts(name).try_into().ok()?;
+        let fold = self.binder.catalog.fold_relation_case;
+        let names_cte = ctes
+            .keys()
+            .any(|key| key == &single || (fold && key.eq_ignore_ascii_case(&single)));
+        let spelling = name.0.last()?.as_ident()?.value.clone();
+        names_cte.then_some(spelling)
     }
 
     /// `COPY t [(cols)] TO|FROM …`의 컬럼 효과를 남긴다.
@@ -2718,22 +2728,21 @@ impl DmlAnalyzer<'_, '_> {
     ) {
         let mut scope = Scope::default();
         let visible = Rc::new(scope.clone());
-        let target_ctes = self.target_ctes();
         self.binder
-            .add_factor(table, &mut scope, &target_ctes, visible);
+            .add_factor(table, &mut scope, &Ctes::new(), visible);
         let visible = Rc::new(scope.clone());
         self.binder
-            .add_factor(source, &mut scope, &self.ctes, visible);
+            .add_factor(source, &mut scope, &Ctes::new(), visible);
         let target = scope.relations.first().cloned();
         let scope = Rc::new(scope);
         self.binder
-            .visit(on, &scope, &self.ctes, "predicate", &[], &BTreeMap::new());
+            .visit(on, &scope, &Ctes::new(), "predicate", &[], &BTreeMap::new());
         for clause in clauses {
             if let Some(predicate) = &clause.predicate {
                 self.binder.visit(
                     predicate,
                     &scope,
-                    &self.ctes,
+                    &Ctes::new(),
                     "predicate",
                     &[],
                     &BTreeMap::new(),
@@ -2754,7 +2763,7 @@ impl DmlAnalyzer<'_, '_> {
                         let sources = self.binder.visit(
                             &assignment.value,
                             &scope,
-                            &self.ctes,
+                            &Ctes::new(),
                             "value",
                             &[],
                             &BTreeMap::new(),
@@ -2775,7 +2784,7 @@ impl DmlAnalyzer<'_, '_> {
                             let sources = self.binder.visit(
                                 value,
                                 &scope,
-                                &self.ctes,
+                                &Ctes::new(),
                                 "value",
                                 &[],
                                 &BTreeMap::new(),
@@ -3218,18 +3227,6 @@ impl DmlAnalyzer<'_, '_> {
     fn note_diagnostic(&mut self, diagnostic: Diagnostic) {
         self.partial = true;
         self.diagnostics.push(diagnostic);
-    }
-
-    /// `note`와 같지만 같은 코드·문구의 진단이 이미 있으면 부분 분석 표시만 한다.
-    fn note_once(&mut self, code: &str, message: &str) {
-        self.partial = true;
-        let known = self
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == code && diagnostic.message == message);
-        if !known {
-            self.note(code, message);
-        }
     }
 }
 
