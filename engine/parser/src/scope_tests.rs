@@ -2019,6 +2019,60 @@ fn skipped_clause_assignments_never_fold_a_stale_value() {
     );
 }
 
+/// MySQL `lower_case_table_names=0`에서 대상이 별칭과 대소문자만 다르면 MySQL은 그 문장을
+/// `ER_UNKNOWN_TABLE`로 거절한다. 카탈로그에 그 철자의 테이블 `C`가 있어도(lctn 0에서는 `c`와 함께 있을
+/// 수 있다) `C`에 쓰지 않는다. FROM 목록에 별칭 없는 `C`가 있으면 그 테이블이 대상이다.
+#[test]
+fn case_sensitive_alias_mismatch_writes_no_catalog_table() {
+    let scan = |body: &str| {
+        scan_routine_with_objects(
+            body,
+            "mysql",
+            "sql",
+            "procedure",
+            Some(naming_context(None, Some(0))),
+            vec![object("c", &["id"]), object("C", &["id"])],
+        )
+    };
+    for body in [
+        "DELETE C FROM audit c WHERE c.id = 1",
+        "DELETE FROM C USING audit c WHERE c.id = 1",
+    ] {
+        let graph = scan(body);
+        let detail = format!("{body}: {:?} {:?}", graph.edges(), graph.analysis());
+        assert!(
+            !edge(&graph, "s.mutate", "s.C", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert!(
+            !edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+            "{detail}"
+        );
+        let analysis = &graph.analysis()[&VertexId::from_raw("s.mutate")];
+        assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "SG_DML_TARGET_SHAPE"
+                    && diagnostic
+                        .message
+                        .starts_with("DML target 'C' matches the alias 'c' only by letter case")),
+            "{detail}"
+        );
+    }
+    let joined = scan("DELETE C FROM audit c JOIN C ON C.id = c.id");
+    let detail = format!("{:?}", joined.edges());
+    assert!(
+        edge(&joined, "s.mutate", "s.C", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(
+        !edge(&joined, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+}
+
 /// T-SQL에서 끊은 자리의 읽기·쓰기는 세미콜론 판과 같다 — `EXECUTE proc` 인자 뒤 문장, `PRINT`의 하위 질의,
 /// 그리고 `WITH cte AS (…)`로 여는 문장. 이전에는 `PRINT 'x' WITH cte AS (…) INSERT …`가 `WITH`를 `PRINT`의
 /// 절로 버려 실제 테이블 `cte`를 읽는 거짓 간선을 냈다.

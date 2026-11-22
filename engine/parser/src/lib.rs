@@ -4298,6 +4298,36 @@ fn write_targets_shallow(stmt: &Statement, rules: CollectRules) -> Vec<(Option<S
 /// 이름은 부분으로 나누지 않고 돌려준다. 데이터베이스까지 한정한 대상(`DELETE FROM app.dbo.audit`,
 /// `DELETE c FROM app.dbo.audit c …`)도 대상으로 남아 `qualified_write_targets`가 쓰기로 모은다.
 fn delete_target_names(delete: &sqlparser::ast::Delete, rules: CollectRules) -> Vec<&ObjectName> {
+    delete_target_resolutions(delete, rules)
+        .into_iter()
+        .filter_map(|(_, resolution)| resolution.relation)
+        .collect()
+}
+
+/// DELETE 대상 하나를 별칭으로 푼 결과다.
+#[derive(Clone, Copy)]
+struct TargetResolution<'a> {
+    /// 행을 지우는 관계. MySQL이 그 대상을 거절해(`ER_UNKNOWN_TABLE`) 쓰기가 없으면 `None`이다.
+    relation: Option<&'a ObjectName>,
+    /// 대소문자만 다른 별칭으로 맞았으면 그 별칭 철자다.
+    case_only_alias: Option<&'a str>,
+}
+
+impl<'a> TargetResolution<'a> {
+    /// 별칭으로 풀지 않은 대상 — 적힌 이름 그대로의 관계다.
+    fn named(target: &'a ObjectName) -> Self {
+        Self {
+            relation: Some(target),
+            case_only_alias: None,
+        }
+    }
+}
+
+/// DELETE 대상마다 적힌 이름과 그 풀이다(`delete_target_names`의 근거).
+fn delete_target_resolutions<'a>(
+    delete: &'a sqlparser::ast::Delete,
+    rules: CollectRules,
+) -> Vec<(&'a ObjectName, TargetResolution<'a>)> {
     let from: &[TableWithJoins] = match &delete.from {
         sqlparser::ast::FromTable::WithFromKeyword(tables)
         | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
@@ -4306,32 +4336,72 @@ fn delete_target_names(delete: &sqlparser::ast::Delete, rules: CollectRules) -> 
         return delete
             .tables
             .iter()
-            .map(|target| alias_target(target, from, rules).map_or(target, |hit| hit.relation))
+            .map(|target| (target, resolve_delete_target(target, from, rules)))
             .collect();
     }
+    let using = delete.using.as_deref().filter(|_| rules.mysql);
     from.iter()
-        .filter_map(|twj| match &twj.relation {
-            TableFactor::Table { name, .. } => Some(
-                using_alias_target(delete, &twj.relation, rules).map_or(name, |hit| hit.relation),
-            ),
+        .filter_map(|twj| match (&twj.relation, using) {
+            (
+                TableFactor::Table {
+                    name, alias: None, ..
+                },
+                Some(using),
+            ) => Some((name, resolve_delete_target(name, using, rules))),
+            (TableFactor::Table { name, .. }, _) => Some((name, TargetResolution::named(name))),
             _ => None,
         })
         .collect()
 }
 
-/// MySQL `DELETE FROM c USING audit c …`에서 FROM 목록의 별칭 없는 한 항목이 가리키는 USING 관계다.
-fn using_alias_target<'a>(
-    delete: &'a sqlparser::ast::Delete,
-    factor: &'a TableFactor,
+/// 다중 테이블 DELETE의 대상 이름 하나를 `tables`(조인한 관계 포함)의 별칭으로 푼다.
+///
+/// 정확한 철자의 별칭이면 그 관계다. 대소문자만 다른 별칭과만 맞으면 문서의 규칙을 따른다 — MySQL은
+/// 대상과 FROM/USING 항목을 `table_alias_charset`으로 비교하고(mysql-server 8.0 `parse_tree_nodes.cc`
+/// `multi_delete_table_match`, 별칭이 있는 항목은 별칭으로만, 없는 항목은 테이블 이름으로), 그 charset은
+/// `lower_case_table_names`=0이면 `my_charset_bin`, 아니면 `my_charset_utf8mb3_tolower_ci`다(`mysqld.cc`).
+/// 그래서 대소문자를 구분하는 규칙에서는 정확히 같은 이름의 별칭 없는 항목만 대상이 되고, 그런 항목이
+/// 없으면 문장이 `ER_UNKNOWN_TABLE`로 실패해 쓰기가 없다 — 카탈로그에 그 철자의 테이블(`C`)이 있어도
+/// 그 테이블에 쓰지 않는다. 대소문자를 무시하거나 규칙을 모르면 별칭의 관계로 푼다(모르면 호출자가
+/// 진단을 단다, `alias_case_messages`).
+fn resolve_delete_target<'a>(
+    target: &'a ObjectName,
+    tables: &'a [TableWithJoins],
     rules: CollectRules,
-) -> Option<AliasHit<'a>> {
-    let using = delete.using.as_deref().filter(|_| rules.mysql)?;
-    match factor {
-        TableFactor::Table {
-            name, alias: None, ..
-        } => alias_target(name, using, rules),
-        _ => None,
+) -> TargetResolution<'a> {
+    let (Some(spelling), Some(hit)) = (single_ident(target), alias_target(target, tables)) else {
+        return TargetResolution::named(target);
+    };
+    if hit.alias == spelling {
+        return TargetResolution {
+            relation: Some(hit.relation),
+            case_only_alias: None,
+        };
     }
+    if rules.alias_case != cte_target::NameCase::Sensitive {
+        return TargetResolution {
+            relation: Some(hit.relation),
+            case_only_alias: Some(hit.alias),
+        };
+    }
+    if names_unaliased_table(tables, spelling) {
+        return TargetResolution::named(target);
+    }
+    TargetResolution {
+        relation: None,
+        case_only_alias: Some(hit.alias),
+    }
+}
+
+/// `tables`(조인한 관계 포함)에 별칭 없이 철자가 정확히 `name`인 한 부분짜리 관계가 있는가.
+fn names_unaliased_table(tables: &[TableWithJoins], name: &str) -> bool {
+    tables
+        .iter()
+        .flat_map(|twj| std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation)))
+        .any(|factor| {
+            matches!(factor, TableFactor::Table { name: table, alias: None, .. }
+                if single_ident(table) == Some(name))
+        })
 }
 
 /// 대상 이름을 별칭으로 푼 결과다.
@@ -4344,72 +4414,49 @@ struct AliasHit<'a> {
 }
 
 /// 한 부분짜리 대상 이름이 `tables`(조인한 관계 포함)에서 별칭으로 선언된 물리 관계를 가리키면
-/// 그 관계다.
-fn alias_target<'a>(
-    target: &ObjectName,
-    tables: &'a [TableWithJoins],
-    rules: CollectRules,
-) -> Option<AliasHit<'a>> {
+/// 그 관계다(정확한 철자 우선, 없으면 ASCII 대소문자 무시).
+fn alias_target<'a>(target: &ObjectName, tables: &'a [TableWithJoins]) -> Option<AliasHit<'a>> {
     let factors = tables.iter().flat_map(|twj| {
         std::iter::once(&twj.relation).chain(twj.joins.iter().map(|join| &join.relation))
     });
-    aliased_relation(single_ident(target)?, factors, rules.alias_case)
+    aliased_relation(single_ident(target)?, factors)
 }
 
-/// DELETE의 대상이 대소문자만 다른 별칭으로 풀렸는데 문서가 별칭의 대소문자 규칙을 증명하지 않을 때의
-/// 진단 문구다. 그 쓰기는 MySQL `lower_case_table_names`=0이나 대소문자를 구분하는 collation에서는
-/// 일어나지 않는다(`ER_UNKNOWN_TABLE`) — 간선은 이전처럼 남기되 `complete`를 주장하지 않는다.
+/// DELETE 대상이 대소문자만 다른 별칭과 맞을 때, 문서가 대소문자 무시를 증명하지 않으면 남기는 진단
+/// 문구다.
+///
+/// 규칙을 모르면 쓰기 간선은 이전처럼 남기되 `complete`를 주장하지 않는다. MySQL
+/// `lower_case_table_names`=0이면 그 문장은 실패하므로 쓰기 간선이 없고, 그 사실을 진단에 적는다.
 fn alias_case_messages(stmt: &Statement, rules: CollectRules) -> Vec<String> {
-    if rules.alias_case != cte_target::NameCase::Unknown {
+    if rules.alias_case == cte_target::NameCase::Insensitive {
         return Vec::new();
     }
     let mut messages = Vec::new();
     let _ = visit_statements(stmt, |statement| {
-        if let Statement::Delete(delete) = statement {
-            for (target, hit) in delete_alias_hits(delete, rules) {
-                if hit.alias != target {
-                    messages.push(format!(
-                        "DML target '{}' names the alias '{}' only if letter case is ignored, and the document does not prove the alias case rule; the write edge to the aliased relation is kept",
-                        cte_target::printable(target),
-                        cte_target::printable(hit.alias)
-                    ));
-                }
-            }
+        let Statement::Delete(delete) = statement else {
+            return ControlFlow::<()>::Continue(());
+        };
+        for (target, resolution) in delete_target_resolutions(delete, rules) {
+            let (Some(alias), Some(spelling)) = (resolution.case_only_alias, single_ident(target))
+            else {
+                continue;
+            };
+            let (target, alias) = (
+                cte_target::printable(spelling),
+                cte_target::printable(alias),
+            );
+            messages.push(match resolution.relation {
+                Some(_) => format!(
+                    "DML target '{target}' names the alias '{alias}' only if letter case is ignored, and the document does not prove the alias case rule; the write edge to the aliased relation is kept"
+                ),
+                None => format!(
+                    "DML target '{target}' matches the alias '{alias}' only by letter case; MySQL compares them byte for byte when lower_case_table_names is 0 and rejects the statement (ER_UNKNOWN_TABLE), so no write edge is recorded"
+                ),
+            });
         }
         ControlFlow::<()>::Continue(())
     });
     messages
-}
-
-/// DELETE 대상 가운데 별칭으로 풀린 것과 그 풀이다.
-fn delete_alias_hits<'a>(
-    delete: &'a sqlparser::ast::Delete,
-    rules: CollectRules,
-) -> Vec<(&'a str, AliasHit<'a>)> {
-    let from: &[TableWithJoins] = match &delete.from {
-        sqlparser::ast::FromTable::WithFromKeyword(tables)
-        | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
-    };
-    let targets: Vec<(&ObjectName, Option<AliasHit<'a>>)> = if delete.tables.is_empty() {
-        from.iter()
-            .filter_map(|twj| match &twj.relation {
-                TableFactor::Table { name, .. } => {
-                    Some((name, using_alias_target(delete, &twj.relation, rules)))
-                }
-                _ => None,
-            })
-            .collect()
-    } else {
-        delete
-            .tables
-            .iter()
-            .map(|target| (target, alias_target(target, from, rules)))
-            .collect()
-    };
-    targets
-        .into_iter()
-        .filter_map(|(target, hit)| Some((single_ident(target)?, hit?)))
-        .collect()
 }
 
 /// 한 부분짜리 이름의 식별자 철자다.
@@ -4424,17 +4471,13 @@ fn single_ident(name: &ObjectName) -> Option<&str> {
 ///
 /// 철자가 정확히 같은 별칭을 먼저 찾는다. 별칭의 대소문자를 구분하는 설정에서는 `c`와 `C`가 다른
 /// 별칭이고, 무시하는 설정에서는 둘을 함께 선언할 수 없다(오류). 그래서 정확한 철자가 하나면 그
-/// 관계가 어느 설정에서나 맞다. 정확한 철자가 없으면 문서의 규칙(`case`)으로 ASCII 대소문자만 다른
-/// 별칭을 찾는다 — MySQL은 별칭을 `table_alias_charset`으로 비교하고(mysql-server 8.0
-/// `parse_tree_nodes.cc` `multi_delete_table_match`), 그 charset은 `lower_case_table_names`=0이면
-/// `my_charset_bin`, 아니면 `my_charset_utf8mb3_tolower_ci`다(`mysqld.cc`). 규칙이 대소문자를
-/// 구분하면 풀지 않고, 모르면 풀되 호출자가 진단을 단다(`alias_case_messages`). 이름을 부분으로
-/// 나누지 않는다 — 별칭이 세 부분 이름의 관계를 가리켜도 후보에서 빠지지 않아야 별칭 철자를 관계
-/// 이름으로 오인하지 않는다.
+/// 관계가 어느 설정에서나 맞다. 정확한 철자가 없으면 ASCII 대소문자만 다른 별칭을 돌려주고, 그
+/// 풀이를 쓸지는 호출자가 문서의 규칙으로 정한다(`resolve_delete_target`). 이름을 부분으로 나누지
+/// 않는다 — 별칭이 세 부분 이름의 관계를 가리켜도 후보에서 빠지지 않아야 별칭 철자를 관계 이름으로
+/// 오인하지 않는다.
 fn aliased_relation<'a>(
     alias: &str,
     factors: impl Iterator<Item = &'a TableFactor>,
-    case: cte_target::NameCase,
 ) -> Option<AliasHit<'a>> {
     let declared: Vec<AliasHit<'a>> = factors
         .filter_map(|factor| match factor {
@@ -4455,11 +4498,7 @@ fn aliased_relation<'a>(
         .copied()
         .filter(|hit| hit.alias == alias)
         .collect();
-    let candidates = match (exact.is_empty(), case) {
-        (false, _) => exact,
-        (true, cte_target::NameCase::Sensitive) => Vec::new(),
-        (true, _) => declared,
-    };
+    let candidates = if exact.is_empty() { declared } else { exact };
     match candidates.as_slice() {
         [hit] => Some(*hit),
         _ => None,
