@@ -993,6 +993,7 @@ fn parse_trigger_body(
                 sqlserver_trigger,
                 sqlite_trigger,
                 sqlite: dialect.is::<SQLiteDialect>(),
+                dml_target_ignores_ctes: dml_target_ignores_ctes(dialect),
             };
             for mut stmt in stmts {
                 if dialect.is::<PostgreSqlDialect>() {
@@ -2004,6 +2005,7 @@ fn parse_procedural_body(
     }
     let rules = CollectRules {
         sqlite: dialect.is::<SQLiteDialect>(),
+        dml_target_ignores_ctes: dml_target_ignores_ctes(dialect),
         ..CollectRules::default()
     };
     for stmt in &stmts {
@@ -3482,6 +3484,51 @@ struct CollectRules {
     /// SQLite 몸체(trigger·DML 쿼리 파일) — CTE 이름을 SQLite처럼 ASCII 대소문자만 접어
     /// 비교한다. 컬럼 단위 Binder(`scope::name`)와 같은 규칙이다.
     sqlite: bool,
+    /// 앞에 WITH가 붙은 DML의 대상이 같은 이름의 CTE가 아니라 실제 테이블인 방언이다
+    /// (`dml_target_ignores_ctes`).
+    dml_target_ignores_ctes: bool,
+}
+
+/// DML 대상 이름을 WITH의 CTE보다 카탈로그 테이블로 먼저 찾는 방언인가.
+///
+/// PostgreSQL은 수정 문장의 대상을 실제 관계로만 연다(`setTargetTable`: "CTEs don't hide
+/// tables (for this purpose)"). SQLite도 같다. 둘 다 PostgreSQL 16·SQLite 3.53.1에서
+/// `WITH audit AS (…) INSERT|UPDATE|DELETE … audit`가 실제 `audit`를 바꾸는 것으로 확인했다.
+/// SQL Server는 CTE를 통해 원본 테이블에 쓰고, 다른 방언은 확인하지 않았다.
+fn dml_target_ignores_ctes(dialect: &dyn Dialect) -> bool {
+    dialect.is::<PostgreSqlDialect>() || dialect.is::<SQLiteDialect>()
+}
+
+/// DML 대상이 그 문장의 CTE 이름일 때의 `SG_DML_TARGET_SHAPE` 문구다. 객체 단위 수집과 컬럼
+/// 단위 분석이 같은 사실을 한 번만 알리도록 문구를 공유한다.
+const CTE_TARGET_MESSAGE: &str =
+    "DML target names a WITH query; the written base relation and its columns are not resolved";
+
+/// 앞에 WITH가 붙은 DML에서 그 WITH의 CTE 이름을 가리키는 한정자 없는 쓰기 대상이다.
+///
+/// 대상이 실제 테이블인 방언(`dml_target_ignores_ctes`)에서는 비어 있다. 다른 방언에서 그
+/// 이름으로 가는 쓰기 간선은 없는 관계이거나 같은 이름의 다른 테이블로 가는 거짓 간선이므로
+/// 남기지 않는다. 비교는 ASCII 대소문자를 무시한다 — 더 많이 잡을수록 간선이 빠질 뿐이다.
+fn cte_named_write_targets(stmt: &Statement, rules: CollectRules) -> Vec<(Option<String>, String)> {
+    if rules.dml_target_ignores_ctes {
+        return Vec::new();
+    }
+    let Statement::Query(query) = stmt else {
+        return Vec::new();
+    };
+    let (Some(with), Some(dml)) = (&query.with, query_dml_statement(query)) else {
+        return Vec::new();
+    };
+    write_targets_shallow(dml)
+        .into_iter()
+        .filter(|(schema, name)| {
+            schema.is_none()
+                && with
+                    .cte_tables
+                    .iter()
+                    .any(|cte| cte.alias.name.value.eq_ignore_ascii_case(name))
+        })
+        .collect()
 }
 
 /// 소유한 문장 하나의 쓰기/읽기/발사-컬럼 참조를 모은다.
@@ -3561,6 +3608,16 @@ fn collect_trigger_facts(stmt: &Statement, parsed: &mut ParsedTrigger, rules: Co
     // write_targets는 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
     // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
     let write_targets = write_targets(stmt);
+    let cte_targets = cte_named_write_targets(stmt, rules);
+    if !cte_targets.is_empty() {
+        parsed.partial = true;
+        parsed.diagnostics.push(schemagraph_core::Diagnostic {
+            code: "SG_DML_TARGET_SHAPE".into(),
+            message: CTE_TARGET_MESSAGE.into(),
+            location: None,
+            candidates: Vec::new(),
+        });
+    }
     let qualified_writes = qualified_write_targets(stmt);
     for target in &qualified_writes {
         if !parsed.qualified_writes.contains(target) {
@@ -3568,7 +3625,7 @@ fn collect_trigger_facts(stmt: &Statement, parsed: &mut ParsedTrigger, rules: Co
         }
     }
     for t in &write_targets {
-        if parsed.local_relations.contains(t) {
+        if parsed.local_relations.contains(t) || cte_targets.contains(t) {
             continue;
         }
         if !parsed.writes.contains(t) {

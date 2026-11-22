@@ -848,14 +848,40 @@ fn with_prefixed_delete_query_file_writes_its_target() {
     assert!(!touches(&graph, "s.mutate", "s.stale"), "{detail}");
 }
 
-/// SQL Server는 CTE를 통한 UPDATE를 허용하고(쓰기는 CTE의 원본 테이블로 간다), PostgreSQL은
-/// 같은 문장을 거절한다. 방언마다 뜻이 달라 대상 컬럼을 추측하지 않고 부분 분석으로 남긴다.
+/// SQL Server는 CTE를 통한 UPDATE·DELETE를 허용한다(쓰기는 CTE의 원본 테이블로 간다).
+/// 대상 테이블을 추측하지 않고 부분 분석으로 남긴다 — CTE 이름으로 가는 쓰기 간선이나 "없는
+/// 관계" 한계, 같은 이름의 카탈로그 테이블로 가는 거짓 쓰기, 원본 컬럼 쓰기를 만들지 않는다.
+/// 중복 행 삭제 관용구(`WITH dupes AS (… ROW_NUMBER() …) DELETE FROM dupes …`)도 같다.
 #[test]
-fn with_prefixed_update_of_a_cte_target_is_partial_without_guessed_columns() {
-    for body in [
-        "WITH named AS (SELECT id, name FROM customers) UPDATE named SET name = 'x'",
+fn sqlserver_dml_through_a_cte_is_partial_without_guessed_targets() {
+    for (body, target) in [
+        (
+            "WITH named AS (SELECT id, name FROM customers) UPDATE named SET name = 'x'",
+            "s.named",
+        ),
         // `UPDATE 별칭 … FROM 관계 별칭`은 별칭이 가리키는 FROM 관계가 대상이다.
-        "WITH named AS (SELECT id, name FROM customers) UPDATE n SET name = 'x' FROM named n",
+        (
+            "WITH named AS (SELECT id, name FROM customers) UPDATE n SET name = 'x' FROM named n",
+            "s.named",
+        ),
+        // 대소문자를 무시하는 collation에서는 `Named`와 `named`가 같은 CTE다.
+        (
+            "WITH Named AS (SELECT id, name FROM customers) UPDATE named SET name = 'x'",
+            "s.named",
+        ),
+        // 같은 이름의 카탈로그 테이블이 있어도 SQL Server는 CTE를 통해 customers에 쓴다.
+        (
+            "WITH audit AS (SELECT id, name FROM customers) UPDATE audit SET name = 'x'",
+            "s.audit",
+        ),
+        (
+            "WITH Audit AS (SELECT id, name FROM customers) UPDATE audit SET name = 'x'",
+            "s.audit",
+        ),
+        (
+            "WITH dupes AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) AS rn FROM customers) DELETE FROM dupes WHERE rn > 1",
+            "s.dupes",
+        ),
     ] {
         let graph = scan_routine_kind(body, "sqlserver", "sql", "query");
         let detail = format!("{body}: {:?} {:?}", graph.edges(), graph.limitations());
@@ -866,7 +892,86 @@ fn with_prefixed_update_of_a_cte_target_is_partial_without_guessed_columns() {
             "{detail}"
         );
         assert!(
-            !edge(&graph, "s.mutate", "s.customers.name", EdgeKind::Writes),
+            graph
+                .edges()
+                .iter()
+                .all(|edge| edge.from.as_str() != "s.mutate" || edge.kind != EdgeKind::Writes),
+            "{detail}"
+        );
+        assert!(!touches(&graph, "s.mutate", target), "{detail}");
+        assert!(
+            edge(&graph, "s.mutate", "s.customers", EdgeKind::Reads),
+            "{detail}"
+        );
+        assert!(
+            !graph.limitations().iter().any(|note| note.contains(target)),
+            "{detail}"
+        );
+    }
+}
+
+/// PostgreSQL·SQLite에서 DML 대상은 같은 이름의 CTE가 있어도 실제 테이블이다(PostgreSQL 16·
+/// SQLite 3.53.1로 확인: `WITH audit AS (SELECT … FROM staging) INSERT INTO audit … FROM audit`는
+/// CTE 행을 실제 `audit`에 넣는다). 원천의 `audit`만 CTE다.
+#[test]
+fn postgres_and_sqlite_dml_targets_ignore_a_cte_of_the_same_name() {
+    for dialect in ["postgres", "sqlite"] {
+        let insert = scan_routine_kind(
+            "WITH audit AS (SELECT id, name FROM customers) INSERT INTO audit (id, name) SELECT id, name FROM audit",
+            dialect,
+            "sql",
+            "query",
+        );
+        let detail = format!(
+            "{dialect} insert: {:?} {:?}",
+            insert.edges(),
+            insert.limitations()
+        );
+        assert_eq!(
+            insert.analysis()[&VertexId::from_raw("s.mutate")].state,
+            AnalysisState::Complete,
+            "{detail}"
+        );
+        assert!(
+            edge(&insert, "s.mutate", "s.audit", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert!(
+            edge(
+                &insert,
+                "s.audit.name",
+                "s.customers.name",
+                EdgeKind::DerivesFrom
+            ),
+            "{detail}"
+        );
+        assert!(
+            !edge(&insert, "s.mutate", "s.audit", EdgeKind::Reads),
+            "{detail}"
+        );
+
+        let update = scan_routine_kind(
+            "WITH audit AS (SELECT id, name FROM customers) UPDATE audit SET name = 'x'",
+            dialect,
+            "sql",
+            "query",
+        );
+        let detail = format!(
+            "{dialect} update: {:?} {:?}",
+            update.edges(),
+            update.limitations()
+        );
+        assert_eq!(
+            update.analysis()[&VertexId::from_raw("s.mutate")].state,
+            AnalysisState::Complete,
+            "{detail}"
+        );
+        assert!(
+            edge(&update, "s.mutate", "s.audit.name", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert!(
+            !edge(&update, "s.mutate", "s.customers.name", EdgeKind::Writes),
             "{detail}"
         );
     }
