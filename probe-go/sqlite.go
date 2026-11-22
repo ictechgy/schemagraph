@@ -135,7 +135,7 @@ func (h *harvester) sqliteColumns(schema, table string) []ColumnDoc {
 	columns := []ColumnDoc{}
 	initialLimitations := len(h.limitations)
 	query := fmt.Sprintf("PRAGMA %s.table_xinfo(%s)", sqliteQuoteIdent(schema), sqliteQuoteIdent(table))
-	h.bestEffort("sqlite columns", query, func(rows *sql.Rows) error {
+	h.bestEffort(sqliteObjectLabel(schema, table, "sqlite columns"), query, func(rows *sql.Rows) error {
 		v, err := sqliteRow(rows)
 		if err != nil {
 			return err
@@ -153,7 +153,7 @@ func (h *harvester) sqliteColumns(schema, table string) []ColumnDoc {
 	// 인덱스를 가지며, STRICT/WITHOUT ROWID의 NOT NULL은 xinfo에서 온다.
 	hasPKIndex := false
 	query = fmt.Sprintf("PRAGMA %s.index_list(%s)", sqliteQuoteIdent(schema), sqliteQuoteIdent(table))
-	h.bestEffort("sqlite primary key index", query, func(rows *sql.Rows) error {
+	h.bestEffort(sqliteObjectLabel(schema, table, "sqlite primary key index"), query, func(rows *sql.Rows) error {
 		v, err := sqliteRow(rows)
 		if err != nil {
 			return err
@@ -186,7 +186,7 @@ func (h *harvester) sqliteConstraints(schema, table string) []ConstraintDoc {
 	groups := map[int][]fkPart{}
 	targets := map[int]string{}
 	query := fmt.Sprintf("PRAGMA %s.foreign_key_list(%s)", sqliteQuoteIdent(schema), sqliteQuoteIdent(table))
-	h.bestEffort("sqlite foreign keys", query, func(rows *sql.Rows) error {
+	h.bestEffort(sqliteObjectLabel(schema, table, "sqlite foreign keys"), query, func(rows *sql.Rows) error {
 		v, err := sqliteRow(rows)
 		if err != nil {
 			return err
@@ -248,7 +248,7 @@ func (h *harvester) sqliteIndexes(schema, table string) []IndexDoc {
 	}
 	indexes := []indexRow{}
 	listQuery := fmt.Sprintf("PRAGMA %s.index_list(%s)", sqliteQuoteIdent(schema), sqliteQuoteIdent(table))
-	h.bestEffort("sqlite indexes", listQuery, func(rows *sql.Rows) error {
+	h.bestEffort(sqliteObjectLabel(schema, table, "sqlite indexes"), listQuery, func(rows *sql.Rows) error {
 		v, err := sqliteRow(rows)
 		if err != nil {
 			return err
@@ -265,7 +265,7 @@ func (h *harvester) sqliteIndexes(schema, table string) []IndexDoc {
 		complete := true
 		notesBefore := len(h.limitations)
 		query := fmt.Sprintf("PRAGMA %s.index_xinfo(%s)", sqliteQuoteIdent(schema), sqliteQuoteIdent(index.name))
-		h.bestEffort("sqlite index columns", query, func(rows *sql.Rows) error {
+		h.bestEffort(sqliteObjectLabel(schema, index.name, "sqlite index columns"), query, func(rows *sql.Rows) error {
 			v, err := sqliteRow(rows)
 			if err != nil {
 				return err
@@ -317,6 +317,13 @@ func (h *harvester) sqliteTriggers(schema string, objects []ObjectDoc) {
 	for _, obj := range objects {
 		sort.Slice(obj.Triggers, func(i, j int) bool { return obj.Triggers[i].Name < obj.Triggers[j].Name })
 	}
+}
+
+// sqliteObjectLabel — 객체 하나에 대한 PRAGMA 실패 문구의 머리다. 객체 이름이 없으면
+// 같은 SQLite 메시지로 실패한 뷰 여러 개가 한 문구로 합쳐져(limitations는 중복을 뺀다)
+// 어느 객체가 몇 개 빠졌는지 알 수 없다. JDBC 프로브의 `schema.object: …`와 같은 모양이다.
+func sqliteObjectLabel(schema, object, label string) string {
+	return fmt.Sprintf("%s.%s: %s", schema, object, label)
 }
 
 // sqliteQuoteIdent는 PRAGMA에도 사용할 수 있는 SQLite 식별자 인용이다.

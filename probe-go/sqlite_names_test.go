@@ -106,3 +106,28 @@ func TestSQLiteDDLWordsSkipQuotesAndComments(t *testing.T) {
 		}
 	}
 }
+
+// 컴파일되지 않는 뷰의 컬럼 실패 문구는 뷰 이름을 적는다. 이름이 없으면 같은 SQLite 메시지로
+// 실패한 뷰 여러 개가 중복 제거로 한 문구가 되어, 어느 뷰가 몇 개 빠졌는지 사라졌다.
+func TestSQLiteColumnFailuresNameTheObject(t *testing.T) {
+	h, doc := sqliteNamesTestDoc(t,
+		"CREATE TABLE t(id INTEGER PRIMARY KEY)",
+		"CREATE VIEW v_a AS SELECT id FROM gone",
+		"CREATE VIEW v_b AS SELECT id FROM gone",
+	)
+	for _, name := range []string{"v_a", "v_b"} {
+		if view := sqliteTestObject(t, doc.Schemas[0].Objects, name); len(view.Columns) != 0 {
+			t.Fatalf("%s columns = %#v", name, view.Columns)
+		}
+	}
+	limitations := sortedDistinct(doc.Limitations)
+	if len(limitations) != 2 || !h.catalogIncomplete {
+		t.Fatalf("incomplete=%v limitations=%q", h.catalogIncomplete, limitations)
+	}
+	for i, name := range []string{"main.v_a", "main.v_b"} {
+		prefix := name + ": sqlite columns source text was not collected ("
+		if !strings.HasPrefix(limitations[i], prefix) || !strings.Contains(limitations[i], "no such table: main.gone") {
+			t.Fatalf("limitation %d = %q, want prefix %q", i, limitations[i], prefix)
+		}
+	}
+}
