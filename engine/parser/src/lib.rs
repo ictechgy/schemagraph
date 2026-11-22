@@ -2332,14 +2332,20 @@ fn extract_procedural_statements(
                     break;
                 }
                 "EXECUTE" => {
-                    strip_execute(rest, wlen, &mut stmts, &mut unextracted, state);
-                    break;
+                    // T-SQL에서는 `EXEC`처럼 인자 뒤에 다음 문장이 붙을 수 있다.
+                    let end = tsql_statement_end(&rest[wlen..], state).map(|at| wlen + at);
+                    let call = &rest[..end.unwrap_or(rest.len())];
+                    strip_execute(call, wlen, &mut stmts, &mut unextracted, state);
+                    let Some(end) = end else {
+                        break;
+                    };
+                    rest = &rest[end..];
                 }
                 "EXEC" => {
                     // T-SQL `EXEC proc <args>`는 CALL의 별칭 — EXECUTE와
                     // 달리 동적 SQL이 아니라 routine 호출이 기본이다. 세미콜론 없는 조각에서는
                     // 인자 뒤에 다음 문장이 붙으므로 인자를 그 앞에서 끝내고 계속 꺼낸다.
-                    let end = next_statement_start(&rest[wlen..]).map(|at| wlen + at);
+                    let end = tsql_statement_end(&rest[wlen..], state).map(|at| wlen + at);
                     let call = &rest[..end.unwrap_or(rest.len())];
                     strip_exec_call(call, wlen, &mut stmts, &mut unextracted, state);
                     let Some(end) = end else {
@@ -2358,7 +2364,7 @@ fn extract_procedural_statements(
                             let rhs = tail[eq + 1..].trim();
                             let name = variable_name(&tail[..eq]);
                             if let Some(name) = name {
-                                state.assign(name, rhs);
+                                assign_tsql_variable(name, &tail[..eq], rhs, state);
                             }
                             if rhs.contains('(') && !is_constant_text(rhs, state) {
                                 stmts.push(format!("SELECT {rhs}"));
@@ -2396,21 +2402,24 @@ fn extract_procedural_statements(
                     // 세미콜론 없는 T-SQL 조각에서는 이 문장 뒤에 다음 문장이 붙어 있다
                     // (`PRINT ERROR_MESSAGE() INSERT INTO log …`). 이 문장의 절은 다음 문장 머리
                     // 앞에서 끝내고, 그 뒤를 계속 꺼낸다.
-                    let clause_end = next_statement_start(&rest[wlen..]).map(|at| wlen + at);
+                    let clause_end = tsql_statement_end(&rest[wlen..], state).map(|at| wlen + at);
                     let clause = &rest[wlen..clause_end.unwrap_or(rest.len())];
                     if word.eq_ignore_ascii_case("FETCH") {
                         if let Some(into) = find_top_level(clause, "INTO", true) {
                             invalidate_variable_list(&clause[into + "INTO".len()..], state);
                         }
                     }
+                    invalidate_assigned_names(clause, state);
+                    // `PRINT (SELECT COUNT(*) FROM audit)`의 하위 질의는 읽기다. 절을 버리면 그 읽기가
+                    // 빠진 채 `complete`가 되므로 식으로 꺼낸다(T-SQL `PRINT`의 인자는 식 하나다).
+                    if word.eq_ignore_ascii_case("PRINT")
+                        && !find_all_keywords(clause, "SELECT").is_empty()
+                    {
+                        stmts.push(format!("SELECT {}", clause.trim()));
+                    }
                     let Some(end) = clause_end else {
                         break;
                     };
-                    // 건너뛴 절의 대입(`GET DIAGNOSTICS @n = ROW_COUNT`)은 추적하지 않으므로 변수
-                    // 값을 버린다 — 뒤 동적 SQL을 옛 값으로 접지 않게.
-                    if find_top_level(clause, "=", false).is_some() {
-                        state.invalidate_all_variables();
-                    }
                     rest = &rest[end..];
                 }
                 _ => {
@@ -2457,19 +2466,43 @@ fn extract_procedural_statements(
     (stmts, unextracted)
 }
 
-/// 무시하는 절차형 문장(`PRINT`·`RAISERROR`·`THROW`·`WAITFOR`·`GOTO`·`BREAK` 등) 뒤에서 다음 문장이
-/// 시작하는 위치다. 없으면 `None`이다.
+/// T-SQL `SET @v = <식>`·`SET @v += <식>` 대입을 추적한다.
 ///
-/// 세미콜론으로 끝나는 방언에서는 그 문장의 절이 조각 끝까지라 찾을 것이 없고, 세미콜론을 생략한
-/// T-SQL에서만 다음 문장이 같은 조각에 붙는다. 인용·주석·괄호 안과 `CASE … END` 안은 보지 않고,
-/// 최상위 단어 가운데 간선을 낼 수 있는 문장 머리(`SELECT`·`INSERT`·`UPDATE`·`DELETE`·`MERGE`·
-/// `TRUNCATE`·`EXEC`·`EXECUTE`·`CALL`)와 블록·제어 머리(`BEGIN`·`END`·`IF`·`WHILE`·`DECLARE`)에서만
-/// 끊는다. `WITH`(`RAISERROR … WITH NOWAIT`)와 `SET`(MySQL `SIGNAL … SET MESSAGE_TEXT`)은 그 문장 절의
-/// 일부일 수 있어 끊지 않는다. `@`·`.`·`:`나 ASCII 밖 글자 바로 뒤의 단어는 변수·한정 이름의 일부다.
+/// `+=`는 `@v = @v + <식>`이다 — 문자열이면 이어 붙인 값을 추적한다. 예전에는 `=` 앞의 연산자를 보지
+/// 않아 `SET @s += N' WHERE 1 = 0'`이 `@s`를 덧붙인 조각으로 덮어썼다. 다른 복합 대입(`-=`·`*=` 등)은
+/// 값을 따라가지 않고 버린다.
+fn assign_tsql_variable(name: &str, lhs: &str, rhs: &str, state: &mut ExtractionState) {
+    match lhs.trim_end().chars().last() {
+        Some('+') => state.assign(name, &format!("{name} + {rhs}")),
+        Some('-' | '*' | '/' | '%' | '&' | '|' | '^') => state.invalidate_variable(name),
+        _ => state.assign(name, rhs),
+    }
+}
+
+/// T-SQL 몸체에서 무시하는 절차형 문장(`PRINT`·`RAISERROR`·`THROW`·`WAITFOR`·`GOTO`·`BREAK` 등)의 절이나
+/// `EXEC` 인자 뒤에서 다음 문장이 시작하는 위치다. T-SQL이 아니거나 다음 문장이 없으면 `None`이다.
+///
+/// 세미콜론을 생략할 수 있는 방언은 T-SQL뿐이다. 다른 방언에서는 그 문장의 절이 조각 끝까지이고,
+/// 이 스캐너가 모르는 인용 규칙(MySQL `\'` 이스케이프·`#` 주석)이 있어 문자열 속 단어를 문장 머리로
+/// 오인할 수 있으므로 끊지 않는다.
+fn tsql_statement_end(text: &str, state: &ExtractionState) -> Option<usize> {
+    (state.dialect == constant_sql::TextDialect::MsSql)
+        .then(|| next_statement_start(text))
+        .flatten()
+}
+
+/// T-SQL 문장 절 뒤에서 다음 문장이 시작하는 위치다. 없으면 `None`이다.
+///
+/// 인용·주석·괄호 안과 `CASE … END` 안은 보지 않고, 최상위 단어 가운데 간선을 낼 수 있는 문장 머리
+/// (`SELECT`·`INSERT`·`UPDATE`·`DELETE`·`MERGE`·`TRUNCATE`·`EXEC`·`EXECUTE`·`CALL`·`SET`)와 블록·제어 머리
+/// (`BEGIN`·`END`·`IF`·`WHILE`·`DECLARE`), 그리고 CTE를 여는 `WITH 이름 [(컬럼…)] AS (`에서 끊는다.
+/// `RAISERROR … WITH NOWAIT`의 `WITH`는 CTE 꼴이 아니라 끊지 않는다(T-SQL의 무시하는 문장 절에는
+/// `SET` 단어가 없다 — `WITH SETERROR`는 한 단어다). `@`·`.`·`:`나 ASCII 밖 글자 바로 뒤의 단어는
+/// 변수·한정 이름의 일부다.
 fn next_statement_start(text: &str) -> Option<usize> {
-    const HEADS: [&str; 13] = [
+    const HEADS: [&str; 14] = [
         "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "EXEC", "EXECUTE", "CALL",
-        "BEGIN", "IF", "WHILE", "DECLARE",
+        "SET", "BEGIN", "IF", "WHILE", "DECLARE",
     ];
     let quotes = QuoteScanner::new(text);
     let bytes = text.as_bytes();
@@ -2497,6 +2530,7 @@ fn next_statement_start(text: &str) -> Option<usize> {
                 "CASE" => cases += 1,
                 "END" if cases > 0 => cases -= 1,
                 "END" => return Some(i),
+                "WITH" if cases == 0 && opens_cte(&text[i + len..]) => return Some(i),
                 head if cases == 0 && HEADS.contains(&head) => return Some(i),
                 _ => {}
             }
@@ -2504,6 +2538,57 @@ fn next_statement_start(text: &str) -> Option<usize> {
         i += len;
     }
     None
+}
+
+/// `WITH` 뒤가 CTE 정의(`이름 [(컬럼…)] AS (`)로 이어지는가.
+fn opens_cte(after_with: &str) -> bool {
+    let rest = skip_ws_comments(after_with);
+    let name_len = match rest.as_bytes().first() {
+        Some(b'[' | b'"') => skip_quoted_ident(rest, 0),
+        _ => head_word(rest).1,
+    };
+    if name_len == 0 {
+        return false;
+    }
+    let mut rest = skip_ws_comments(&rest[name_len..]);
+    if rest.starts_with('(') {
+        let Some(close) = rest.find(')') else {
+            return false;
+        };
+        rest = skip_ws_comments(&rest[close + 1..]);
+    }
+    starts_with_keyword(rest, "AS") && skip_ws_comments(&rest[2..]).starts_with('(')
+}
+
+/// 건너뛴 절에서 `=` 왼쪽에 오는 이름의 추적 값을 버린다 — 괄호 안도 본다.
+///
+/// `GET DIAGNOSTICS @n = ROW_COUNT`·`WAITFOR (RECEIVE TOP(1) @s = message_body FROM q)`처럼 무시하는
+/// 문장도 변수에 값을 넣는다. 그 대입은 추적하지 않으므로, 버리지 않으면 뒤 `EXEC(@s)`를 옛 값으로
+/// 접어 실행되지 않는 문장이 쓰기 간선이 된다. 비교 연산(`<=`·`>=`·`!=`)과 이름이 아닌 왼쪽은 건너뛴다.
+/// 이름 하나만 버리므로 다른 변수의 추적은 그대로다.
+fn invalidate_assigned_names(clause: &str, state: &mut ExtractionState) {
+    let quotes = QuoteScanner::new(clause);
+    let bytes = clause.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = quotes.end(i) {
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'=' {
+            let before = clause[..i].trim_end();
+            let start = before
+                .char_indices()
+                .rev()
+                .find(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '#' | '$')))
+                .map_or(0, |(at, c)| at + c.len_utf8());
+            let name = &before[start..];
+            if !name.is_empty() && !name.bytes().all(|b| b.is_ascii_digit()) {
+                state.invalidate_variable(name);
+            }
+        }
+        i += 1;
+    }
 }
 
 /// `;`로 끝나는 최상위 조각으로 나눈다 — 문자열·식별자 인용·주석·

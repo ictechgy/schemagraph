@@ -1930,6 +1930,145 @@ fn delete_alias_case_follows_the_documented_alias_rule() {
     assert_eq!(exact.analysis()[&mutate].state, AnalysisState::Complete);
 }
 
+/// 무시하는 문장을 다음 문장 머리에서 끊는 일은 세미콜론을 생략할 수 있는 T-SQL에서만 한다. 추출기의
+/// 인용 스캐너는 MySQL의 `\'` 이스케이프와 `#` 주석을 모르므로, MySQL·MariaDB에서 끊으면 문자열이나
+/// 주석 속 `delete from audit`·`update audit`가 문장이 되어 거짓 쓰기가 생겼다(bc223db). 이 몸체들은
+/// main과 같이 간선이 없어야 한다.
+#[test]
+fn skipped_statements_are_not_cut_outside_tsql() {
+    let bodies = [
+        "BEGIN\n IF p_force = 0 THEN\n SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Can\\'t delete from audit; it\\'s immutable';\n END IF;\nEND",
+        "BEGIN\n IF p_force = 0 THEN\n SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'You can\\'t truncate audit; it\\'s protected';\n END IF;\nEND",
+        "BEGIN\n SIGNAL SQLSTATE '45000' # callers update audit themselves\n SET MESSAGE_TEXT = 'x';\nEND",
+        "BEGIN\n SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'x\\' update audit set name = 1 #\\'';\nEND",
+        "BEGIN\n SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Don\\'t update orders now, it\\'s frozen';\nEND",
+    ];
+    for dialect in ["mysql", "mariadb"] {
+        for body in bodies {
+            let graph = scan_routine_kind(body, dialect, "sql", "procedure");
+            let detail = format!(
+                "{dialect} {body:?}: {:?} {:?}",
+                graph.edges(),
+                graph.limitations()
+            );
+            assert!(!touches(&graph, "s.mutate", "s.audit"), "{detail}");
+            assert!(!touches(&graph, "s.mutate", "s.orders"), "{detail}");
+            assert_ne!(
+                graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+                AnalysisState::Complete,
+                "{detail}"
+            );
+        }
+    }
+}
+
+/// 건너뛴 절의 대입은 괄호 안에 있어도(`WAITFOR (RECEIVE … @s = message_body …)`), 절이 `;`에서 끝나도
+/// (`GET DIAGNOSTICS @s = ROW_COUNT;`) 그 변수의 추적 값을 버린다. `PRINT 'x' SET @s = …`의 `SET`은 다음
+/// 문장이라 그 값을 추적한다. 이전에는 세 경우 모두 옛 값 `UPDATE audit`로 `EXEC(@s)`를 접어 거짓
+/// `writes audit`·`complete`였다. `SET @s += …`는 이어 붙인 값을 추적한다.
+#[test]
+fn skipped_clause_assignments_never_fold_a_stale_value() {
+    let prefix = "DECLARE @s nvarchar(max) = N'UPDATE audit SET name = 1'; ";
+    for clause in [
+        "WAITFOR (RECEIVE TOP(1) @s = message_body FROM q), TIMEOUT 1000 EXEC(@s)",
+        "WAITFOR (RECEIVE TOP(1) @s = message_body FROM q), TIMEOUT 1000; EXEC(@s);",
+        "GET DIAGNOSTICS @s = ROW_COUNT; EXEC(@s);",
+        "SET @s -= 1; EXEC(@s);",
+    ] {
+        let graph = scan_routine_kind(
+            &format!("{prefix}{clause}"),
+            "sqlserver",
+            "sql",
+            "procedure",
+        );
+        let detail = format!("{clause}: {:?} {:?}", graph.edges(), graph.limitations());
+        assert!(!touches(&graph, "s.mutate", "s.audit"), "{detail}");
+        assert_eq!(
+            graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+            AnalysisState::Partial,
+            "{detail}"
+        );
+    }
+    let reassigned = scan_routine_kind(
+        &format!("{prefix}PRINT 'x' SET @s = N'UPDATE orders SET amount = 1'; EXEC(@s)"),
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?}", reassigned.edges());
+    assert!(
+        edge(&reassigned, "s.mutate", "s.orders", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(!touches(&reassigned, "s.mutate", "s.audit"), "{detail}");
+    let appended = scan_routine_kind(
+        &format!("{prefix}SET @s += N' WHERE 1 = 0'; EXEC(@s)"),
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?} {:?}", appended.edges(), appended.limitations());
+    assert!(
+        edge(&appended, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert_eq!(
+        appended.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Complete,
+        "{detail}"
+    );
+}
+
+/// T-SQL에서 끊은 자리의 읽기·쓰기는 세미콜론 판과 같다 — `EXECUTE proc` 인자 뒤 문장, `PRINT`의 하위 질의,
+/// 그리고 `WITH cte AS (…)`로 여는 문장. 이전에는 `PRINT 'x' WITH cte AS (…) INSERT …`가 `WITH`를 `PRINT`의
+/// 절로 버려 실제 테이블 `cte`를 읽는 거짓 간선을 냈다.
+#[test]
+fn tsql_cut_points_match_the_semicolon_version() {
+    let facts = |body: &str| {
+        let graph = scan_routine_with_objects(
+            body,
+            "sqlserver",
+            "sql",
+            "procedure",
+            None,
+            vec![object("cte", &["id"])],
+        );
+        let mut edges: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.from.as_str() == "s.mutate")
+            .map(|edge| format!("{:?} {}", edge.kind, edge.to))
+            .collect();
+        edges.sort();
+        edges
+    };
+    for (without, with) in [
+        (
+            "EXECUTE log_error @code = 1 INSERT INTO orders (id) VALUES (1)",
+            "EXECUTE log_error @code = 1; INSERT INTO orders (id) VALUES (1)",
+        ),
+        (
+            "DECLARE @n int; PRINT (SELECT COUNT(*) FROM audit) UPDATE orders SET amount = 1",
+            "DECLARE @n int; PRINT (SELECT COUNT(*) FROM audit); UPDATE orders SET amount = 1",
+        ),
+    ] {
+        assert_eq!(facts(without), facts(with), "{without}");
+        assert!(facts(without)
+            .iter()
+            .any(|edge| edge.starts_with("Writes s.orders")));
+    }
+    let printed =
+        facts("DECLARE @n int; PRINT (SELECT COUNT(*) FROM audit) UPDATE orders SET amount = 1");
+    assert!(
+        printed.iter().any(|edge| edge == "Reads s.audit"),
+        "{printed:?}"
+    );
+    let cte = facts(
+        "PRINT 'x' WITH cte AS (SELECT id FROM audit) INSERT INTO orders (id) SELECT id FROM cte",
+    );
+    assert!(!cte.iter().any(|edge| edge.contains("s.cte")), "{cte:?}");
+}
+
 /// MySQL USING 형식의 FROM 목록 별칭은 그 자리만 읽기에서 뺀다. 하위 질의가 같은 이름의 실제 테이블
 /// `c`를 읽는 것은 읽기다.
 #[test]
