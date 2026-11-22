@@ -1,28 +1,269 @@
 # HANDOFF.md
 
-## 현재 상태 (2026-11-22, 라운드 3 작업 브랜치)
+## 현재 상태 (2026-11-22, 라운드 4 작업 브랜치)
 
 - 발행본은 **0.9.0**이다. 태그 `v0.9.0` = `fad8e9d`([#58](https://github.com/ictechgy/schemagraph/pull/58)).
   그 커밋의 [CI](https://github.com/ictechgy/schemagraph/actions/runs/41583763434)·
   [SQL Server/Oracle](https://github.com/ictechgy/schemagraph/actions/runs/41583763488)·
   [IBM](https://github.com/ictechgy/schemagraph/actions/runs/41583763549)·
   [DML](https://github.com/ictechgy/schemagraph/actions/runs/41583763689) 검증이 모두 성공했다.
-- [PR #59](https://github.com/ictechgy/schemagraph/pull/59)(`bdac8a6`, 2026-11-09)와
-  [PR #61](https://github.com/ictechgy/schemagraph/pull/61)(`b8e4054`, 2026-11-16)이 `main`으로 스쿼시 머지됐다.
+- [PR #59](https://github.com/ictechgy/schemagraph/pull/59)(`bdac8a6`, 2026-11-09),
+  [PR #61](https://github.com/ictechgy/schemagraph/pull/61)(`b8e4054`, 2026-11-16),
+  [PR #62](https://github.com/ictechgy/schemagraph/pull/62)(`1365d37`, 2026-11-22)이 `main`으로 스쿼시 머지됐다.
   아직 발행하지 않았다. RELEASE-NOTES `# Unreleased`가 미발행 변경 목록의 정본이다: facts의 스키마 필터·교환
   불가 식별자 범위 공백과 SQLite 예약 관계 선언, COPY 테이블·컬럼 간선, SQLite 수집기 3종 수정(네이티브·Go·JDBC),
   대소문자 접기 방언의 관계·routine 해석과 몸체 캐시 지문, 서버 대소문자 규칙 수집(`context.lower_case_table_names`·
   `collation`), 프로브 메시지 영어화, JDBC 파티션·외부 테이블과 방언별(대소문자 구분) 시스템 스키마,
-  CI의 isthmus 0.14.0 실검증, SQLite ASCII 식별자 접기, 컴파일되지 않는 SQLite 뷰, 그리고 아래 라운드 3 항목.
+  CI의 isthmus 0.14.0 실검증, SQLite ASCII 식별자 접기, 컴파일되지 않는 SQLite 뷰, 아래 라운드 3 항목과 라운드 4 항목.
 - 채널별 게시 현황은 RELEASE-NOTES.md 끝의 "Publication channels" 표가 정본이다.
   crates.io에는 0.7.1·0.8.0·0.8.1이 없고, Maven Central에는 0.7.1이 없다(2026-11-03 조회).
   GitHub Release v0.1.0–v0.3.0에는 첨부 아카이브가 없다(2026-11-09 조회). 누락 버전은 다시 게시하지 않는다.
 - isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
-- 브랜치 `ccr-37904670-hxdjsx`는 `origin/main` `b8e4054`에서 다시 시작한 라운드 3 작업이며
-  [PR #62](https://github.com/ictechgy/schemagraph/pull/62)다. 아래 "라운드 3" 절의 네 커밋(`1c8d976`·`86c9e98`·`0206bea`·
-  `d91236b`), 독립 리뷰 반영 세 커밋(`5be9173`·`d872048`·`f9c700b`), HANDOFF 커밋(`0161c96`), PR #62 2차 리뷰 반영
-  (`6144529`·`982941d`·`5699c2d`, push됨), 3차(델타) 리뷰 반영 커밋 `9528ca3`(parser)과 그 HANDOFF 커밋 `8fb92cc`, 그리고 4차(대항 행렬) 리뷰 반영
-  `fbee2c3`·`60589e9`(parser)와 그 HANDOFF 커밋(아래 절, 아직 push 전)이 있다.
+- 브랜치 `ccr-37904670-hxdjsx`는 `origin/main` `1365d37`(PR #62 머지)에서 다시 시작한 라운드 4 작업이며
+  [PR #63](https://github.com/ictechgy/schemagraph/pull/63)이다. 커밋: `f2164ab`(parser, DELETE·TRUNCATE 대상), `ae54036`(parser,
+  최상위 END), `67943bb`(HANDOFF·RELEASE-NOTES, push됨), PR #63 리뷰 반영 `f6ff67e`(S2)·`2c9b79d`(S1·N1)·`f6caf78`(S3·N2)·`bc223db`(문서, push됨),
+  델타 리뷰 반영 `377e635`(B1·S1·nit)·`0ecad86`(S2)·`72b0c94`(S3)·`5b11c7a`(문서, push됨), 좁은 재리뷰 반영 `595d2fb`(SF1)·
+  `9350d0e`(SF2)·`c724ca9`(nit 1)와 그 문서 커밋(아래 "PR #63 좁은 재리뷰 반영" 절, push 전).
+- 원격에 이 세션과 무관한 브랜치 `fix/postgres-ascii-identifier-fold`(`5ff7a51`, 다른 세션, 2026-11-22, PR 없음)가 있다.
+  후속 후보의 PostgreSQL 미인용 식별자 ASCII 접기(`scope.rs` `name()`)를 다룬다. 겹치지 않게 라운드 4는 그 항목과
+  `scope.rs`를 건드리지 않았다. 두 브랜치는 `parser/src/lib.rs`·`scope_tests.rs`의 서로 다른 곳을 고친다.
+
+### 라운드 4 (2026-11-22)
+
+HANDOFF 후속 후보와 그 주변에서 사용자 결정이 필요 없는 정확성 항목 세 가지를 골랐다. 근거와 결과의 정본은
+RELEASE-NOTES `# Unreleased`의 해당 항목이다. 회귀 테스트는 모두 origin/main 소스나 수정을 되돌린 변이에서 실패하는 것을
+확인했다(변이는 parser 소스를 바꾼 뒤 `cargo test -p schemagraph-parser --lib`, 끝나면 원래 파일로 되돌림).
+
+- parser `f2164ab` — DELETE·TRUNCATE의 데이터베이스 한정 대상. 재현(수정 전 CLI, `--document` SQL Server, context
+  `database: app`): `DELETE FROM app.dbo.audit WHERE id = 1`·`TRUNCATE TABLE app.dbo.audit`가 `reads dbo.audit`만 남기고
+  `complete`였다. 세 부분 쓰기 대상을 따로 모으는 `qualified_write_targets`에 DELETE·TRUNCATE가 없어 대상이 세 부분 읽기가
+  됐다. 실제 PostgreSQL 16.15에서 `DELETE FROM postgres.s.audit a USING s.orders o …`·`TRUNCATE postgres.s.audit, s.orders`
+  프로시저를 실행하면 `s.audit` 행이 지워지고 비워졌는데, 같은 DB를 `scan`하면 main은 `s.p1 reads s.audit`·
+  `s.p2 reads s.audit`, 수정 후는 `writes`다. 별칭이 세 부분 관계를 가리키는 `DELETE c FROM app.dbo.audit c …`·
+  `UPDATE c … FROM app.dbo.audit c`는 별칭 해석(`aliased_relation`)이 두 부분 이름만 후보로 삼아 별칭 철자로 되돌아가
+  `references dbo.c, which is missing from the catalog`와 `partial`이었다. `delete_target_names`가 이름을 나누지 않고
+  돌려주고(두 부분 이하는 `write_targets_shallow`, 세 부분은 `qualified_write_targets`), UPDATE는 `promoted_update_factor`를
+  쓴다(`lib.rs`의 `promoted_update_target`은 지웠다).
+- 같은 커밋 — MySQL·MariaDB `DELETE FROM c USING audit c …`(후속 후보였다). 재현: `references s.c, which is missing from
+  the catalog`, `reads s.audit`, `partial`. mysql-server 8.0 `sql/sql_yacc.yy`(GitHub 원문)의 `delete_stmt`는
+  `table_alias_ref_list FROM table_reference_list`와 `FROM table_alias_ref_list USING table_reference_list`를 같은 인자 순서의
+  `PT_delete`로 만든다 — USING 형식의 FROM 목록은 대상 목록과 같은 별칭 참조다. `CollectRules.mysql`(MySqlDialect)일 때만
+  USING 별칭으로 풀고 그 철자를 읽기에서 뺀다(`read_exclusions`). PostgreSQL의 FROM은 삭제 대상 자체다 — PostgreSQL 16에서
+  `DELETE FROM c USING audit c`는 "table name "c" specified more than once" 오류이고 `DELETE FROM c USING audit "C"`는 c를
+  지운다(테스트의 대조 사례). 별칭 후보가 대소문자 무시로 여럿이면 정확한 철자를 고른다(`c`와 `C`는 별칭 대소문자를 구분하는
+  설정에서만 함께 쓸 수 있다). 이전에는 `DELETE c FROM audit c JOIN orders C …`가 `s.c` 한계를, 세 부분 `app.dbo.audit c`면
+  거짓 `writes dbo.orders`를 냈다. MySQL 서버로 실행해 확인하지는 못했다(아래 "돌리지 못한 것").
+  테스트: `database_qualified_delete_and_truncate_targets_are_writes`, `mysql_delete_using_resolves_the_from_list_through_using_aliases`.
+  둘 다 origin/main 소스에서 실패하고, 변이 8종(세 부분 DELETE 누락, TRUNCATE 누락, 두 부분 별칭만, UPDATE 별칭 되돌아가기,
+  MySQL 규칙 끔, 모든 방언에 적용, USING 읽기 제외 끔, 정확 철자 우선 끔)을 각각 잡는다.
+- parser `ae54036` — 세미콜론 없는 문장 뒤 최상위 END. 재현(수정 전 CLI, SQL Server 프로시저):
+  `BEGIN TRY UPDATE audit SET name = 'x' WHERE id = 1 END TRY BEGIN CATCH UPDATE log SET amount = 0 END CATCH`가 `writes s.audit`만
+  남기고 `complete`였다(세미콜론을 붙이면 `writes s.log`도 있다). sqlparser 0.58 `Parser::parse_statements`는 구분자를 기다리는
+  자리에 END가 오면 `break`하고 `Ok`를 돌려준다(블록 문장 목록용 규칙) — 최상위에서 뒤가 소리 없이 버려졌다. 3차 리뷰가 짚은
+  `BEGIN TRY … END CATCH` 후속 후보가 이것이다. `parse_limits::parse_sql_prefix`가 멈춘 END부터 다시 읽어 이어 붙이고(END를 문장
+  경계로), 다시 읽기가 실패하면 앞 문장과 남은 부분의 원문 바이트 위치(`end_keyword_offset`, 토크나이저의 줄·열 규칙을 따르고
+  그 자리가 END가 아니면 버림)를 돌려준다. `parse_sql`은 그때 오류다(뷰·쿼리 파일·캐시 지문은 엄격). 절차형 추출
+  (`collect_extracted`)은 남은 부분을 평가를 끈 새 상태로 다시 꺼내고(조각마다 `MAX_REEXTRACTIONS` 16번, 넘으면 미추출),
+  통째로 읽는 몸체(trigger 등)는 앞 문장의 간선을 남기고 `SG_BODY_PARTIAL`(`body text from a top-level END …`)로 부분 분석이다.
+  수정 후 같은 재현은 `writes s.log`·`s.log.amount`까지 남기고 `complete`이며 세미콜론 판과 같다.
+  성능: TRY·CATCH 2천 쌍(200KB, 세미콜론 없음) 몸체가 디버그 빌드로 main 0.33초 → 상한 64에서 6.9초 → 16에서 2.3초. 상한
+  안의 일은 조각 길이에 선형이다.
+  테스트: parse_limits `세미콜론_없는_문장_뒤의_최상위_end에서_멈추지_않는다`·`토큰_위치가_end를_가리키지_않으면_원문_위치를_버린다`,
+  scope_tests `tsql_try_catch_without_semicolons_keeps_the_statements_after_end`·
+  `statements_after_an_unparsed_top_level_end_are_not_claimed_complete`·`reextraction_after_end_is_bounded_per_piece`, lib
+  `sqlserver_trigger의_최상위_end_뒤를_못_읽으면_부분_분석이다`. 새 함수를 부르지 않는 3개는 origin/main 소스에서 실패하고, 이어
+  읽기를 끈 변이(main 동작)에서 5개가 실패한다. 변이 5종(이어 읽기 끔, 다시 꺼내기 끔, 통째 몸체 표시 끔, 첫 줄 열 위치 하나
+  어긋남, 상한 없음)을 각각 잡는다.
+
+### 라운드 4 대항 입력과 코퍼스 대조
+
+- 대항 입력 38개(세션 scratchpad의 `adv.py`, main과 수정본 바이너리로 같은 `--document` 실행): 세 부분 대상(대소문자 다른 DB
+  이름, 없는 테이블, `DELETE TOP`, 조인 안의 별칭, 자기 조인, 다른 DB 별칭, 컨텍스트 없음, 대소문자만 다른 두 별칭, PostgreSQL
+  `DELETE … USING`·여러 테이블 TRUNCATE), MySQL USING(대문자 대상 lctn 0·1, 대소문자만 다른 두 별칭, 파생 테이블 별칭, 한정 대상,
+  하위 질의, MariaDB, Generic 방언, 단일 테이블 별칭, `IF … THEN` 안), END(중첩 TRY, 빈 CATCH, END 앞 `CASE … END`, 문자열·주석
+  속 END, 여러 바이트 글자, `IF … BEGIN … END ELSE …`, MySQL 끝 END, CATCH 안 동적 SQL, `#t` 임시 테이블, `WHILE … BREAK`,
+  `BEGIN TRAN`, PostgreSQL 끝 END, END 뒤 쓰레기, `THROW`). main에만 있는 간선은 거짓으로 확인한 것뿐이다: 세 부분 대상의
+  `reads`(PostgreSQL 실행으로 확인), 대소문자만 다른 별칭에서 고른 `writes orders`(SQL Server CI collation에서는 그 문장이
+  오류, CS에서는 `c`가 audit). `complete`→`partial`이 된 것(`IF 1 = 1 BEGIN … END ELSE …`, END 뒤 쓰레기, CATCH 안
+  `EXEC(@s)`)은 모두 뒤 문장을 버리던 몸체이고, CATCH 안 동적 SQL은 세미콜론 판과 같은 미추출 한계다. `DELETE TOP (10) FROM …`·
+  `DELETE app.dbo.audit`(FROM 없음)·`BEGIN TRAN … COMMIT TRAN`·`WHILE … BREAK END`는 sqlparser가 못 읽어 전과 같은 부분 분석이다.
+- 코퍼스: SQL Server fixture(`Fixtures/mssql/basic.sql`을 `--document`로 옮긴 근사 카탈로그, 세미콜론 있는 판·지운 판), 실제
+  PostgreSQL 16.15의 `verify-accuracy.py --sqlglot --suite all --strict`(chinook·pagila, 둘 다 실패 0; 엔진 결과는 main과 같고
+  다른 곳은 sqlglot 어댑터 오류 목록의 순서뿐), PG 골든(`Fixtures/postgres`, diff 0), SQLite 골든(diff 0) — 모두 main과 같은
+  그래프다.
+
+### 라운드 4 검증
+
+- Rust 1.96.0(`CARGO_PROFILE_DEV_DEBUG=0`, `-j 2`): `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  워크스페이스 테스트 733개 통과(이전 725 + parser 8). 첫 커밋 상태(`f2164ab`)도 parser 테스트 233개·clippy·fmt를 따로 통과했다.
+- Python: CI 시작 실패 경로·측정 불변식 테스트 11개와 `test-dml-producers.py`, `test-capture-migration.py`, `verify-contracts.py`
+  (jsonschema 4.23.0·sqlglot 30.18.0), `verify-competitive.py`, `verify-cancellation.py`, `verify-document-versions.py`(SQLite·PG 문서),
+  `verify-dynamic-sql.py`(PG).
+- 실제 PostgreSQL 16.15(로컬 바이너리, `postgres` 계정과 `/tmp` 작업 디렉터리, 끝나고 지움): `verify-accuracy.py`, PG 골든,
+  `verify-bridge-facts.py --require-isthmus`(isthmus-cli 0.14.0, `ok`), `verify-openlineage.py`, `verify-collection-scope.py`·
+  `verify-schema-lint.py`·`verify-unused.py`(네이티브), `verify-catalog-dependencies.py`(네이티브; Go·JDBC 생산자는 건너뜀).
+- Go: `gofmt -l`(없음), `go vet ./...`, `go test ./...`(Go 코드는 바뀌지 않았다).
+- 돌리지 못한 것: MySQL·MariaDB·SQL Server 실서버(Docker 데몬 없음; 이 세션에서 MySQL 8.0 deb를 scratchpad에 풀어 띄우려던
+  시도는 권한 정책으로 멈췄다) — USING·TRY/CATCH 판정은 mysql-server 문법 원문과 Microsoft 문서, sqlparser 소스에 근거한다.
+  DML 정확도 워크플로(v0.4.3 기준선; `Fixtures/accuracy/dml-cases.json`에 DELETE·TRUNCATE·END가 없어 영향 없음),
+  JDBC `gradle check`, `verify-html.py`, `verify-review-action.py`, `verify-external-imports.py`, `cargo package`, GLM 리뷰.
+
+### PR #63 리뷰 반영 (2026-11-22)
+
+독립 리뷰(`67943bb`)는 blocker 없음, END 이어 읽기의 거짓 간선 없음, should-fix 3개와 nit 3개였다. 리뷰어 바이너리
+(`r4-review-schemagraph/bin/sg-old`가 main 동작임을 세 부분 DELETE로 확인)와 이 세션에서 `67943bb`를 다시 빌드한 바이너리로 주장마다
+재현한 뒤 고쳤다. 커밋: `f6ff67e`(parser S2), `2c9b79d`(parser S1·N1), `f6caf78`(parser S3·N2), 그리고 이 문서 커밋. 중간 커밋 두 개도
+따로 parser 테스트(240·243개)·clippy·fmt를 통과했다.
+
+- S2(새로 잃은 참 간선): `parse_sql_prefix`가 끝에 남은 `END` 하나를 `COMMIT` 문장으로 붙였다. SQLite 뷰 `SELECT id FROM audit end`
+  (SQLite 3.53.1이 만들고 읽는다 — `end`는 별칭)는 main에서 `reads audit`·`audit.id`·`complete`였는데 `67943bb`에서 간선 없이
+  `SG_VIEW_STATEMENT: a view definition must contain exactly one query`, MySQL `--sql-dir` 같은 문장은 `is_select`가 거짓이 되어
+  `object-dependencies`(컬럼 읽기 없음)였다(CLI로 재현). 수정: 다시 읽은 목록이 `END` 한 문장(`Statement::Commit { end: true, .. }`)이고
+  끝(EOF)이면 버린다(`is_lone_end`) — main과 같은 동작이다. 수정 후 둘 다 main과 같다.
+- S1(RELEASE-NOTES 주장과 어긋남, main부터): 추출기가 무시하는 문장(`PRINT`·`RAISERROR`·`THROW`·`WAITFOR`·`GOTO`·`BREAK`·`FETCH`·`CLOSE`·
+  `DEALLOCATE` 등)이 세미콜론 없는 조각에서 뒤를 통째로 삼켜, `BEGIN TRY UPDATE audit … END TRY BEGIN CATCH PRINT ERROR_MESSAGE() INSERT INTO
+  log … END CATCH`가 main·`67943bb` 모두 `writes audit`만 남기고 `complete`였다(세미콜론 판은 `writes log`도). `RAISERROR … WITH NOWAIT`,
+  `WAITFOR DELAY`, `GOTO`, `THROW … END CATCH UPDATE orders`도 같았다. 같은 계열로 `EXEC proc <인자>`도 인자 뒤 문장을 삼켰다(이 세션에서
+  확인). 수정: `next_statement_start`가 인용·주석·괄호·`CASE … END` 밖의 다음 문장 머리(`SELECT`·`INSERT`·`UPDATE`·`DELETE`·`MERGE`·
+  `TRUNCATE`·`EXEC`·`EXECUTE`·`CALL`·`BEGIN`·`END`·`IF`·`WHILE`·`DECLARE`)를 찾고, 그 앞에서 무시하는 문장의 절과 `EXEC` 인자를 끝낸 뒤
+  계속 꺼낸다. `WITH`(`RAISERROR … WITH NOWAIT`)·`SET`(MySQL `SIGNAL … SET MESSAGE_TEXT`)은 끊지 않고, `@`·`.`·`:`·ASCII 밖 글자 바로 뒤
+  단어는 이름의 일부다. 건너뛴 절에 `=`가 있으면(`GET DIAGNOSTICS @s = ROW_COUNT`) 변수 값을 버린다 — 그 대입을 추적하지 않으므로
+  뒤 `EXEC(@s)`를 옛 값으로 접으면 거짓 쓰기다. 수정 후 다섯 재현과 `EXEC` 사례가 세미콜론 판과 같다. **(델타 리뷰에서 바로잡음, 아래
+  절)**: "세미콜론으로 끝나는 방언은 바뀌지 않는다"는 틀렸다(MySQL `\'`·`#` 때문에 거짓 쓰기가 생겼다). `=` 검사는 괄호 안과 `;`로
+  끝나는 절을 놓쳤다. PL/pgSQL `RAISE … (SELECT …)`는 셋 다 `reads audit`가 없는 main부터의 틈이라 대조 사례가 아니었다.
+  남은 틈: T-SQL `OPEN cur` 뒤에 세미콜론 없이 오는 문장은 여전히 소리 없이 빠진다(`OPEN c FOR SELECT …`의 질의를 끊지 않으려면 FOR 절을
+  따로 봐야 해 손대지 않았다). `BREAK END UPDATE …`는 END 갈래가 꼬리 단어로 `UPDATE`를 먹어 미추출로 센다(소리 없지 않음).
+  RELEASE-NOTES의 "조용히 버리던 몸체는 모두 complete이거나 partial" 문장은 이 틈을 적도록 고쳤다.
+- S3(별칭 대소문자 규칙): 대소문자만 다른 별칭으로 DELETE 대상을 늘 풀어, MySQL `lower_case_table_names=0`의 `DELETE FROM C USING audit c …`가
+  `writes s.audit`·`complete`였다(실제로는 `ER_UNKNOWN_TABLE`). 대상 목록 형식은 라운드 3부터 같았고, SQL Server CS collation도 같았다.
+  근거(GitHub 원문, mysql-server 8.0): `parse_tree_nodes.cc` `multi_delete_table_match`가 대상과 FROM/USING 항목을 `table_alias_charset`으로
+  비교하고(별칭이 있는 항목은 별칭으로만), `mysqld.cc`에서 그 charset은 lctn 0이면 `my_charset_bin`, 아니면 `my_charset_utf8mb3_tolower_ci`다.
+  그 함수 주석이 USING 형식의 FROM 목록도 같은 별칭 참조라고 적는다. 수정: `CollectRules.alias_case`(문서의 `cte_target::name_case`,
+  MySQL만 lctn으로 증명)를 몸체 파서까지 넘긴다. 정확한 철자는 늘 풀고, 대소문자만 다르면 Insensitive(lctn 1·2)는 풀고, Sensitive(lctn 0)는
+  풀지 않으며(델타 리뷰에서 바로잡음: 이름이 남으면 카탈로그에 `C`가 있을 때 `writes s.C`가 됐다 — 아래 절), Unknown(lctn 없음, MariaDB, SQL Server 모든 collation)은 쓰기를
+  남기고 `SG_DML_TARGET_SHAPE: DML target 'C' names the alias 'c' only if letter case is ignored, …`와 부분 분석이다. SQL Server를 `_CI`로도
+  증명하지 않은 것은 라운드 3 4차의 CTE 이름 판정과 같은 이유(별칭을 어느 collation이 비교하는지 문서 없음)다 — 리뷰는 `_CI`를 증명으로
+  보자고 했지만 쓰기를 지우지 않는 보수 판정이라 그대로 두었다. 좁힘: lctn 0의 대상 목록 형식에서 라운드 3이 내던 거짓 `writes`가 사라진다.
+- N1: 상한에 걸리면 "1 body statement(s) not extracted"만 남아 손실 크기를 알 수 없었다(2천 쌍에서 약 3,980문장). 상한에 걸린 조각마다
+  남은 바이트 수를 실은 `SG_BODY_PARTIAL`(`statement extraction stopped after 16 re-extractions … its remaining N bytes, which may hold many
+  statements, were not analyzed`)을 더한다.
+- N2: USING 형식의 FROM 목록 철자를 문장 전체 읽기에서 빼서, `DELETE FROM c USING audit c WHERE c.id IN (SELECT id FROM c)`(실제 테이블 `c`)의
+  `reads s.c`가 사라졌다. `read_exclusions`에서 그 갈래를 빼고 `body_relations`가 그 FROM 목록 이름 노드의 주소만 건너뛴다
+  (`using_alias_references`). `UPDATE c … FROM audit c`의 대상 철자 제외는 main부터 문장 전체라 그대로다(후속 후보).
+- N3(성능 선형): 바꾸지 않았다.
+- 테스트(새 7개): `a_lone_trailing_end_is_dropped_for_views_and_query_files`, `ignored_tsql_statements_end_at_the_next_statement_head`
+  (여덟 사례: 다섯 재현·`EXEC` 인자·`PRINT @update`·`PRINT CASE … END`), `a_skipped_clause_with_an_assignment_forgets_variable_values`,
+  `reextraction_cap_reports_the_size_left_unanalyzed`, `delete_alias_case_follows_the_documented_alias_rule`(두 형식 × lctn 0·1·2·없음,
+  MariaDB, SQL Server CS·CI·없음), `mysql_using_alias_exclusion_does_not_hide_a_real_table_read`, 그리고 parse_limits 끝 END 단위 테스트를
+  바꿨다(세 입력이 한 문장). 새 6개가 `67943bb`의 parser 소스에서 실패하고, 변이 10종(끝 END 버리기 끔, 무시 문장 절 끊기 끔, `=` 변수 버리기 끔,
+  CASE 깊이 무시, EXEC 인자 끊기 끔, `@` 뒤 단어 허용, Sensitive를 풀기, Unknown 진단 끔, 상한 진단 끔, 주소 대신 이름 비교)을 각각 잡는다.
+- 대항 입력 21개(`adv2.py`, main·`67943bb`·수정본)와 라운드 4의 38개(`67943bb`·수정본): 38개 가운데 바뀐 것은 S3의 lctn 0 사례 하나다. 새 21개에서
+  main에만 있던 간선은 lctn 0 대상 목록 형식의 거짓 `writes audit`뿐이고, 더해진 간선은 모두 세미콜론 판과 같다. 세미콜론으로 끝나는 방언
+  사례(PL/pgSQL·MySQL·PL/SQL)와 `RAISERROR … WITH NOWAIT;`는 셋이 같다. `EXEC get_sql @s OUTPUT EXEC(@s)`는 `OUTPUT` 인자를 지워 동적
+  SQL을 접지 않는다(세미콜론 판과 같은 미추출). 코퍼스: SQL Server fixture는 세미콜론 판이 같고, 세미콜론을 지운 판은 `dynamic_touch`의
+  `EXEC(N'UPDATE customers …')` 간선 3개가 더해진다(세미콜론 판에 있는 간선).
+- 검증(최종 트리): `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, 워크스페이스 테스트
+  739개 통과(733 + parser 6). Python CI 테스트 11개와 `test-dml-producers.py`·`test-capture-migration.py`·`verify-contracts.py`·
+  `verify-competitive.py`·`verify-cancellation.py`·`verify-document-versions.py`(SQLite·PG)·`verify-dynamic-sql.py`(PG). SQLite 골든·PG 골든
+  diff 0. 실제 PostgreSQL 16.15: `verify-accuracy.py --sqlglot --suite all --strict`(실패 0, 엔진 결과는 main과 같음),
+  `verify-bridge-facts.py --require-isthmus`(isthmus-cli 0.14.0), `verify-openlineage.py`, `verify-collection-scope.py`·`verify-schema-lint.py`·
+  `verify-unused.py`·`verify-catalog-dependencies.py`(네이티브) 모두 `ok`. Go `gofmt -l`·`go vet`·`go test` 통과. `--cache-dir` cold/warm는
+  `lower_case_table_names`를 0↔1로 바꿔도, 새 몸체 모양에서도 같다. 성능: TRY·CATCH 2천 쌍 몸체 0.84초(디버그, 부하 낮을 때).
+  돌리지 못한 것은 라운드 4와 같다(MySQL·MariaDB·SQL Server 실서버, Docker fixture, DML 정확도, JDBC, GLM 리뷰).
+
+### PR #63 좁은 재리뷰 반영 (2026-11-22)
+
+`bc223db..5b11c7a` 재리뷰(blocker 없음, should-fix 2, nit 3). 리뷰어 도구 `r4-delta-schemagraph/run2.py`와 새 사례 `c7`–`c9`(96개)를
+복사해 다섯째 바이너리(새 머리)를 더했고(세션 scratchpad `r4-schemagraph/delta2/`), 별도 대상 디렉터리로 빌드했다.
+
+- SF1(`SET` 갈래가 다음 문장을 삼킴): 5b11c7a가 `SET`을 끊기 머리로 더하자 `PRINT 'x' SET @n = 1 UPDATE audit …`·`EXEC mutate SET @c = 3 UPDATE
+  audit …`·`WAITFOR … SET …`·`PRINT 'x' SET NOCOUNT ON UPDATE orders …`의 `SET` 갈래가 조각 끝까지를 우변으로 삼아 `UPDATE`를 잃었다(두 사례는
+  소리 없는 `complete`). 맨 앞의 `SET @n = 1 UPDATE …`는 main부터 같았다. 수정: T-SQL에서 `SET` 문장도 `tsql_statement_end`(다음 문장 머리)에서
+  끝내고 계속 꺼낸다(`EXEC` 갈래와 같은 모양). 수정 후 리뷰어 사례 17개(`s_*`·`x_*`·`t_print_set_nosemi2`)의 간선·상태가 세미콜론을 넣은 판과
+  모두 같다.
+- SF2(거절된 DELETE의 다른 대상): `DELETE C, o FROM audit c JOIN orders o …`(lctn 0, `c`·`C`)가 거절 진단과 함께 `writes orders`·`reads audit`를
+  남겼다. MySQL은 문장 전체를 거절하므로 수정 후 `delete_target_names`가 대상 하나라도 거절되면 쓰기를 모두 빼고, `body_relations`가 그 문장
+  안의 관계 읽기를 세지 않는다(`is_rejected_delete`). 진단 문구는 "rejects the whole statement (ER_UNKNOWN_TABLE), so none of its writes or reads
+  are recorded"로 바꿨다. 같이 본 것: 절차형 추출로 가는 몸체(`BEGIN DECLARE x INT DEFAULT 1; DELETE C FROM audit c …; END`)는 간선이 없어지자
+  "body parse failed"·`unsupported`가 되어 진단을 잃었다 — 간선이 없어도 `partial`로 표시된 추출 결과는 분석 결과로 기록한다. 남은 것: 거절된
+  DELETE 안의 함수 호출(`calls`)과 앞에 WITH가 붙은 거절 DELETE의 CTE 컬럼 읽기는 그대로다.
+- nit 1(should-fix로 처리, `=` 앞 주석): `RECEIVE TOP(1) @s /*x*/ = message_body`에서 왼쪽 이름을 못 찾아 옛 값으로 접었다(5b11c7a `complete`·
+  `writes audit`). `invalidate_assigned_names`를 앞에서부터 훑게 바꿔 공백·주석을 건너뛰고 왼쪽 이름을 찾으며, 이름이 아니면(괄호·리터럴)
+  추적 값을 모두 버린다. `<=`·`>=`·`!=`·`==`는 비교로 건너뛴다.
+- nit 2(비교를 대입으로 봄): `PRINT CASE WHEN @s = N'' …`·PL/pgSQL `RAISE … CASE WHEN q = '' …`는 참인 접기를 잃고 `partial`이다(보수 판정 —
+  RELEASE-NOTES에 그렇게 적었다). 같은 보수 판정으로 `SET @s += …`의 `@s`가 값 없음(NULL)이면 접지 않는다(main은 빈 문자열처럼 접어
+  `writes orders`를 냈다 — 기본 `CONCAT_NULL_YIELDS_NULL`에서 `NULL + 문자열`은 NULL이라 거짓). PL/pgSQL `GET DIAGNOSTICS q = PG_CONTEXT;
+  EXECUTE q;`의 main `writes orders`도 옛 값 접기라 사라진다.
+- nit 3(`PRINT (SELECT …)`): SQL Server는 PRINT의 하위 질의를 거절한다(Msg 1046, 리뷰 지적 — Microsoft PRINT 문서의 문법은 `string_expr`뿐이다).
+  읽기를 남기는 쪽을 유지했다 — 되돌리면 끊긴 몸체 `PRINT (SELECT …) UPDATE …`가 다시 읽기 없이 `complete`가 된다. 실제 카탈로그에는 나올 수
+  없는 잘못된 T-SQL을 보수적으로 다루는 것이고, `sys.objects`처럼 카탈로그에 없는 관계를 읽으면 그 한계로 `partial`이다(`r_sys_semi`).
+- 테스트(새 2개, 바꾼 1개): `set_statements_end_at_the_next_statement_head`(일곱 입력을 세미콜론 판과 비교 — 리뷰 여섯 + 맨 앞 `SET`),
+  `a_rejected_delete_records_no_writes_or_reads`(두 형식, 하위 질의, 절차형 몸체), 그리고 `skipped_clause_assignments_never_fold_a_stale_value`에
+  주석 사례와 이름 없는 왼쪽 사례를 더했다. 셋 모두 5b11c7a parser 소스에서 실패하고, 변이 6종(SET 끊기 끔, 다른 대상 쓰기 유지, 거절 문장
+  읽기 유지, 주석 건너뛰기 끔, 이름 없는 왼쪽 무시, 간선 없는 부분 분석을 파싱 실패로)을 각각 잡는다.
+- 사례 대조(리뷰어 옛 175 + 새 96 + REALC 27, main·bc223db·5b11c7a·새 머리): 새 머리가 5b11c7a와 다른 사례는 SF1(세미콜론 판과 같음), SF2(거절된
+  문장의 쓰기·읽기 제거), nit 1(옛 값 접기 제거)뿐이다. main에만 있는 간선은 모두 거짓이거나(옛 값·NULL 접기, lctn 0 거절 문장의 쓰기·읽기,
+  USING `writes s.c`, 세 부분 `reads`) nit 2의 보수 판정으로 잃은 접기(`partial`)다. 이 세션의 38·21개는 SF2 두 사례만 바뀐다.
+- 커밋: `595d2fb`(SF1)·`9350d0e`(SF2와 절차형 간선 없는 부분 분석)·`c724ca9`(nit 1). 중간 커밋은 별도 대상 디렉터리에서 각자 parser 테스트·
+  clippy·fmt를 통과했다(`595d2fb` 251, `9350d0e` 252).
+- 검증(최종 트리, Rust 1.96.0, `-j 2`, `CARGO_PROFILE_DEV_DEBUG=0`): `cargo fmt --all -- --check`·`cargo clippy --workspace --all-targets
+  --locked -- -D warnings` 통과, `cargo test --workspace --locked` 746 통과. Python CI 테스트 11개·`test-dml-producers.py`·
+  `test-capture-migration.py`·`verify-competitive.py`·`verify-cancellation.py`·`verify-contracts.py`·`verify-document-versions.py`(SQLite)
+  통과, SQLite·PG golden diff 0, `verify-dynamic-sql.py`(PG) 통과, PostgreSQL 16.15 `verify-accuracy.py --sqlglot --suite all --strict`
+  0 failing(엔진 결과 main과 같음). SQL Server fixture 프로시저(`Fixtures/mssql/basic.sql`, 세미콜론 있음·없음)는 5b11c7a와 같다.
+
+### PR #63 델타 리뷰 반영 (2026-11-22)
+
+`67943bb..bc223db` 델타 리뷰(blocker 1, should-fix 3, nit 4). 리뷰어 도구(`r4-delta-schemagraph/run.py`, 사례 `cases/c1–c6.json` 155개, main
+`1365d37`·`67943bb`·`bc223db` 바이너리)를 복사해 수정본을 넷째 바이너리로 더했고(세션 scratchpad `r4-schemagraph/delta/`), 주장마다 재현한 뒤
+고쳤다. 대상 디렉터리는 따로 두고 처음부터 빌드했다(공유 대상 디렉터리의 크레이트 재사용 함정).
+
+- B1(blocker, MySQL·MariaDB 거짓 쓰기): `next_statement_start`의 인용 스캐너(`skip_string`)는 `''`만 알고 MySQL `\'`·`#` 주석을 몰라,
+  `SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Can\'t delete from audit; it\'s immutable';`에서 문자열 속 `delete from audit`를 문장으로 끊었다
+  (bc223db `writes s.audit`; main·67943bb 간선 없음). `'You can\'t truncate audit; …'`, `# callers update audit` 주석, `'x\' update audit set
+  name = 1 #\''`(bc223db `complete`)도 같았다. 수정: 끊기(무시하는 문장 절·`EXEC`·`EXECUTE` 인자)는 T-SQL 문서(`sqlserver`·`mssql`,
+  `TextDialect::MsSql`)에서만 한다(`tsql_statement_end`). 수정 후 다섯 MySQL 사례와 MariaDB가 main과 같다(간선 없음, 같은 상태).
+- S1(옛 값 접기): `=` 검사가 괄호 안(`WAITFOR (RECEIVE TOP(1) @s = message_body FROM q)`, bc223db `complete`·`writes audit`)과 `;`로 끝나는 절
+  (`GET DIAGNOSTICS @s = ROW_COUNT; EXEC(@s);`, `PRINT 'x' SET @s = N'UPDATE orders …'; EXEC(@s)` — 셋 다 main부터 `writes audit`)을 놓쳤다.
+  수정: `invalidate_assigned_names`가 괄호와 무관하게 각 `=` 왼쪽 이름의 추적 값을 버리고(그 이름만 — 다른 변수의 접기는 그대로), `break`
+  앞에서 돈다(모든 방언). T-SQL 끊기 머리에 `SET`을 더해(T-SQL의 무시하는 문장 절에는 `SET` 단어가 없다) `PRINT 'x' SET @s = …`가 그 값을
+  추적한다. 같이 보인 `SET @s += N' WHERE 1 = 0'`(c1 `t_raiserror_set`)은 `@s`를 덮어써 `EXEC(@s)`를 못 읽었다 — `assign_tsql_variable`이 `+=`를
+  `@s = @s + …`로 추적하고 다른 복합 대입은 버린다. 수정 후 RECEIVE·GET DIAGNOSTICS는 `partial`(동적 SQL 미추출), `PRINT … SET`은 `writes
+  orders`(세미콜론 판과 같음), `+=`는 `writes audit`(이어 붙인 문장).
+- S2(lctn 0에서 실제 테이블 `C`로 풀림): 카탈로그에 `c`와 `C`가 함께 있으면 `DELETE C FROM audit c WHERE c.id = 1`이 bc223db에서 `writes s.C`·
+  `complete`였다(USING 형식은 main부터 같음). mysql-server `multi_delete_table_match`는 별칭 있는 항목은 별칭으로만, 없는 항목은 테이블 이름으로
+  비교한다 — 그 문장은 `ER_UNKNOWN_TABLE`이다. 수정: `resolve_delete_target`이 Sensitive 규칙에서 대소문자만 다른 별칭과만 맞으면 쓰기를 내지
+  않고(`relation: None`) `SG_DML_TARGET_SHAPE: DML target 'C' matches the alias 'c' only by letter case; MySQL compares them byte for byte when
+  lower_case_table_names is 0 and rejects the statement (ER_UNKNOWN_TABLE), so no write edge is recorded`와 부분 분석이다. FROM 목록에 별칭 없이
+  정확히 `C`가 있으면(`DELETE C FROM audit c JOIN C …`) 그 테이블이 대상이다. 좁힘: main의 USING 형식 `writes s.C`(테이블 `C`가 있을 때)와
+  대상 목록 형식 `writes s.audit`(lctn 0)이 사라진다 — 둘 다 MySQL이 거절하는 문장의 거짓 쓰기다.
+- S3(`ae54036`부터, `end` 별칭 뒤 절): SQLite가 만드는 뷰 `select id from audit end order by id`·`… where end.id = 1`·`select end.id from audit end
+  join orders o …`가 main에서 `reads audit`였는데 `67943bb`·`bc223db`에서 `SG_PARSE_ERROR`로 간선이 없었다. 수정: 뷰·쿼리 파일 경로(`enrich_view`,
+  `is_select`)가 `parse_sql_prefix`로 END 앞 문장을 쓰고, 뒤를 읽지 못했으면 `SG_BODY_PARTIAL: SQL text from a bare END onward was not parsed; …`로
+  부분 분석이다. main은 뒤 절을 소리 없이 버리고 `complete`일 수 있었다. 수정 후 세 뷰는 main의 간선(`reads audit`, `audit.id`)과 `partial`이다.
+- nit 1: `PRINT 'x' WITH cte AS (…) INSERT …`가 `WITH`를 `PRINT` 절로 버려 실제 테이블 `cte`를 읽는 거짓 간선을 냈다. `WITH 이름 [(컬럼…)] AS (`
+  (`opens_cte`)를 문장 머리로 끊는다. 추출기는 `WITH … INSERT`를 읽지 못해(main부터, 세미콜론 판도 같음) 미추출로 세어 `partial`이다.
+- nit 2(`GOTO done done:UPDATE …`, `:` 규칙): 셋 다 unsupported라 그대로 두고 기록한다.
+- nit 3: T-SQL `EXECUTE proc 인자` 뒤 문장도 `EXEC`처럼 끊는다(세미콜론 판과 같은 `writes orders`; `EXECUTE proc`는 전처럼 호출 간선 없이 미추출).
+- nit 4: PL/pgSQL `RAISE NOTICE '%', (SELECT count(*) FROM audit)`가 `reads audit` 없이 `complete`인 것은 main부터의 틈이다(무시하는 문장의 하위 질의).
+  T-SQL `PRINT (SELECT …)`는 이번에 식으로 꺼내(`reads audit`) 세미콜론 판과 같아졌고, 다른 무시하는 문장의 하위 질의는 후속 후보다.
+- 테스트(새 5개): `skipped_statements_are_not_cut_outside_tsql`(다섯 MySQL 몸체 × MySQL·MariaDB), `skipped_clause_assignments_never_fold_a_stale_value`
+  (RECEIVE 두 형태·GET DIAGNOSTICS `;`·`-=`·`PRINT … SET`·`+=`), `case_sensitive_alias_mismatch_writes_no_catalog_table`(두 형식 + 별칭 없는 `C`),
+  `an_end_alias_followed_by_clauses_keeps_the_select_edges`(세 SQLite 뷰 + MySQL 쿼리 파일), `tsql_cut_points_match_the_semicolon_version`(EXECUTE,
+  PRINT 하위 질의, WITH CTE). 다섯 모두 `bc223db` parser 소스에서 실패하고, 변이 11종(방언 제한 끔, `=` 검사를 옛 위치·최상위로, `SET` 머리
+  뺌, `+=`를 덮어쓰기로, 별칭 없는 테이블 검사 끔, CTE 끊기 끔, PRINT 하위 질의 끔, EXECUTE 끊기 끔, Sensitive를 풀기, 뷰 미파싱 진단 끔,
+  `is_select` 엄격)을 각각 잡는다.
+- 사례 대조(리뷰어 155개 + 이 세션 38·21개 + 재현 20개, main·bc223db·수정본): 수정본에만 있는 간선은 모두 세미콜론 판과 같거나(T-SQL 끊기 28개를
+  세미콜론을 넣은 판과 자동 대조 — 다른 둘은 세미콜론을 주석 안에 넣은 대조 실수와, 이번에 고친 PRINT 하위 질의), 앞 커밋에서 근거를 적은 것
+  (USING 별칭, 세 부분 대상, N2의 `reads c`, S3의 뷰 간선)이다. main에만 있는 간선은 모두 거짓으로 확인했다 — 옛 값 접기의 `writes audit`
+  (RECEIVE·GET DIAGNOSTICS·`PRINT … SET`), lctn 0의 별칭 대소문자 불일치 쓰기, USING 형식의 `writes s.c`, 세 부분 대상의 `reads`.
+- 커밋: `377e635`(B1·S1·nit 1·nit 3), `0ecad86`(S2), `72b0c94`(S3), 그리고 이 문서 커밋. 중간 두 커밋도 따로 parser 테스트(248·249개)·clippy·fmt를
+  통과했다(별도 대상 디렉터리).
+- 검증(최종 트리): `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, 워크스페이스 테스트 744개 통과
+  (739 + 5). Python CI 테스트 11개와 `test-dml-producers.py`·`test-capture-migration.py`·`verify-contracts.py`·`verify-competitive.py`·
+  `verify-cancellation.py`, SQLite 골든·PG 골든 diff 0, `verify-document-versions.py`(SQLite)·`verify-dynamic-sql.py`(PG), 실제 PostgreSQL 16.15
+  `verify-accuracy.py --sqlglot --suite all --strict`(실패 0, 엔진 결과 main과 같음). SQL Server fixture는 세미콜론 판이 bc223db와 같고, 세미콜론을
+  지운 판은 `dynamic_touch`가 `reads orders`를 더해 `complete`가 된다(세미콜론 판과 같음 — `EXECUTE(N'SELECT id FROM orders')` 끊기).
 
 ### 라운드 3 (2026-11-22)
 
@@ -382,8 +623,9 @@ PR #59는 GLM 리뷰 없이 머지됐다.
    GitHub Release·crates.io·Maven Central을 **각각** 게시하고, 채널 표를 실제 조회 결과로 갱신한다.
    crates.io 누락분(0.7.1·0.8.0·0.8.1)은 다시 게시하지 않고 0.10.0이 그 변경을 담는다.
 2. isthmus 쪽 `compatibility.json`의 schemagraph 고정을 올리는 일은 isthmus 저장소에 맡긴다.
-3. 라운드 3 브랜치: push·PR 뒤 CI를 확인하고 머지한다. 이 세션에서 돌리지 못한 검증은 PR 본문의 Verification 절에
-   적었다(Docker DB fixture·DML 정확도·JDBC JUnit·GLM 리뷰 등).
+3. 라운드 4 브랜치: push·PR 뒤 CI를 확인하고 머지한다. 이 세션에서 돌리지 못한 검증은 위 "라운드 4 검증"과 PR 본문의
+   Verification 절에 적었다(MySQL·SQL Server 실서버, Docker DB fixture, DML 정확도, JDBC, GLM 리뷰 등). 원격의
+   `fix/postgres-ascii-identifier-fold`와 함께 머지하면 `parser/src/lib.rs`·`scope_tests.rs`·RELEASE-NOTES·HANDOFF의 충돌을 확인한다.
 4. 후속 후보(관찰했지만 고치지 않음):
    - 대소문자 접기 방언(MySQL `lower_case_table_names` 1·2, SQL Server `_CI` collation)은 routine·trigger 몸체의
      객체 단위 간선만 대소문자만 다른 관계로 잇는다. 뷰 몸체와 컬럼 단위 간선(Binder)은 정확 비교라 같은 참조가
@@ -411,20 +653,35 @@ PR #59는 GLM 리뷰 없이 머지됐다.
      CTE 읽기는 대소문자 규칙을 따르지 않는다 — `_CI`에서 `WITH Recent AS (…) … FROM recent`가 같은 이름의 실제 테이블
      `recent`를 읽는 간선을 낸다(`body_relations::collect_reads`와 Binder `factor`가 정확 비교, main부터; 3차 리뷰가 짚고 main
      바이너리로 확인). 대소문자 접기 방언 항목과 함께 고친다.
-   - (main부터, 3차 리뷰가 짚고 main 바이너리로 확인) T-SQL `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`를 세미콜론 없이 쓰면
-     CATCH 안의 문장(`UPDATE log …`)이 빠진 채 `complete`다. MySQL 다중 테이블 `UPDATE a JOIN b … SET b.x = …`는 `b`를 쓰기가
+   - (main부터, 3차 리뷰가 짚고 main 바이너리로 확인) MySQL 다중 테이블 `UPDATE a JOIN b … SET b.x = …`는 `b`를 쓰기가
      아니라 읽기로 남기고(`SG_DML_TARGET_SHAPE`로 부분 분석), 쉼표 형식 `UPDATE a, b SET …`은 파싱하지 못한다(`SG_BODY_PARTIAL`).
+     세미콜론 없는 T-SQL `BEGIN TRY … END CATCH`는 라운드 4에서 고쳤다.
+   - (main부터, 라운드 4에서 확인) routine 몸체도 `extract_trigger_inner`로 첫 `BEGIN`과 마지막 `END` 사이만 읽어, 그 밖의
+     텍스트를 버린다. `IF 1 = 1 BEGIN UPDATE audit … END ELSE BEGIN UPDATE log … END UPDATE orders …`(SQL Server)는 `IF` 머리와 끝의
+     `UPDATE orders`를 잃는다. 라운드 4 뒤로는 그 안의 `END ELSE`를 읽지 못해 `partial`로 표시되지만 `log`·`orders` 간선은 없다.
+     고치려면 routine에서는 바깥 `BEGIN … END`가 몸체 전체를 감쌀 때만 벗겨야 하고, trigger 머리(`CREATE TRIGGER … AS`)와 갈라야 한다.
+   - (PR #63 좁은 재리뷰) 거절된 MySQL DELETE 안의 함수 호출과, 앞에 WITH가 붙은 거절 DELETE의 CTE 컬럼 읽기는 남는다. `=` 리셋은 비교도
+     대입으로 봐 참인 접기를 버릴 수 있다(`partial`).
+   - (PR #63 델타 리뷰) 무시하는 문장의 하위 질의 읽기: PL/pgSQL `RAISE NOTICE '%', (SELECT …)`(main부터 `complete`, 읽기 없음) 등. T-SQL `PRINT`만
+     식으로 꺼낸다. 추출기는 `WITH … INSERT|UPDATE|DELETE`를 읽지 못해 미추출로 센다(main부터). `GOTO done done:UPDATE …`처럼 레이블 콜론에 붙은
+     문장 머리는 끊지 않는다(셋 다 unsupported). T-SQL `EXECUTE proc …`는 `EXEC proc`와 달리 호출 간선이 없다.
+   - (PR #63 리뷰 반영 중 확인) 세미콜론 없는 T-SQL에서 `OPEN cur` 뒤 문장은 여전히 소리 없이 빠진다(`strip_open`이 조각 끝까지 본다;
+     PL/pgSQL `OPEN c FOR SELECT …`의 질의를 끊지 않게 FOR 절을 따로 봐야 한다). END 갈래는 `END` 뒤 한 단어를 꼬리로 먹어
+     `BREAK END UPDATE log …`의 `UPDATE`를 잃는다(미추출로 셈) — 꼬리가 문장 머리면 먹지 않게 할 수 있다. `UPDATE C … FROM audit c`의 승격
+     (`promoted_update_factor`·`scope.rs` `promoted_update_target`)은 아직 문서의 별칭 대소문자 규칙을 보지 않고 늘 대소문자를 무시하며,
+     대상 철자를 문장 전체 읽기에서 뺀다(main부터; DELETE는 PR #63 리뷰에서 고침). MariaDB의 별칭·CTE 이름 규칙은 확인하지 않았다.
+   - (sqlparser 0.58 한계, 라운드 4에서 확인) T-SQL 문장 사이 `;`는 `END` 앞에서만 생략할 수 있다. `UPDATE a … UPDATE b …`는
+     미추출로 세고, 세미콜론 없는 `DECLARE @n int BEGIN TRY …`는 추출기가 DECLARE 조각에 나머지를 삼켜 몸체가 unsupported다(라운드 4
+     전후 같음). `DELETE TOP (n) FROM …`과 FROM 없는 `DELETE app.dbo.audit WHERE …`도 파싱하지 못해 미추출이다.
    - 데이터 수정 CTE(PostgreSQL `WITH ins AS (INSERT INTO log … RETURNING …) SELECT … FROM ins`): 쿼리 파일은 `is_select`가
      참이라 읽기 경로로 가서 `writes log`가 없고 `SG_SET_UNSUPPORTED`로 부분 분석이다. routine은 객체 단위 `writes`·`reads`만
      남기고 컬럼 효과 없이 `complete`다(라운드 3 CLI로 확인). 고치려면 CTE 몸체의 DML을 `DmlAnalyzer`가 분석하고
      RETURNING 출력을 바깥 질의의 원천으로 이어야 한다. 쿼리 파일만 DML 경로로 보내면 같은 거짓 complete가 되므로
      둘을 함께 고친다.
-   - (main부터, 4차 작업 중 확인) PostgreSQL 미인용 식별자 접기(`scope.rs` `name()`·`name_for_dialect`)가 `to_lowercase`라 ASCII 밖
-     글자도 접는다. PostgreSQL은 다중 바이트 인코딩(UTF8)에서 ASCII만 접는다(REL_16_STABLE `src/backend/parser/scansup.c`
+   - (main부터, 4차 작업 중 확인; 원격 브랜치 `fix/postgres-ascii-identifier-fold`가 다룬다, PR 없음) PostgreSQL 미인용 식별자
+     접기(`scope.rs` `name()`·`name_for_dialect`)가 `to_lowercase`라 ASCII 밖 글자도 접는다. PostgreSQL은 다중 바이트 인코딩(UTF8)에서 ASCII만 접는다(REL_16_STABLE `src/backend/parser/scansup.c`
      `downcase_identifier`: 높은 비트 글자는 `enc_is_single_byte`일 때만 `tolower`). main 바이너리에서 PostgreSQL 프로시저
      `UPDATE ΑΣ SET name = 'x'`가 테이블 `ΑΣ`를 두고 `s.ας`가 없는 관계라는 한계를 낸다. 같은 이름의 `ας` 테이블이 있으면 거짓 간선이 된다.
-   - 다중 테이블 DELETE의 MySQL `DELETE FROM c USING audit c …` 형식은 대상(`FROM` 목록)의 별칭을 `USING` 관계로 풀지 않는다(main부터).
-     PostgreSQL의 `DELETE FROM t USING …`과 같은 AST라 방언을 보고 갈라야 해 4차 범위에서 뺐다.
    - `--sql-dir` 쿼리 파일의 컬럼 분석 한계 문구는 `view main.query_…: SG_…`처럼 객체 종류를 `view`로 적는다
      (`record_body`/`enrich_view` 경로의 문구). 의미는 맞지만 쿼리 파일을 뷰로 부른다.
 

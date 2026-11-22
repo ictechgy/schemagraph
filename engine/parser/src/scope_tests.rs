@@ -1405,6 +1405,904 @@ fn delete_through_a_from_alias_writes_the_aliased_table() {
     );
 }
 
+/// 수집한 데이터베이스까지 한정한 DELETE·TRUNCATE 대상(`app.s.audit`)은 쓰기다. 세 부분 쓰기 대상은
+/// `qualified_write_targets`가 따로 모으는데 DELETE·TRUNCATE가 빠져 있어, 대상이 FROM 관계로 방문되어
+/// `reads s.audit`(거짓)이 되고 쓰기 간선은 없었다. 별칭이 세 부분 관계를 가리키는 다중 테이블
+/// DELETE·UPDATE(`DELETE c FROM app.s.audit c …`)는 별칭 철자로 되돌아가 없는 관계 `s.c` 한계와 부분
+/// 분석을 냈다. SQL Server 문서의 DELETE `<object>`와 TRUNCATE TABLE 문법은 `database_name.schema_name.`
+/// 한정을 허용한다.
+#[test]
+fn database_qualified_delete_and_truncate_targets_are_writes() {
+    let context = CollectionContext {
+        database: Some("app".into()),
+        ..naming_context(None, None)
+    };
+    for body in [
+        "DELETE FROM app.s.audit WHERE id = 1",
+        "TRUNCATE TABLE app.s.audit",
+        "DELETE c FROM app.s.audit c JOIN s.orders o ON c.id = o.id",
+        "UPDATE c SET name = 'x' FROM app.s.audit c JOIN s.orders o ON c.id = o.id",
+        "WITH x AS (SELECT id FROM s.orders) DELETE FROM app.s.audit WHERE id IN (SELECT id FROM x)",
+        // 별칭 `c`·`C`는 대소문자를 구분하는 collation에서만 함께 쓸 수 있고, 그때 `c`는 audit다.
+        // 이전에는 세 부분 관계를 후보에서 빼 `C`(orders)를 대상으로 골랐다.
+        "DELETE c FROM app.s.audit c JOIN s.orders C ON c.id = C.id",
+    ] {
+        let graph = scan_routine_in_context(
+            body,
+            "sqlserver",
+            "sql",
+            "procedure",
+            Some(context.clone()),
+        );
+        let detail = format!("{body}: {:?} {:?}", graph.edges(), graph.limitations());
+        assert!(
+            edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert!(
+            !edge(&graph, "s.mutate", "s.audit", EdgeKind::Reads),
+            "{detail}"
+        );
+        assert!(
+            !edge(&graph, "s.mutate", "s.orders", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert!(!touches(&graph, "s.mutate", "s.c"), "{detail}");
+        assert!(graph.limitations().is_empty(), "{detail}");
+        assert_eq!(
+            graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+            AnalysisState::Complete,
+            "{detail}"
+        );
+    }
+    // 다른 데이터베이스의 대상은 이전처럼 간선 없이 SG_CROSS_DATABASE다.
+    let other = scan_routine_in_context(
+        "DELETE FROM other.s.audit WHERE id = 1",
+        "sqlserver",
+        "sql",
+        "procedure",
+        Some(context),
+    );
+    let detail = format!("{:?} {:?}", other.edges(), other.limitations());
+    assert!(!touches(&other, "s.mutate", "s.audit"), "{detail}");
+    assert!(has_diagnostic(&other, "SG_CROSS_DATABASE"), "{detail}");
+}
+
+/// MySQL·MariaDB의 `DELETE FROM c USING audit c …`에서 FROM 목록은 USING 관계를 가리키는 참조다
+/// (mysql-server 8.0 `sql_yacc.yy`: `FROM table_alias_ref_list USING table_reference_list`). 이전에는
+/// FROM의 `c`를 삭제 대상 테이블로 읽어 `s.c`가 없다는 거짓 한계와 `reads s.audit`만 남겼다.
+/// PostgreSQL의 FROM은 삭제할 테이블 자체라 같은 모양을 풀지 않는다 — `DELETE FROM c USING audit "C"`는
+/// PostgreSQL에서 테이블 `c`를 지운다(PostgreSQL 16에서 확인).
+#[test]
+fn mysql_delete_using_resolves_the_from_list_through_using_aliases() {
+    for dialect in ["mysql", "mariadb"] {
+        for (body, writes, reads) in [
+            (
+                "DELETE FROM c USING audit c JOIN orders o ON c.id = o.id",
+                &["s.audit"][..],
+                &["s.orders"][..],
+            ),
+            (
+                "DELETE FROM c, o USING audit AS c JOIN orders AS o ON c.id = o.id",
+                &["s.audit", "s.orders"][..],
+                &[][..],
+            ),
+            (
+                "DELETE FROM audit USING audit JOIN orders o ON audit.id = o.id",
+                &["s.audit"][..],
+                &["s.orders"][..],
+            ),
+            (
+                "WITH c AS (SELECT id FROM customers) DELETE FROM c USING audit c JOIN orders o ON c.id = o.id",
+                &["s.audit"][..],
+                &["s.orders", "s.customers"][..],
+            ),
+        ] {
+            let graph = scan_routine_in_context(
+                body,
+                dialect,
+                "sql",
+                "procedure",
+                Some(naming_context(None, Some(0))),
+            );
+            let detail = format!(
+                "{dialect} {body}: {:?} {:?}",
+                graph.edges(),
+                graph.limitations()
+            );
+            for target in writes {
+                assert!(
+                    edge(&graph, "s.mutate", target, EdgeKind::Writes),
+                    "{detail}"
+                );
+            }
+            for source in reads {
+                assert!(edge(&graph, "s.mutate", source, EdgeKind::Reads), "{detail}");
+            }
+            assert!(!touches(&graph, "s.mutate", "s.c"), "{detail}");
+            assert!(graph.limitations().is_empty(), "{detail}");
+            assert_eq!(
+                graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+                AnalysisState::Complete,
+                "{detail}"
+            );
+        }
+    }
+    // USING 별칭이 그 문장의 WITH 이름인 관계를 가리키면 MySQL은 그 WITH 질의를 대상으로 본다.
+    let through_cte = scan_routine_in_context(
+        "WITH audit AS (SELECT id FROM customers) DELETE FROM x USING audit x JOIN orders o ON x.id = o.id",
+        "mysql",
+        "sql",
+        "procedure",
+        Some(naming_context(None, Some(0))),
+    );
+    let detail = format!("{:?}", through_cte.edges());
+    assert!(!touches(&through_cte, "s.mutate", "s.audit"), "{detail}");
+    assert!(
+        has_diagnostic(&through_cte, "SG_DML_TARGET_SHAPE"),
+        "{detail}"
+    );
+    // PostgreSQL은 FROM의 테이블을 지운다.
+    let postgres = scan_routine_with_objects(
+        "DELETE FROM c USING audit \"C\" WHERE \"C\".id = c.id",
+        "postgres",
+        "sql",
+        "procedure",
+        None,
+        vec![object("c", &["id"])],
+    );
+    let detail = format!("{:?} {:?}", postgres.edges(), postgres.limitations());
+    assert!(
+        edge(&postgres, "s.mutate", "s.c", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(
+        !edge(&postgres, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+}
+
+/// 세미콜론을 생략한 T-SQL의 `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`(문법: MicrosoftDocs
+/// `try-catch-transact-sql.md`, 세미콜론은 대부분 문장에서 선택: `transact-sql-syntax-conventions…`)는
+/// 세미콜론을 붙인 같은 몸체와 같은 간선을 남긴다. sqlparser는 `;` 없는 문장 뒤의 `END`에서 멈추고
+/// 성공을 돌려줘, `END TRY` 뒤의 CATCH 문장이 소리 없이 빠진 채 `complete`였다.
+#[test]
+fn tsql_try_catch_without_semicolons_keeps_the_statements_after_end() {
+    let without = "BEGIN TRY\n  UPDATE audit SET name = 'x' WHERE id = 1\nEND TRY\nBEGIN CATCH\n  INSERT INTO orders (id, amount) SELECT id, id FROM customers\nEND CATCH";
+    let with = "BEGIN TRY\n  UPDATE audit SET name = 'x' WHERE id = 1;\nEND TRY\nBEGIN CATCH\n  INSERT INTO orders (id, amount) SELECT id, id FROM customers;\nEND CATCH";
+    let facts = |body: &str| {
+        let graph = scan_routine_kind(body, "sqlserver", "sql", "procedure");
+        let mut edges: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.from.as_str() == "s.mutate")
+            .map(|edge| format!("{:?} {}", edge.kind, edge.to))
+            .collect();
+        edges.sort();
+        let analysis = &graph.analysis()[&VertexId::from_raw("s.mutate")];
+        (edges, analysis.state, graph.limitations().to_vec())
+    };
+    let (edges, state, limitations) = facts(without);
+    let detail = format!("{edges:?} {limitations:?}");
+    for expected in [
+        "Writes s.audit",
+        "Writes s.audit.name",
+        "Writes s.orders",
+        "Writes s.orders.amount",
+        "Reads s.customers",
+    ] {
+        assert!(edges.iter().any(|edge| edge == expected), "{detail}");
+    }
+    assert_eq!(state, AnalysisState::Complete, "{detail}");
+    assert_eq!((edges, state, limitations), facts(with));
+}
+
+/// 최상위 `END` 뒤를 다시 읽지 못하면 그 앞 문장의 간선은 남기되 `complete`를 주장하지 않는다.
+/// 절차형 추출로 가는 몸체는 남은 조각을 미추출로 세고, 통째로 읽은 몸체는 이름 붙은
+/// `SG_BODY_PARTIAL` 진단을 단다. 이전에는 둘 다 뒤 문장을 소리 없이 버리고 `complete`였다.
+#[test]
+fn statements_after_an_unparsed_top_level_end_are_not_claimed_complete() {
+    let whole = scan_routine_kind(
+        "UPDATE audit SET name = 'x' END TRY UPDATE orders SET amount = 0",
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?} {:?}", whole.edges(), whole.analysis());
+    let analysis = &whole.analysis()[&VertexId::from_raw("s.mutate")];
+    assert!(
+        edge(&whole, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(!touches(&whole, "s.mutate", "s.orders"), "{detail}");
+    assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+    assert!(
+        analysis.diagnostics.iter().any(|diagnostic| diagnostic.code == "SG_BODY_PARTIAL"
+            && diagnostic.message.starts_with(
+                "body text from a top-level END that follows a statement without a semicolon was not parsed"
+            )),
+        "{detail}"
+    );
+    // DECLARE가 있어 절차형 추출로 가는 몸체: `END` 뒤 조각은 같은 추출기로 다시 꺼낸다. 추출기는
+    // `END` 뒤 한 단어를 블록 꼬리로 벗기고, 남은 `orders`처럼 문장 머리가 아닌 조각은 미추출로 센다.
+    let extracted = scan_routine_kind(
+        "DECLARE @n int; UPDATE audit SET name = 'x' END frobnicate orders",
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?} {:?}", extracted.edges(), extracted.limitations());
+    assert!(
+        edge(&extracted, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert_eq!(
+        extracted.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Partial,
+        "{detail}"
+    );
+    assert!(
+        extracted
+            .limitations()
+            .iter()
+            .any(|note| note.contains("body statement(s) not extracted")),
+        "{detail}"
+    );
+}
+
+/// 세미콜론 없는 조각에서 최상위 `END` 뒤를 다시 꺼내는 일은 조각마다 `MAX_REEXTRACTIONS`번까지다.
+/// 다시 꺼낼 때마다 남은 텍스트를 다시 토큰화하므로, 상한이 없으면 `TRY`·`CATCH`가 많은 몸체에서
+/// 일이 블록 수 × 길이로 커진다. 상한 안(여덟 쌍)은 모두 쓰기 간선이 되고, 넘은 나머지는
+/// 미추출로 세어 부분 분석이다.
+#[test]
+fn reextraction_after_end_is_bounded_per_piece() {
+    let scan_pairs = |pairs: usize| {
+        let tables: Vec<ObjectDoc> = (0..2 * pairs)
+            .map(|index| object(&format!("t{index}"), &["id"]))
+            .collect();
+        let body: String = (0..pairs)
+            .map(|pair| {
+                format!(
+                    "BEGIN TRY UPDATE t{} SET id = 1 END TRY BEGIN CATCH UPDATE t{} SET id = 2 END CATCH ",
+                    2 * pair,
+                    2 * pair + 1
+                )
+            })
+            .collect();
+        let graph = scan_routine_with_objects(&body, "sqlserver", "sql", "procedure", None, tables);
+        let written = (0..2 * pairs)
+            .filter(|index| edge(&graph, "s.mutate", &format!("s.t{index}"), EdgeKind::Writes))
+            .count();
+        let state = graph.analysis()[&VertexId::from_raw("s.mutate")].state;
+        (written, state, graph.limitations().to_vec())
+    };
+    let within = super::MAX_REEXTRACTIONS / 2;
+    let (written, state, limitations) = scan_pairs(within);
+    assert_eq!(written, 2 * within, "{limitations:?}");
+    assert_eq!(state, AnalysisState::Complete, "{limitations:?}");
+    let (written, state, limitations) = scan_pairs(within + 1);
+    assert_eq!(written, 2 * within + 1, "{limitations:?}");
+    assert_eq!(state, AnalysisState::Partial, "{limitations:?}");
+    assert!(
+        limitations
+            .iter()
+            .any(|note| note.contains("1 body statement(s) not extracted")),
+        "{limitations:?}"
+    );
+}
+
+/// 상한에 걸리면 미추출 수(조각 하나)만으로는 손실의 크기를 알 수 없어, 남은 바이트 수를 진단에 싣는다.
+#[test]
+fn reextraction_cap_reports_the_size_left_unanalyzed() {
+    let pairs = super::MAX_REEXTRACTIONS;
+    let body: String = (0..pairs)
+        .map(|_| "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH UPDATE orders SET amount = 0 END CATCH ")
+        .collect();
+    let graph = scan_routine_kind(&body, "sqlserver", "sql", "procedure");
+    let analysis = &graph.analysis()[&VertexId::from_raw("s.mutate")];
+    assert_eq!(analysis.state, AnalysisState::Partial);
+    assert!(
+        analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "SG_BODY_PARTIAL"
+                && diagnostic.message.starts_with(&format!(
+                    "statement extraction stopped after {} re-extractions",
+                    super::MAX_REEXTRACTIONS
+                ))
+                && diagnostic
+                    .message
+                    .contains("bytes, which may hold many statements")
+        }),
+        "{:?}",
+        analysis.diagnostics
+    );
+}
+
+/// 세미콜론 없는 T-SQL 조각에서 추출기가 무시하는 문장(`PRINT`·`RAISERROR`·`WAITFOR`·`GOTO`·`THROW`)과
+/// `EXEC proc` 인자는 다음 문장 머리 앞에서 끝난다. 이전에는 그 문장이 조각 끝까지를 삼켜 뒤 문장이
+/// 소리 없이 빠진 채 `complete`였다. 세미콜론을 붙인 같은 몸체와 같은 결과여야 한다.
+#[test]
+fn ignored_tsql_statements_end_at_the_next_statement_head() {
+    let facts = |body: &str| {
+        let graph = scan_routine_kind(body, "sqlserver", "sql", "procedure");
+        let mut edges: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.from.as_str() == "s.mutate")
+            .map(|edge| format!("{:?} {}", edge.kind, edge.to))
+            .collect();
+        edges.sort();
+        let state = graph.analysis()[&VertexId::from_raw("s.mutate")].state;
+        (edges, state, graph.limitations().to_vec())
+    };
+    for (without, with, written) in [
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH PRINT ERROR_MESSAGE() INSERT INTO orders (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH PRINT ERROR_MESSAGE(); INSERT INTO orders (id) VALUES (1); END CATCH",
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH RAISERROR('x', 10, 1) WITH NOWAIT INSERT INTO orders (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH RAISERROR('x', 10, 1) WITH NOWAIT; INSERT INTO orders (id) VALUES (1); END CATCH",
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH WAITFOR DELAY '00:00:01' INSERT INTO orders (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH WAITFOR DELAY '00:00:01'; INSERT INTO orders (id) VALUES (1); END CATCH",
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH GOTO retry INSERT INTO orders (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH GOTO retry; INSERT INTO orders (id) VALUES (1); END CATCH",
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH THROW 50000, 'x', 1 END CATCH UPDATE orders SET amount = 0",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH THROW 50000, 'x', 1; END CATCH; UPDATE orders SET amount = 0",
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH EXEC log_error @code = 1 INSERT INTO orders (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH EXEC log_error @code = 1; INSERT INTO orders (id) VALUES (1); END CATCH",
+            "Writes s.orders",
+        ),
+        // 변수 이름 안의 `update`는 문장 머리가 아니다.
+        (
+            "DECLARE @update int; PRINT @update INSERT INTO orders (id) VALUES (1)",
+            "DECLARE @update int; PRINT @update; INSERT INTO orders (id) VALUES (1)",
+            "Writes s.orders",
+        ),
+        // `CASE … END`의 END는 다음 문장이 아니다.
+        (
+            "DECLARE @n int; PRINT CASE WHEN @n = 1 THEN 'a' ELSE 'b' END UPDATE orders SET amount = 0",
+            "DECLARE @n int; PRINT CASE WHEN @n = 1 THEN 'a' ELSE 'b' END; UPDATE orders SET amount = 0",
+            "Writes s.orders",
+        ),
+    ] {
+        let (edges, state, limitations) = facts(without);
+        assert!(
+            edges.iter().any(|edge| edge == written),
+            "{without}: {edges:?} {limitations:?}"
+        );
+        assert_eq!((edges, state, limitations), facts(with), "{without}");
+    }
+}
+
+/// 건너뛴 절에 대입이 있으면(`GET DIAGNOSTICS @s = ROW_COUNT`) 그 변수의 옛 값으로 뒤 동적 SQL을 접지
+/// 않는다. 접으면 실행되지 않는 `UPDATE audit`가 거짓 쓰기가 된다.
+#[test]
+fn a_skipped_clause_with_an_assignment_forgets_variable_values() {
+    let graph = scan_routine_kind(
+        "DECLARE @s nvarchar(100) = N'UPDATE audit SET name = 1'; GET DIAGNOSTICS @s = ROW_COUNT EXEC(@s)",
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(!touches(&graph, "s.mutate", "s.audit"), "{detail}");
+    assert_eq!(
+        graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Partial,
+        "{detail}"
+    );
+}
+
+/// 끝에 `END` 하나만 남은 몸체는 이전처럼 그 END를 버린다. SQLite·MySQL은 `SELECT id FROM audit end`의
+/// `end`를 별칭으로 받는다(SQLite 3.53.1에서 그 뷰를 만들고 읽었다). END를 `COMMIT` 문장으로 붙이면
+/// 뷰는 "exactly one query"가 아니라며 간선을 잃고, 쿼리 파일은 SELECT가 아니게 되어 컬럼 읽기를 잃었다.
+#[test]
+fn a_lone_trailing_end_is_dropped_for_views_and_query_files() {
+    let view = scan_with_dialect("SELECT id FROM orders end", &["id"], "sqlite");
+    let detail = format!("{:?} {:?}", view.edges(), view.analysis());
+    complete(&view);
+    assert!(
+        edge(&view, "s.v", "s.orders.id", EdgeKind::Reads),
+        "{detail}"
+    );
+    let query = scan_routine_kind("SELECT id FROM audit end", "mysql", "sql", "query");
+    let detail = format!("{:?} {:?}", query.edges(), query.analysis());
+    assert!(
+        edge(&query, "s.mutate", "s.audit.id", EdgeKind::Reads),
+        "{detail}"
+    );
+}
+
+/// 다중 테이블 DELETE의 대상이 별칭과 대소문자만 다르면 문서가 증명하는 별칭 규칙을 따른다. MySQL은
+/// 별칭을 `table_alias_charset`으로 비교하고(`multi_delete_table_match`), 그 charset은
+/// `lower_case_table_names`=0이면 바이트 비교, 1·2면 대소문자 무시다(`mysqld.cc`). 0에서 `DELETE FROM C
+/// USING audit c`는 `ER_UNKNOWN_TABLE`로 실패해 쓰기가 없다. 규칙을 모르는 문서(lctn 없음, SQL Server —
+/// CTE 이름과 같이 어느 collation이 별칭을 비교하는지 문서가 없다, MariaDB)는 쓰기를 남기되 진단과
+/// 부분 분석이다. 이전에는 어느 문서에서나 대소문자를 무시해 `complete`로 풀었다.
+#[test]
+fn delete_alias_case_follows_the_documented_alias_rule() {
+    let bodies = [
+        "DELETE FROM C USING audit c JOIN orders o ON c.id = o.id",
+        "DELETE C FROM audit c JOIN orders o ON c.id = o.id",
+    ];
+    let mutate = VertexId::from_raw("s.mutate");
+    for body in bodies {
+        let sensitive = scan_routine_in_context(
+            body,
+            "mysql",
+            "sql",
+            "procedure",
+            Some(naming_context(None, Some(0))),
+        );
+        let detail = format!("{body}: {:?}", sensitive.edges());
+        assert!(
+            !edge(&sensitive, "s.mutate", "s.audit", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert_eq!(
+            sensitive.analysis()[&mutate].state,
+            AnalysisState::Partial,
+            "{detail}"
+        );
+        for lctn in [1, 2] {
+            let folded = scan_routine_in_context(
+                body,
+                "mysql",
+                "sql",
+                "procedure",
+                Some(naming_context(None, Some(lctn))),
+            );
+            let detail = format!(
+                "{body} {lctn}: {:?} {:?}",
+                folded.edges(),
+                folded.limitations()
+            );
+            assert!(
+                edge(&folded, "s.mutate", "s.audit", EdgeKind::Writes),
+                "{detail}"
+            );
+            assert_eq!(
+                folded.analysis()[&mutate].state,
+                AnalysisState::Complete,
+                "{detail}"
+            );
+        }
+        let mut unknown_rules = vec![
+            ("mysql", None),
+            ("mariadb", Some(naming_context(None, Some(1)))),
+        ];
+        // USING 형식은 MySQL·MariaDB 문법이다. SQL Server는 대상 목록 형식만 쓴다.
+        if body.starts_with("DELETE C FROM") {
+            unknown_rules.extend([
+                (
+                    "sqlserver",
+                    Some(naming_context(Some("Latin1_General_CS_AS"), None)),
+                ),
+                (
+                    "sqlserver",
+                    Some(naming_context(Some("SQL_Latin1_General_CP1_CI_AS"), None)),
+                ),
+                ("sqlserver", None),
+            ]);
+        }
+        for (dialect, context) in unknown_rules {
+            let unknown =
+                scan_routine_in_context(body, dialect, "sql", "procedure", context.clone());
+            let detail = format!("{body} {dialect} {context:?}: {:?}", unknown.analysis());
+            assert!(
+                edge(&unknown, "s.mutate", "s.audit", EdgeKind::Writes),
+                "{detail}"
+            );
+            let analysis = &unknown.analysis()[&mutate];
+            assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+            assert!(
+                analysis.diagnostics.iter().any(|diagnostic| diagnostic.code
+                    == "SG_DML_TARGET_SHAPE"
+                    && diagnostic.message.starts_with(
+                        "DML target 'C' names the alias 'c' only if letter case is ignored"
+                    )),
+                "{detail}"
+            );
+        }
+    }
+    // 철자가 같은 별칭은 어느 규칙에서나 그 관계다.
+    let exact = scan_routine_in_context(
+        "DELETE FROM c USING audit c JOIN orders o ON c.id = o.id",
+        "mysql",
+        "sql",
+        "procedure",
+        Some(naming_context(None, Some(0))),
+    );
+    assert!(edge(&exact, "s.mutate", "s.audit", EdgeKind::Writes));
+    assert_eq!(exact.analysis()[&mutate].state, AnalysisState::Complete);
+}
+
+/// 무시하는 문장을 다음 문장 머리에서 끊는 일은 세미콜론을 생략할 수 있는 T-SQL에서만 한다. 추출기의
+/// 인용 스캐너는 MySQL의 `\'` 이스케이프와 `#` 주석을 모르므로, MySQL·MariaDB에서 끊으면 문자열이나
+/// 주석 속 `delete from audit`·`update audit`가 문장이 되어 거짓 쓰기가 생겼다(bc223db). 이 몸체들은
+/// main과 같이 간선이 없어야 한다.
+#[test]
+fn skipped_statements_are_not_cut_outside_tsql() {
+    let bodies = [
+        "BEGIN\n IF p_force = 0 THEN\n SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Can\\'t delete from audit; it\\'s immutable';\n END IF;\nEND",
+        "BEGIN\n IF p_force = 0 THEN\n SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'You can\\'t truncate audit; it\\'s protected';\n END IF;\nEND",
+        "BEGIN\n SIGNAL SQLSTATE '45000' # callers update audit themselves\n SET MESSAGE_TEXT = 'x';\nEND",
+        "BEGIN\n SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'x\\' update audit set name = 1 #\\'';\nEND",
+        "BEGIN\n SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Don\\'t update orders now, it\\'s frozen';\nEND",
+    ];
+    for dialect in ["mysql", "mariadb"] {
+        for body in bodies {
+            let graph = scan_routine_kind(body, dialect, "sql", "procedure");
+            let detail = format!(
+                "{dialect} {body:?}: {:?} {:?}",
+                graph.edges(),
+                graph.limitations()
+            );
+            assert!(!touches(&graph, "s.mutate", "s.audit"), "{detail}");
+            assert!(!touches(&graph, "s.mutate", "s.orders"), "{detail}");
+            assert_ne!(
+                graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+                AnalysisState::Complete,
+                "{detail}"
+            );
+        }
+    }
+}
+
+/// 건너뛴 절의 대입은 괄호 안에 있어도(`WAITFOR (RECEIVE … @s = message_body …)`), 절이 `;`에서 끝나도
+/// (`GET DIAGNOSTICS @s = ROW_COUNT;`) 그 변수의 추적 값을 버린다. `PRINT 'x' SET @s = …`의 `SET`은 다음
+/// 문장이라 그 값을 추적한다. 이전에는 세 경우 모두 옛 값 `UPDATE audit`로 `EXEC(@s)`를 접어 거짓
+/// `writes audit`·`complete`였다. `SET @s += …`는 이어 붙인 값을 추적한다.
+#[test]
+fn skipped_clause_assignments_never_fold_a_stale_value() {
+    let prefix = "DECLARE @s nvarchar(max) = N'UPDATE audit SET name = 1'; ";
+    for clause in [
+        "WAITFOR (RECEIVE TOP(1) @s = message_body FROM q), TIMEOUT 1000 EXEC(@s)",
+        "WAITFOR (RECEIVE TOP(1) @s = message_body FROM q), TIMEOUT 1000; EXEC(@s);",
+        "GET DIAGNOSTICS @s = ROW_COUNT; EXEC(@s);",
+        "SET @s -= 1; EXEC(@s);",
+        // 주석이 `=` 앞에 있어도 왼쪽 이름을 찾는다.
+        "WAITFOR (RECEIVE TOP(1) @s /*x*/ = message_body FROM q), TIMEOUT 5 EXEC(@s)",
+        // 왼쪽이 이름이 아니면 어느 변수인지 모르므로 모두 버린다.
+        "GET DIAGNOSTICS (@s) = ROW_COUNT; EXEC(@s);",
+    ] {
+        let graph = scan_routine_kind(
+            &format!("{prefix}{clause}"),
+            "sqlserver",
+            "sql",
+            "procedure",
+        );
+        let detail = format!("{clause}: {:?} {:?}", graph.edges(), graph.limitations());
+        assert!(!touches(&graph, "s.mutate", "s.audit"), "{detail}");
+        assert_eq!(
+            graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+            AnalysisState::Partial,
+            "{detail}"
+        );
+    }
+    // 주석을 건너뛰고 찾은 이름(@s)만 버린다 — 다른 변수(@t)의 접기는 그대로다.
+    let targeted = scan_routine_kind(
+        &format!(
+            "{prefix}DECLARE @t nvarchar(max) = N'UPDATE orders SET amount = 1'; WAITFOR (RECEIVE TOP(1) @s /*x*/ = message_body FROM q), TIMEOUT 5 EXEC(@t)"
+        ),
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?} {:?}", targeted.edges(), targeted.limitations());
+    assert!(
+        edge(&targeted, "s.mutate", "s.orders", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(!touches(&targeted, "s.mutate", "s.audit"), "{detail}");
+    let reassigned = scan_routine_kind(
+        &format!("{prefix}PRINT 'x' SET @s = N'UPDATE orders SET amount = 1'; EXEC(@s)"),
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?}", reassigned.edges());
+    assert!(
+        edge(&reassigned, "s.mutate", "s.orders", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(!touches(&reassigned, "s.mutate", "s.audit"), "{detail}");
+    let appended = scan_routine_kind(
+        &format!("{prefix}SET @s += N' WHERE 1 = 0'; EXEC(@s)"),
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?} {:?}", appended.edges(), appended.limitations());
+    assert!(
+        edge(&appended, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert_eq!(
+        appended.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Complete,
+        "{detail}"
+    );
+}
+
+/// MySQL `lower_case_table_names=0`에서 대상이 별칭과 대소문자만 다르면 MySQL은 그 문장을
+/// `ER_UNKNOWN_TABLE`로 거절한다. 카탈로그에 그 철자의 테이블 `C`가 있어도(lctn 0에서는 `c`와 함께 있을
+/// 수 있다) `C`에 쓰지 않는다. FROM 목록에 별칭 없는 `C`가 있으면 그 테이블이 대상이다.
+#[test]
+fn case_sensitive_alias_mismatch_writes_no_catalog_table() {
+    let scan = |body: &str| {
+        scan_routine_with_objects(
+            body,
+            "mysql",
+            "sql",
+            "procedure",
+            Some(naming_context(None, Some(0))),
+            vec![object("c", &["id"]), object("C", &["id"])],
+        )
+    };
+    for body in [
+        "DELETE C FROM audit c WHERE c.id = 1",
+        "DELETE FROM C USING audit c WHERE c.id = 1",
+    ] {
+        let graph = scan(body);
+        let detail = format!("{body}: {:?} {:?}", graph.edges(), graph.analysis());
+        assert!(
+            !edge(&graph, "s.mutate", "s.C", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert!(
+            !edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+            "{detail}"
+        );
+        let analysis = &graph.analysis()[&VertexId::from_raw("s.mutate")];
+        assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "SG_DML_TARGET_SHAPE"
+                    && diagnostic
+                        .message
+                        .starts_with("DML target 'C' matches the alias 'c' only by letter case")),
+            "{detail}"
+        );
+    }
+    let joined = scan("DELETE C FROM audit c JOIN C ON C.id = c.id");
+    let detail = format!("{:?}", joined.edges());
+    assert!(
+        edge(&joined, "s.mutate", "s.C", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(
+        !edge(&joined, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+}
+
+/// 뷰·쿼리 파일에서 `end` 별칭 뒤에 절이 이어지면(SQLite 3.53.1은 세 뷰를 모두 만든다) sqlparser는 그
+/// `END`에서 멈춘다. 그 앞 SELECT의 간선은 남기고 뒤 절을 분석하지 않았다고 부분 분석으로 표시한다.
+/// main은 뒤를 소리 없이 버렸고(`complete`일 수 있었다), bc223db는 파싱 실패로 간선을 모두 잃었다.
+#[test]
+fn an_end_alias_followed_by_clauses_keeps_the_select_edges() {
+    for body in [
+        "select id from orders end order by id",
+        "select id from orders end where end.id = 1",
+        "select end.id from orders end join customers o on o.id = end.id",
+    ] {
+        let view = scan_with_dialect(body, &["id"], "sqlite");
+        let detail = format!("{body}: {:?} {:?}", view.edges(), view.analysis());
+        assert!(edge(&view, "s.v", "s.orders", EdgeKind::Reads), "{detail}");
+        let analysis = &view.analysis()[&VertexId::from_raw("s.v")];
+        assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "SG_BODY_PARTIAL"
+                    && diagnostic
+                        .message
+                        .starts_with("SQL text from a bare END onward was not parsed")),
+            "{detail}"
+        );
+    }
+    let query = scan_routine_kind(
+        "select id from audit end where end.id = 1",
+        "mysql",
+        "sql",
+        "query",
+    );
+    let detail = format!("{:?} {:?}", query.edges(), query.analysis());
+    assert!(
+        edge(&query, "s.mutate", "s.audit.id", EdgeKind::Reads),
+        "{detail}"
+    );
+}
+
+/// T-SQL에서 끊은 자리의 읽기·쓰기는 세미콜론 판과 같다 — `EXECUTE proc` 인자 뒤 문장, `PRINT`의 하위 질의,
+/// 그리고 `WITH cte AS (…)`로 여는 문장. 이전에는 `PRINT 'x' WITH cte AS (…) INSERT …`가 `WITH`를 `PRINT`의
+/// 절로 버려 실제 테이블 `cte`를 읽는 거짓 간선을 냈다.
+#[test]
+fn tsql_cut_points_match_the_semicolon_version() {
+    let facts = |body: &str| {
+        let graph = scan_routine_with_objects(
+            body,
+            "sqlserver",
+            "sql",
+            "procedure",
+            None,
+            vec![object("cte", &["id"])],
+        );
+        let mut edges: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.from.as_str() == "s.mutate")
+            .map(|edge| format!("{:?} {}", edge.kind, edge.to))
+            .collect();
+        edges.sort();
+        edges
+    };
+    for (without, with) in [
+        (
+            "EXECUTE log_error @code = 1 INSERT INTO orders (id) VALUES (1)",
+            "EXECUTE log_error @code = 1; INSERT INTO orders (id) VALUES (1)",
+        ),
+        (
+            "DECLARE @n int; PRINT (SELECT COUNT(*) FROM audit) UPDATE orders SET amount = 1",
+            "DECLARE @n int; PRINT (SELECT COUNT(*) FROM audit); UPDATE orders SET amount = 1",
+        ),
+    ] {
+        assert_eq!(facts(without), facts(with), "{without}");
+        assert!(facts(without)
+            .iter()
+            .any(|edge| edge.starts_with("Writes s.orders")));
+    }
+    let printed =
+        facts("DECLARE @n int; PRINT (SELECT COUNT(*) FROM audit) UPDATE orders SET amount = 1");
+    assert!(
+        printed.iter().any(|edge| edge == "Reads s.audit"),
+        "{printed:?}"
+    );
+    let cte = facts(
+        "PRINT 'x' WITH cte AS (SELECT id FROM audit) INSERT INTO orders (id) SELECT id FROM cte",
+    );
+    assert!(!cte.iter().any(|edge| edge.contains("s.cte")), "{cte:?}");
+}
+
+/// 세미콜론 없는 T-SQL에서 `SET`은 우변·설정 뒤에 붙은 다음 문장 머리에서 끝난다. 이전에는 `SET` 갈래가
+/// 조각 끝까지를 우변으로 삼아, `PRINT 'x' SET @n = 1 UPDATE audit …`(5b11c7a에서 `SET`을 끊기 머리로 더한 뒤)와
+/// 맨 앞의 `SET @n = 1 UPDATE audit …`(main부터)가 `UPDATE`를 소리 없이 잃고 `complete`였다. 세미콜론을 붙인
+/// 같은 몸체와 같은 간선·상태여야 한다.
+#[test]
+fn set_statements_end_at_the_next_statement_head() {
+    let facts = |body: &str| {
+        let graph = scan_routine_kind(body, "sqlserver", "sql", "procedure");
+        let mut edges: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.from.as_str() == "s.mutate")
+            .map(|edge| format!("{:?} {}", edge.kind, edge.to))
+            .collect();
+        edges.sort();
+        (
+            edges,
+            graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        )
+    };
+    for (without, with, written) in [
+        (
+            "DECLARE @n int; UPDATE orders SET amount = 1; PRINT 'x' SET @n = 1 UPDATE audit SET name = 'x'",
+            "DECLARE @n int; UPDATE orders SET amount = 1; PRINT 'x'; SET @n = 1; UPDATE audit SET name = 'x'",
+            "Writes s.audit",
+        ),
+        (
+            "DECLARE @c int; EXEC mutate SET @c = 3 UPDATE audit SET name = 'x'",
+            "DECLARE @c int; EXEC mutate; SET @c = 3; UPDATE audit SET name = 'x'",
+            "Writes s.audit",
+        ),
+        (
+            "BEGIN TRY UPDATE orders SET amount = 1 END TRY BEGIN CATCH PRINT ERROR_MESSAGE() SET @n = 1 INSERT INTO audit (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE orders SET amount = 1; END TRY BEGIN CATCH PRINT ERROR_MESSAGE(); SET @n = 1; INSERT INTO audit (id) VALUES (1); END CATCH",
+            "Writes s.audit",
+        ),
+        (
+            "DECLARE @c int; PRINT 'x' SET NOCOUNT ON UPDATE orders SET amount = 1",
+            "DECLARE @c int; PRINT 'x'; SET NOCOUNT ON; UPDATE orders SET amount = 1",
+            "Writes s.orders",
+        ),
+        (
+            "DECLARE @c int; PRINT 'x' SET XACT_ABORT ON INSERT INTO audit (id) VALUES (1)",
+            "DECLARE @c int; PRINT 'x'; SET XACT_ABORT ON; INSERT INTO audit (id) VALUES (1)",
+            "Writes s.audit",
+        ),
+        (
+            "DECLARE @c int; WAITFOR DELAY '00:00:01' SET @c = 3 UPDATE audit SET name = 'x'",
+            "DECLARE @c int; WAITFOR DELAY '00:00:01'; SET @c = 3; UPDATE audit SET name = 'x'",
+            "Writes s.audit",
+        ),
+        (
+            "DECLARE @n int; SET @n = 1 UPDATE audit SET name = 'x'",
+            "DECLARE @n int; SET @n = 1; UPDATE audit SET name = 'x'",
+            "Writes s.audit",
+        ),
+    ] {
+        let (edges, state) = facts(without);
+        assert!(edges.iter().any(|edge| edge == written), "{without}: {edges:?}");
+        assert_eq!((edges, state), facts(with), "{without}");
+    }
+}
+
+/// MySQL이 거절하는 DELETE(대상 하나가 lctn 0에서 별칭과 대소문자만 다름)는 문장 전체가 실행되지 않는다 —
+/// 다른 대상(`o`)에도 쓰지 않고 그 문장의 읽기도 없다. 이전에는 거절된 대상만 빼고 `writes orders`와
+/// `reads audit`를 남겼다.
+#[test]
+fn a_rejected_delete_records_no_writes_or_reads() {
+    for body in [
+        "DELETE C, o FROM audit c JOIN orders o ON o.id = c.id",
+        "DELETE FROM C, o USING audit c JOIN orders o ON o.id = c.id",
+        "DELETE C FROM audit c WHERE c.id IN (SELECT id FROM C)",
+        // 절차형 추출로 가는 몸체도 거절 진단과 부분 분석을 남긴다(간선이 없어도 파싱 실패가 아니다).
+        "BEGIN DECLARE x INT DEFAULT 1; DELETE C FROM audit c WHERE c.id = x; END",
+    ] {
+        let graph = scan_routine_with_objects(
+            body,
+            "mysql",
+            "sql",
+            "procedure",
+            Some(naming_context(None, Some(0))),
+            vec![object("c", &["id"]), object("C", &["id"])],
+        );
+        let detail = format!("{body}: {:?} {:?}", graph.edges(), graph.analysis());
+        for target in ["s.audit", "s.orders", "s.C", "s.c"] {
+            assert!(!touches(&graph, "s.mutate", target), "{detail}");
+        }
+        let analysis = &graph.analysis()[&VertexId::from_raw("s.mutate")];
+        assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+        assert!(
+            analysis.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("rejects the whole statement (ER_UNKNOWN_TABLE)")),
+            "{detail}"
+        );
+    }
+}
+
+/// MySQL USING 형식의 FROM 목록 별칭은 그 자리만 읽기에서 뺀다. 하위 질의가 같은 이름의 실제 테이블
+/// `c`를 읽는 것은 읽기다.
+#[test]
+fn mysql_using_alias_exclusion_does_not_hide_a_real_table_read() {
+    let graph = scan_routine_with_objects(
+        "DELETE FROM c USING audit c WHERE c.id IN (SELECT id FROM c)",
+        "mysql",
+        "sql",
+        "procedure",
+        Some(naming_context(None, Some(0))),
+        vec![object("c", &["id"])],
+    );
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(
+        edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(edge(&graph, "s.mutate", "s.c", EdgeKind::Reads), "{detail}");
+    assert!(
+        !edge(&graph, "s.mutate", "s.c", EdgeKind::Writes),
+        "{detail}"
+    );
+}
+
 /// 앞에 WITH가 붙은 DELETE도 CTE 몸체가 읽는 컬럼을 남긴다. 읽기 경로로 보내던 때에는 그
 /// 컬럼 읽기가 남았는데, DML 경로로 옮기면서 DELETE를 컬럼 분석기로 보내지 않아 사라졌다.
 #[test]

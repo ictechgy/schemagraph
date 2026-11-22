@@ -16,7 +16,7 @@ use sqlparser::ast::{Expr, Statement};
 use sqlparser::dialect::Dialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError, ParserOptions};
-use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Word};
+use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, Word};
 
 /// 한 문장에 둘 수 있는 집합 연산자(UNION·INTERSECT·EXCEPT·MINUS) 수.
 ///
@@ -39,16 +39,115 @@ pub(crate) const MAX_INFIX_OPERATORS: usize = 100_000;
 /// 어느 쪽이든 몸체는 같은 파싱 실패 경로를 탄다. 앞 문장만 먼저 파싱해 문법 오류를
 /// 고르지 않는 이유는, `;`로 자른 토큰 접두가 sqlparser의 문장 경계와 늘 같지는 않아서다.
 /// 블록 안의 `;`에서 자르면 원문에 없던 문법 오류를 지어낸다.
+///
+/// 입력 전체를 읽지 못하면 오류다 — `;` 없이 문장 뒤에 온 최상위 `END` 다음이 파싱되지 않는
+/// 경우도 그렇다([`parse_sql_prefix`]).
 pub(crate) fn parse_sql(dialect: &dyn Dialect, sql: &str) -> Result<Vec<Statement>, ParserError> {
+    let prefix = parse_sql_prefix(dialect, sql)?;
+    match prefix.unparsed {
+        None => Ok(prefix.statements),
+        Some(unparsed) => Err(unparsed.error),
+    }
+}
+
+/// 몸체를 끝까지 읽은 문장과, 끝까지 읽지 못했다면 그 이유다.
+pub(crate) struct StatementPrefix {
+    /// 읽은 문장. `unparsed`가 있으면 읽지 못한 부분 앞의 최상위 `END`까지다.
+    pub(crate) statements: Vec<Statement>,
+    /// 최상위 `END`부터 다시 읽다 실패했으면 그 사실이다. 그 `END`부터 끝까지는 분석하지 않았다.
+    pub(crate) unparsed: Option<Unparsed>,
+}
+
+/// 최상위 `END`부터 다시 읽다 실패한 나머지다.
+pub(crate) struct Unparsed {
+    /// 다시 읽다 난 파싱 오류.
+    pub(crate) error: ParserError,
+    /// 나머지가 시작하는 `END`의 원문 바이트 위치. 토큰 위치를 원문 위치로 옮기지 못하면 없다.
+    pub(crate) from: Option<usize>,
+}
+
+/// `parse_sql`과 같되, 최상위 `END` 뒤에서 파싱이 실패하면 그 앞까지 읽은 문장을 함께 돌려준다.
+///
+/// sqlparser 0.58의 `parse_statements`는 `;` 없이 문장 바로 뒤에 `END`가 오면 거기서 멈추고
+/// 성공을 돌려준다(블록 안 문장 목록을 읽을 때 쓰는 규칙이다). 최상위에서도 그래서, 세미콜론을
+/// 생략한 T-SQL `BEGIN TRY UPDATE a … END TRY BEGIN CATCH UPDATE b … END CATCH`는 `UPDATE a`만
+/// 남고 나머지가 소리 없이 버려져 몸체가 `complete`였다. 세미콜론을 붙인 같은 몸체는 `END TRY`·
+/// `BEGIN CATCH`·`UPDATE b`·`END CATCH`를 각각 문장으로 읽는다. 그래서 멈춘 자리의 `END`부터
+/// 다시 문장 목록을 읽어 이어 붙인다 — `END`를 문장 경계로 보는 것이고, `;`가 있을 때와 같은
+/// 결과다. 다시 읽은 `parse_statements`는 처음에 구분자를 기다리지 않으므로 `END`를 문장으로
+/// 읽거나(소비) 오류를 내며, 같은 자리에서 다시 멈추지 않는다. 끝에 `END` 한 문장만 남으면
+/// 이전처럼 버린다(`is_lone_end`).
+///
+/// 이어 읽기가 실패하면 그 앞까지의 문장과 오류를 돌려준다. 이전처럼 그 앞 문장의 간선은
+/// 남기되, 호출자가 몸체를 완전 분석이라고 주장하지 않게 하기 위해서다. 첫 `END` 앞에서의
+/// 파싱 실패와 토큰화·사슬 상한 오류는 그대로 오류다.
+pub(crate) fn parse_sql_prefix(
+    dialect: &dyn Dialect,
+    sql: &str,
+) -> Result<StatementPrefix, ParserError> {
     // Parser::parse_sql(try_with_sql)과 같은 토큰화 옵션이다. 토큰을 한 번만 만들어
     // 세기와 파싱에 함께 쓴다.
     let tokens = Tokenizer::new(dialect, sql)
         .with_unescape(ParserOptions::new().unescape)
         .tokenize_with_location()?;
     check_chain_lengths(&tokens)?;
-    Parser::new(dialect)
-        .with_tokens_with_locations(tokens)
-        .parse_statements()
+    let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
+    let mut statements = parser.parse_statements()?;
+    while parser.peek_token().token != Token::EOF {
+        let resume = parser.peek_token().span.start;
+        match parser.parse_statements() {
+            // 끝에 `END` 하나만 남았으면 이전처럼 버린다. 문장 목록에 `COMMIT` 하나가 더 붙으면
+            // 한 질의여야 하는 뷰·쿼리 파일(`SELECT id FROM audit end` — SQLite·MySQL은 `end`를
+            // 별칭으로 받는다)이 두 문장이 되어 간선을 잃는다.
+            Ok(more) if parser.peek_token().token == Token::EOF && is_lone_end(&more) => {}
+            Ok(more) => statements.extend(more),
+            Err(error) => {
+                return Ok(StatementPrefix {
+                    statements,
+                    unparsed: Some(Unparsed {
+                        error,
+                        from: end_keyword_offset(sql, resume),
+                    }),
+                })
+            }
+        }
+    }
+    Ok(StatementPrefix {
+        statements,
+        unparsed: None,
+    })
+}
+
+/// 다시 읽은 문장 목록이 `END` 한 문장(`END`·`END TRY`·`END TRANSACTION` 등)뿐인가.
+fn is_lone_end(statements: &[Statement]) -> bool {
+    matches!(statements, [Statement::Commit { end: true, .. }])
+}
+
+/// 토큰 위치(1부터 센 줄·글자)가 가리키는 원문 바이트 위치다. 그 자리가 `END` 키워드일 때만 돌려준다.
+///
+/// sqlparser 토크나이저는 `\n`에서 줄을 올리고 그 밖의 글자마다 열을 하나 올린다(`State::next`).
+/// 같은 규칙으로 세되, 결과가 `END`로 시작하지 않으면 위치 규칙이 어긋난 것이라 버린다.
+fn end_keyword_offset(sql: &str, location: Location) -> Option<usize> {
+    let (mut line, mut column) = (1u64, 1u64);
+    let offset = sql
+        .char_indices()
+        .find(|&(_, ch)| {
+            let here = line == location.line && column == location.column;
+            if ch == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+            here
+        })
+        .map(|(offset, _)| offset)?;
+    let word = sql.get(offset..offset + 3)?;
+    let boundary = sql[offset + 3..]
+        .chars()
+        .next()
+        .is_none_or(|next| !(next.is_alphanumeric() || next == '_'));
+    (word.eq_ignore_ascii_case("END") && boundary).then_some(offset)
 }
 
 /// DEFAULT를 문장으로 포장하지 않고 하나의 식으로만 읽는다. 뒤의 SQL은 허용하지 않는다.
@@ -836,6 +935,60 @@ mod tests {
             parse_sql(&GenericDialect {}, within).expect("within limits"),
             Parser::parse_sql(&GenericDialect {}, within).expect("sqlparser")
         );
+    }
+
+    #[test]
+    fn 세미콜론_없는_문장_뒤의_최상위_end에서_멈추지_않는다() {
+        let dialect = MsSqlDialect {};
+        // sqlparser만 쓰면 `END`에서 멈추고 성공을 돌려주며 뒤를 버린다.
+        let tail = "UPDATE a SET x = 1 END TRY UPDATE b SET y = 2";
+        assert_eq!(
+            Parser::parse_sql(&dialect, tail).expect("sqlparser").len(),
+            1
+        );
+        // 끝에 `END` 한 문장만 남으면 이전처럼 버린다 — 한 질의여야 하는 뷰·쿼리 파일이 두
+        // 문장이 되지 않게.
+        for trailing in [
+            "UPDATE a SET x = 1 END",
+            "SELECT id FROM audit end",
+            "UPDATE a SET x = 1 END TRY;",
+        ] {
+            let parsed = parse_sql(&dialect, trailing).expect("trailing END");
+            assert_eq!(parsed.len(), 1, "{trailing}");
+        }
+        // 다시 읽어도 끝까지 못 읽으면 오류이고, prefix는 앞 문장과 남은 부분의 위치를 준다.
+        assert!(parse_sql(&dialect, tail).is_err());
+        let prefix = parse_sql_prefix(&dialect, tail).expect("prefix");
+        assert_eq!(prefix.statements.len(), 1);
+        let unparsed = prefix.unparsed.expect("unparsed tail");
+        assert_eq!(
+            &tail[unparsed.from.expect("offset")..],
+            "END TRY UPDATE b SET y = 2"
+        );
+        // 줄바꿈과 여러 바이트 글자 뒤의 위치도 원문 바이트 위치로 옮긴다.
+        let wide = "UPDATE a SET x = N'é한글'\r\n  -- 주석 ü\nEND TRY\nUPDATE b SET y = 2";
+        let unparsed = parse_sql_prefix(&dialect, wide)
+            .expect("prefix")
+            .unparsed
+            .expect("unparsed tail");
+        assert_eq!(
+            &wide[unparsed.from.expect("offset")..],
+            "END TRY\nUPDATE b SET y = 2"
+        );
+        // `END`부터 끝까지 읽히면 이어 붙인다.
+        let continued = parse_sql(&dialect, "UPDATE a SET x = 1 END TRY; UPDATE b SET y = 2")
+            .expect("continued");
+        assert_eq!(continued.len(), 3);
+    }
+
+    #[test]
+    fn 토큰_위치가_end를_가리키지_않으면_원문_위치를_버린다() {
+        let at = |line, column| Location { line, column };
+        assert_eq!(end_keyword_offset("x END", at(1, 3)), Some(2));
+        assert_eq!(end_keyword_offset("x\nend", at(2, 1)), Some(2));
+        assert_eq!(end_keyword_offset("x ENDING", at(1, 3)), None);
+        assert_eq!(end_keyword_offset("x UPDATE", at(1, 3)), None);
+        assert_eq!(end_keyword_offset("x END", at(3, 1)), None);
     }
 
     #[test]
