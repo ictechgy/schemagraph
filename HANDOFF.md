@@ -18,9 +18,10 @@
   crates.io에는 0.7.1·0.8.0·0.8.1이 없고, Maven Central에는 0.7.1이 없다(2026-11-03 조회).
   GitHub Release v0.1.0–v0.3.0에는 첨부 아카이브가 없다(2026-11-09 조회). 누락 버전은 다시 게시하지 않는다.
 - isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
-- 브랜치 `ccr-37904670-hxdjsx`는 `origin/main` `b8e4054`에서 다시 시작한 라운드 3 작업이다(아직 push·PR 전).
-  아래 "라운드 3" 절의 네 커밋(`1c8d976`·`86c9e98`·`0206bea`·`d91236b`), 독립 리뷰 반영 세 커밋
-  (`5be9173`·`d872048`·`f9c700b`)과 이 HANDOFF 커밋이 있다.
+- 브랜치 `ccr-37904670-hxdjsx`는 `origin/main` `b8e4054`에서 다시 시작한 라운드 3 작업이다. `0161c96`까지가
+  [PR #62](https://github.com/ictechgy/schemagraph/pull/62)로 push됐다. 아래 "라운드 3" 절의 네 커밋(`1c8d976`·`86c9e98`·
+  `0206bea`·`d91236b`), 독립 리뷰 반영 세 커밋(`5be9173`·`d872048`·`f9c700b`), HANDOFF 커밋(`0161c96`), 그리고 PR #62
+  리뷰(2차) 반영 커밋 `6144529`(parser)·`982941d`(probe-go)과 그 HANDOFF 커밋(아래 절, 아직 push 전)이 있다.
 
 ### 라운드 3 (2026-11-22)
 
@@ -35,7 +36,8 @@ RELEASE-NOTES `# Unreleased`의 해당 항목이다. 회귀 테스트는 모두 
   같은 몸체의 PostgreSQL 함수는 `writes log`·`reads orders`만 남기고 컬럼 효과 없이 `complete`였다. 수정:
   `query_dml_statement`로 감싼 DML을 꺼내 `is_select`(DELETE 포함)·`is_column_dml_statement`(INSERT·UPDATE)·
   `qualified_write_targets`(3부분 대상)가 보게 했고, `DmlAnalyzer`가 그 WITH의 CTE를 `Binder::bind_ctes`(SELECT와 같은
-  CTE 규칙, `Binder::query`에서 뽑아 냄)로 해석해 INSERT·UPDATE·MERGE의 원천에 보이게 한다. 대상이 그 문장의 CTE
+  CTE 규칙, `Binder::query`에서 뽑아 냄)로 해석해 INSERT·UPDATE의 원천에 보이게 한다(sqlparser 0.58은 `WITH … MERGE`를
+  파싱하지 못해 MERGE에는 해당하지 않는다). 대상이 그 문장의 CTE
   이름일 때의 처리는 리뷰 반영(아래)에서 방언별로 바꿨다.
   수정 후 같은 CLI 재현에서 `archive.sql`이 `plain.sql`(WITH 없는 같은 문장)과 같은 `writes log`·`log.order_id`·
   `log.amount`, `derives-from`, `complete`를 낸다. 테스트 5개(`with_prefixed_*`, `scope_tests.rs`): INSERT(PostgreSQL 쿼리
@@ -72,18 +74,65 @@ GLM `packet-ask`는 이 세션에서 쓸 수 없어 `/code-review high`(독립 C
   expression_name in the query uses the common table expression and not the base object")대로 CTE를 통해 쓰므로, 두
   방언 밖에서는 그 이름으로 가는 객체 단위 `writes`를 남기지 않고 `SG_DML_TARGET_SHAPE` 하나로 센다. 좁힘: 그 방언들의
   routine·trigger가 이전부터 남기던 CTE 이름 쓰기 간선(없는 관계면 "missing" 한계, 같은 이름 테이블이 있으면 거짓
-  간선, 수정 전 CLI의 SQL Server 프로시저 재현에서 `writes dbo.shadow -> dbo.log`)이 사라지고 진단으로 바뀐다. CTE 이름
-  비교는 ASCII 대소문자를 무시한다(pre_existing 지적 3의 일부).
+  간선, 수정 전 CLI의 SQL Server 프로시저 재현에서 `writes dbo.shadow -> dbo.log`)이 사라지고 진단으로 바뀐다. 이때의
+  CTE 이름 비교(ASCII 대소문자 무시)는 2차 리뷰에서 문서의 대소문자 규칙을 따르게 고쳤다(아래).
 - 반영 `d872048`(nit): Go 문구의 객체 이름 제어문자를 `\u{..}`로 이스케이프한다.
 - 반영 `f9c700b`(nit 3개): 실패 위치를 표준 라이브러리 밖 프레임으로, 정리 실패가 검사 실패를 가리지 않게,
   RELEASE-NOTES 예시를 실제 문구로.
 - 보류(pre_existing 2개): CTE 원천 조회의 SQL Server 대소문자 무시(대소문자 접기 방언 후속 후보에 포함)와
   데이터 수정 CTE(`WITH ins AS (INSERT … RETURNING …) SELECT …`, 아래 후속 후보).
 
+### PR #62 리뷰(2차) 반영 (2026-11-22)
+
+리뷰는 모델 출력이라 리뷰어 도구(`run.py`·`cases.py`, main·branch 빌드)로 주장마다 다시 재현했고, main·branch·수정본을
+같은 사례 파일(cases1–7과 추가 사례)로 돌려 main에만 있던 간선을 찾았다.
+
+- should-fix 1(절차형 블록): `IF 1 = 1 WITH audit AS (…) UPDATE audit …`(SQL Server)와 MySQL `IF … THEN WITH t AS (…)
+  UPDATE t …; END IF`에서 거짓 `writes s.audit`·`writes s.t`가 남았다. 부모 `Statement::If`의 쓰기 대상 수집이 안쪽 문장까지
+  내려가는데 CTE 이름 판정은 최상위 `Statement::Query`만 봤다. `split_write_targets`가 visitor로 감싼 DML을 만날 때마다 그
+  안쪽 DML의 주소와 CTE 이름을 기억해 그 DML의 대상만 가른다(`IF` 안의 다른 문장이 같은 이름의 실제 테이블에 쓰면 그 쓰기는
+  남는다).
+- should-fix 2(새 회귀): `WITH … DELETE`를 DML 경로로 옮기면서 DELETE를 컬럼 분석기로 보내지 않아, 읽기 경로가 남기던 CTE
+  몸체의 컬럼 읽기(PostgreSQL `reads s.audit.id`, SQL Server 중복 삭제 관용구의 `customers.id`·`name`, MySQL 다중 테이블
+  DELETE의 `orders.id`)가 사라졌다. 앞에 WITH가 있으면 DELETE도 `DmlAnalyzer`로 보내 CTE를 해석한다. DELETE 자체의 WHERE
+  컬럼 읽기는 WITH 없는 DELETE처럼 남기지 않으므로 상태는 `complete`다(아래 후속 후보). 수정 후 리뷰 사례 전체에서 main에만
+  있는 간선은 문서화한 좁힘(SQL Server CTE 이름 대상의 `writes`)뿐이다.
+- nit 3(collation): CTE 이름 비교를 문서의 관계 이름 규칙(`relation_names_fold_case`: SQL Server `_CI` collation, MySQL
+  `lower_case_table_names`≠0, Oracle·DB2)에 맞췄다. 파싱 단계는 대소문자 무시로 후보(`CteWrite`, 철자 일치 여부 포함)만 가르고,
+  적용 단계(`settle_cte_writes`)가 `ci`로 판정해 CTE가 아니면 평범한 쓰기로 되돌린다. 컬럼 단위(`dml_target_naming_cte`)도
+  같은 `fold_relation_case`를 쓴다. 그래서 CS collation·collation 없음에서 `WITH Dupes … DELETE FROM dupes`의 `writes s.dupes`가
+  main처럼 남는다. SQL Server 문서(MicrosoftDocs `collation-and-unicode-support.md`: 데이터베이스 collation은 "all metadata in
+  the database … and any other strings used in the database")를 근거로 삼았지만 CTE 이름을 직접 말하지는 않아 실서버 확인이
+  남았다.
+- 방언 규칙(`CteTargetRule`, 2차 반영 중 좁힘 근거를 다시 따져 바꿈): 1차 반영은 PostgreSQL·SQLite 밖의 모든 방언에서 CTE
+  이름 대상의 쓰기 간선을 지웠지만, 근거가 있는 방언은 SQL Server(문서)뿐이었다. MySQL은 mysql-server 8.0
+  `mysql-test/include/with_non_recursive.inc`·`r/with_non_recursive.result`(GitHub 원문)로 확인했다 — CTE가 같은 이름의
+  임시 테이블을 가리고(`QN shadows tmp table`), CTE를 UPDATE·DELETE 대상으로 쓰면 `ER_NON_UPDATABLE_TABLE`("The target table
+  qn of the DELETE is not updatable"). 그래서 `Table`(PostgreSQL·SQLite), `Cte`(SQL Server·MySQL: 쓰기 간선 대신 진단),
+  `Unknown`(MariaDB·Oracle·DB2·Informix·H2·external: 객체 단위 쓰기는 main처럼 남기고 컬럼만 추측하지 않으며 진단 문구는
+  `its target columns are not resolved`)으로 나눴다. 판정은 문서 방언 이름이 있는 적용 단계(`settle_cte_writes`)에서 한다.
+- nit 4: 진단 문구에 대상 이름을 싣는다(`DML target 'dupes' names a WITH query; …`, 제어문자 이스케이프). 객체·컬럼 단위가
+  같은 문구를 쓰고 대상마다 한 번만 센다 — 두 대상이면 진단 두 개다.
+- nit 5(Go): `oneLine`이 공백을 접은 뒤 남은 제어문자를 `\u{..}`로 바꾼다. SQLite 이유 문구(`no such table: main.gone\x1b[31m`)를
+  포함해 Go 프로브의 모든 한계·오류 문구에 적용된다.
+- nit 6: MERGE 경로의 `target_ctes`·`self.ctes`는 sqlparser 0.58이 `WITH … MERGE`를 파싱하지 못해 실행될 수 없었다 — main처럼
+  빈 CTE로 되돌리고 HANDOFF 문구를 고쳤다. RELEASE-NOTES에 데이터 수정 WITH 질의를 가진 WITH-DML(`WITH del AS (DELETE …)
+  INSERT …`)이 routine에서 complete→partial(`SG_SET_UNSUPPORTED`, 바깥 INSERT의 컬럼 쓰기는 추가)로 바뀐다는 사실을 적었다.
+- 회귀 테스트: 새 `cte_target_diagnostics_name_each_target`, `sqlserver_cte_target_names_follow_the_collation`,
+  `with_prefixed_delete_keeps_the_cte_column_reads`, 바꾼 `sqlserver_dml_through_a_cte_is_partial_without_guessed_targets`(절차형
+  블록 두 사례·이름 확인), Go `TestSQLiteColumnFailureReasonEscapesControlCharacters`. `0161c96`의 parser 코드에서 새·바꾼 Rust
+  테스트 4개가 실패하고, 변이 6종(적용 판정 항상 CTE·철자 일치만, WITH DELETE 미전달, 이름 없는 문구, 컬럼 단위 항상 접기,
+  최상위만 가르기)을 각각 잡는다. 방언 규칙을 바꾼 뒤 `unverified_dialects_keep_the_object_write_of_a_cte_named_target`을
+  더했고, 최종 코드에서 변이 8종(Unknown→Cte, MySQL→Unknown, 적용 판정 두 가지, 컬럼 단위 접기, 최상위만 가르기, WITH
+  DELETE 미전달, 이름 없는 문구)을 모두 잡으며 `0161c96` 코드에서는 새·바꾼 테스트 5개가 실패한다. Go 테스트는 이스케이프를
+  되돌리면 실패한다.
+- 리뷰 사례 cases1–7(+CS·CI collation)을 main과 최종 바이너리로 돌려 비교했다. main에만 있는 간선은 SQL Server·MySQL에서 CTE
+  이름 대상으로 가던 `writes` 9건뿐이다(문서화한 좁힘).
+
 ### 라운드 3 검증 (리뷰 반영 뒤 최종 바이너리)
 
 - Rust 1.96.0: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, 워크스페이스
-  테스트 716개 통과(이전 707개 + parser 6 + source 3). Go: `gofmt -l`, `go vet`, `go test ./...`.
+  테스트 720개 통과(이전 707개 + parser 10 + source 3; 2차 리뷰 반영 뒤 재실행). Go: `gofmt -l`, `go vet`, `go test ./...`.
 - CI 측정 불변식 단계의 Python 테스트 11개와 `test-dml-producers.py`, `test-capture-migration.py`, `verify-contracts.py`
   (jsonschema 4.23.0·sqlglot 30.18.0), `verify-competitive.py`, `verify-cancellation.py`, SQLite 골든 diff 0과
   `verify-document-versions.py`, `verify-sqlite-nullability.py`(네이티브·Go·JDBC).
@@ -250,6 +299,12 @@ PR #59는 GLM 리뷰 없이 머지됐다.
      `SG_DML_TARGET_SHAPE`로 부분 분석이고 실제로 쓰이는 원본 테이블 `t`에는 간선이 없다. CTE가 단일 테이블을 읽는
      갱신 가능한 모양일 때 그 테이블로 쓰기를 옮길 수 있지만, SQL Server의 갱신 가능 CTE 규칙을 실서버로 확인해야 한다.
      MySQL·DB2 등은 이 모양의 의미를 확인하지 않아 같은 보수 규칙을 쓴다.
+   - DELETE의 WHERE·USING·조인 컬럼 읽기는 DELETE 앞에 WITH가 있든 없든 남기지 않는다(`DmlAnalyzer`가 DELETE를 해석하지
+     않는다, main부터). UPDATE는 WHERE 컬럼을 읽기로 남기므로 비대칭이다. 넣으려면 DELETE의 대상·USING·조인·WHERE를 Binder로
+     해석하고, DELETE가 든 SQL Server·Oracle fixture 골든(`Fixtures/mssql`·`Fixtures/oracle`, Docker에서만 생성)을 실DB로
+     다시 확인해야 한다.
+   - SQL Server CTE 이름의 대소문자 비교가 데이터베이스 collation을 따르는지 실서버로 확인한다(지금은 관계 이름 규칙을
+     그대로 쓴다). CTE 원천 조회(Binder `factor`)는 `_CI`에서도 정확 비교다(대소문자 접기 방언 항목과 같은 공백).
    - 데이터 수정 CTE(PostgreSQL `WITH ins AS (INSERT INTO log … RETURNING …) SELECT … FROM ins`): 쿼리 파일은 `is_select`가
      참이라 읽기 경로로 가서 `writes log`가 없고 `SG_SET_UNSUPPORTED`로 부분 분석이다. routine은 객체 단위 `writes`·`reads`만
      남기고 컬럼 효과 없이 `complete`다(라운드 3 CLI로 확인). 고치려면 CTE 몸체의 DML을 `DmlAnalyzer`가 분석하고
