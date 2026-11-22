@@ -3944,26 +3944,75 @@ fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
             .and_then(|into| relation_name_parts(&into.name))
             .into_iter()
             .collect(),
-        Statement::Delete(delete) => {
-            if !delete.tables.is_empty() {
-                delete
-                    .tables
-                    .iter()
-                    .filter_map(relation_name_parts)
-                    .collect()
-            } else {
-                // DELETE FROM t — from 절이 쓰기 대상이다.
-                let tables: &[sqlparser::ast::TableWithJoins] = match &delete.from {
-                    sqlparser::ast::FromTable::WithFromKeyword(t)
-                    | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
-                };
-                tables
-                    .iter()
-                    .filter_map(|twj| table_factor_name(&twj.relation))
-                    .collect()
-            }
-        }
+        Statement::Delete(delete) => delete_write_targets(delete),
         _ => vec![],
+    }
+}
+
+/// DELETE의 쓰기 대상이다.
+///
+/// `DELETE FROM t`는 FROM 절이 대상이다. FROM 앞에 대상 목록이 있는 다중 테이블 DELETE
+/// (`DELETE c FROM audit c JOIN orders o …`, MySQL·SQL Server)에서 목록의 이름은 FROM 절 관계를
+/// 가리키는 참조다 — SQL Server 문서의 *table_alias*는 "The alias specified in the FROM
+/// table_source clause representing the table or view from which the rows are to be deleted"이고,
+/// mysql-server 8.0 `Query_block::add_table_to_list`는 그 목록(`TL_OPTION_ALIAS`)을 CTE로 찾지
+/// 않는다("those are only references into the FROM list, and any CTEs referenced by the aliases will
+/// be resolved when we later resolve the FROM list"). 그래서 `UPDATE` 승격(`promoted_update_target`)
+/// 처럼 FROM 절의 별칭이 가리키는 관계로 먼저 바꾸고, 그 관계 이름으로 CTE 이름 판정을 한다.
+fn delete_write_targets(delete: &sqlparser::ast::Delete) -> Vec<(Option<String>, String)> {
+    let from: &[TableWithJoins] = match &delete.from {
+        sqlparser::ast::FromTable::WithFromKeyword(tables)
+        | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+    };
+    if delete.tables.is_empty() {
+        return from
+            .iter()
+            .filter_map(|twj| table_factor_name(&twj.relation))
+            .collect();
+    }
+    let sources: Vec<&TableFactor> = from
+        .iter()
+        .flat_map(|twj| {
+            std::iter::once(&twj.relation).chain(twj.joins.iter().map(|join| &join.relation))
+        })
+        .collect();
+    delete
+        .tables
+        .iter()
+        .filter_map(|target| {
+            single_ident(target)
+                .and_then(|alias| aliased_relation(alias, sources.iter().copied()))
+                .or_else(|| relation_name_parts(target))
+        })
+        .collect()
+}
+
+/// 한 부분짜리 이름의 식별자 철자다.
+fn single_ident(name: &ObjectName) -> Option<&str> {
+    let [part] = name.0.as_slice() else {
+        return None;
+    };
+    Some(part.as_ident()?.value.as_str())
+}
+
+/// `alias`(ASCII 대소문자 무시)로 선언된 물리 관계가 `factors` 가운데 하나뿐이면 그 관계 이름이다.
+fn aliased_relation<'a>(
+    alias: &str,
+    factors: impl Iterator<Item = &'a TableFactor>,
+) -> Option<(Option<String>, String)> {
+    let matches: Vec<_> = factors
+        .filter_map(|factor| match factor {
+            TableFactor::Table {
+                alias: Some(declared),
+                args: None,
+                ..
+            } if declared.name.value.eq_ignore_ascii_case(alias) => table_factor_name(factor),
+            _ => None,
+        })
+        .collect();
+    match matches.as_slice() {
+        [target] => Some(target.clone()),
+        _ => None,
     }
 }
 
@@ -3995,25 +4044,10 @@ fn promoted_update_target(
     else {
         return None;
     };
-    let [target_name] = name.0.as_slice() else {
-        return None;
-    };
-    let target_name = target_name.as_ident()?.value.as_str();
-    let matches: Vec<_> = from
-        .iter()
-        .filter_map(|table| match &table.relation {
-            factor @ TableFactor::Table {
-                alias: Some(alias),
-                args: None,
-                ..
-            } if alias.name.value.eq_ignore_ascii_case(target_name) => table_factor_name(factor),
-            _ => None,
-        })
-        .collect();
-    match matches.as_slice() {
-        [target] => Some(target.clone()),
-        _ => None,
-    }
+    aliased_relation(
+        single_ident(name)?,
+        from.iter().map(|table| &table.relation),
+    )
 }
 
 fn qualified_write_targets(stmt: &Statement) -> Vec<ObjectName> {

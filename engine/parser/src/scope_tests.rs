@@ -1345,6 +1345,66 @@ fn cte_target_diagnostics_fold_names_under_a_case_insensitive_rule() {
     }
 }
 
+/// 다중 테이블 DELETE의 대상 목록은 FROM 절 관계를 가리킨다(SQL Server *table_alias*: "The alias
+/// specified in the FROM table_source clause representing the table or view from which the rows are
+/// to be deleted", mysql-server 8.0은 그 목록을 CTE로 찾지 않는다). 별칭이 CTE 이름과 같아도
+/// 별칭이 가리키는 테이블에 쓴다 — 이전에는 `DELETE c FROM audit c …`의 `c`를 CTE로 판정해
+/// `audit` 쓰기를 지웠다(WITH가 없으면 `s.c`가 없는 관계라는 한계가 남았다). `UPDATE c … FROM
+/// audit c` 승격과 같은 규칙이다. 별칭이 가리키는 FROM 관계가 CTE면 CTE를 통한 DELETE다.
+#[test]
+fn delete_through_a_from_alias_writes_the_aliased_table() {
+    let with_alias =
+        "WITH c AS (SELECT id, name FROM customers) DELETE c FROM audit c JOIN orders o ON c.id = o.id";
+    let joined_alias =
+        "WITH c AS (SELECT id, name FROM customers) DELETE c FROM orders o JOIN audit c ON c.id = o.id";
+    let plain = "DELETE c FROM audit c JOIN orders o ON c.id = o.id";
+    for (dialect, kind, context) in [
+        ("sqlserver", "procedure", None),
+        ("sqlserver", "query", None),
+        ("mysql", "procedure", Some(naming_context(None, Some(0)))),
+        ("mysql", "query", Some(naming_context(None, Some(1)))),
+        ("mysql", "procedure", None),
+    ] {
+        for body in [with_alias, joined_alias, plain] {
+            let graph = scan_routine_in_context(body, dialect, "sql", kind, context.clone());
+            let detail = format!(
+                "{dialect} {kind} {context:?} {body}: {:?} {:?}",
+                graph.edges(),
+                graph.limitations()
+            );
+            let analysis = &graph.analysis()[&VertexId::from_raw("s.mutate")];
+            assert!(
+                edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+                "{detail}"
+            );
+            assert!(!has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"), "{detail}");
+            assert!(!touches(&graph, "s.mutate", "s.c"), "{detail}");
+            assert!(
+                !graph.limitations().iter().any(|note| note.contains("s.c,")),
+                "{detail}"
+            );
+            assert_eq!(analysis.state, AnalysisState::Complete, "{detail}");
+        }
+    }
+    let through_cte = scan_routine_kind(
+        "WITH audit AS (SELECT id, name FROM customers) DELETE x FROM audit x JOIN orders o ON x.id = o.id",
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?}", through_cte.edges());
+    assert!(!touches(&through_cte, "s.mutate", "s.audit"), "{detail}");
+    assert!(
+        through_cte.analysis()[&VertexId::from_raw("s.mutate")]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.starts_with(
+                "DML target 'audit' names a WITH query; SQL Server writes through it"
+            )),
+        "{detail}"
+    );
+}
+
 /// 앞에 WITH가 붙은 DELETE도 CTE 몸체가 읽는 컬럼을 남긴다. 읽기 경로로 보내던 때에는 그
 /// 컬럼 읽기가 남았는데, DML 경로로 옮기면서 DELETE를 컬럼 분석기로 보내지 않아 사라졌다.
 #[test]
