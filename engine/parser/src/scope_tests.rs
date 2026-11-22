@@ -727,6 +727,203 @@ fn merge_maps_match_update_and_not_matched_insert_members() {
     ));
 }
 
+/// 앞에 WITH가 붙은 DML이다. sqlparser는 이 문장을 `Query`로 감싸고 DML을 그 몸체에 둔다.
+const WITH_INSERT: &str = "WITH big AS (SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.amount > 0) INSERT INTO audit (id, name) SELECT id, name FROM big";
+
+/// 앞에 WITH가 붙은 INSERT도 일반 INSERT처럼 대상 쓰기와 값 계보를 남긴다. 쿼리 파일은 읽기
+/// 전용 SELECT 경로로 가서 `writes` 없이 `SG_SET_UNSUPPORTED`만 남았고, routine은 객체 단위
+/// 간선만 남긴 채 컬럼 효과 없이 complete였다.
+#[test]
+fn with_prefixed_insert_maps_writes_and_lineage() {
+    for (dialect, kind) in [
+        ("postgres", "query"),
+        ("postgres", "procedure"),
+        ("sqlite", "query"),
+        ("sqlserver", "query"),
+    ] {
+        let graph = scan_routine_kind(WITH_INSERT, dialect, "sql", kind);
+        let detail = format!(
+            "{dialect} {kind}: {:?} {:?}",
+            graph.edges(),
+            graph.limitations()
+        );
+        assert_eq!(
+            graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+            AnalysisState::Complete,
+            "{detail}"
+        );
+        assert!(
+            edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+            "{detail}"
+        );
+        for column in ["s.audit.id", "s.audit.name"] {
+            assert!(
+                edge(&graph, "s.mutate", column, EdgeKind::Writes),
+                "{detail}"
+            );
+        }
+        assert!(
+            edge(&graph, "s.audit.id", "s.orders.id", EdgeKind::DerivesFrom),
+            "{detail}"
+        );
+        assert!(
+            edge(
+                &graph,
+                "s.audit.name",
+                "s.customers.name",
+                EdgeKind::DerivesFrom
+            ),
+            "{detail}"
+        );
+        assert!(
+            edge(&graph, "s.mutate", "s.orders.amount", EdgeKind::Reads),
+            "{detail}"
+        );
+        assert!(
+            !edge(&graph, "s.mutate", "s.audit", EdgeKind::Reads),
+            "{detail}"
+        );
+        assert!(!touches(&graph, "s.mutate", "s.big"), "{detail}");
+    }
+}
+
+/// 앞에 WITH가 붙은 UPDATE의 FROM·SET·WHERE는 그 CTE를 본다. CTE를 모른 채 분석하면 `big`이
+/// 없는 관계가 되어 값 계보가 빠진다.
+#[test]
+fn with_prefixed_update_reads_the_cte_in_from_set_and_where() {
+    let body = "WITH big AS (SELECT c.id, c.name FROM customers c) UPDATE audit SET name = big.name FROM big WHERE audit.id = big.id";
+    for kind in ["query", "procedure"] {
+        let graph = scan_routine_kind(body, "postgres", "sql", kind);
+        let detail = format!("{kind}: {:?} {:?}", graph.edges(), graph.limitations());
+        assert_eq!(
+            graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+            AnalysisState::Complete,
+            "{detail}"
+        );
+        assert!(
+            edge(&graph, "s.mutate", "s.audit.name", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert!(
+            edge(
+                &graph,
+                "s.audit.name",
+                "s.customers.name",
+                EdgeKind::DerivesFrom
+            ),
+            "{detail}"
+        );
+        assert!(
+            edge(&graph, "s.mutate", "s.audit.id", EdgeKind::Reads),
+            "{detail}"
+        );
+        assert!(
+            edge(&graph, "s.mutate", "s.customers.id", EdgeKind::Reads),
+            "{detail}"
+        );
+        assert!(!touches(&graph, "s.mutate", "s.big"), "{detail}");
+    }
+}
+
+/// 앞에 WITH가 붙은 DELETE 쿼리 파일은 읽기 전용 SELECT가 아니다. 삭제 대상 쓰기와 CTE가
+/// 읽는 관계를 남기고, CTE 이름을 관계로 보지 않는다.
+#[test]
+fn with_prefixed_delete_query_file_writes_its_target() {
+    let graph = scan_routine_kind(
+        "WITH stale AS (SELECT id FROM orders WHERE amount < 0) DELETE FROM audit WHERE id IN (SELECT id FROM stale)",
+        "sqlite",
+        "sql",
+        "query",
+    );
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(
+        edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(
+        edge(&graph, "s.mutate", "s.orders", EdgeKind::Reads),
+        "{detail}"
+    );
+    assert!(!has_diagnostic(&graph, "SG_SET_UNSUPPORTED"), "{detail}");
+    assert!(!touches(&graph, "s.mutate", "s.stale"), "{detail}");
+}
+
+/// SQL Server는 CTE를 통한 UPDATE를 허용하고(쓰기는 CTE의 원본 테이블로 간다), PostgreSQL은
+/// 같은 문장을 거절한다. 방언마다 뜻이 달라 대상 컬럼을 추측하지 않고 부분 분석으로 남긴다.
+#[test]
+fn with_prefixed_update_of_a_cte_target_is_partial_without_guessed_columns() {
+    for body in [
+        "WITH named AS (SELECT id, name FROM customers) UPDATE named SET name = 'x'",
+        // `UPDATE 별칭 … FROM 관계 별칭`은 별칭이 가리키는 FROM 관계가 대상이다.
+        "WITH named AS (SELECT id, name FROM customers) UPDATE n SET name = 'x' FROM named n",
+    ] {
+        let graph = scan_routine_kind(body, "sqlserver", "sql", "query");
+        let detail = format!("{body}: {:?} {:?}", graph.edges(), graph.limitations());
+        assert!(has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"), "{detail}");
+        assert_eq!(
+            graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+            AnalysisState::Partial,
+            "{detail}"
+        );
+        assert!(
+            !edge(&graph, "s.mutate", "s.customers.name", EdgeKind::Writes),
+            "{detail}"
+        );
+    }
+}
+
+/// 앞에 WITH가 붙은 DML의 `database.schema.table` 대상도 수집 DB와 같으면 로컬 쓰기다.
+/// 3부분 쓰기 대상을 바깥 문장에서만 찾으면 이 쓰기가 빠진다.
+#[test]
+fn with_prefixed_insert_into_a_database_qualified_target_is_a_local_write() {
+    let doc = CatalogDocument {
+        context: Some(CollectionContext {
+            source_id: "fixture".into(),
+            database: Some("app".into()),
+            schema_filter: None,
+            catalog_complete: true,
+            lower_case_table_names: None,
+            collation: None,
+        }),
+        dependencies: Vec::new(),
+        version: 1,
+        dialect: "sqlserver".into(),
+        reader: "fixture".into(),
+        limitations: vec![],
+        schemas: vec![SchemaDoc {
+            name: "s".into(),
+            objects: vec![
+                object("customers", &["id", "name"]),
+                object("audit", &["id", "name"]),
+            ],
+            routines: vec![case_routine(
+                "load",
+                "query",
+                "WITH c AS (SELECT id, name FROM s.customers) INSERT INTO app.s.audit (id, name) SELECT id, name FROM c",
+            )],
+        }],
+    };
+    let mut graph = schemagraph_source::graph::document_to_graph(&doc);
+    let (_, notes) = super::enrich_from_document(&mut graph, &doc);
+    for note in notes {
+        graph.add_limitation(note);
+    }
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(
+        edge(&graph, "s.load", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(
+        edge(&graph, "s.load", "s.audit.name", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(
+        !edge(&graph, "s.load", "s.audit", EdgeKind::Reads),
+        "{detail}"
+    );
+    assert!(!has_diagnostic(&graph, "SG_CROSS_DATABASE"), "{detail}");
+}
+
 #[test]
 fn temporal_self_update_is_partial_without_self_derives_edge() {
     let graph = scan_routine("UPDATE orders SET amount = amount + 1");

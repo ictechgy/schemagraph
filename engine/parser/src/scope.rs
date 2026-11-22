@@ -730,10 +730,13 @@ fn object_shape(object: &ObjectDoc) -> String {
 }
 
 /// 목적지가 없는 단일 SELECT만 읽기 해석기로 보내고 SELECT INTO는 DML로 남긴다.
+///
+/// 앞에 WITH가 붙은 INSERT·UPDATE·DELETE도 sqlparser에서는 `Statement::Query`다. 그 문장을
+/// 읽기 해석기로 보내면 쓰기 대상이 사라지므로 DML 경로에 남긴다.
 pub(crate) fn is_select(dialect: &dyn Dialect, body: &str) -> bool {
     super::parse_limits::parse_sql(dialect, body).is_ok_and(|s| {
         s.len() == 1
-            && matches!(s[0], Statement::Query(_))
+            && matches!(&s[0], Statement::Query(query) if super::query_dml_statement(query).is_none())
             && !super::is_column_dml_statement(&s[0])
     })
 }
@@ -999,24 +1002,7 @@ impl Binder<'_, '_> {
             };
         }
         self.depth += 1;
-        let mut ctes = inherited.clone();
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                let key = name(self.catalog.dialect, &cte.alias.name);
-                if with.recursive {
-                    ctes.insert(
-                        key.clone(),
-                        Relation {
-                            unknown: true,
-                            ..Relation::default()
-                        },
-                    );
-                }
-                let mut relation = self.query(&cte.query, &ctes, outer.clone());
-                self.alias(&mut relation, &cte.alias);
-                ctes.insert(key, relation);
-            }
-        }
+        let ctes = self.bind_ctes(query.with.as_ref(), inherited, outer.clone());
         let (result, scope) = self.set(&query.body, &ctes, outer);
         if let Some(order) = &query.order_by {
             self.visit(
@@ -1043,6 +1029,38 @@ impl Binder<'_, '_> {
         }
         self.depth -= 1;
         result
+    }
+
+    /// `WITH` 절의 CTE를 앞에서부터 해석해 물려받은 CTE에 더한다.
+    ///
+    /// 비재귀 CTE는 앞선 형제만 보고, RECURSIVE CTE는 자기 자신을 모르는 관계로 먼저
+    /// 등록한다. SELECT와 앞에 WITH가 붙은 DML이 같은 규칙을 쓰도록 한 곳에 둔다.
+    fn bind_ctes(
+        &mut self,
+        with: Option<&sqlparser::ast::With>,
+        inherited: &Ctes,
+        outer: Option<Rc<Scope>>,
+    ) -> Ctes {
+        let mut ctes = inherited.clone();
+        let Some(with) = with else {
+            return ctes;
+        };
+        for cte in &with.cte_tables {
+            let key = name(self.catalog.dialect, &cte.alias.name);
+            if with.recursive {
+                ctes.insert(
+                    key.clone(),
+                    Relation {
+                        unknown: true,
+                        ..Relation::default()
+                    },
+                );
+            }
+            let mut relation = self.query(&cte.query, &ctes, outer.clone());
+            self.alias(&mut relation, &cte.alias);
+            ctes.insert(key, relation);
+        }
+        ctes
     }
 
     fn set(
@@ -2101,6 +2119,7 @@ pub(crate) fn apply_dml_column_effects(
         effects: Vec::new(),
         allow_local_temps: options.allow_local_temps,
         locations_trusted: options.locations_trusted,
+        ctes: Ctes::new(),
     };
     if let Some((transition_table, transition_names)) = options.transition {
         // 소유 테이블 이름은 카탈로그 철자 그대로다. Binder 색인은 `catalog_key`로 접혀 있어
@@ -2192,6 +2211,9 @@ struct DmlAnalyzer<'a, 'd> {
     effects: Vec<DmlEffect>,
     allow_local_temps: bool,
     locations_trusted: bool,
+    /// 지금 분석하는 DML 앞의 `WITH`가 정의한 CTE다. 그 DML의 원천(SELECT·FROM·식)에서만
+    /// 보이고, 문장이 끝나면 비운다. 앞에 WITH가 없는 DML에서는 비어 있다.
+    ctes: Ctes,
 }
 
 impl DmlAnalyzer<'_, '_> {
@@ -2217,7 +2239,10 @@ impl DmlAnalyzer<'_, '_> {
                     self.ctas(create, query);
                 }
             }
-            Statement::Query(query) => self.select_into(query),
+            Statement::Query(query) => match super::query_dml_statement(query) {
+                Some(dml) => self.with_statement(query, dml),
+                None => self.select_into(query),
+            },
             Statement::Copy {
                 source:
                     CopySource::Table {
@@ -2228,6 +2253,58 @@ impl DmlAnalyzer<'_, '_> {
                 ..
             } => self.copy_table(table_name, columns, *to),
             _ => {}
+        }
+    }
+
+    /// `WITH … INSERT|UPDATE …`를 그 CTE가 보이는 상태로 분석한다.
+    ///
+    /// CTE는 DML의 원천에서만 보인다. 대상이 CTE 이름이면 방언마다 뜻이 다르다 — SQL
+    /// Server는 CTE를 통해 원본 테이블에 쓰고, PostgreSQL은 그 문장을 거절한다. 그래서 대상
+    /// 컬럼을 추측하지 않고 부분 분석으로 남긴다.
+    fn with_statement(&mut self, query: &Query, dml: &Statement) {
+        let ctes = self
+            .binder
+            .bind_ctes(query.with.as_ref(), &Ctes::new(), None);
+        if self.dml_target_names_cte(dml, &ctes) {
+            self.note(
+                "SG_DML_TARGET_SHAPE",
+                "DML target names a WITH query; target columns omitted",
+            );
+            return;
+        }
+        let previous = std::mem::replace(&mut self.ctes, ctes);
+        self.statement(dml);
+        self.ctes = previous;
+    }
+
+    /// INSERT·UPDATE 대상이 한정자 없는 CTE 이름인가.
+    ///
+    /// SQL Server의 `UPDATE b … FROM big b`는 별칭이 가리키는 FROM 관계가 대상이므로
+    /// `update`와 같은 승격 규칙으로 대상을 고른 뒤 비교한다.
+    fn dml_target_names_cte(&self, dml: &Statement, ctes: &Ctes) -> bool {
+        let name = match dml {
+            Statement::Insert(insert) => match &insert.table {
+                TableObject::TableName(name) => name,
+                TableObject::TableFunction(_) => return false,
+            },
+            Statement::Update { table, from, .. } => {
+                let from_tables: &[TableWithJoins] = match from {
+                    Some(UpdateTableFromKind::BeforeSet(tables))
+                    | Some(UpdateTableFromKind::AfterSet(tables)) => tables,
+                    None => &[],
+                };
+                match promoted_update_target(&table.relation, from_tables)
+                    .unwrap_or(&table.relation)
+                {
+                    TableFactor::Table { name, .. } => name,
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        match self.binder.parts(name).as_slice() {
+            [single] => ctes.contains_key(single),
+            _ => false,
         }
     }
 
@@ -2310,7 +2387,7 @@ impl DmlAnalyzer<'_, '_> {
         scope.add(target.clone());
         let visible = Rc::new(scope.clone());
         if let Some(query) = &insert.source {
-            let result = self.binder.query(query, &Ctes::new(), Some(visible));
+            let result = self.binder.query(query, &self.ctes, Some(visible));
             if result.unknown || result.columns.iter().any(|column| column.unknown) {
                 self.note(
                     "SG_DML_SOURCE_SHAPE",
@@ -2338,7 +2415,7 @@ impl DmlAnalyzer<'_, '_> {
                 let sources = self.binder.visit(
                     &assignment.value,
                     &scope,
-                    &Ctes::new(),
+                    &self.ctes,
                     "value",
                     &[],
                     &BTreeMap::new(),
@@ -2394,7 +2471,7 @@ impl DmlAnalyzer<'_, '_> {
                 Vec::new()
             },
         };
-        self.binder.join(&target_table, &mut scope, &Ctes::new());
+        self.binder.join(&target_table, &mut scope, &self.ctes);
         let local_target = match &target_factor {
             TableFactor::Table { name, .. } => {
                 let parts = self.binder.parts(name);
@@ -2416,7 +2493,7 @@ impl DmlAnalyzer<'_, '_> {
                 if same_update_target(&target_factor, &from_table.relation) {
                     self.add_update_sources(&from_table.joins, &mut scope);
                 } else {
-                    self.binder.join(from_table, &mut scope, &Ctes::new());
+                    self.binder.join(from_table, &mut scope, &self.ctes);
                 }
             }
         }
@@ -2436,7 +2513,7 @@ impl DmlAnalyzer<'_, '_> {
             self.binder.visit(
                 selection,
                 &scope,
-                &Ctes::new(),
+                &self.ctes,
                 "predicate",
                 &[],
                 &BTreeMap::new(),
@@ -2459,7 +2536,7 @@ impl DmlAnalyzer<'_, '_> {
             let sources = self.binder.visit(
                 &assignment.value,
                 scope,
-                &Ctes::new(),
+                &self.ctes,
                 "value",
                 &[],
                 &BTreeMap::new(),
@@ -2504,7 +2581,7 @@ impl DmlAnalyzer<'_, '_> {
     fn tuple_assignment_outputs(&mut self, value: &Expr, scope: &Rc<Scope>) -> Option<Vec<Column>> {
         match value {
             Expr::Subquery(query) => {
-                let result = self.binder.query(query, &Ctes::new(), Some(scope.clone()));
+                let result = self.binder.query(query, &self.ctes, Some(scope.clone()));
                 (!result.unknown).then_some(result.columns)
             }
             Expr::Tuple(expressions) => Some(
@@ -2515,7 +2592,7 @@ impl DmlAnalyzer<'_, '_> {
                         let sources = self.binder.visit(
                             expression,
                             scope,
-                            &Ctes::new(),
+                            &self.ctes,
                             "value",
                             &[],
                             &BTreeMap::new(),
@@ -2543,7 +2620,7 @@ impl DmlAnalyzer<'_, '_> {
         for join in joins {
             let right = self
                 .binder
-                .factor(&join.relation, &Ctes::new(), Rc::new(scope.clone()));
+                .factor(&join.relation, &self.ctes, Rc::new(scope.clone()));
             let mut combined = scope.clone();
             combined.add(right.clone());
             match &join.join_operator {
@@ -2573,7 +2650,7 @@ impl DmlAnalyzer<'_, '_> {
                 self.binder.visit(
                     expression,
                     &Rc::new(scope.clone()),
-                    &Ctes::new(),
+                    &self.ctes,
                     "join",
                     &[],
                     &BTreeMap::new(),
@@ -2617,20 +2694,20 @@ impl DmlAnalyzer<'_, '_> {
         let mut scope = Scope::default();
         let visible = Rc::new(scope.clone());
         self.binder
-            .add_factor(table, &mut scope, &Ctes::new(), visible);
+            .add_factor(table, &mut scope, &self.ctes, visible);
         let visible = Rc::new(scope.clone());
         self.binder
-            .add_factor(source, &mut scope, &Ctes::new(), visible);
+            .add_factor(source, &mut scope, &self.ctes, visible);
         let target = scope.relations.first().cloned();
         let scope = Rc::new(scope);
         self.binder
-            .visit(on, &scope, &Ctes::new(), "predicate", &[], &BTreeMap::new());
+            .visit(on, &scope, &self.ctes, "predicate", &[], &BTreeMap::new());
         for clause in clauses {
             if let Some(predicate) = &clause.predicate {
                 self.binder.visit(
                     predicate,
                     &scope,
-                    &Ctes::new(),
+                    &self.ctes,
                     "predicate",
                     &[],
                     &BTreeMap::new(),
@@ -2651,7 +2728,7 @@ impl DmlAnalyzer<'_, '_> {
                         let sources = self.binder.visit(
                             &assignment.value,
                             &scope,
-                            &Ctes::new(),
+                            &self.ctes,
                             "value",
                             &[],
                             &BTreeMap::new(),
@@ -2672,7 +2749,7 @@ impl DmlAnalyzer<'_, '_> {
                             let sources = self.binder.visit(
                                 value,
                                 &scope,
-                                &Ctes::new(),
+                                &self.ctes,
                                 "value",
                                 &[],
                                 &BTreeMap::new(),

@@ -3665,6 +3665,11 @@ fn into_nested_statements(stmt: Statement) -> Vec<Statement> {
 }
 
 fn is_column_dml_statement(stmt: &Statement) -> bool {
+    if let Statement::Query(query) = stmt {
+        if let Some(dml) = query_dml_statement(query) {
+            return is_column_dml_statement(dml);
+        }
+    }
     matches!(
         stmt,
         Statement::Insert(_)
@@ -3676,6 +3681,19 @@ fn is_column_dml_statement(stmt: &Statement) -> bool {
                 ..
             }
     ) || select_into(stmt).is_some()
+}
+
+/// `WITH … INSERT|UPDATE|DELETE …`의 DML 문장이다.
+///
+/// sqlparser는 앞에 WITH가 붙은 DML을 `Statement::Query`로 감싸고 DML을 그 몸체
+/// (`SetExpr::Insert`·`Update`·`Delete`)에 둔다. 이 모양을 SELECT로 보면 쓰기 대상이
+/// 읽기 전용 경로로 가서 `writes` 간선이 빠진다.
+fn query_dml_statement(query: &sqlparser::ast::Query) -> Option<&Statement> {
+    use sqlparser::ast::SetExpr;
+    match query.body.as_ref() {
+        SetExpr::Insert(dml) | SetExpr::Update(dml) | SetExpr::Delete(dml) => Some(dml),
+        _ => None,
+    }
 }
 
 fn select_into(stmt: &Statement) -> Option<&sqlparser::ast::SelectInto> {
@@ -3932,7 +3950,11 @@ fn qualified_write_targets(stmt: &Statement) -> Vec<ObjectName> {
             }
         }
         Statement::CreateTable(create) if create.query.is_some() => names.push(create.name.clone()),
-        Statement::Query(_) => {
+        Statement::Query(query) => {
+            // 앞에 WITH가 붙은 DML의 대상은 감싼 문장 안에 있다.
+            if let Some(dml) = query_dml_statement(query) {
+                return qualified_write_targets(dml);
+            }
             if let Some(into) = select_into(stmt) {
                 names.push(into.name.clone());
             }
