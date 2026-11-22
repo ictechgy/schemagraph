@@ -1,27 +1,103 @@
 # HANDOFF.md
 
-## 현재 상태 (2026-11-15, PR #61 독립 리뷰 반영 이후)
+## 현재 상태 (2026-11-22, 라운드 3 작업 브랜치)
 
 - 발행본은 **0.9.0**이다. 태그 `v0.9.0` = `fad8e9d`([#58](https://github.com/ictechgy/schemagraph/pull/58)).
   그 커밋의 [CI](https://github.com/ictechgy/schemagraph/actions/runs/41583763434)·
   [SQL Server/Oracle](https://github.com/ictechgy/schemagraph/actions/runs/41583763488)·
   [IBM](https://github.com/ictechgy/schemagraph/actions/runs/41583763549)·
   [DML](https://github.com/ictechgy/schemagraph/actions/runs/41583763689) 검증이 모두 성공했다.
-- [PR #59](https://github.com/ictechgy/schemagraph/pull/59)는 2026-11-09에 `main`으로 스쿼시 머지됐다(`bdac8a6`).
-  아직 발행하지 않았다. `main` `bdac8a6`의 push 워크플로 4개(CI·SQL Server/Oracle·IBM·DML, DB fixture 포함)가
-  모두 성공했다(2026-11-10 확인).
-  RELEASE-NOTES `# Unreleased`가 미발행 변경 목록의 정본이다: facts의 스키마 필터·교환 불가 식별자 범위 공백과
-  SQLite 예약 관계 선언, COPY 테이블·컬럼 간선, SQLite 수집기 3종 수정(네이티브·Go·JDBC), 대소문자 접기
-  방언의 관계·routine 해석과 몸체 캐시 지문, 서버 대소문자 규칙 수집(`context.lower_case_table_names`·
+- [PR #59](https://github.com/ictechgy/schemagraph/pull/59)(`bdac8a6`, 2026-11-09)와
+  [PR #61](https://github.com/ictechgy/schemagraph/pull/61)(`b8e4054`, 2026-11-16)이 `main`으로 스쿼시 머지됐다.
+  아직 발행하지 않았다. RELEASE-NOTES `# Unreleased`가 미발행 변경 목록의 정본이다: facts의 스키마 필터·교환
+  불가 식별자 범위 공백과 SQLite 예약 관계 선언, COPY 테이블·컬럼 간선, SQLite 수집기 3종 수정(네이티브·Go·JDBC),
+  대소문자 접기 방언의 관계·routine 해석과 몸체 캐시 지문, 서버 대소문자 규칙 수집(`context.lower_case_table_names`·
   `collation`), 프로브 메시지 영어화, JDBC 파티션·외부 테이블과 방언별(대소문자 구분) 시스템 스키마,
-  CI의 isthmus 0.14.0 실검증.
+  CI의 isthmus 0.14.0 실검증, SQLite ASCII 식별자 접기, 컴파일되지 않는 SQLite 뷰, 그리고 아래 라운드 3 항목.
 - 채널별 게시 현황은 RELEASE-NOTES.md 끝의 "Publication channels" 표가 정본이다.
   crates.io에는 0.7.1·0.8.0·0.8.1이 없고, Maven Central에는 0.7.1이 없다(2026-11-03 조회).
   GitHub Release v0.1.0–v0.3.0에는 첨부 아카이브가 없다(2026-11-09 조회). 누락 버전은 다시 게시하지 않는다.
 - isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
-- 브랜치 `ccr-37904670-hxdjsx`(`origin/main` `ea1bd11` 기준)는 [PR #61](https://github.com/ictechgy/schemagraph/pull/61)이다.
-  아래 세 작업(SQLite ASCII 접기 `1299676`, 컴파일되지 않는 SQLite 뷰 `dfdeecd`, CATALOG.md SQL Server 문단 `bb4c916`)과
-  독립 리뷰(r2) 반영 커밋이 있다. 리뷰 반영 커밋(`734a4a9`까지)은 push했고, 증분 재검증(r3)에서 머지 가능 판정을 받았다.
+- 브랜치 `ccr-37904670-hxdjsx`는 `origin/main` `b8e4054`에서 다시 시작한 라운드 3 작업이다(아직 push·PR 전).
+  아래 "라운드 3" 절의 네 커밋(`1c8d976`·`86c9e98`·`0206bea`·`d91236b`), 독립 리뷰 반영 세 커밋
+  (`5be9173`·`d872048`·`f9c700b`)과 이 HANDOFF 커밋이 있다.
+
+### 라운드 3 (2026-11-22)
+
+HANDOFF 후속 후보 4번 목록에서 사용자 결정이 필요 없는 정확성·위생 항목을 골랐다. 근거와 결과의 정본은
+RELEASE-NOTES `# Unreleased`의 해당 항목이다. 회귀 테스트는 모두 수정을 되돌리거나 변이시킨 사본에서 실패하는 것을
+확인했다.
+
+- parser — 앞에 WITH가 붙은 DML(`WITH big AS (…) INSERT|UPDATE|DELETE …`, 모든 방언). sqlparser는 이 문장을
+  `Statement::Query { body: SetExpr::Insert|Update|Delete }`로 감싼다. 재현(수정 전 CLI): SQLite `--sql-dir`의
+  `WITH big AS (SELECT id, total FROM orders WHERE total > 10) INSERT INTO log (order_id, amount) SELECT id, total FROM big`는
+  `reads orders`·컬럼 reads만 남고 `writes log`가 없었으며 `partial` + `SG_SET_UNSUPPORTED`(한계 문구는 "view main.query_…"),
+  같은 몸체의 PostgreSQL 함수는 `writes log`·`reads orders`만 남기고 컬럼 효과 없이 `complete`였다. 수정:
+  `query_dml_statement`로 감싼 DML을 꺼내 `is_select`(DELETE 포함)·`is_column_dml_statement`(INSERT·UPDATE)·
+  `qualified_write_targets`(3부분 대상)가 보게 했고, `DmlAnalyzer`가 그 WITH의 CTE를 `Binder::bind_ctes`(SELECT와 같은
+  CTE 규칙, `Binder::query`에서 뽑아 냄)로 해석해 INSERT·UPDATE·MERGE의 원천에 보이게 한다. 대상이 그 문장의 CTE
+  이름일 때의 처리는 리뷰 반영(아래)에서 방언별로 바꿨다.
+  수정 후 같은 CLI 재현에서 `archive.sql`이 `plain.sql`(WITH 없는 같은 문장)과 같은 `writes log`·`log.order_id`·
+  `log.amount`, `derives-from`, `complete`를 낸다. 테스트 5개(`with_prefixed_*`, `scope_tests.rs`): INSERT(PostgreSQL 쿼리
+  파일·프로시저, SQLite·SQL Server 쿼리 파일), UPDATE … FROM CTE, SQLite DELETE 쿼리 파일, CTE 대상(직접·`UPDATE n … FROM
+  named n` 승격), 3부분 대상. 변이 6종(각 변경 하나씩 되돌림)을 모두 잡는다. 결과는 간선 추가뿐이다(좁힘 아님).
+- source — 앱 등록 모듈을 쓰는 SQLite 가상 테이블. 재현(수정 전): `writable_schema`로 `CREATE VIRTUAL TABLE vt USING
+  app_mod(a, b)` 행을 넣은 DB를 `scan`하면 `catalog read failed: … (code: 1) no such module: app_mod`, 종료 코드 2.
+  같은 DB에서 Go 프로브(`sqlite columns source text was not collected (…)`)와 JDBC 프로브(`main.vt: getColumns failed`)는
+  이미 테이블을 남기고 카탈로그를 불완전으로 표시했다(둘 다 이 세션에서 실행). 수정: `sqlite.rs`의 `UnreadableColumns`가
+  컴파일 불가 뷰와 같은 분류(SQLITE_ERROR 계열만)로 DDL이 `CREATE VIRTUAL TABLE`로 시작하는 테이블만 남기고 한계를 따로
+  센다. 일반 테이블·다른 오류는 그대로 종료 코드 2다. 수정 후 같은 DB는 종료 코드 0, 한계 2개(그 테이블을 읽는 뷰
+  `v_vt`는 컴파일 불가 뷰로), `catalog_complete: false`, facts에 `catalog-coverage:`. 그 테이블을 읽는 `SELECT *`는
+  `SG_WILDCARD_UNKNOWN`으로 `partial`이다(쿼리 파일·뷰 둘 다 확인). FTS5처럼 내장 모듈은 이전처럼 읽힌다. 테스트 3개
+  (통합·키워드 판정·실제 SQLite 오류 경계), 변이 3종을 잡는다. scan이 아예 실패하던 입력이라 출력은 늘기만 한다.
+- probe-go — SQLite 객체별 수집 실패 문구에 `schema.object:`를 붙였다(컬럼·PK 인덱스·FK·인덱스·인덱스 컬럼). 재현(수정
+  전): 같은 SQLite 메시지로 실패한 뷰 두 개가 `sortedDistinct`로 한 문구가 되어 어느 뷰가 몇 개 빠졌는지 사라졌다
+  (가상 테이블 DB에서도 `vt`·`v_vt`가 한 문구). 테스트 `TestSQLiteColumnFailuresNameTheObject`(수정 전 실패 확인).
+  SUPPORT-MATRIX 수집기 차이 표를 고치고 가상 테이블 행을 더했다.
+- ci — `Scripts/verify-cancellation.py`가 실패한 검사 이름과 표준 라이브러리 밖의 가장 안쪽 함수·줄을 적는다
+  (`failed in check_mcp (send_json line …): could not write MCP request: [Errno 32] Broken pipe`). 재현: 수정 전 스크립트에
+  BrokenPipeError를 주입하면 `cancellation process regression failed: [Errno 32] Broken pipe`만 나왔다.
+  `Scripts/test-verify-cancellation.py`(6개, 수정 전 스크립트에서 모두 실패)를 CI의 측정 불변식 단계에 더했다.
+  실제 스크립트는 이 세션에서 `ok`다.
+
+### 라운드 3 독립 리뷰 반영 (2026-11-22)
+
+GLM `packet-ask`는 이 세션에서 쓸 수 없어 `/code-review high`(독립 Claude 리뷰)를 `origin/main...HEAD`에 돌렸다.
+지적 8개를 실제 DB·문서·테스트로 확인한 뒤 처리했다.
+
+- 반영 `5be9173`(important 2개): PostgreSQL·SQLite에서 WITH 이름과 같은 DML 대상은 실제 테이블이다(PostgreSQL
+  `parse_clause.c` `setTargetTable`의 "CTEs don't hide tables (for this purpose)" 주석을 REL_16_STABLE 원문으로 확인하고,
+  PostgreSQL 16.15와 SQLite 3.53.1에서 INSERT·UPDATE·DELETE가 실제 `audit`를 바꾸는 것을 실행해 확인). 그 두 방언은
+  대상을 CTE 없이 찾는다. SQL Server는 MicrosoftDocs `with-common-table-expression-transact-sql.md` 원문("Any reference to
+  expression_name in the query uses the common table expression and not the base object")대로 CTE를 통해 쓰므로, 두
+  방언 밖에서는 그 이름으로 가는 객체 단위 `writes`를 남기지 않고 `SG_DML_TARGET_SHAPE` 하나로 센다. 좁힘: 그 방언들의
+  routine·trigger가 이전부터 남기던 CTE 이름 쓰기 간선(없는 관계면 "missing" 한계, 같은 이름 테이블이 있으면 거짓
+  간선, 수정 전 CLI의 SQL Server 프로시저 재현에서 `writes dbo.shadow -> dbo.log`)이 사라지고 진단으로 바뀐다. CTE 이름
+  비교는 ASCII 대소문자를 무시한다(pre_existing 지적 3의 일부).
+- 반영 `d872048`(nit): Go 문구의 객체 이름 제어문자를 `\u{..}`로 이스케이프한다.
+- 반영 `f9c700b`(nit 3개): 실패 위치를 표준 라이브러리 밖 프레임으로, 정리 실패가 검사 실패를 가리지 않게,
+  RELEASE-NOTES 예시를 실제 문구로.
+- 보류(pre_existing 2개): CTE 원천 조회의 SQL Server 대소문자 무시(대소문자 접기 방언 후속 후보에 포함)와
+  데이터 수정 CTE(`WITH ins AS (INSERT … RETURNING …) SELECT …`, 아래 후속 후보).
+
+### 라운드 3 검증 (리뷰 반영 뒤 최종 바이너리)
+
+- Rust 1.96.0: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, 워크스페이스
+  테스트 716개 통과(이전 707개 + parser 6 + source 3). Go: `gofmt -l`, `go vet`, `go test ./...`.
+- CI 측정 불변식 단계의 Python 테스트 11개와 `test-dml-producers.py`, `test-capture-migration.py`, `verify-contracts.py`
+  (jsonschema 4.23.0·sqlglot 30.18.0), `verify-competitive.py`, `verify-cancellation.py`, SQLite 골든 diff 0과
+  `verify-document-versions.py`, `verify-sqlite-nullability.py`(네이티브·Go·JDBC).
+- 실제 PostgreSQL 16.15(로컬 바이너리, root로는 initdb가 거부되어 별도 일반 계정과 `/tmp` 작업 디렉터리로 실행하고
+  지웠다): `verify-accuracy.py --sqlglot --suite all --strict`(실패 0), `verify-fixtures.sh`의 PG 골든 단계를 같은
+  명령으로 재현(골든과 같음), `verify-bridge-facts.py --require-isthmus`(isthmus-cli 0.14.0, SQLite·PostgreSQL 사례 모두
+  `ok` — 이전 세션은 PostgreSQL 사례를 못 돌렸다), `verify-catalog-dependencies.py`·`verify-openlineage.py`·
+  `verify-schema-lint.py`·`verify-unused.py`·`verify-collection-scope.py`(네이티브·Go).
+- DML 정확도(SQLite·PostgreSQL): 고정된 v0.4.3 릴리스 엔진·Go·JDBC로 `verify-dml-producers.py` 기준선을 만들고(sha256
+  확인) 이 브랜치로 `verify-dml-replay.py` — 둘 다 `failures: 0`.
+- 돌리지 못한 것: Docker DB fixture(MySQL·MariaDB·SQL Server·Oracle·IBM, 데몬 없음)와 그에 딸린 정확도·TLS 검사,
+  `verify-review-action.py`(SARIF 스키마 호스트가 프록시 403), `verify-html.py`(headless Chrome이 이 환경에서 시간 초과),
+  `verify-external-imports.py`(dbt), JDBC `gradle check`(Kotlin 코드 변경 없음, 기존 jar로 교차 수집기 검사만),
+  `cargo package`, GLM 리뷰.
 
 ### SQLite 식별자 ASCII 접기 (2026-11-15, `1299676`)
 
@@ -149,16 +225,15 @@ PR #59는 GLM 리뷰 없이 머지됐다.
 - JDBC 프로브의 JUnit 실행은 이 세션에서 Maven Central 429로 의존성을 받지 못해 못 돌렸다.
   바뀐 `CatalogScopeTest.systemSchemasDependOnTheDialect`만 컴파일된 클래스를 직접 실행해 확인했다(수정 전 실패).
 
-## 다음 할 일 (2026-11-15)
+## 다음 할 일 (2026-11-22)
 
 1. 다음 릴리스는 **0.10.0**이다 — `CollectionContext`에 공개 필드가 늘었다. [RELEASING.md](RELEASING.md) 절차로
    GitHub Release·crates.io·Maven Central을 **각각** 게시하고, 채널 표를 실제 조회 결과로 갱신한다.
    crates.io 누락분(0.7.1·0.8.0·0.8.1)은 다시 게시하지 않고 0.10.0이 그 변경을 담는다.
 2. isthmus 쪽 `compatibility.json`의 schemagraph 고정을 올리는 일은 isthmus 저장소에 맡긴다.
-3. PR #61: CI를 확인한 뒤 머지한다. 이 세션에서 돌리지 못한 검증: Docker DB fixture,
-   `verify-bridge-facts.py`의 PostgreSQL 사례(PostgreSQL 바이너리 없음 — SQLite 사례만 isthmus 0.14.0으로 실행),
-   JDBC 프로브 JUnit·Go 프로브 테스트(프로브 코드는 바꾸지 않았다), GLM 리뷰.
-4. 후속 후보(이번 작업에서 관찰, 고치지 않음):
+3. 라운드 3 브랜치: push·PR 뒤 CI를 확인하고 머지한다. 이 세션에서 돌리지 못한 검증은 PR 본문의 Verification 절에
+   적었다(Docker DB fixture·DML 정확도·JDBC JUnit·GLM 리뷰 등).
+4. 후속 후보(관찰했지만 고치지 않음):
    - 대소문자 접기 방언(MySQL `lower_case_table_names` 1·2, SQL Server `_CI` collation)은 routine·trigger 몸체의
      객체 단위 간선만 대소문자만 다른 관계로 잇는다. 뷰 몸체와 컬럼 단위 간선(Binder)은 정확 비교라 같은 참조가
      뷰에서는 간선 없이, routine에서는 테이블 간선만 있고 컬럼 간선 없이 남는다. SQL Server 미해석 메시지는 CI
@@ -166,21 +241,22 @@ PR #59는 GLM 리뷰 없이 머지됐다.
      PR #59 항목은 과장("relation names in bodies match …")을 고쳐 지금 범위를 적었다. 엔진 수정은 별도 PR로 한다
      (지문이 미묘해 지난 라운드 blocker가 났다). 고치려면 Binder(`scope.rs`의
      `CatalogIndex::tables`·`relation_key`)가 같은 단일 후보 규칙을 따르게 하고 지문을 함께 확인해야 한다.
+     라운드 3에서도 지문 검증까지 한 번에 끝낼 범위가 아니라 손대지 않았다.
    - SQLite routine 호출의 마지막 정점 조회는 정확 비교(`lookup(false)`)라, 호출 이름을 ASCII 소문자로 접은 철자가
      카탈로그 이름과 같을 때만 잇는다. `ECHO` routine을 `echo(...)`로, `ÉCHO`를 `Écho(...)`로 부르면 잇지 못한다
      (`ECHO(...)`로 `echo`는 잇지만, ASCII 대문자가 든 이름의 routine `ECHO`는 `ECHO(...)`로도 잇지 못한다 — r3 재검증에서 확인). 수집기는 SQLite routine을 내지 않고(경로 이름의 query routine뿐) 실사용 영향은
      없다고 봤다. CATALOG.md·RELEASE-NOTES는 이 범위로 적었다.
-   - `734a4a9`의 Release binaries `Build aarch64-apple-darwin binaries`가 `Scripts/verify-cancellation.py`에서 한 번
-     `cancellation process regression failed: [Errno 32] Broken pipe`로 실패했고(job 133006619519), 같은 job을 한 번
-     다시 돌리자 통과했다. 같은 커밋의 Linux job은 통과했고 이 PR은 취소·입출력 경로를 바꾸지 않았다. 어느 검사에서
-     파이프가 끊겼는지 스크립트가 알려 주지 않아 원인은 모른다. 다시 나오면 검사 이름을 함께 출력하게 고친다.
-   - 앱이 등록하는 가상 테이블 모듈을 쓰는 SQLite 가상 테이블(`no such module: …`, SQLITE_ERROR)은 kind가 table이라
-     여전히 scan 전체를 종료 코드 2로 끝낸다(리뷰 r2 nit 5, writable_schema로 만든 DB로 확인). 컴파일 불가 뷰
-     규칙은 뷰에만 적용했다. 고치려면 `CREATE VIRTUAL TABLE` 테이블만 같은 규칙으로 남기고 한계를 따로 세야 한다.
-   - 범위 밖(모든 방언): `--sql-dir`의 `WITH x AS (…) INSERT INTO log …`는 `is_select`가 참이라 SELECT 경로로 가서
-     `SG_SET_UNSUPPORTED`만 남고 `writes log` 간선이 없다(`lib.rs` `is_column_dml_statement`가 `Query { body: Insert }`를
-     보지 않는다). SQLite 문서로 확인했다. 이슈로 올릴 후보다.
-   - Go 프로브의 컴파일 불가 뷰 한계는 뷰 이름 없이 "sqlite columns source text was not collected (…)"라고 쓴다.
+   - SQL Server에서 DML 대상이 그 문장의 CTE 이름이면(`WITH c AS (SELECT … FROM t) UPDATE c …`, 중복 삭제 관용구) 이제
+     `SG_DML_TARGET_SHAPE`로 부분 분석이고 실제로 쓰이는 원본 테이블 `t`에는 간선이 없다. CTE가 단일 테이블을 읽는
+     갱신 가능한 모양일 때 그 테이블로 쓰기를 옮길 수 있지만, SQL Server의 갱신 가능 CTE 규칙을 실서버로 확인해야 한다.
+     MySQL·DB2 등은 이 모양의 의미를 확인하지 않아 같은 보수 규칙을 쓴다.
+   - 데이터 수정 CTE(PostgreSQL `WITH ins AS (INSERT INTO log … RETURNING …) SELECT … FROM ins`): 쿼리 파일은 `is_select`가
+     참이라 읽기 경로로 가서 `writes log`가 없고 `SG_SET_UNSUPPORTED`로 부분 분석이다. routine은 객체 단위 `writes`·`reads`만
+     남기고 컬럼 효과 없이 `complete`다(라운드 3 CLI로 확인). 고치려면 CTE 몸체의 DML을 `DmlAnalyzer`가 분석하고
+     RETURNING 출력을 바깥 질의의 원천으로 이어야 한다. 쿼리 파일만 DML 경로로 보내면 같은 거짓 complete가 되므로
+     둘을 함께 고친다.
+   - `--sql-dir` 쿼리 파일의 컬럼 분석 한계 문구는 `view main.query_…: SG_…`처럼 객체 종류를 `view`로 적는다
+     (`record_body`/`enrich_view` 경로의 문구). 의미는 맞지만 쿼리 파일을 뷰로 부른다.
 
 ## Blocker와 열린 질문 (2026-11-09)
 
