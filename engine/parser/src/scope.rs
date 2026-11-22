@@ -74,6 +74,8 @@ pub(crate) struct CatalogIndex<'a> {
     /// 바인더가 대소문자만 다른 단일 관계 후보도 고르는 문서인가(`relation_names_fold_case`).
     /// 캐시 지문이 바인더와 같은 후보 집합을 담아야 낡은 해석을 재사용하지 않는다.
     fold_relation_case: bool,
+    /// 문서가 증명하는 CTE 이름의 대소문자 규칙(`cte_target::name_case`).
+    cte_name_case: super::cte_target::NameCase,
     routines: BTreeSet<(String, String)>,
     database: Option<String>,
     doc: &'a CatalogDocument,
@@ -116,6 +118,7 @@ impl<'a> CatalogIndex<'a> {
             tables,
             dialect: &doc.dialect,
             fold_relation_case: super::relation_names_fold_case(doc),
+            cte_name_case: super::cte_target::name_case(doc),
             routines,
             database: doc
                 .context
@@ -139,6 +142,11 @@ impl<'a> CatalogIndex<'a> {
     /// 이 색인이 정규화 규칙으로 쓰는 문서 방언.
     pub(crate) fn dialect(&self) -> &str {
         self.dialect
+    }
+
+    /// 앞에 WITH가 붙은 DML의 CTE 이름 대상을 판정할 문서 쪽 사실이다.
+    pub(crate) fn cte_context(&self) -> super::cte_target::Context<'_> {
+        super::cte_target::Context::new(self.dialect, self.cte_name_case)
     }
 
     /// owner의 DML 효과에 origin을 단 간선 키를 기록한다.
@@ -741,9 +749,9 @@ pub(crate) fn is_select(dialect: &dyn Dialect, body: &str) -> bool {
     })
 }
 
-/// DML 대상 이름을 WITH의 CTE보다 카탈로그 테이블로 먼저 찾는 방언인가(`CteTargetRule::Table`).
+/// DML 대상 이름을 WITH의 CTE보다 카탈로그 테이블로 먼저 찾는 방언인가(`cte_target::Rule::Table`).
 fn dml_target_ignores_ctes(dialect: &str) -> bool {
-    super::cte_target_rule(dialect) == super::CteTargetRule::Table
+    super::cte_target::rule(dialect) == super::cte_target::Rule::Table
 }
 
 /// 카탈로그 쪽 스키마·관계·routine 이름을 `name`과 같은 규칙의 키로 만든다.
@@ -2266,23 +2274,21 @@ impl DmlAnalyzer<'_, '_> {
     /// CTE 몸체가 읽는 컬럼은 DELETE에서도 사실이라 먼저 해석한다(DELETE 자체의 컬럼 효과는
     /// WITH가 없는 DELETE처럼 남기지 않는다).
     ///
-    /// CTE는 DML의 원천에서만 보인다. 대상이 CTE 이름이면 방언마다 뜻이 다르다
-    /// (`CteTargetRule`) — PostgreSQL·SQLite는 같은 이름의 실제 테이블에 쓰므로 대상을 CTE 없이
-    /// 찾는다. SQL Server·MySQL은 CTE를 가리키고, 나머지 방언은 확인하지 않았으므로 대상 컬럼을
-    /// 추측하지 않고 부분 분석으로 남긴다.
+    /// CTE는 DML의 원천에서만 보인다. 대상이 CTE 이름이면 `cte_target`이 방언과 대소문자
+    /// 규칙으로 판정한다 — 실제 테이블이면 평범하게 분석하고, CTE이거나 증명되지 않았으면 대상
+    /// 컬럼을 추측하지 않고 객체 단위 적용과 같은 진단으로 부분 분석을 표시한다.
     fn with_statement(&mut self, query: &Query, dml: &Statement) {
         let ctes = self
             .binder
             .bind_ctes(query.with.as_ref(), &Ctes::new(), None);
-        if let Some(target) = self.dml_target_naming_cte(dml, &ctes) {
-            // 객체 단위 적용이 같은 대상의 진단을 이미 남겼으면 다시 쌓지 않는다.
-            let rule = super::cte_target_rule(self.binder.catalog.dialect);
-            self.partial = true;
-            super::push_cte_target_diagnostic(
-                self.diagnostics,
-                &super::cte_target_message(&target, rule),
-            );
-            return;
+        let context = self.binder.catalog.cte_context();
+        if let Some((target, outcome)) = self.dml_target_naming_cte(query, dml) {
+            if let Some(message) = context.message(&target, outcome) {
+                // 객체 단위 적용이 같은 대상의 진단을 이미 남겼으면 다시 쌓지 않는다.
+                self.partial = true;
+                super::cte_target::push_diagnostic(self.diagnostics, &message);
+                return;
+            }
         }
         let previous = std::mem::replace(&mut self.ctes, ctes);
         self.statement(dml);
@@ -2302,17 +2308,16 @@ impl DmlAnalyzer<'_, '_> {
         }
     }
 
-    /// INSERT·UPDATE 대상이 한정자 없는 CTE 이름이면 그 대상의 원래 철자를 돌려준다.
+    /// INSERT·UPDATE 대상이 한정자 없이 그 문장의 CTE 이름(대소문자를 빼고)이면 대상의 원래 철자와
+    /// `cte_target` 판정을 돌려준다.
     ///
-    /// PostgreSQL·SQLite는 대상을 늘 실제 테이블로 찾으므로(`dml_target_ignores_ctes`) 비교하지
-    /// 않는다. SQL Server의 `UPDATE b … FROM big b`는 별칭이 가리키는 FROM 관계가 대상이므로
-    /// `update`와 같은 승격 규칙으로 대상을 고른 뒤 비교한다. 대소문자만 다른 이름은 관계 이름을
-    /// 대소문자 무시로 비교하는 문서(`fold_relation_case`)에서만 같은 CTE다 — 객체 단위
-    /// `settle_cte_writes`와 같은 규칙이다.
-    fn dml_target_naming_cte(&self, dml: &Statement, ctes: &Ctes) -> Option<String> {
-        if dml_target_ignores_ctes(self.binder.catalog.dialect) {
-            return None;
-        }
+    /// SQL Server의 `UPDATE b … FROM big b`는 별칭이 가리키는 FROM 관계가 대상이므로 `update`와
+    /// 같은 승격 규칙으로 대상을 고른다. CTE 이름은 객체 단위 수집과 같은 원래 철자로 비교한다.
+    fn dml_target_naming_cte(
+        &self,
+        query: &Query,
+        dml: &Statement,
+    ) -> Option<(String, super::cte_target::Outcome)> {
         let name = match dml {
             Statement::Insert(insert) => match &insert.table {
                 TableObject::TableName(name) => name,
@@ -2333,13 +2338,19 @@ impl DmlAnalyzer<'_, '_> {
             }
             _ => return None,
         };
-        let [single] = self.binder.parts(name).try_into().ok()?;
-        let fold = self.binder.catalog.fold_relation_case;
-        let names_cte = ctes
-            .keys()
-            .any(|key| key == &single || (fold && key.eq_ignore_ascii_case(&single)));
-        let spelling = name.0.last()?.as_ident()?.value.clone();
-        names_cte.then_some(spelling)
+        let [part] = name.0.as_slice() else {
+            return None;
+        };
+        let spelling = part.as_ident()?.value.clone();
+        let names: Vec<String> = query
+            .with
+            .as_ref()?
+            .cte_tables
+            .iter()
+            .map(|cte| cte.alias.name.value.clone())
+            .collect();
+        let outcome = self.binder.catalog.cte_context().judge(&spelling, &names)?;
+        Some((spelling, outcome))
     }
 
     /// `COPY t [(cols)] TO|FROM …`의 컬럼 효과를 남긴다.
