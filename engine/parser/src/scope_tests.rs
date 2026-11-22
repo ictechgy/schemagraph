@@ -1691,6 +1691,121 @@ fn reextraction_after_end_is_bounded_per_piece() {
     );
 }
 
+/// 상한에 걸리면 미추출 수(조각 하나)만으로는 손실의 크기를 알 수 없어, 남은 바이트 수를 진단에 싣는다.
+#[test]
+fn reextraction_cap_reports_the_size_left_unanalyzed() {
+    let pairs = super::MAX_REEXTRACTIONS;
+    let body: String = (0..pairs)
+        .map(|_| "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH UPDATE orders SET amount = 0 END CATCH ")
+        .collect();
+    let graph = scan_routine_kind(&body, "sqlserver", "sql", "procedure");
+    let analysis = &graph.analysis()[&VertexId::from_raw("s.mutate")];
+    assert_eq!(analysis.state, AnalysisState::Partial);
+    assert!(
+        analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "SG_BODY_PARTIAL"
+                && diagnostic.message.starts_with(&format!(
+                    "statement extraction stopped after {} re-extractions",
+                    super::MAX_REEXTRACTIONS
+                ))
+                && diagnostic
+                    .message
+                    .contains("bytes, which may hold many statements")
+        }),
+        "{:?}",
+        analysis.diagnostics
+    );
+}
+
+/// 세미콜론 없는 T-SQL 조각에서 추출기가 무시하는 문장(`PRINT`·`RAISERROR`·`WAITFOR`·`GOTO`·`THROW`)과
+/// `EXEC proc` 인자는 다음 문장 머리 앞에서 끝난다. 이전에는 그 문장이 조각 끝까지를 삼켜 뒤 문장이
+/// 소리 없이 빠진 채 `complete`였다. 세미콜론을 붙인 같은 몸체와 같은 결과여야 한다.
+#[test]
+fn ignored_tsql_statements_end_at_the_next_statement_head() {
+    let facts = |body: &str| {
+        let graph = scan_routine_kind(body, "sqlserver", "sql", "procedure");
+        let mut edges: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.from.as_str() == "s.mutate")
+            .map(|edge| format!("{:?} {}", edge.kind, edge.to))
+            .collect();
+        edges.sort();
+        let state = graph.analysis()[&VertexId::from_raw("s.mutate")].state;
+        (edges, state, graph.limitations().to_vec())
+    };
+    for (without, with, written) in [
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH PRINT ERROR_MESSAGE() INSERT INTO orders (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH PRINT ERROR_MESSAGE(); INSERT INTO orders (id) VALUES (1); END CATCH",
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH RAISERROR('x', 10, 1) WITH NOWAIT INSERT INTO orders (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH RAISERROR('x', 10, 1) WITH NOWAIT; INSERT INTO orders (id) VALUES (1); END CATCH",
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH WAITFOR DELAY '00:00:01' INSERT INTO orders (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH WAITFOR DELAY '00:00:01'; INSERT INTO orders (id) VALUES (1); END CATCH",
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH GOTO retry INSERT INTO orders (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH GOTO retry; INSERT INTO orders (id) VALUES (1); END CATCH",
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH THROW 50000, 'x', 1 END CATCH UPDATE orders SET amount = 0",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH THROW 50000, 'x', 1; END CATCH; UPDATE orders SET amount = 0",
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH EXEC log_error @code = 1 INSERT INTO orders (id) VALUES (1) END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH EXEC log_error @code = 1; INSERT INTO orders (id) VALUES (1); END CATCH",
+            "Writes s.orders",
+        ),
+        // 변수 이름 안의 `update`는 문장 머리가 아니다.
+        (
+            "DECLARE @update int; PRINT @update INSERT INTO orders (id) VALUES (1)",
+            "DECLARE @update int; PRINT @update; INSERT INTO orders (id) VALUES (1)",
+            "Writes s.orders",
+        ),
+        // `CASE … END`의 END는 다음 문장이 아니다.
+        (
+            "DECLARE @n int; PRINT CASE WHEN @n = 1 THEN 'a' ELSE 'b' END UPDATE orders SET amount = 0",
+            "DECLARE @n int; PRINT CASE WHEN @n = 1 THEN 'a' ELSE 'b' END; UPDATE orders SET amount = 0",
+            "Writes s.orders",
+        ),
+    ] {
+        let (edges, state, limitations) = facts(without);
+        assert!(
+            edges.iter().any(|edge| edge == written),
+            "{without}: {edges:?} {limitations:?}"
+        );
+        assert_eq!((edges, state, limitations), facts(with), "{without}");
+    }
+}
+
+/// 건너뛴 절에 대입이 있으면(`GET DIAGNOSTICS @s = ROW_COUNT`) 그 변수의 옛 값으로 뒤 동적 SQL을 접지
+/// 않는다. 접으면 실행되지 않는 `UPDATE audit`가 거짓 쓰기가 된다.
+#[test]
+fn a_skipped_clause_with_an_assignment_forgets_variable_values() {
+    let graph = scan_routine_kind(
+        "DECLARE @s nvarchar(100) = N'UPDATE audit SET name = 1'; GET DIAGNOSTICS @s = ROW_COUNT EXEC(@s)",
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(!touches(&graph, "s.mutate", "s.audit"), "{detail}");
+    assert_eq!(
+        graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Partial,
+        "{detail}"
+    );
+}
+
 /// 끝에 `END` 하나만 남은 몸체는 이전처럼 그 END를 버린다. SQLite·MySQL은 `SELECT id FROM audit end`의
 /// `end`를 별칭으로 받는다(SQLite 3.53.1에서 그 뷰를 만들고 읽었다). END를 `COMMIT` 문장으로 붙이면
 /// 뷰는 "exactly one query"가 아니라며 간선을 잃고, 쿼리 파일은 SELECT가 아니게 되어 컬럼 읽기를 잃었다.

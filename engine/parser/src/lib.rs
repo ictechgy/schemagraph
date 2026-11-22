@@ -2121,8 +2121,8 @@ fn collect_extracted(
 /// 돌려준다.
 ///
 /// 나머지는 블록이 끝난 자리라 변수 값을 모르므로, 평가를 끈 새 상태로 꺼낸다(동적 SQL을 변수 값으로
-/// 접지 않고 미추출로 센다). 나머지의 위치를 모르거나 `MAX_REEXTRACTIONS`를 넘으면 조각 하나를
-/// 미추출로 센다.
+/// 접지 않고 미추출로 센다). 나머지의 위치를 모르면 조각 하나를 미추출로 세고, `MAX_REEXTRACTIONS`를
+/// 넘으면 그에 더해 남은 크기를 진단에 싣는다.
 fn collect_extracted_piece(
     piece: &str,
     parsed: &mut ParsedTrigger,
@@ -2148,14 +2148,26 @@ fn collect_extracted_piece(
     let Some(unparsed) = prefix.unparsed else {
         return Vec::new();
     };
-    let rest = unparsed
-        .from
-        .and_then(|from| piece.get(from..))
-        .filter(|_| *rounds < MAX_REEXTRACTIONS);
-    let Some(rest) = rest else {
+    let Some(rest) = unparsed.from.and_then(|from| piece.get(from..)) else {
         *unextracted += 1;
         return Vec::new();
     };
+    if *rounds >= MAX_REEXTRACTIONS {
+        // 미추출 수는 조각 하나로 세지만 그 안에 문장이 몇 개 남았는지는 모른다 — 남은 크기를
+        // 진단에 실어 손실의 범위를 알린다.
+        *unextracted += 1;
+        parsed.partial = true;
+        parsed.diagnostics.push(schemagraph_core::Diagnostic {
+            code: "SG_BODY_PARTIAL".into(),
+            message: format!(
+                "statement extraction stopped after {MAX_REEXTRACTIONS} re-extractions after top-level END in one semicolon-free piece; its remaining {} bytes, which may hold many statements, were not analyzed",
+                rest.len()
+            ),
+            location: None,
+            candidates: Vec::new(),
+        });
+        return Vec::new();
+    }
     *rounds += 1;
     let mut state = ExtractionState::new(body.text_dialect, body.format_shadowed);
     state.invalidate();
@@ -2302,9 +2314,15 @@ fn extract_procedural_statements(
                 }
                 "EXEC" => {
                     // T-SQL `EXEC proc <args>`는 CALL의 별칭 — EXECUTE와
-                    // 달리 동적 SQL이 아니라 routine 호출이 기본이다.
-                    strip_exec_call(rest, wlen, &mut stmts, &mut unextracted, state);
-                    break;
+                    // 달리 동적 SQL이 아니라 routine 호출이 기본이다. 세미콜론 없는 조각에서는
+                    // 인자 뒤에 다음 문장이 붙으므로 인자를 그 앞에서 끝내고 계속 꺼낸다.
+                    let end = next_statement_start(&rest[wlen..]).map(|at| wlen + at);
+                    let call = &rest[..end.unwrap_or(rest.len())];
+                    strip_exec_call(call, wlen, &mut stmts, &mut unextracted, state);
+                    let Some(end) = end else {
+                        break;
+                    };
+                    rest = &rest[end..];
                 }
                 "SET" => {
                     // T-SQL `SET @v = <expr>`은 변수 대입 — 우변에 질의가
@@ -2352,13 +2370,25 @@ fn extract_procedural_statements(
                 "GOTO" | "GET" | "RAISE" | "SIGNAL" | "RESIGNAL" | "NULL" | "PRAGMA" | "CLOSE"
                 | "FETCH" | "MOVE" | "LEAVE" | "ITERATE" | "PRINT" | "THROW" | "RAISERROR"
                 | "WAITFOR" | "DEALLOCATE" | "BREAK" => {
+                    // 세미콜론 없는 T-SQL 조각에서는 이 문장 뒤에 다음 문장이 붙어 있다
+                    // (`PRINT ERROR_MESSAGE() INSERT INTO log …`). 이 문장의 절은 다음 문장 머리
+                    // 앞에서 끝내고, 그 뒤를 계속 꺼낸다.
+                    let clause_end = next_statement_start(&rest[wlen..]).map(|at| wlen + at);
+                    let clause = &rest[wlen..clause_end.unwrap_or(rest.len())];
                     if word.eq_ignore_ascii_case("FETCH") {
-                        let tail = &rest[wlen..];
-                        if let Some(into) = find_top_level(tail, "INTO", true) {
-                            invalidate_variable_list(&tail[into + "INTO".len()..], state);
+                        if let Some(into) = find_top_level(clause, "INTO", true) {
+                            invalidate_variable_list(&clause[into + "INTO".len()..], state);
                         }
                     }
-                    break;
+                    let Some(end) = clause_end else {
+                        break;
+                    };
+                    // 건너뛴 절의 대입(`GET DIAGNOSTICS @n = ROW_COUNT`)은 추적하지 않으므로 변수
+                    // 값을 버린다 — 뒤 동적 SQL을 옛 값으로 접지 않게.
+                    if find_top_level(clause, "=", false).is_some() {
+                        state.invalidate_all_variables();
+                    }
+                    rest = &rest[end..];
                 }
                 _ => {
                     // 문장 머리가 오면 선언 섹션은 끝났다 — T-SQL은 DECLARE가
@@ -2402,6 +2432,55 @@ fn extract_procedural_statements(
         }
     }
     (stmts, unextracted)
+}
+
+/// 무시하는 절차형 문장(`PRINT`·`RAISERROR`·`THROW`·`WAITFOR`·`GOTO`·`BREAK` 등) 뒤에서 다음 문장이
+/// 시작하는 위치다. 없으면 `None`이다.
+///
+/// 세미콜론으로 끝나는 방언에서는 그 문장의 절이 조각 끝까지라 찾을 것이 없고, 세미콜론을 생략한
+/// T-SQL에서만 다음 문장이 같은 조각에 붙는다. 인용·주석·괄호 안과 `CASE … END` 안은 보지 않고,
+/// 최상위 단어 가운데 간선을 낼 수 있는 문장 머리(`SELECT`·`INSERT`·`UPDATE`·`DELETE`·`MERGE`·
+/// `TRUNCATE`·`EXEC`·`EXECUTE`·`CALL`)와 블록·제어 머리(`BEGIN`·`END`·`IF`·`WHILE`·`DECLARE`)에서만
+/// 끊는다. `WITH`(`RAISERROR … WITH NOWAIT`)와 `SET`(MySQL `SIGNAL … SET MESSAGE_TEXT`)은 그 문장 절의
+/// 일부일 수 있어 끊지 않는다. `@`·`.`·`:`나 ASCII 밖 글자 바로 뒤의 단어는 변수·한정 이름의 일부다.
+fn next_statement_start(text: &str) -> Option<usize> {
+    const HEADS: [&str; 13] = [
+        "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "EXEC", "EXECUTE", "CALL",
+        "BEGIN", "IF", "WHILE", "DECLARE",
+    ];
+    let quotes = QuoteScanner::new(text);
+    let bytes = text.as_bytes();
+    let (mut i, mut parens, mut cases) = (0usize, 0usize, 0usize);
+    while i < bytes.len() {
+        if let Some(end) = quotes.end(i) {
+            i = end;
+            continue;
+        }
+        let byte = bytes[i];
+        if !is_ident_char(byte) {
+            match byte {
+                b'(' => parens += 1,
+                b')' => parens = parens.saturating_sub(1),
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        let (word, len) = head_word(&text[i..]);
+        let part_of_name = i > 0 && matches!(bytes[i - 1], b'@' | b'.' | b':' | 0x80..=0xff);
+        if parens == 0 && !part_of_name {
+            let upper = word.to_ascii_uppercase();
+            match upper.as_str() {
+                "CASE" => cases += 1,
+                "END" if cases > 0 => cases -= 1,
+                "END" => return Some(i),
+                head if cases == 0 && HEADS.contains(&head) => return Some(i),
+                _ => {}
+            }
+        }
+        i += len;
+    }
+    None
 }
 
 /// `;`로 끝나는 최상위 조각으로 나눈다 — 문자열·식별자 인용·주석·
