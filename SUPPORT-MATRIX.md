@@ -77,6 +77,7 @@ not hidden by any comparison step:
 | MySQL/MariaDB `PRIMARY` index | Not listed | Not listed | Listed (`getIndexInfo` path) |
 | SQLite inline UNIQUE/CHECK notice | Limitation when the DDL has the keyword | Same | Not reported; unique constraints are still visible as unique indexes |
 | SQLite view that SQLite cannot compile (missing table or column, application-defined function) | Kept without columns; one limitation per schema counts the views and lists them with SQLite's reason | Kept without columns; one `schema.view: sqlite columns source text was not collected (…)` limitation per view with SQLite's reason | Kept without columns; `getColumns failed` and `getPrimaryKeys failed` limitations per view |
+| SQLite virtual table whose module is not available (`no such module: …`) | Kept without columns; one limitation per schema counts the virtual tables and lists them with SQLite's reason | Kept without columns; one `schema.table: sqlite columns source text was not collected (…)` limitation per table | Kept without columns; `getColumns failed` and `getPrimaryKeys failed` limitations per table |
 | Server case rules in `context` | MySQL `lower_case_table_names` | MySQL, SQL Server collation | MySQL, MariaDB, SQL Server collation |
 | System schemas skipped | Per database | Per database | Per dialect; unknown dialects use the combined list |
 

@@ -112,8 +112,9 @@ documents. A
 SQLite table or view whose `columns` list is empty is read as a relation with
 unknown columns, because SQLite objects always have at least one column: the
 native reader writes such a view when SQLite cannot compile its definition, and
-`SELECT *` over it is reported as `SG_WILDCARD_UNKNOWN` instead of expanding to
-nothing.
+such a virtual table when SQLite cannot connect its module (`no such module: …`).
+`SELECT *` over either is reported as `SG_WILDCARD_UNKNOWN` instead of expanding
+to nothing.
 
 SQL Server relation names follow the database collation when the document
 carries it in `context.collation` (the Go and JDBC probes collect it). With a
