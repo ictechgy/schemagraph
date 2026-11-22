@@ -22,7 +22,8 @@
 - 브랜치 `ccr-37904670-hxdjsx`는 `origin/main` `1365d37`(PR #62 머지)에서 다시 시작한 라운드 4 작업이며
   [PR #63](https://github.com/ictechgy/schemagraph/pull/63)이다. 커밋: `f2164ab`(parser, DELETE·TRUNCATE 대상), `ae54036`(parser,
   최상위 END), `67943bb`(HANDOFF·RELEASE-NOTES, push됨), PR #63 리뷰 반영 `f6ff67e`(S2)·`2c9b79d`(S1·N1)·`f6caf78`(S3·N2)·`bc223db`(문서, push됨),
-  그리고 델타 리뷰 반영 `377e635`(B1·S1·nit)·`0ecad86`(S2)·`72b0c94`(S3)와 그 문서 커밋(아래 "PR #63 델타 리뷰 반영" 절, push 전).
+  델타 리뷰 반영 `377e635`(B1·S1·nit)·`0ecad86`(S2)·`72b0c94`(S3)·`5b11c7a`(문서, push됨), 좁은 재리뷰 반영 `595d2fb`(SF1)·
+  `9350d0e`(SF2)·`c724ca9`(nit 1)와 그 문서 커밋(아래 "PR #63 좁은 재리뷰 반영" 절, push 전).
 - 원격에 이 세션과 무관한 브랜치 `fix/postgres-ascii-identifier-fold`(`5ff7a51`, 다른 세션, 2026-11-22, PR 없음)가 있다.
   후속 후보의 PostgreSQL 미인용 식별자 ASCII 접기(`scope.rs` `name()`)를 다룬다. 겹치지 않게 라운드 4는 그 항목과
   `scope.rs`를 건드리지 않았다. 두 브랜치는 `parser/src/lib.rs`·`scope_tests.rs`의 서로 다른 곳을 고친다.
@@ -169,6 +170,47 @@ RELEASE-NOTES `# Unreleased`의 해당 항목이다. 회귀 테스트는 모두 
   `verify-unused.py`·`verify-catalog-dependencies.py`(네이티브) 모두 `ok`. Go `gofmt -l`·`go vet`·`go test` 통과. `--cache-dir` cold/warm는
   `lower_case_table_names`를 0↔1로 바꿔도, 새 몸체 모양에서도 같다. 성능: TRY·CATCH 2천 쌍 몸체 0.84초(디버그, 부하 낮을 때).
   돌리지 못한 것은 라운드 4와 같다(MySQL·MariaDB·SQL Server 실서버, Docker fixture, DML 정확도, JDBC, GLM 리뷰).
+
+### PR #63 좁은 재리뷰 반영 (2026-11-22)
+
+`bc223db..5b11c7a` 재리뷰(blocker 없음, should-fix 2, nit 3). 리뷰어 도구 `r4-delta-schemagraph/run2.py`와 새 사례 `c7`–`c9`(96개)를
+복사해 다섯째 바이너리(새 머리)를 더했고(세션 scratchpad `r4-schemagraph/delta2/`), 별도 대상 디렉터리로 빌드했다.
+
+- SF1(`SET` 갈래가 다음 문장을 삼킴): 5b11c7a가 `SET`을 끊기 머리로 더하자 `PRINT 'x' SET @n = 1 UPDATE audit …`·`EXEC mutate SET @c = 3 UPDATE
+  audit …`·`WAITFOR … SET …`·`PRINT 'x' SET NOCOUNT ON UPDATE orders …`의 `SET` 갈래가 조각 끝까지를 우변으로 삼아 `UPDATE`를 잃었다(두 사례는
+  소리 없는 `complete`). 맨 앞의 `SET @n = 1 UPDATE …`는 main부터 같았다. 수정: T-SQL에서 `SET` 문장도 `tsql_statement_end`(다음 문장 머리)에서
+  끝내고 계속 꺼낸다(`EXEC` 갈래와 같은 모양). 수정 후 리뷰어 사례 17개(`s_*`·`x_*`·`t_print_set_nosemi2`)의 간선·상태가 세미콜론을 넣은 판과
+  모두 같다.
+- SF2(거절된 DELETE의 다른 대상): `DELETE C, o FROM audit c JOIN orders o …`(lctn 0, `c`·`C`)가 거절 진단과 함께 `writes orders`·`reads audit`를
+  남겼다. MySQL은 문장 전체를 거절하므로 수정 후 `delete_target_names`가 대상 하나라도 거절되면 쓰기를 모두 빼고, `body_relations`가 그 문장
+  안의 관계 읽기를 세지 않는다(`is_rejected_delete`). 진단 문구는 "rejects the whole statement (ER_UNKNOWN_TABLE), so none of its writes or reads
+  are recorded"로 바꿨다. 같이 본 것: 절차형 추출로 가는 몸체(`BEGIN DECLARE x INT DEFAULT 1; DELETE C FROM audit c …; END`)는 간선이 없어지자
+  "body parse failed"·`unsupported`가 되어 진단을 잃었다 — 간선이 없어도 `partial`로 표시된 추출 결과는 분석 결과로 기록한다. 남은 것: 거절된
+  DELETE 안의 함수 호출(`calls`)과 앞에 WITH가 붙은 거절 DELETE의 CTE 컬럼 읽기는 그대로다.
+- nit 1(should-fix로 처리, `=` 앞 주석): `RECEIVE TOP(1) @s /*x*/ = message_body`에서 왼쪽 이름을 못 찾아 옛 값으로 접었다(5b11c7a `complete`·
+  `writes audit`). `invalidate_assigned_names`를 앞에서부터 훑게 바꿔 공백·주석을 건너뛰고 왼쪽 이름을 찾으며, 이름이 아니면(괄호·리터럴)
+  추적 값을 모두 버린다. `<=`·`>=`·`!=`·`==`는 비교로 건너뛴다.
+- nit 2(비교를 대입으로 봄): `PRINT CASE WHEN @s = N'' …`·PL/pgSQL `RAISE … CASE WHEN q = '' …`는 참인 접기를 잃고 `partial`이다(보수 판정 —
+  RELEASE-NOTES에 그렇게 적었다). 같은 보수 판정으로 `SET @s += …`의 `@s`가 값 없음(NULL)이면 접지 않는다(main은 빈 문자열처럼 접어
+  `writes orders`를 냈다 — 기본 `CONCAT_NULL_YIELDS_NULL`에서 `NULL + 문자열`은 NULL이라 거짓). PL/pgSQL `GET DIAGNOSTICS q = PG_CONTEXT;
+  EXECUTE q;`의 main `writes orders`도 옛 값 접기라 사라진다.
+- nit 3(`PRINT (SELECT …)`): SQL Server는 PRINT의 하위 질의를 거절한다(Msg 1046, 리뷰 지적 — Microsoft PRINT 문서의 문법은 `string_expr`뿐이다).
+  읽기를 남기는 쪽을 유지했다 — 되돌리면 끊긴 몸체 `PRINT (SELECT …) UPDATE …`가 다시 읽기 없이 `complete`가 된다. 실제 카탈로그에는 나올 수
+  없는 잘못된 T-SQL을 보수적으로 다루는 것이고, `sys.objects`처럼 카탈로그에 없는 관계를 읽으면 그 한계로 `partial`이다(`r_sys_semi`).
+- 테스트(새 2개, 바꾼 1개): `set_statements_end_at_the_next_statement_head`(일곱 입력을 세미콜론 판과 비교 — 리뷰 여섯 + 맨 앞 `SET`),
+  `a_rejected_delete_records_no_writes_or_reads`(두 형식, 하위 질의, 절차형 몸체), 그리고 `skipped_clause_assignments_never_fold_a_stale_value`에
+  주석 사례와 이름 없는 왼쪽 사례를 더했다. 셋 모두 5b11c7a parser 소스에서 실패하고, 변이 6종(SET 끊기 끔, 다른 대상 쓰기 유지, 거절 문장
+  읽기 유지, 주석 건너뛰기 끔, 이름 없는 왼쪽 무시, 간선 없는 부분 분석을 파싱 실패로)을 각각 잡는다.
+- 사례 대조(리뷰어 옛 175 + 새 96 + REALC 27, main·bc223db·5b11c7a·새 머리): 새 머리가 5b11c7a와 다른 사례는 SF1(세미콜론 판과 같음), SF2(거절된
+  문장의 쓰기·읽기 제거), nit 1(옛 값 접기 제거)뿐이다. main에만 있는 간선은 모두 거짓이거나(옛 값·NULL 접기, lctn 0 거절 문장의 쓰기·읽기,
+  USING `writes s.c`, 세 부분 `reads`) nit 2의 보수 판정으로 잃은 접기(`partial`)다. 이 세션의 38·21개는 SF2 두 사례만 바뀐다.
+- 커밋: `595d2fb`(SF1)·`9350d0e`(SF2와 절차형 간선 없는 부분 분석)·`c724ca9`(nit 1). 중간 커밋은 별도 대상 디렉터리에서 각자 parser 테스트·
+  clippy·fmt를 통과했다(`595d2fb` 251, `9350d0e` 252).
+- 검증(최종 트리, Rust 1.96.0, `-j 2`, `CARGO_PROFILE_DEV_DEBUG=0`): `cargo fmt --all -- --check`·`cargo clippy --workspace --all-targets
+  --locked -- -D warnings` 통과, `cargo test --workspace --locked` 746 통과. Python CI 테스트 11개·`test-dml-producers.py`·
+  `test-capture-migration.py`·`verify-competitive.py`·`verify-cancellation.py`·`verify-contracts.py`·`verify-document-versions.py`(SQLite)
+  통과, SQLite·PG golden diff 0, `verify-dynamic-sql.py`(PG) 통과, PostgreSQL 16.15 `verify-accuracy.py --sqlglot --suite all --strict`
+  0 failing(엔진 결과 main과 같음). SQL Server fixture 프로시저(`Fixtures/mssql/basic.sql`, 세미콜론 있음·없음)는 5b11c7a와 같다.
 
 ### PR #63 델타 리뷰 반영 (2026-11-22)
 
@@ -618,6 +660,8 @@ PR #59는 GLM 리뷰 없이 머지됐다.
      텍스트를 버린다. `IF 1 = 1 BEGIN UPDATE audit … END ELSE BEGIN UPDATE log … END UPDATE orders …`(SQL Server)는 `IF` 머리와 끝의
      `UPDATE orders`를 잃는다. 라운드 4 뒤로는 그 안의 `END ELSE`를 읽지 못해 `partial`로 표시되지만 `log`·`orders` 간선은 없다.
      고치려면 routine에서는 바깥 `BEGIN … END`가 몸체 전체를 감쌀 때만 벗겨야 하고, trigger 머리(`CREATE TRIGGER … AS`)와 갈라야 한다.
+   - (PR #63 좁은 재리뷰) 거절된 MySQL DELETE 안의 함수 호출과, 앞에 WITH가 붙은 거절 DELETE의 CTE 컬럼 읽기는 남는다. `=` 리셋은 비교도
+     대입으로 봐 참인 접기를 버릴 수 있다(`partial`).
    - (PR #63 델타 리뷰) 무시하는 문장의 하위 질의 읽기: PL/pgSQL `RAISE NOTICE '%', (SELECT …)`(main부터 `complete`, 읽기 없음) 등. T-SQL `PRINT`만
      식으로 꺼낸다. 추출기는 `WITH … INSERT|UPDATE|DELETE`를 읽지 못해 미추출로 센다(main부터). `GOTO done done:UPDATE …`처럼 레이블 콜론에 붙은
      문장 머리는 끊지 않는다(셋 다 unsupported). T-SQL `EXECUTE proc …`는 `EXEC proc`와 달리 호출 간선이 없다.
