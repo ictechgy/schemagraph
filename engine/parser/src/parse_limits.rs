@@ -75,7 +75,8 @@ pub(crate) struct Unparsed {
 /// `BEGIN CATCH`·`UPDATE b`·`END CATCH`를 각각 문장으로 읽는다. 그래서 멈춘 자리의 `END`부터
 /// 다시 문장 목록을 읽어 이어 붙인다 — `END`를 문장 경계로 보는 것이고, `;`가 있을 때와 같은
 /// 결과다. 다시 읽은 `parse_statements`는 처음에 구분자를 기다리지 않으므로 `END`를 문장으로
-/// 읽거나(소비) 오류를 내며, 같은 자리에서 다시 멈추지 않는다.
+/// 읽거나(소비) 오류를 내며, 같은 자리에서 다시 멈추지 않는다. 끝에 `END` 한 문장만 남으면
+/// 이전처럼 버린다(`is_lone_end`).
 ///
 /// 이어 읽기가 실패하면 그 앞까지의 문장과 오류를 돌려준다. 이전처럼 그 앞 문장의 간선은
 /// 남기되, 호출자가 몸체를 완전 분석이라고 주장하지 않게 하기 위해서다. 첫 `END` 앞에서의
@@ -95,6 +96,10 @@ pub(crate) fn parse_sql_prefix(
     while parser.peek_token().token != Token::EOF {
         let resume = parser.peek_token().span.start;
         match parser.parse_statements() {
+            // 끝에 `END` 하나만 남았으면 이전처럼 버린다. 문장 목록에 `COMMIT` 하나가 더 붙으면
+            // 한 질의여야 하는 뷰·쿼리 파일(`SELECT id FROM audit end` — SQLite·MySQL은 `end`를
+            // 별칭으로 받는다)이 두 문장이 되어 간선을 잃는다.
+            Ok(more) if parser.peek_token().token == Token::EOF && is_lone_end(&more) => {}
             Ok(more) => statements.extend(more),
             Err(error) => {
                 return Ok(StatementPrefix {
@@ -111,6 +116,11 @@ pub(crate) fn parse_sql_prefix(
         statements,
         unparsed: None,
     })
+}
+
+/// 다시 읽은 문장 목록이 `END` 한 문장(`END`·`END TRY`·`END TRANSACTION` 등)뿐인가.
+fn is_lone_end(statements: &[Statement]) -> bool {
+    matches!(statements, [Statement::Commit { end: true, .. }])
 }
 
 /// 토큰 위치(1부터 센 줄·글자)가 가리키는 원문 바이트 위치다. 그 자리가 `END` 키워드일 때만 돌려준다.
@@ -936,9 +946,16 @@ mod tests {
             Parser::parse_sql(&dialect, tail).expect("sqlparser").len(),
             1
         );
-        // 남는 것이 `END` 하나면 그 END를 문장으로 읽어 끝까지 읽는다.
-        let trailing = parse_sql(&dialect, "UPDATE a SET x = 1 END").expect("trailing END");
-        assert_eq!(trailing.len(), 2);
+        // 끝에 `END` 한 문장만 남으면 이전처럼 버린다 — 한 질의여야 하는 뷰·쿼리 파일이 두
+        // 문장이 되지 않게.
+        for trailing in [
+            "UPDATE a SET x = 1 END",
+            "SELECT id FROM audit end",
+            "UPDATE a SET x = 1 END TRY;",
+        ] {
+            let parsed = parse_sql(&dialect, trailing).expect("trailing END");
+            assert_eq!(parsed.len(), 1, "{trailing}");
+        }
         // 다시 읽어도 끝까지 못 읽으면 오류이고, prefix는 앞 문장과 남은 부분의 위치를 준다.
         assert!(parse_sql(&dialect, tail).is_err());
         let prefix = parse_sql_prefix(&dialect, tail).expect("prefix");

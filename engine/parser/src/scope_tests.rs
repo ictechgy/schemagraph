@@ -1691,6 +1691,26 @@ fn reextraction_after_end_is_bounded_per_piece() {
     );
 }
 
+/// 끝에 `END` 하나만 남은 몸체는 이전처럼 그 END를 버린다. SQLite·MySQL은 `SELECT id FROM audit end`의
+/// `end`를 별칭으로 받는다(SQLite 3.53.1에서 그 뷰를 만들고 읽었다). END를 `COMMIT` 문장으로 붙이면
+/// 뷰는 "exactly one query"가 아니라며 간선을 잃고, 쿼리 파일은 SELECT가 아니게 되어 컬럼 읽기를 잃었다.
+#[test]
+fn a_lone_trailing_end_is_dropped_for_views_and_query_files() {
+    let view = scan_with_dialect("SELECT id FROM orders end", &["id"], "sqlite");
+    let detail = format!("{:?} {:?}", view.edges(), view.analysis());
+    complete(&view);
+    assert!(
+        edge(&view, "s.v", "s.orders.id", EdgeKind::Reads),
+        "{detail}"
+    );
+    let query = scan_routine_kind("SELECT id FROM audit end", "mysql", "sql", "query");
+    let detail = format!("{:?} {:?}", query.edges(), query.analysis());
+    assert!(
+        edge(&query, "s.mutate", "s.audit.id", EdgeKind::Reads),
+        "{detail}"
+    );
+}
+
 /// 앞에 WITH가 붙은 DELETE도 CTE 몸체가 읽는 컬럼을 남긴다. 읽기 경로로 보내던 때에는 그
 /// 컬럼 읽기가 남았는데, DML 경로로 옮기면서 DELETE를 컬럼 분석기로 보내지 않아 사라졌다.
 #[test]
