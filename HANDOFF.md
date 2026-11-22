@@ -23,6 +23,47 @@
   `d91236b`), 독립 리뷰 반영 세 커밋(`5be9173`·`d872048`·`f9c700b`), HANDOFF 커밋(`0161c96`), PR #62 2차 리뷰 반영
   (`6144529`·`982941d`·`5699c2d`, push됨), 3차(델타) 리뷰 반영 커밋 `9528ca3`(parser)과 그 HANDOFF 커밋 `8fb92cc`, 그리고 4차(대항 행렬) 리뷰 반영
   `fbee2c3`·`60589e9`(parser)와 그 HANDOFF 커밋(아래 절, 아직 push 전)이 있다.
+- PR #62는 `main`에 `1365d37`로 스쿼시 머지됐다. 브랜치 `fix/postgres-ascii-identifier-fold`는 그 커밋에서 시작한
+  PostgreSQL 식별자 ASCII 접기 작업이다(아래 절).
+
+### PostgreSQL 식별자 ASCII 접기 (2026-11-22)
+
+근거와 결과의 정본은 RELEASE-NOTES `# Unreleased`의 해당 항목이다. SQLite ASCII 접기(아래 절)와 같은 모양의 작업이다.
+
+- 근거: PostgreSQL `src/backend/parser/scansup.c` `downcase_identifier`(REL_16_STABLE과 master가 같음)는 ASCII
+  `A`–`Z`를 늘 접고, 상위 비트 바이트는 `enc_is_single_byte`(`pg_database_encoding_max_length() == 1`)일 때만
+  `tolower()`에 넘긴다. 어휘 분석기(`scan.l`)와 `search_path` 값(`SplitIdentifierString`)이 모두
+  `downcase_truncate_identifier`로 이 함수를 쓴다. 이 세션의 PostgreSQL 16.15(UTF8, `C.UTF-8`)에서 확인했다:
+  `CREATE TABLE ΑΣ`·`Été (id, Nom)`은 `ΑΣ`·`Été`(컬럼 `nom`)로 저장, `ΑΣ`와 `ας` 공존 가능, 프로시저
+  `UPDATE ΑΣ`는 `ΑΣ`만 바꿈, `UPDATE ÉTÉ`는 `relation "ÉtÉ" does not exist`, `όνομα`·`PRÉNOM`은 없는 컬럼,
+  `ÉCHO(1)`은 함수 `Écho`를 부름, `CREATE SCHEMA ÉCOLE`·`SET search_path TO ÉCOLE`은 `École`, 현재 database로
+  한정한 `UPDATE postgres.s.ΑΣ`도 `ΑΣ`만 바꿈. `LATIN1` + `C` 로캘 DB에서도 `Été`는 그대로였다. 비-C 단일 바이트
+  로캘(`fr_FR.ISO-8859-1` 등)은 이 컨테이너에 없어 실행하지 못했다.
+- parser: `scope.rs`에 `fold_unquoted_postgres_identifier`(ASCII 소문자화)를 두고 `name()`·`name_for_dialect()`·
+  전이 테이블 이름(`new`/`old` 상수라 동작 변화 없음)·`lib.rs` `search_path_entry`가 모두 그것을 쓴다. 객체 단위
+  경로는 `body_relations::normalize_postgres`가 `scope::name`을 거치므로 따로 고칠 곳이 없었다. PostgreSQL
+  `catalog_key`·`column_key`는 원래 철자 그대로이고, 몸체 캐시 지문은 `relation_names`가 `name()`을 쓰므로 같은
+  규칙을 따른다. 다른 방언(Oracle·DB2의 `to_uppercase`, MySQL 컬럼의 `to_lowercase`)은 바꾸지 않았다.
+- 회귀 테스트 7개(수정 전 모두 실패 확인, 공용 함수를 `to_lowercase`로 되돌린 사본에서도 모두 실패):
+  `identifier_semantics.rs`의 그리스어(`ΑΣ` 단독·`ας` 공존), 악센트(`Été`/`Nom`, `ÉTÉ` 누락 문구, 뷰 계보),
+  비ASCII 컬럼(`ΌΝΟΜΑ`, `PRÉNOM` 거짓 매치 제거, `PRéNOM`은 계속 일치), routine 호출(`ÉCHO`→`Écho`), 3부분 이름
+  (`APP.s.ΑΣ`), `search_path.rs`의 `ÉCOLE`(공존하는 `école`이 아니라 `École`), `cache.rs`의 cold/warm 일치와 지문.
+  부분 변이: `name()`만 되돌리면 4개, `name_for_dialect()`만 되돌리면 3부분 이름 테스트, `search_path_entry`만
+  되돌리면 `search_path` 테스트가 잡는다.
+- 실제 PostgreSQL 대조: 네이티브 reader로 같은 DB를 수정 전·후 바이너리로 scan했다. 수정 전은 `writes s.ας`(거짓),
+  `s.touch references s.été … missing`, PL/pgSQL `UPDATE γ SET ΌΝΟΜΑ` 컬럼 누락이었고, 수정 후는 모두 서버 동작과
+  같다. 수집된 뷰 정의(`pg_get_viewdef`)·컬럼 기본값(`column_default`)·`pg_get_functiondef`의 `SET search_path`는 ASCII
+  소문자 밖 이름을 큰따옴표·문자열로 싣기 때문에 수정 전후가 같았다. 영향은 routine 원문(`prosrc`)·쿼리 파일·손으로
+  쓴 문서에 있다.
+- 검증: `cargo fmt --check`, `cargo build/test --workspace --locked`, `cargo clippy --workspace --all-targets --locked
+  -- -D warnings`, `Scripts/verify-accuracy.py --sqlglot --suite all --strict`(PostgreSQL 16, postgres 사용자로 실행 —
+  root에서는 initdb가 거부된다), `verify-contracts.py`, `verify-competitive.py`가 모두 통과했다.
+- 넓힘과 좁힘: RELEASE-NOTES 항목에 적었다. 넓힘은 비ASCII 대문자가 든 이름(`ΑΣ`·`Été`·`ΌΝΟΜΑ`·`Écho`)의 누락이
+  간선으로 바뀐 것, 좁힘은 Unicode 접기가 다른 객체(`ας`, 컬럼 `prénom`)에 이은 거짓 간선 제거다.
+- 후속 후보: 문서에 데이터베이스 인코딩·`LC_CTYPE`이 없어 단일 바이트 인코딩 DB의 `tolower()` 접기를 모델링하지
+  못한다(수집기가 `pg_database.encoding`·`datctype`을 실으면 가능). PostgreSQL 식별자 63바이트 절단
+  (`truncate_identifier`, NAMEDATALEN)도 모델링하지 않는다. `search_path_entry`의 따옴표 없는 이름 끝 판정은
+  `char::is_alphanumeric`이라 PostgreSQL(구분자나 공백까지)과 다를 수 있다 — 이번 범위 밖이라 확인하지 않았다.
 
 ### 라운드 3 (2026-11-22)
 
