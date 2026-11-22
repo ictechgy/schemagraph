@@ -965,7 +965,7 @@ fn parse_trigger_body(
     let inner = extract_trigger_inner(body).unwrap_or(body);
     let locations_trusted =
         std::ptr::eq(inner.as_ptr(), body.as_ptr()) && inner.len() == body.len();
-    let statements = parse_limits::parse_sql(dialect, inner.trim());
+    let statements = parse_limits::parse_sql_prefix(dialect, inner.trim());
     let mut parsed = ParsedTrigger {
         writes: Vec::new(),
         cte_writes: Vec::new(),
@@ -985,7 +985,10 @@ fn parse_trigger_body(
         locations_trusted,
     };
     match statements {
-        Ok(stmts) if !stmts.is_empty() => {
+        Ok(parse_limits::StatementPrefix {
+            statements: stmts,
+            unparsed,
+        }) if !stmts.is_empty() => {
             // 일부 T-SQL 파서는 DECLARE/SET/EXEC 조각을 성공으로 분류하지만
             // 변수와 동적 SQL의 의미는 AST에 남기지 않는다. 그런 몸체는
             // 절차형 추출기로 다시 읽어야 한다. trigger의 EXECUTE FUNCTION은
@@ -1007,15 +1010,38 @@ fn parse_trigger_body(
                 }
                 collect_trigger_stmt(stmt, &mut parsed, rules);
             }
+            if let Some(unparsed) = unparsed {
+                note_unparsed_after_end(&mut parsed, &unparsed.error);
+            }
             invalidate_temp_state_if_unsafe(&mut parsed, body, 0);
             Ok(parsed)
         }
         // EXECUTE FUNCTION 꼴 trigger는 본문 자체는 못 파지만 호출 대상은
         // 채취됐다 — 문장 파싱 실패를 호출 간선 포기 이유로 쓰지 않는다.
         _ if !parsed.calls.is_empty() => Ok(parsed),
+        Ok(parse_limits::StatementPrefix {
+            unparsed: Some(parse_limits::Unparsed { error: e, .. }),
+            ..
+        })
+        | Err(e) => Err(e.to_string()),
         Ok(_) => Err("no statement found in the body".to_owned()),
-        Err(e) => Err(e.to_string()),
     }
+}
+
+/// 최상위 `END` 뒤를 파싱하지 못한 몸체를 부분 분석으로 표시한다(`parse_limits::parse_sql_prefix`).
+///
+/// 그 `END` 앞의 문장은 이전처럼 간선을 남기지만, 뒤의 문장은 분석하지 않았으므로 `complete`를
+/// 주장하지 않는다.
+fn note_unparsed_after_end(parsed: &mut ParsedTrigger, error: &sqlparser::parser::ParserError) {
+    parsed.partial = true;
+    parsed.diagnostics.push(schemagraph_core::Diagnostic {
+        code: "SG_BODY_PARTIAL".into(),
+        message: format!(
+            "body text from a top-level END that follows a statement without a semicolon was not parsed; statements after it were not analyzed ({error})"
+        ),
+        location: None,
+        candidates: Vec::new(),
+    });
 }
 
 /// AST 도매 파싱이 성공해도 변수·동적 실행을 잃는 표면 구문인지 확인한다.
@@ -1999,37 +2025,19 @@ fn parse_procedural_body(
         temp_state_safe: true,
         locations_trusted: false,
     };
-    if let Some(reason) = state.take_tracking_limit() {
-        // 상한 뒤의 변수 값은 버렸으므로 그 뒤 동적 SQL을 상수로 접지 못했다.
-        parsed.partial = true;
-        parsed.diagnostics.push(schemagraph_core::Diagnostic {
-            code: "SG_VARIABLE_STATE_LIMIT".into(),
-            message: format!(
-                "{reason}; dynamic SQL after the limit was not folded from variable values"
-            ),
-            location: None,
-            candidates: Vec::new(),
-        });
-    }
-    let rules = CollectRules {
-        sqlite: dialect.is::<SQLiteDialect>(),
-        mysql: dialect.is::<MySqlDialect>(),
-        ..CollectRules::default()
+    note_tracking_limit(&mut parsed, &mut state);
+    let body_rules = ExtractedBody {
+        dialect,
+        rules: CollectRules {
+            sqlite: dialect.is::<SQLiteDialect>(),
+            mysql: dialect.is::<MySqlDialect>(),
+            ..CollectRules::default()
+        },
+        text_dialect,
+        format_shadowed,
     };
     for stmt in &stmts {
-        match parse_limits::parse_sql(dialect, stmt) {
-            Ok(list) => {
-                for mut s in list {
-                    if dialect.is::<PostgreSqlDialect>() {
-                        body_relations::normalize_postgres(&mut s);
-                    }
-                    collect_trigger_stmt(s, &mut parsed, rules);
-                }
-            }
-            // 추출기가 SQL이 아닌 조각을 문장으로 오인한 경우 — 하나의
-            // 실패가 전체를 쓰러뜨리지 않게 수만 센다.
-            Err(_) => unextracted += 1,
-        }
+        collect_extracted(stmt, &mut parsed, &mut unextracted, body_rules);
     }
     if ["IF", "ELSIF", "ELSEIF", "WHILE", "FOR", "CASE", "LOOP"]
         .iter()
@@ -2046,6 +2054,116 @@ fn parse_procedural_body(
     }
     invalidate_temp_state_if_unsafe(&mut parsed, body, unextracted);
     (parsed, unextracted)
+}
+
+/// 변수 추적 상한에 걸렸으면 그 뒤 동적 SQL을 접지 못했다고 부분 분석으로 표시한다.
+fn note_tracking_limit(parsed: &mut ParsedTrigger, state: &mut ExtractionState) {
+    if let Some(reason) = state.take_tracking_limit() {
+        // 상한 뒤의 변수 값은 버렸으므로 그 뒤 동적 SQL을 상수로 접지 못했다.
+        parsed.partial = true;
+        parsed.diagnostics.push(schemagraph_core::Diagnostic {
+            code: "SG_VARIABLE_STATE_LIMIT".into(),
+            message: format!(
+                "{reason}; dynamic SQL after the limit was not folded from variable values"
+            ),
+            location: None,
+            candidates: Vec::new(),
+        });
+    }
+}
+
+/// 절차형 몸체에서 꺼낸 문장을 파싱해 모을 때 몸체 전체에 같은 판정이다.
+#[derive(Clone, Copy)]
+struct ExtractedBody<'a> {
+    /// 문장을 읽는 sqlparser 방언.
+    dialect: &'a dyn Dialect,
+    /// 문장 수집 판정(`collect_trigger_stmt`).
+    rules: CollectRules,
+    /// 동적 SQL 상수 접기의 방언.
+    text_dialect: constant_sql::TextDialect,
+    /// PostgreSQL `format`이 사용자 함수로 가려졌는가.
+    format_shadowed: bool,
+}
+
+/// 추출한 조각 하나에서 최상위 `END` 뒤를 다시 꺼내는 횟수 상한.
+///
+/// 세미콜론 없는 조각은 다음 `;`까지 이어져, 다시 꺼낼 때마다 남은 텍스트 전체를 다시
+/// 토큰화한다. 상한이 없으면 일은 `END` 수 × 조각 길이로 늘어난다(TRY·CATCH 2천 쌍, 200KB 몸체에서
+/// 상한 64는 디버그 빌드로 이전의 20배인 7초였다). 상한까지의 일은 조각 길이에 선형이고, 넘은
+/// 나머지는 미추출로 센다. T-SQL `TRY`·`CATCH` 한 쌍이 두 번을 쓰므로 세미콜론 없는 한 조각에
+/// 그런 블록 여덟 쌍까지는 모두 꺼낸다.
+const MAX_REEXTRACTIONS: usize = 16;
+
+/// 추출한 문장 조각 하나를 파싱해 모은다.
+///
+/// 조각은 다음 `;`까지라, 세미콜론을 생략한 T-SQL `UPDATE a … END TRY BEGIN CATCH UPDATE b … END
+/// CATCH`는 한 조각이다. sqlparser는 `UPDATE a` 뒤의 `END`에서 멈추고, 거기서 다시 읽어도
+/// `END TRY` 뒤에 `;`가 없어 실패한다(`parse_limits::parse_sql_prefix`). 그러면 앞 문장은 거두고
+/// `END`부터의 나머지를 같은 추출기로 다시 꺼낸다 — `END`·`BEGIN`·`TRY`·`CATCH`를 벗기면 `UPDATE b`가
+/// 문장 머리로 나온다. 다시 꺼낸 문장은 원문 순서대로 모은다(임시 relation 상태가 순서에 달렸다).
+fn collect_extracted(
+    stmt: &str,
+    parsed: &mut ParsedTrigger,
+    unextracted: &mut usize,
+    body: ExtractedBody<'_>,
+) {
+    let mut rounds = 0usize;
+    let mut pending = collect_extracted_piece(stmt, parsed, unextracted, body, &mut rounds);
+    pending.reverse();
+    while let Some(piece) = pending.pop() {
+        let mut more = collect_extracted_piece(&piece, parsed, unextracted, body, &mut rounds);
+        more.reverse();
+        pending.extend(more);
+    }
+}
+
+/// 조각 하나를 파싱해 모으고, 최상위 `END` 뒤를 읽지 못했으면 그 나머지에서 다시 꺼낸 조각을
+/// 돌려준다.
+///
+/// 나머지는 블록이 끝난 자리라 변수 값을 모르므로, 평가를 끈 새 상태로 꺼낸다(동적 SQL을 변수 값으로
+/// 접지 않고 미추출로 센다). 나머지의 위치를 모르거나 `MAX_REEXTRACTIONS`를 넘으면 조각 하나를
+/// 미추출로 센다.
+fn collect_extracted_piece(
+    piece: &str,
+    parsed: &mut ParsedTrigger,
+    unextracted: &mut usize,
+    body: ExtractedBody<'_>,
+    rounds: &mut usize,
+) -> Vec<String> {
+    let prefix = match parse_limits::parse_sql_prefix(body.dialect, piece) {
+        Ok(prefix) => prefix,
+        // 추출기가 SQL이 아닌 조각을 문장으로 오인한 경우 — 하나의
+        // 실패가 전체를 쓰러뜨리지 않게 수만 센다.
+        Err(_) => {
+            *unextracted += 1;
+            return Vec::new();
+        }
+    };
+    for mut s in prefix.statements {
+        if body.dialect.is::<PostgreSqlDialect>() {
+            body_relations::normalize_postgres(&mut s);
+        }
+        collect_trigger_stmt(s, parsed, body.rules);
+    }
+    let Some(unparsed) = prefix.unparsed else {
+        return Vec::new();
+    };
+    let rest = unparsed
+        .from
+        .and_then(|from| piece.get(from..))
+        .filter(|_| *rounds < MAX_REEXTRACTIONS);
+    let Some(rest) = rest else {
+        *unextracted += 1;
+        return Vec::new();
+    };
+    *rounds += 1;
+    let mut state = ExtractionState::new(body.text_dialect, body.format_shadowed);
+    state.invalidate();
+    let (pieces, missed) = extract_procedural_statements(rest, &mut state, false);
+    *unextracted += missed;
+    note_tracking_limit(parsed, &mut state);
+    parsed.scalar_symbols.extend(state.declared_symbols);
+    pieces
 }
 
 /// 동적·미추출·DROP 뒤의 임시 relation은 실행 순서를 완전히 복원하지 못하면
@@ -5262,6 +5380,34 @@ mod tests {
         }));
         assert!(!g.edges().iter().any(|edge| {
             edge.from.as_str() == "dbo.orders.trg_touch" && edge.to.as_str().ends_with(".deleted")
+        }));
+    }
+
+    #[test]
+    fn sqlserver_trigger의_최상위_end_뒤를_못_읽으면_부분_분석이다() {
+        // `UPDATE customers …` 뒤에 `;` 없이 `END TRY`가 오고, `END TRY` 뒤에도 `;`가 없어
+        // sqlparser가 다시 읽지 못한다. trigger는 절차형 추출로 가지 않으므로 앞 문장의 간선을
+        // 남기고 부분 분석으로 표시한다. 이전에는 CATCH의 `UPDATE orders`를 버리고 complete였다.
+        let doc = sqlserver_trigger_doc(
+            "CREATE TRIGGER trg_touch AFTER UPDATE ON orders AS BEGIN \
+             SET NOCOUNT ON; BEGIN TRY; UPDATE customers SET name = 'x' END TRY \
+             BEGIN CATCH; UPDATE orders SET customer_id = 0; END CATCH; END",
+        );
+        let (g, notes) = build(&doc);
+        let analysis = &g.analysis()[&VertexId::from_raw("dbo.orders.trg_touch")];
+        assert_eq!(
+            analysis.state,
+            schemagraph_core::AnalysisState::Partial,
+            "{notes:?} {:?}",
+            analysis.diagnostics
+        );
+        assert!(analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "SG_BODY_PARTIAL" && diagnostic.message.contains("top-level END")
+        }));
+        assert!(g.edges().iter().any(|edge| {
+            edge.kind == EdgeKind::Writes
+                && edge.from.as_str() == "dbo.orders.trg_touch"
+                && edge.to.as_str() == "dbo.customers"
         }));
     }
 

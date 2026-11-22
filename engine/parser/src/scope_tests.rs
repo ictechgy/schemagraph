@@ -1562,6 +1562,135 @@ fn mysql_delete_using_resolves_the_from_list_through_using_aliases() {
     );
 }
 
+/// 세미콜론을 생략한 T-SQL의 `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`(문법: MicrosoftDocs
+/// `try-catch-transact-sql.md`, 세미콜론은 대부분 문장에서 선택: `transact-sql-syntax-conventions…`)는
+/// 세미콜론을 붙인 같은 몸체와 같은 간선을 남긴다. sqlparser는 `;` 없는 문장 뒤의 `END`에서 멈추고
+/// 성공을 돌려줘, `END TRY` 뒤의 CATCH 문장이 소리 없이 빠진 채 `complete`였다.
+#[test]
+fn tsql_try_catch_without_semicolons_keeps_the_statements_after_end() {
+    let without = "BEGIN TRY\n  UPDATE audit SET name = 'x' WHERE id = 1\nEND TRY\nBEGIN CATCH\n  INSERT INTO orders (id, amount) SELECT id, id FROM customers\nEND CATCH";
+    let with = "BEGIN TRY\n  UPDATE audit SET name = 'x' WHERE id = 1;\nEND TRY\nBEGIN CATCH\n  INSERT INTO orders (id, amount) SELECT id, id FROM customers;\nEND CATCH";
+    let facts = |body: &str| {
+        let graph = scan_routine_kind(body, "sqlserver", "sql", "procedure");
+        let mut edges: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter(|edge| edge.from.as_str() == "s.mutate")
+            .map(|edge| format!("{:?} {}", edge.kind, edge.to))
+            .collect();
+        edges.sort();
+        let analysis = &graph.analysis()[&VertexId::from_raw("s.mutate")];
+        (edges, analysis.state, graph.limitations().to_vec())
+    };
+    let (edges, state, limitations) = facts(without);
+    let detail = format!("{edges:?} {limitations:?}");
+    for expected in [
+        "Writes s.audit",
+        "Writes s.audit.name",
+        "Writes s.orders",
+        "Writes s.orders.amount",
+        "Reads s.customers",
+    ] {
+        assert!(edges.iter().any(|edge| edge == expected), "{detail}");
+    }
+    assert_eq!(state, AnalysisState::Complete, "{detail}");
+    assert_eq!((edges, state, limitations), facts(with));
+}
+
+/// 최상위 `END` 뒤를 다시 읽지 못하면 그 앞 문장의 간선은 남기되 `complete`를 주장하지 않는다.
+/// 절차형 추출로 가는 몸체는 남은 조각을 미추출로 세고, 통째로 읽은 몸체는 이름 붙은
+/// `SG_BODY_PARTIAL` 진단을 단다. 이전에는 둘 다 뒤 문장을 소리 없이 버리고 `complete`였다.
+#[test]
+fn statements_after_an_unparsed_top_level_end_are_not_claimed_complete() {
+    let whole = scan_routine_kind(
+        "UPDATE audit SET name = 'x' END TRY UPDATE orders SET amount = 0",
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?} {:?}", whole.edges(), whole.analysis());
+    let analysis = &whole.analysis()[&VertexId::from_raw("s.mutate")];
+    assert!(
+        edge(&whole, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(!touches(&whole, "s.mutate", "s.orders"), "{detail}");
+    assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+    assert!(
+        analysis.diagnostics.iter().any(|diagnostic| diagnostic.code == "SG_BODY_PARTIAL"
+            && diagnostic.message.starts_with(
+                "body text from a top-level END that follows a statement without a semicolon was not parsed"
+            )),
+        "{detail}"
+    );
+    // DECLARE가 있어 절차형 추출로 가는 몸체: `END` 뒤 조각은 같은 추출기로 다시 꺼낸다. 추출기는
+    // `END` 뒤 한 단어를 블록 꼬리로 벗기고, 남은 `orders`처럼 문장 머리가 아닌 조각은 미추출로 센다.
+    let extracted = scan_routine_kind(
+        "DECLARE @n int; UPDATE audit SET name = 'x' END frobnicate orders",
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?} {:?}", extracted.edges(), extracted.limitations());
+    assert!(
+        edge(&extracted, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert_eq!(
+        extracted.analysis()[&VertexId::from_raw("s.mutate")].state,
+        AnalysisState::Partial,
+        "{detail}"
+    );
+    assert!(
+        extracted
+            .limitations()
+            .iter()
+            .any(|note| note.contains("body statement(s) not extracted")),
+        "{detail}"
+    );
+}
+
+/// 세미콜론 없는 조각에서 최상위 `END` 뒤를 다시 꺼내는 일은 조각마다 `MAX_REEXTRACTIONS`번까지다.
+/// 다시 꺼낼 때마다 남은 텍스트를 다시 토큰화하므로, 상한이 없으면 `TRY`·`CATCH`가 많은 몸체에서
+/// 일이 블록 수 × 길이로 커진다. 상한 안(여덟 쌍)은 모두 쓰기 간선이 되고, 넘은 나머지는
+/// 미추출로 세어 부분 분석이다.
+#[test]
+fn reextraction_after_end_is_bounded_per_piece() {
+    let scan_pairs = |pairs: usize| {
+        let tables: Vec<ObjectDoc> = (0..2 * pairs)
+            .map(|index| object(&format!("t{index}"), &["id"]))
+            .collect();
+        let body: String = (0..pairs)
+            .map(|pair| {
+                format!(
+                    "BEGIN TRY UPDATE t{} SET id = 1 END TRY BEGIN CATCH UPDATE t{} SET id = 2 END CATCH ",
+                    2 * pair,
+                    2 * pair + 1
+                )
+            })
+            .collect();
+        let graph = scan_routine_with_objects(&body, "sqlserver", "sql", "procedure", None, tables);
+        let written = (0..2 * pairs)
+            .filter(|index| edge(&graph, "s.mutate", &format!("s.t{index}"), EdgeKind::Writes))
+            .count();
+        let state = graph.analysis()[&VertexId::from_raw("s.mutate")].state;
+        (written, state, graph.limitations().to_vec())
+    };
+    let within = super::MAX_REEXTRACTIONS / 2;
+    let (written, state, limitations) = scan_pairs(within);
+    assert_eq!(written, 2 * within, "{limitations:?}");
+    assert_eq!(state, AnalysisState::Complete, "{limitations:?}");
+    let (written, state, limitations) = scan_pairs(within + 1);
+    assert_eq!(written, 2 * within + 1, "{limitations:?}");
+    assert_eq!(state, AnalysisState::Partial, "{limitations:?}");
+    assert!(
+        limitations
+            .iter()
+            .any(|note| note.contains("1 body statement(s) not extracted")),
+        "{limitations:?}"
+    );
+}
+
 /// 앞에 WITH가 붙은 DELETE도 CTE 몸체가 읽는 컬럼을 남긴다. 읽기 경로로 보내던 때에는 그
 /// 컬럼 읽기가 남았는데, DML 경로로 옮기면서 DELETE를 컬럼 분석기로 보내지 않아 사라졌다.
 #[test]
