@@ -2575,30 +2575,54 @@ fn opens_cte(after_with: &str) -> bool {
 ///
 /// `GET DIAGNOSTICS @n = ROW_COUNT`·`WAITFOR (RECEIVE TOP(1) @s = message_body FROM q)`처럼 무시하는
 /// 문장도 변수에 값을 넣는다. 그 대입은 추적하지 않으므로, 버리지 않으면 뒤 `EXEC(@s)`를 옛 값으로
-/// 접어 실행되지 않는 문장이 쓰기 간선이 된다. 비교 연산(`<=`·`>=`·`!=`)과 이름이 아닌 왼쪽은 건너뛴다.
-/// 이름 하나만 버리므로 다른 변수의 추적은 그대로다.
+/// 접어 실행되지 않는 문장이 쓰기 간선이 된다. 왼쪽 이름은 공백·주석을 건너뛰고 찾는다
+/// (`@s /*x*/ = …`). 비교 연산(`<=`·`>=`·`!=`·`==`)은 건너뛴다. 왼쪽이 이름이 아니면(리터럴·괄호 등)
+/// 어느 변수인지 모르므로 추적 값을 모두 버린다. 비교식의 `=`(`CASE WHEN @s = N'' …`)도 대입으로
+/// 보므로 참인 접기를 버릴 수 있다 — 그러면 동적 SQL이 미추출로 남아 몸체는 부분 분석이다.
 fn invalidate_assigned_names(clause: &str, state: &mut ExtractionState) {
     let quotes = QuoteScanner::new(clause);
     let bytes = clause.as_bytes();
+    // `=` 바로 앞(공백·주석 제외)의 이름, 그리고 이름이 아닌 바로 앞 바이트.
+    let (mut name, mut operator): (Option<&str>, Option<u8>) = (None, None);
     let mut i = 0usize;
     while i < bytes.len() {
         if let Some(end) = quotes.end(i) {
+            if !matches!(bytes[i], b'-' | b'/') {
+                // 문자열·인용 식별자 — 그 뒤 `=`의 왼쪽은 변수 이름이 아니다.
+                (name, operator) = (None, Some(bytes[i]));
+            }
             i = end;
             continue;
         }
-        if bytes[i] == b'=' {
-            let before = clause[..i].trim_end();
-            let start = before
-                .char_indices()
-                .rev()
-                .find(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '#' | '$')))
-                .map_or(0, |(at, c)| at + c.len_utf8());
-            let name = &before[start..];
-            if !name.is_empty() && !name.bytes().all(|b| b.is_ascii_digit()) {
-                state.invalidate_variable(name);
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace() {
+            i += 1;
+        } else if byte == b'@' || is_ident_char(byte) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i] == b'@' || is_ident_char(bytes[i])) {
+                i += 1;
             }
+            (name, operator) = (Some(&clause[start..i]), None);
+        } else if byte == b'=' {
+            let comparison = matches!(operator, Some(b'<' | b'>' | b'!' | b'='))
+                || bytes.get(i + 1) == Some(&b'=');
+            if !comparison {
+                match name.filter(|name| !name.bytes().all(|b| b.is_ascii_digit())) {
+                    Some(name) => state.invalidate_variable(name),
+                    None => state.invalidate_all_variables(),
+                }
+            }
+            (name, operator) = (None, Some(b'='));
+            i += 1;
+        } else {
+            // PL/pgSQL `:=`의 `:`는 왼쪽 이름을 지우지 않는다.
+            if byte != b':' {
+                name = None;
+            }
+            operator = Some(byte);
+            i += 1;
         }
-        i += 1;
     }
 }
 

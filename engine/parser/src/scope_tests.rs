@@ -1974,6 +1974,10 @@ fn skipped_clause_assignments_never_fold_a_stale_value() {
         "WAITFOR (RECEIVE TOP(1) @s = message_body FROM q), TIMEOUT 1000; EXEC(@s);",
         "GET DIAGNOSTICS @s = ROW_COUNT; EXEC(@s);",
         "SET @s -= 1; EXEC(@s);",
+        // 주석이 `=` 앞에 있어도 왼쪽 이름을 찾는다.
+        "WAITFOR (RECEIVE TOP(1) @s /*x*/ = message_body FROM q), TIMEOUT 5 EXEC(@s)",
+        // 왼쪽이 이름이 아니면 어느 변수인지 모르므로 모두 버린다.
+        "GET DIAGNOSTICS (@s) = ROW_COUNT; EXEC(@s);",
     ] {
         let graph = scan_routine_kind(
             &format!("{prefix}{clause}"),
@@ -1989,6 +1993,21 @@ fn skipped_clause_assignments_never_fold_a_stale_value() {
             "{detail}"
         );
     }
+    // 주석을 건너뛰고 찾은 이름(@s)만 버린다 — 다른 변수(@t)의 접기는 그대로다.
+    let targeted = scan_routine_kind(
+        &format!(
+            "{prefix}DECLARE @t nvarchar(max) = N'UPDATE orders SET amount = 1'; WAITFOR (RECEIVE TOP(1) @s /*x*/ = message_body FROM q), TIMEOUT 5 EXEC(@t)"
+        ),
+        "sqlserver",
+        "sql",
+        "procedure",
+    );
+    let detail = format!("{:?} {:?}", targeted.edges(), targeted.limitations());
+    assert!(
+        edge(&targeted, "s.mutate", "s.orders", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(!touches(&targeted, "s.mutate", "s.audit"), "{detail}");
     let reassigned = scan_routine_kind(
         &format!("{prefix}PRINT 'x' SET @s = N'UPDATE orders SET amount = 1'; EXEC(@s)"),
         "sqlserver",
