@@ -3497,8 +3497,8 @@ struct CollectRules {
 struct CteWrite {
     /// 쓰기 대상 — `ParsedTrigger::writes`와 같은 모양이다.
     target: (Option<String>, String),
-    /// CTE 이름과 얼마나 같은가. 철자가 다르면 문서의 대소문자 규칙으로 판정한다.
-    matched: cte_target::Match,
+    /// 가장 가까운 CTE 이름과 일치 정도. 철자가 다르면 문서의 비교 규칙으로 판정한다.
+    candidate: cte_target::Candidate,
 }
 
 /// 문장과 안쪽 문장의 쓰기 대상을 모으되, 앞에 WITH가 붙은 DML이 그 WITH의 CTE 이름으로 쓰는
@@ -3546,14 +3546,14 @@ fn cte_wrapped_dml(statement: &Statement) -> Option<(*const Statement, Vec<Strin
     Some((dml as *const Statement, names))
 }
 
-/// 한정자 없는 대상이 어떤 CTE 이름과 대소문자를 빼고 같으면 그 일치를 돌려준다.
+/// 한정자 없는 대상이 어떤 CTE 이름의 후보(`cte_target::name_match`)이면 그 일치를 돌려준다.
 fn cte_write(target: &(Option<String>, String), names: &[String]) -> Option<CteWrite> {
     if target.0.is_some() {
         return None;
     }
-    cte_target::name_match(&target.1, names).map(|matched| CteWrite {
+    cte_target::name_match(&target.1, names).map(|candidate| CteWrite {
         target: target.clone(),
-        matched,
+        candidate,
     })
 }
 
@@ -3563,8 +3563,8 @@ fn cte_write(target: &(Option<String>, String), names: &[String]) -> Option<CteW
 /// 진단으로 부분 분석을 표시하며, 실제 테이블이면 평범한 쓰기로 `writes`에 옮긴다.
 fn settle_cte_writes(parsed: &mut ParsedTrigger, context: cte_target::Context<'_>) {
     for write in std::mem::take(&mut parsed.cte_writes) {
-        let outcome = cte_target::outcome(context.rule, context.case, write.matched);
-        if let Some(message) = context.message(&write.target.1, outcome) {
+        let outcome = cte_target::outcome(context.rule, context.case, write.candidate.matched);
+        if let Some(message) = context.message(&write.target.1, &write.candidate, outcome) {
             cte_target::push_diagnostic(&mut parsed.diagnostics, &message);
             parsed.partial = true;
         }

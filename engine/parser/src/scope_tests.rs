@@ -112,6 +112,24 @@ fn scan_routine_in_context(
     kind: &str,
     context: Option<CollectionContext>,
 ) -> Graph {
+    scan_routine_with_objects(body, dialect, language, kind, context, Vec::new())
+}
+
+/// `scan_routine_in_context`의 카탈로그에 테이블을 더한다(ASCII 밖 이름의 대상 등).
+fn scan_routine_with_objects(
+    body: &str,
+    dialect: &str,
+    language: &str,
+    kind: &str,
+    context: Option<CollectionContext>,
+    extra: Vec<ObjectDoc>,
+) -> Graph {
+    let mut objects = vec![
+        object("orders", &["id", "customer_id", "amount"]),
+        object("customers", &["id", "name"]),
+        object("audit", &["id", "name"]),
+    ];
+    objects.extend(extra);
     let doc = CatalogDocument {
         context,
         dependencies: Vec::new(),
@@ -121,11 +139,7 @@ fn scan_routine_in_context(
         limitations: vec![],
         schemas: vec![SchemaDoc {
             name: "s".into(),
-            objects: vec![
-                object("orders", &["id", "customer_id", "amount"]),
-                object("customers", &["id", "name"]),
-                object("audit", &["id", "name"]),
-            ],
+            objects,
             routines: vec![RoutineDoc {
                 name: "mutate".into(),
                 kind: kind.into(),
@@ -945,6 +959,8 @@ fn sqlserver_dml_through_a_cte_is_partial_without_guessed_targets() {
 #[test]
 fn unverified_dialects_keep_the_object_write_of_a_cte_named_target() {
     const UNVERIFIED: &str = "DML target 'audit' names a WITH query; this dialect's rule for such targets is unverified; the write edge is kept, but target columns are not resolved";
+    // 철자가 다르면 같은 이름이라고 단정하지 않는다.
+    const UNVERIFIED_CASE: &str = "DML target 'audit' may name the WITH query 'Audit'; this dialect's rule for such targets is unverified; the write edge is kept, but target columns are not resolved";
     for dialect in ["mariadb", "h2", "external"] {
         for (kind, body) in [
             (
@@ -984,11 +1000,16 @@ fn unverified_dialects_keep_the_object_write_of_a_cte_named_target() {
                 !edge(&graph, "s.mutate", "s.customers.name", EdgeKind::Writes),
                 "{detail}"
             );
+            let expected = if body.starts_with("WITH Audit") {
+                UNVERIFIED_CASE
+            } else {
+                UNVERIFIED
+            };
             assert!(
                 analysis
                     .diagnostics
                     .iter()
-                    .any(|diagnostic| diagnostic.message == UNVERIFIED),
+                    .any(|diagnostic| diagnostic.message == expected),
                 "{detail}"
             );
             assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
@@ -1101,53 +1122,48 @@ fn cte_target_diagnostics_name_each_target() {
     }
 }
 
-/// SQL Server CTE 이름은 관계 이름처럼 데이터베이스 collation을 따른다(SQL Server 문서: 데이터베이스
-/// collation은 그 데이터베이스의 모든 메타데이터와 문자열에 쓰인다). 대소문자만 다른 대상은 `_CI`
-/// collation에서 CTE이고 `_CS`·`_BIN2`에서 같은 이름의 실제 테이블이다. collation을 모르거나 터키어
-/// `_CI`처럼 ASCII 접기로 확정하지 않는 collation이면 판정하지 않는다 — SQL Server 기본 collation은
-/// `_CI`라 실제 테이블로 단정하면 거짓 쓰기 간선과 거짓 complete가 된다. 그때는 쓰기를 남기되
-/// 이름 붙은 진단과 부분 분석으로 알리고 컬럼 효과를 추측하지 않는다. ASCII 밖 글자의 대소문자만
-/// 다른 이름도 `_CI`에서 판정하지 않는다.
-#[test]
-fn sqlserver_cte_target_names_follow_the_collation() {
-    let context = |collation: Option<&str>| CollectionContext {
+/// CTE 이름 판정 테스트의 수집 context다.
+fn naming_context(collation: Option<&str>, lctn: Option<u8>) -> CollectionContext {
+    CollectionContext {
         source_id: "fixture".into(),
         database: None,
         schema_filter: None,
         catalog_complete: true,
-        lower_case_table_names: None,
+        lower_case_table_names: lctn,
         collation: collation.map(str::to_owned),
-    };
+    }
+}
+
+/// SQL Server 문서는 어느 collation이 CTE 이름을 비교하는지 말하지 않는다 — 데이터베이스 안 객체
+/// 식별자는 데이터베이스 collation, 변수·GOTO 레이블·임시 테이블은 인스턴스 collation, 포함된
+/// 데이터베이스는 카탈로그 collation이라고만 한다. 그래서 대상과 CTE 이름이 대소문자만 다르면
+/// 문서의 데이터베이스 collation이 무엇이든(`_CI`·`_CS`·`_BIN2`·터키어·없음) 판정하지 않는다 —
+/// 쓰기는 남기고 이름 붙은 진단과 부분 분석, 컬럼 효과 없음. 이전에는 `_CI`에서 쓰기를 지우고
+/// `_CS`·`_BIN2`에서 실제 테이블로 단정해 `complete`를 냈다. 철자가 정확히 같으면 어느 collation이든
+/// CTE다("Any reference to expression_name in the query uses the common table expression").
+#[test]
+fn sqlserver_case_only_cte_targets_are_unproven_under_every_collation() {
     let scan = |body: &str, collation: Option<&str>| {
         scan_routine_in_context(
             body,
             "sqlserver",
             "sql",
             "procedure",
-            Some(context(collation)),
+            Some(naming_context(collation, None)),
         )
     };
     let update = "WITH Audit AS (SELECT id, name FROM customers) UPDATE audit SET name = 'x'";
     let delete = "WITH Audit AS (SELECT id, name FROM customers) DELETE FROM audit WHERE id = 1";
-    for body in [update, delete] {
-        for collation in ["Latin1_General_CS_AS", "Latin1_General_BIN2"] {
-            let graph = scan(body, Some(collation));
-            let detail = format!(
-                "{body} {collation}: {:?} {:?}",
-                graph.edges(),
-                graph.limitations()
-            );
-            assert!(
-                edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
-                "{detail}"
-            );
-            assert!(!has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"), "{detail}");
-        }
-        let graph = scan(body, Some("SQL_Latin1_General_CP1_CI_AS"));
-        let detail = format!("{body} CI: {:?} {:?}", graph.edges(), graph.limitations());
-        assert!(!touches(&graph, "s.mutate", "s.audit"), "{detail}");
-        assert!(has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"), "{detail}");
-        for collation in [None, Some("Turkish_CI_AS")] {
+    let exact = "WITH audit AS (SELECT id, name FROM customers) UPDATE audit SET name = 'x'";
+    for collation in [
+        None,
+        Some("SQL_Latin1_General_CP1_CI_AS"),
+        Some("Latin1_General_CS_AS"),
+        Some("Latin1_General_BIN2"),
+        Some("Turkish_CI_AS"),
+        Some("Latin1_General_100_CI_AI_SC_UTF8"),
+    ] {
+        for body in [update, delete] {
             let graph = scan(body, collation);
             let detail = format!(
                 "{body} {collation:?}: {:?} {:?}",
@@ -1164,59 +1180,169 @@ fn sqlserver_cte_target_names_follow_the_collation() {
                 "{detail}"
             );
             assert!(
-                analysis
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.message.contains(
-                        "differ only in letter case and the document does not prove the case rule"
-                    )),
+                analysis.diagnostics.iter().any(|diagnostic| diagnostic.message
+                    == "DML target 'audit' may name the WITH query 'Audit'; the names differ only in letter case and the case rule for WITH names is not proven (SQL Server does not document which collation compares them); the write edge is kept, but target columns are not resolved"),
                 "{detail}"
             );
             assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
         }
+        let graph = scan(exact, collation);
+        let detail = format!("exact {collation:?}: {:?}", graph.edges());
+        assert!(!touches(&graph, "s.mutate", "s.audit"), "{detail}");
+        assert!(
+            graph.analysis()[&VertexId::from_raw("s.mutate")]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("SQL Server writes through it")),
+            "{detail}"
+        );
     }
-    let sensitive = scan(update, Some("Latin1_General_CS_AS"));
-    assert!(edge(
-        &sensitive,
-        "s.mutate",
-        "s.audit.name",
-        EdgeKind::Writes
-    ));
-    let other_case = scan(
-        "WITH Été AS (SELECT id, name FROM customers) UPDATE été SET name = 'x'",
-        Some("SQL_Latin1_General_CP1_CI_AS"),
-    );
-    assert!(other_case.analysis()[&VertexId::from_raw("s.mutate")]
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.message.contains("does not prove the case rule")));
+}
+
+/// 대상과 CTE 이름의 바이트가 다르고 ASCII 밖 글자가 있으면 바이트 비교 규칙(MySQL
+/// `lower_case_table_names`=0)에서만 다른 이름으로 증명된다. 접는 규칙(SQL Server `_CI`·`Greek_CI`,
+/// 폭을 무시하는 `_CS_AS`, MySQL 1·2)이나 모르는 규칙(collation 없음, MariaDB·`external`)에서는
+/// 판정하지 않는다 — 쓰기는 남기고 이름 붙은 진단과 부분 분석. 이전에는 `str::to_lowercase`로
+/// 비교해 그리스어 어말 시그마(`ΑΣ`→`ας`)·전각(`ａｕｄｉｔ`)·악센트(`äudit`) 차이를 "다른 이름"으로
+/// 단정했고, 실제 테이블 쓰기와 추측한 컬럼 쓰기, `complete`를 냈다. MySQL 1·2에서 ASCII 밖 글자가
+/// 섞인 이름(`étAPE`·`étape`)은 대소문자만 다르다고 단정해 쓰기를 지웠다.
+#[test]
+fn non_ascii_cte_target_names_are_unproven_under_folding_rules() {
+    let cases = [
+        // (CTE 이름, 대상)
+        ("ασ", "ΑΣ"),
+        ("ａｕｄｉｔ", "audit"),
+        ("äudit", "audit"),
+        // ASCII 글자의 대소문자만 다르더라도 ASCII 밖 글자가 섞이면 ASCII 접기로 증명하지 않는다.
+        ("étAPE", "étape"),
+    ];
+    let scan = |dialect: &str, context: Option<CollectionContext>, cte: &str, target: &str| {
+        scan_routine_with_objects(
+            &format!(
+                "WITH {cte} AS (SELECT id, name FROM customers) UPDATE {target} SET name = 'x'"
+            ),
+            dialect,
+            "sql",
+            "procedure",
+            context,
+            vec![
+                object("ΑΣ", &["id", "name"]),
+                object("étape", &["id", "name"]),
+            ],
+        )
+    };
+    for (cte, target) in cases {
+        for (dialect, context) in [
+            (
+                "sqlserver",
+                Some(naming_context(Some("SQL_Latin1_General_CP1_CI_AS"), None)),
+            ),
+            ("sqlserver", Some(naming_context(Some("Greek_CI_AS"), None))),
+            (
+                "sqlserver",
+                Some(naming_context(Some("Latin1_General_CS_AS"), None)),
+            ),
+            ("sqlserver", None),
+            ("mysql", Some(naming_context(None, Some(1)))),
+            ("mysql", Some(naming_context(None, Some(2)))),
+            ("mysql", None),
+            ("mariadb", None),
+            ("external", None),
+        ] {
+            let graph = scan(dialect, context.clone(), cte, target);
+            let detail = format!(
+                "{dialect} {context:?} {cte}/{target}: {:?} {:?}",
+                graph.edges(),
+                graph.limitations()
+            );
+            let analysis = &graph.analysis()[&VertexId::from_raw("s.mutate")];
+            assert!(
+                edge(&graph, "s.mutate", &format!("s.{target}"), EdgeKind::Writes),
+                "{detail}"
+            );
+            assert!(
+                !edge(
+                    &graph,
+                    "s.mutate",
+                    &format!("s.{target}.name"),
+                    EdgeKind::Writes
+                ),
+                "{detail}"
+            );
+            assert!(
+                analysis.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "SG_DML_TARGET_SHAPE"
+                        && diagnostic
+                            .message
+                            .contains(&format!("'{target}' may name the WITH query"))
+                }),
+                "{detail}"
+            );
+            assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+        }
+        // 바이트 비교(MySQL 0)와 대상을 실제 테이블로 여는 SQLite에서는 평범한 UPDATE다.
+        for (dialect, context) in [
+            ("mysql", Some(naming_context(None, Some(0)))),
+            ("sqlite", None),
+        ] {
+            let graph = scan(dialect, context, cte, target);
+            let detail = format!("{dialect} {cte}/{target}: {:?}", graph.edges());
+            assert!(
+                edge(
+                    &graph,
+                    "s.mutate",
+                    &format!("s.{target}.name"),
+                    EdgeKind::Writes
+                ),
+                "{detail}"
+            );
+            assert!(!has_diagnostic(&graph, "SG_DML_TARGET_SHAPE"), "{detail}");
+            assert_eq!(
+                graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+                AnalysisState::Complete,
+                "{detail}"
+            );
+        }
+    }
 }
 
 /// 대소문자를 무시하는 문서에서 철자만 다른 같은 CTE 이름 대상(`dupes`·`DUPES`)은 한 번만 센다.
+/// 그리스어도 같다 — `str::to_lowercase`는 `ΑΣ`를 어말 시그마 `ας`로 바꿔, 그 규칙에서 같은 이름인
+/// `ΑΣ`·`ασ`를 두 대상으로 셌다. 철자 그대로 비교하는 문서(MySQL 0)에서는 접지 않는다.
 #[test]
 fn cte_target_diagnostics_fold_names_under_a_case_insensitive_rule() {
-    let graph = scan_routine_in_context(
-        "WITH Dupes AS (SELECT id FROM orders) DELETE FROM dupes; WITH DUPES AS (SELECT id FROM orders) DELETE FROM DUPES",
-        "sqlserver",
-        "sql",
-        "procedure",
-        Some(CollectionContext {
-            source_id: "fixture".into(),
-            database: None,
-            schema_filter: None,
-            catalog_complete: true,
-            lower_case_table_names: None,
-            collation: Some("SQL_Latin1_General_CP1_CI_AS".into()),
-        }),
-    );
-    let messages: Vec<&str> = graph.analysis()[&VertexId::from_raw("s.mutate")]
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.code == "SG_DML_TARGET_SHAPE")
-        .map(|diagnostic| diagnostic.message.as_str())
-        .collect();
-    assert_eq!(messages.len(), 1, "{messages:?}");
-    assert!(messages[0].contains("'dupes'"), "{messages:?}");
+    let messages = |body: &str, lctn: u8| -> Vec<String> {
+        scan_routine_in_context(
+            body,
+            "mysql",
+            "sql",
+            "procedure",
+            Some(naming_context(None, Some(lctn))),
+        )
+        .analysis()[&VertexId::from_raw("s.mutate")]
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "SG_DML_TARGET_SHAPE")
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect()
+    };
+    let dupes = "WITH Dupes AS (SELECT id FROM orders) DELETE FROM dupes; WITH DUPES AS (SELECT id FROM orders) DELETE FROM DUPES";
+    let folded = messages(dupes, 1);
+    assert_eq!(folded.len(), 1, "{folded:?}");
+    assert!(folded[0].contains("'dupes'"), "{folded:?}");
+
+    let sigma = "WITH ΑΣ AS (SELECT id FROM orders) DELETE FROM ΑΣ; WITH ασ AS (SELECT id FROM orders) DELETE FROM ασ";
+    let folded = messages(sigma, 1);
+    assert_eq!(folded.len(), 1, "{folded:?}");
+    assert!(folded[0].contains("'ασ'"), "{folded:?}");
+    let exact = messages(sigma, 0);
+    assert_eq!(exact.len(), 2, "{exact:?}");
+    for target in ["'ΑΣ'", "'ασ'"] {
+        assert!(
+            exact.iter().any(|message| message.contains(target)),
+            "{exact:?}"
+        );
+    }
 }
 
 /// 앞에 WITH가 붙은 DELETE도 CTE 몸체가 읽는 컬럼을 남긴다. 읽기 경로로 보내던 때에는 그

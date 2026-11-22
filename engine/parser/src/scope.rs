@@ -74,7 +74,7 @@ pub(crate) struct CatalogIndex<'a> {
     /// 바인더가 대소문자만 다른 단일 관계 후보도 고르는 문서인가(`relation_names_fold_case`).
     /// 캐시 지문이 바인더와 같은 후보 집합을 담아야 낡은 해석을 재사용하지 않는다.
     fold_relation_case: bool,
-    /// 문서가 증명하는 CTE 이름의 대소문자 규칙(`cte_target::name_case`).
+    /// 문서가 증명하는 CTE 이름의 비교 규칙(`cte_target::name_case`).
     cte_name_case: super::cte_target::NameCase,
     routines: BTreeSet<(String, String)>,
     database: Option<String>,
@@ -2282,8 +2282,8 @@ impl DmlAnalyzer<'_, '_> {
             .binder
             .bind_ctes(query.with.as_ref(), &Ctes::new(), None);
         let context = self.binder.catalog.cte_context();
-        if let Some((target, outcome)) = self.dml_target_naming_cte(query, dml) {
-            if let Some(message) = context.message(&target, outcome) {
+        if let Some((target, candidate, outcome)) = self.dml_target_naming_cte(query, dml) {
+            if let Some(message) = context.message(&target, &candidate, outcome) {
                 // 객체 단위 적용이 같은 대상의 진단을 이미 남겼으면 다시 쌓지 않는다.
                 self.partial = true;
                 super::cte_target::push_diagnostic(self.diagnostics, &message);
@@ -2308,8 +2308,8 @@ impl DmlAnalyzer<'_, '_> {
         }
     }
 
-    /// INSERT·UPDATE 대상이 한정자 없이 그 문장의 CTE 이름(대소문자를 빼고)이면 대상의 원래 철자와
-    /// `cte_target` 판정을 돌려준다.
+    /// INSERT·UPDATE 대상이 한정자 없이 그 문장의 CTE 이름의 후보(`cte_target::name_match`)이면
+    /// 대상의 원래 철자와 그 후보, `cte_target` 판정을 돌려준다.
     ///
     /// SQL Server의 `UPDATE b … FROM big b`는 별칭이 가리키는 FROM 관계가 대상이므로 `update`와
     /// 같은 승격 규칙으로 대상을 고른다. CTE 이름은 객체 단위 수집과 같은 원래 철자로 비교한다.
@@ -2317,7 +2317,11 @@ impl DmlAnalyzer<'_, '_> {
         &self,
         query: &Query,
         dml: &Statement,
-    ) -> Option<(String, super::cte_target::Outcome)> {
+    ) -> Option<(
+        String,
+        super::cte_target::Candidate,
+        super::cte_target::Outcome,
+    )> {
         let name = match dml {
             Statement::Insert(insert) => match &insert.table {
                 TableObject::TableName(name) => name,
@@ -2349,8 +2353,8 @@ impl DmlAnalyzer<'_, '_> {
             .iter()
             .map(|cte| cte.alias.name.value.clone())
             .collect();
-        let outcome = self.binder.catalog.cte_context().judge(&spelling, &names)?;
-        Some((spelling, outcome))
+        let (candidate, outcome) = self.binder.catalog.cte_context().judge(&spelling, &names)?;
+        Some((spelling, candidate, outcome))
     }
 
     /// `COPY t [(cols)] TO|FROM …`의 컬럼 효과를 남긴다.

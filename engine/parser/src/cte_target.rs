@@ -1,9 +1,15 @@
 //! 앞에 WITH가 붙은 DML의 대상 이름이 그 문장의 CTE 이름과 같을 때의 판정이다.
 //!
 //! 객체 단위 적용(`settle_cte_writes`)과 컬럼 단위 분석(`scope.rs`의 `with_statement`)이 같은
-//! 판정과 같은 진단 문구를 쓰도록 한 곳에 둔다. 원칙은 하나다 — 방언의 규칙이나 이름의 대소문자
+//! 판정과 같은 진단 문구를 쓰도록 한 곳에 둔다. 원칙은 하나다 — 방언의 규칙이나 이름의 비교
 //! 규칙이 증명되지 않았으면 쓰기 간선은 이전처럼 남기되 `complete`를 주장하지 않는다(대상마다
 //! 이름 붙은 `SG_DML_TARGET_SHAPE`, 부분 분석, 추측한 컬럼 효과 없음).
+//!
+//! 이름 비교는 collation을 다시 구현하지 않는다. 바이트가 같으면 같은 이름이고, 둘 다 ASCII면
+//! 증명된 대소문자 규칙을 적용한다. 한쪽이라도 ASCII 밖 글자가 있고 바이트가 다르면 정확 비교
+//! 규칙(MySQL `lower_case_table_names`=0의 memcmp)에서만 다르다고 증명되고, 접는 규칙이나 모르는
+//! 규칙에서는 증명되지 않는다 — 그리스어 어말 시그마(`ΑΣ`→`ας`), 전각(`ａｕｄｉｔ`), 악센트
+//! (`äudit`)처럼 collation마다 다른 접기를 한 번에 덮는다.
 
 use schemagraph_core::Diagnostic;
 use schemagraph_source::document::CatalogDocument;
@@ -33,28 +39,38 @@ pub(crate) fn rule(dialect: &str) -> Rule {
     }
 }
 
-/// 문서가 증명하는 CTE 이름의 대소문자 규칙이다.
+/// 문서가 증명하는 CTE 이름의 비교 규칙이다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NameCase {
-    /// 대소문자를 구분한다.
+    /// 철자를 바이트 그대로 비교한다 — ASCII 밖 글자의 차이도 다른 이름이다.
     Sensitive,
-    /// 대소문자를 무시한다.
+    /// ASCII 대소문자를 무시한다. ASCII 밖 글자를 어떻게 접는지는 증명하지 않는다.
     Insensitive,
     /// 문서로 알 수 없다.
     Unknown,
 }
 
-/// 문서의 수집 context로 CTE 이름의 대소문자 규칙을 정한다.
+/// 문서의 수집 context로 CTE 이름의 비교 규칙을 정한다.
 ///
-/// SQL Server는 데이터베이스 collation을 따른다 — 문서는 그 collation이 "all metadata in the
-/// database … and any other strings used in the database"에 쓰인다고 한다. `_CI`(터키어·아제르바이잔어·
-/// CP1254 제외)는 무시, `_CS`·`_BIN`·`_BIN2`는 구분, collation이 없거나 그 밖이면 알 수 없다. MySQL은
-/// `lower_case_table_names`≠0이면 CTE 이름과 테이블 참조를 모두 소문자로 바꿔 비교하고, 0이면 그대로
-/// 비교한다(mysql-server 8.0 `PT_common_table_expr` 생성자·`match_table_ref`). 값이 없으면 알 수 없다.
+/// MySQL은 `lower_case_table_names`≠0이면 CTE 이름과 테이블 참조를 모두 소문자로 바꾸고, 0이면
+/// 바꾸지 않은 채 memcmp로 비교한다(mysql-server 8.0 `PT_common_table_expr` 생성자의
+/// `my_casedn_str`, `PT_common_table_expr::match_table_ref`의 "memcmp() is fine even if
+/// lower_case_table_names==1, as CTE names have been lowercased in the ctor"). 값이 없으면 알 수
+/// 없다.
+///
+/// SQL Server는 어느 collation이 CTE 이름을 비교하는지 문서가 말하지 않아 늘 알 수 없다고 본다.
+/// Microsoft 문서는 데이터베이스 안 객체(테이블·뷰·컬럼)의 식별자에 데이터베이스 collation을,
+/// 변수·GOTO 레이블·임시 테이블 식별자에 인스턴스 collation을 쓴다고 하고(COLLATE (Transact-SQL)
+/// "The identifiers for variables, GOTO labels, temporary stored procedures, and temporary tables
+/// are in the default collation of the server instance"), 포함된 데이터베이스는 그것들을
+/// 카탈로그 collation(`Latin1_General_100_CI_AS_WS_KS_SC`)으로, Azure SQL Database는 식별자를
+/// `CATALOG_COLLATION`으로 비교한다(Contained Database Collations·CREATE DATABASE). CTE 이름(질의
+/// 범위 이름)은 어느 목록에도 없고, 문서가 싣는 collation은 데이터베이스 collation
+/// (`DATABASEPROPERTYEX(DB_NAME(), 'Collation')`)뿐이다. 그래서 철자가 정확히 같은 대상만 CTE로
+/// 판정한다("Any reference to expression_name in the query uses the common table expression").
 pub(crate) fn name_case(doc: &CatalogDocument) -> NameCase {
     let context = doc.context.as_ref();
     match doc.dialect.as_str() {
-        "sqlserver" | "mssql" => sqlserver_case(context.and_then(|c| c.collation.as_deref())),
         "mysql" => match context.and_then(|c| c.lower_case_table_names) {
             Some(0) => NameCase::Sensitive,
             Some(_) => NameCase::Insensitive,
@@ -64,50 +80,47 @@ pub(crate) fn name_case(doc: &CatalogDocument) -> NameCase {
     }
 }
 
-/// SQL Server collation 이름의 대소문자 속성이다.
-fn sqlserver_case(collation: Option<&str>) -> NameCase {
-    let Some(collation) = collation else {
-        return NameCase::Unknown;
-    };
-    if super::collation_is_case_insensitive(collation) {
-        return NameCase::Insensitive;
-    }
-    let sensitive = collation.split('_').any(|part| {
-        ["CS", "BIN", "BIN2"]
-            .iter()
-            .any(|attribute| part.eq_ignore_ascii_case(attribute))
-    });
-    if sensitive {
-        NameCase::Sensitive
-    } else {
-        NameCase::Unknown
-    }
-}
-
 /// 대상 이름이 CTE 이름과 얼마나 같은가.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Match {
-    /// 철자까지 같다.
+    /// 바이트까지 같다.
     Exact,
-    /// ASCII 대소문자만 다르다.
+    /// 둘 다 ASCII이고 대소문자만 다르다.
     AsciiCase,
-    /// ASCII 밖 글자의 대소문자도 다르다(유니코드 소문자로는 같다).
-    OtherCase,
+    /// 바이트가 다르고 한쪽이라도 ASCII 밖 글자가 있다 — 대소문자·악센트·전각을 접는 규칙에
+    /// 따라 같은 이름일 수 있다.
+    NonAscii,
 }
 
-/// 대상 이름과 가장 가까운 CTE 이름의 `Match`다. 대소문자를 빼고도 다르면 `None`이다.
-pub(crate) fn name_match(target: &str, names: &[String]) -> Option<Match> {
-    if names.iter().any(|name| name == target) {
-        return Some(Match::Exact);
-    }
-    if names.iter().any(|name| name.eq_ignore_ascii_case(target)) {
-        return Some(Match::AsciiCase);
-    }
-    let folded = target.to_lowercase();
-    names
-        .iter()
-        .any(|name| name.to_lowercase() == folded)
-        .then_some(Match::OtherCase)
+/// 대상과 가장 가깝게 일치하는 CTE 이름이다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Candidate {
+    /// 얼마나 같은가.
+    pub(crate) matched: Match,
+    /// 그 CTE 이름(원래 철자).
+    pub(crate) cte: String,
+}
+
+/// 대상 이름과 가장 가까운 CTE 이름이다. `Exact`·`AsciiCase`·`NonAscii` 순으로 고른다. 둘 다
+/// ASCII인데 대소문자를 빼고도 다른 이름뿐이면 `None`이다 — 어떤 대소문자 규칙에서도 다르다.
+pub(crate) fn name_match(target: &str, names: &[String]) -> Option<Candidate> {
+    let find = |matched: Match, same: &dyn Fn(&str) -> bool| {
+        names.iter().find(|name| same(name)).map(|name| Candidate {
+            matched,
+            cte: name.clone(),
+        })
+    };
+    find(Match::Exact, &|name| name == target)
+        .or_else(|| {
+            find(Match::AsciiCase, &|name| {
+                name.is_ascii() && target.is_ascii() && name.eq_ignore_ascii_case(target)
+            })
+        })
+        .or_else(|| {
+            find(Match::NonAscii, &|name| {
+                !(name.is_ascii() && target.is_ascii())
+            })
+        })
 }
 
 /// 판정 결과다.
@@ -121,15 +134,16 @@ pub(crate) enum Outcome {
     Unproven,
 }
 
-/// 방언·대소문자 규칙과 이름 일치로 대상을 판정한다.
+/// 방언·비교 규칙과 이름 일치로 대상을 판정한다.
 pub(crate) fn outcome(rule: Rule, case: NameCase, matched: Match) -> Outcome {
     match (rule, matched, case) {
         (Rule::Table, _, _) => Outcome::Table,
         (Rule::Unknown, _, _) => Outcome::Unproven,
         (Rule::Cte, Match::Exact, _) => Outcome::Cte,
+        // 바이트 비교 규칙에서는 철자가 다르면 다른 이름이다(ASCII 밖 글자 포함).
         (Rule::Cte, _, NameCase::Sensitive) => Outcome::Table,
         (Rule::Cte, Match::AsciiCase, NameCase::Insensitive) => Outcome::Cte,
-        // ASCII 밖 글자의 대소문자 접기는 collation마다 달라 모델링하지 않는다.
+        // ASCII 밖 글자의 접기는 collation마다 달라 모델링하지 않는다.
         (Rule::Cte, _, _) => Outcome::Unproven,
     }
 }
@@ -141,7 +155,7 @@ pub(crate) struct Context<'a> {
     pub(crate) dialect: &'a str,
     /// 방언의 규칙.
     pub(crate) rule: Rule,
-    /// CTE 이름의 대소문자 규칙.
+    /// CTE 이름의 비교 규칙.
     pub(crate) case: NameCase,
 }
 
@@ -155,37 +169,78 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// 대상 철자와 CTE 이름들로 판정한다. CTE 이름과 대소문자를 빼고도 다르면 `None`이다.
-    pub(crate) fn judge(&self, target: &str, names: &[String]) -> Option<Outcome> {
-        name_match(target, names).map(|matched| outcome(self.rule, self.case, matched))
+    /// 대상 철자와 CTE 이름들로 판정한다. 어떤 CTE 이름의 후보도 아니면 `None`이다.
+    pub(crate) fn judge(&self, target: &str, names: &[String]) -> Option<(Candidate, Outcome)> {
+        name_match(target, names).map(|candidate| {
+            let outcome = outcome(self.rule, self.case, candidate.matched);
+            (candidate, outcome)
+        })
     }
 
     /// 판정의 `SG_DML_TARGET_SHAPE` 문구다. 평범한 DML(`Table`)이면 없다.
     ///
-    /// 대상 이름을 실어 대상마다 따로 센다. 대소문자를 무시하는 문서에서는 접은 이름을 실어,
-    /// 철자만 다른 같은 대상(`dupes`·`DUPES`)을 한 번만 센다.
-    pub(crate) fn message(&self, target: &str, outcome: Outcome) -> Option<String> {
-        let shown = if self.case == NameCase::Insensitive {
-            printable(&target.to_lowercase())
-        } else {
-            printable(target)
-        };
-        let reason = match (outcome, self.rule) {
-            (Outcome::Table, _) => return None,
-            (Outcome::Cte, _) if self.dialect == "mysql" => {
+    /// 대상 이름을 실어 대상마다 따로 센다. 대상이 CTE 이름이면(철자가 같거나 CTE로 증명됨)
+    /// "names a WITH query"라 쓰고, 대소문자를 무시하는 문서에서는 `fold`로 접은 이름을 실어 철자만
+    /// 다른 같은 대상(`dupes`·`DUPES`)을 한 번만 센다. 철자가 다른데 증명되지 않은 후보면 "may
+    /// name"과 두 철자를 그대로 실어 이름이 같다고 단정하지 않는다 — 같은 이름일 수도 다른 이름일
+    /// 수도 있으므로 철자마다 따로 센다.
+    pub(crate) fn message(
+        &self,
+        target: &str,
+        candidate: &Candidate,
+        outcome: Outcome,
+    ) -> Option<String> {
+        let reason = self.reason(candidate.matched, outcome)?;
+        if candidate.matched == Match::Exact || outcome == Outcome::Cte {
+            let target = printable(&self.fold(target));
+            return Some(format!(
+                "DML target '{target}' names a WITH query; {reason}"
+            ));
+        }
+        Some(format!(
+            "DML target '{}' may name the WITH query '{}'; {reason}",
+            printable(target),
+            printable(&candidate.cte)
+        ))
+    }
+
+    /// 판정의 이유 문구다. 평범한 DML(`Table`)이면 없다.
+    fn reason(&self, matched: Match, outcome: Outcome) -> Option<&'static str> {
+        Some(match (outcome, self.rule, matched) {
+            (Outcome::Table, _, _) => return None,
+            (Outcome::Cte, _, _) if self.dialect == "mysql" => {
                 "MySQL rejects a WITH query as an UPDATE or DELETE target (ER_NON_UPDATABLE_TABLE), so no write edge or column effect is recorded"
             }
-            (Outcome::Cte, _) => {
+            (Outcome::Cte, _, _) => {
                 "SQL Server writes through it to a base relation that is not resolved, so no write edge or column effect is recorded"
             }
-            (Outcome::Unproven, Rule::Cte) => {
-                "the names differ only in letter case and the document does not prove the case rule; the write edge is kept, but target columns are not resolved"
+            (Outcome::Unproven, Rule::Cte, Match::AsciiCase) if self.dialect == "mysql" => {
+                "the names differ only in letter case and the document does not record lower_case_table_names, which decides the case rule for WITH names; the write edge is kept, but target columns are not resolved"
             }
-            (Outcome::Unproven, _) => {
+            (Outcome::Unproven, Rule::Cte, Match::AsciiCase) => {
+                "the names differ only in letter case and the case rule for WITH names is not proven (SQL Server does not document which collation compares them); the write edge is kept, but target columns are not resolved"
+            }
+            (Outcome::Unproven, Rule::Cte, _) => {
+                "the names are not byte-equal and contain non-ASCII characters, and whether the comparison folds them (letter case, accents, character width) is not proven; the write edge is kept, but target columns are not resolved"
+            }
+            (Outcome::Unproven, _, _) => {
                 "this dialect's rule for such targets is unverified; the write edge is kept, but target columns are not resolved"
             }
-        };
-        Some(format!("DML target '{shown}' names a WITH query; {reason}"))
+        })
+    }
+
+    /// 진단에 싣고 중복을 가르는 이름이다.
+    ///
+    /// 대소문자를 무시하는 문서에서만 글자마다 소문자로 접는다. `str::to_lowercase`는 그리스어
+    /// 어말 시그마 규칙을 적용해 `ΑΣ`를 `ας`로 바꾸므로, 그 규칙에서 같은 이름일 수 있는 `ΑΣ`·
+    /// `ασ`가 두 이름으로 세어졌다. 글자 단위 `char::to_lowercase`는 문맥 없이 `Σ`를 `σ`로 바꾼다.
+    /// 철자 그대로 비교하거나 규칙을 모르는 문서에서는 접지 않는다.
+    fn fold(&self, name: &str) -> String {
+        if self.case == NameCase::Insensitive {
+            name.chars().flat_map(char::to_lowercase).collect()
+        } else {
+            name.to_owned()
+        }
     }
 }
 
