@@ -21,7 +21,8 @@
 - 브랜치 `ccr-37904670-hxdjsx`는 `origin/main` `b8e4054`에서 다시 시작한 라운드 3 작업이며
   [PR #62](https://github.com/ictechgy/schemagraph/pull/62)다. 아래 "라운드 3" 절의 네 커밋(`1c8d976`·`86c9e98`·`0206bea`·
   `d91236b`), 독립 리뷰 반영 세 커밋(`5be9173`·`d872048`·`f9c700b`), HANDOFF 커밋(`0161c96`), PR #62 2차 리뷰 반영
-  (`6144529`·`982941d`·`5699c2d`, push됨), 그리고 3차(델타) 리뷰 반영 커밋 `9528ca3`(parser)과 그 HANDOFF 커밋(아래 절, 아직 push 전)이 있다.
+  (`6144529`·`982941d`·`5699c2d`, push됨), 3차(델타) 리뷰 반영 커밋 `9528ca3`(parser)과 그 HANDOFF 커밋 `8fb92cc`, 그리고 4차(대항 행렬) 리뷰 반영
+  `fbee2c3`·`60589e9`(parser)와 그 HANDOFF 커밋(아래 절, 아직 push 전)이 있다.
 
 ### 라운드 3 (2026-11-22)
 
@@ -159,10 +160,81 @@ GLM `packet-ask`는 이 세션에서 쓸 수 없어 `/code-review high`(독립 C
   →Table, 터키어 접기, MySQL 대소문자 모름, 접지 않은 표시, WITH DELETE를 컬럼 DML로 셈, ASCII 밖 대소문자→CTE, 컬럼 단위 판정
   무시)을 각각 잡는다.
 
+### PR #62 리뷰(4차, 대항 행렬 7,050칸) 반영 (2026-11-22)
+
+리뷰는 모델 출력이라 리뷰어 도구(`tools/one.py`·`matrix.py`·`analyze.py`)와 `8fb92cc` 바이너리로 주장마다 다시 재현했다.
+원칙은 3차와 같다 — 증명되지 않으면 쓰기는 남기고 `complete`를 주장하지 않는다. 커밋: `fbee2c3`(parser 이름 비교·SQL Server),
+`60589e9`(parser 별칭 DELETE), 그리고 이 HANDOFF.
+
+- should-fix 1(어말 시그마, `5699c2d`부터): `name_match`가 `str::to_lowercase`로 비교해 `"ΑΣ".to_lowercase()`가 `"ας"`가 되고,
+  CTE `ασ`와 대상 `ΑΣ`(대소문자만 다름)를 다른 이름으로 단정했다. 재현(수정 전): SQL Server `_CI_AS`·`Greek_CI_AS`, MySQL lctn=1,
+  MariaDB·`external`(context 없음)에서 `writes s.ΑΣ`·`writes s.ΑΣ.name`·`complete`. 수정: 이름 비교를 collation 재구현 없이
+  `cte_target::name_match`에 둔다 — 바이트가 같으면 같은 이름(`Exact`), 둘 다 ASCII면 증명된 대소문자 규칙(`AsciiCase`), 한쪽이라도
+  ASCII 밖 글자가 있고 바이트가 다르면 `NonAscii`로, 바이트 비교 규칙(MySQL lctn=0, mysql-server 8.0 `match_table_ref`의 memcmp)에서만
+  다른 이름으로 증명되고 접는 규칙·모르는 규칙에서는 `Unproven`이다. 수정 후 같은 재현은 `writes s.ΑΣ`만 남고 `partial`,
+  `DML target 'ΑΣ' may name the WITH query 'ασ'; the names are not byte-equal and contain non-ASCII characters, and whether the
+  comparison folds them (letter case, accents, character width) is not proven; …`(MariaDB·`external`은 방언 미확인 문구).
+- nit 3(전각·악센트): 같은 규칙이 덮는다. `WITH ａｕｄｉｔ … UPDATE audit`(`_CI_AS`·`_CS_AS`)와 `WITH äudit … UPDATE audit`(`_CI_AI`)가
+  `writes s.audit.name`·`complete`에서 쓰기만 남긴 `partial`이 됐다.
+- 열린 질문 4(SQL Server CTE 이름의 collation): Microsoft 문서에 CTE 이름(질의 범위 이름)을 어느 collation이 비교하는지 말하는
+  문장이 없다. learn.microsoft.com은 이 세션에서 DNS가 풀리지 않아 같은 페이지의 원본(`MicrosoftDocs/sql-docs` `live` 브랜치,
+  raw.githubusercontent.com)을 읽었다: `docs/t-sql/statements/collations.md`(ms.date 03/03/2025: 데이터베이스 안 객체 식별자는
+  데이터베이스 collation, "The identifiers for variables, GOTO labels, temporary stored procedures, and temporary tables are in the
+  default collation of the server instance"), `docs/relational-databases/databases/contained-database-collations.md`(10/01/2025:
+  비포함 DB에서 변수·GOTO 레이블·커서 이름은 인스턴스 collation, 포함 DB는 `CATALOG_DEFAULT` = `Latin1_General_100_CI_AS_WS_KS_SC`),
+  `docs/relational-databases/collations/collation-and-unicode-support.md`(01/07/2026: 데이터베이스 collation이 "variable names"에도
+  쓰인다고 해 앞 문서와 엇갈림, Azure SQL Database는 `CATALOG_COLLATION`), `database-identifiers.md`(04/08/2026),
+  `with-common-table-expression-transact-sql.md`(04/10/2026: collation 언급 없음). 그래서 SQL Server의 `name_case`는 늘 `Unknown`이다
+  — 철자가 정확히 같은 대상만 `Cte`이고, 대소문자만 다른 대상은 어느 collation에서도 쓰기를 남긴 `partial`(`…; the names differ only
+  in letter case and the case rule for WITH names is not proven (SQL Server does not document which collation compares them); …`)이다.
+  3차에서 `_CI`는 쓰기를 지웠고 `_CS`·`_BIN2`는 컬럼 쓰기와 `complete`를 냈다. 문서가 싣는 collation은
+  `DATABASEPROPERTYEX(DB_NAME(), 'Collation')`(Go·JDBC)뿐이라 인스턴스·카탈로그 collation도 알 수 없다. 이 결정으로 `_BIN`·`_BIN2`가
+  식별자를 코드 포인트로 비교하는지 확인할 필요도 없어졌다. 관계 이름(`relation_names_fold_case`)은 문서가 데이터베이스 collation을
+  명시하므로 그대로 둔다.
+- 표시·중복 제거(`Context::message`): CTE로 증명됐거나 철자가 같은 대상만 "names a WITH query"라 쓰고, 증명된 대소문자 무시 규칙
+  (MySQL 1·2)에서는 글자 단위 `char::to_lowercase`로 접어 `dupes`·`DUPES`와 `ΑΣ`·`ασ`를 한 번만 센다(`str::to_lowercase`는 어말
+  시그마로 둘을 갈랐다). 철자가 다른데 증명되지 않은 후보는 `may name the WITH query '<CTE 철자>'`와 두 철자를 그대로 실어 철자마다
+  센다(같은 이름인지 모르므로). 바이트 비교 규칙(MySQL 0)에서는 접지 않는다.
+- nit 2(별칭 DELETE, `5699c2d`부터): `WITH c AS (…) DELETE c FROM audit c JOIN orders o ON c.id = o.id`(SQL Server, MySQL lctn=0)가
+  `c`를 CTE로 판정해 `audit` 쓰기를 지우고 `SG_DML_TARGET_SHAPE`를 냈다. WITH 없는 같은 문장은 main부터 `s.c`가 없는 관계라는 거짓 한계와
+  `reads s.audit`만 남겼다. 근거: SQL Server DELETE 문서(`docs/t-sql/statements/delete-transact-sql.md`)의 *table_alias* "The alias specified
+  in the FROM table_source clause representing the table or view from which the rows are to be deleted", mysql-server 8.0
+  `sql/sql_parse.cc` `Query_block::add_table_to_list`가 다중 테이블 DELETE 별칭 목록(`TL_OPTION_ALIAS`)을 CTE로 찾지 않는다("those are
+  only references into the FROM list, and any CTEs referenced by the aliases will be resolved when we later resolve the FROM list").
+  수정: `write_targets_shallow`의 DELETE(`delete_write_targets`)가 대상 목록 이름을 FROM 절 관계(조인 포함)의 별칭으로 먼저 풀고
+  (`aliased_relation`, `promoted_update_target`과 같은 ASCII 대소문자 무시·후보 하나 규칙), 그 관계 이름으로 CTE 판정을 한다. 수정 후 두
+  재현 모두 `writes s.audit`·`complete`이고, 별칭이 가리키는 FROM 관계가 CTE면(`WITH audit … DELETE x FROM audit x …`) 이전처럼 CTE를
+  통한 DELETE다. MySQL `DELETE FROM c USING audit c …` 형식은 바꾸지 않았다(후속 후보).
+- 회귀 테스트: 새 `non_ascii_cte_target_names_are_unproven_under_folding_rules`(시그마·전각·악센트·`étAPE`/`étape`, SQL Server 4개
+  context·MySQL 1·2·없음·MariaDB·`external`, 대조로 MySQL 0·SQLite), `sqlserver_case_only_cte_targets_are_unproven_under_every_collation`
+  (이전 `sqlserver_cte_target_names_follow_the_collation`을 대체, collation 6종과 정확 철자), `delete_through_a_from_alias_writes_the_aliased_table`
+  (SQL Server·MySQL, 조인한 별칭, WITH 없는 문장, CTE를 가리키는 별칭), 바꾼 `cte_target_diagnostics_fold_names_under_a_case_insensitive_rule`
+  (MySQL 1의 `dupes`·`ΑΣ`/`ασ` 한 번, MySQL 0은 두 번)과 `unverified_dialects_keep_the_object_write_of_a_cte_named_target`(대소문자만 다른
+  철자는 "may name"). 5개 모두 `8fb92cc` 코드(소스만 되돌리고 테스트 유지)에서 실패한다. 변이 11종(NonAscii를 `to_lowercase` 같음으로,
+  SQL Server collation으로 대소문자 판정, DELETE 별칭 미해석, 표시에 `str::to_lowercase`, 규칙과 무관하게 접기, 미증명 문구에 "names",
+  바이트 규칙이 ASCII 밖 차이를 증명 못 함, ASCII 접기에 ASCII 검사 없음, 조인 별칭 미해석, 접는 규칙이 NonAscii를 CTE로, 미증명 쓰기
+  삭제)을 각각 잡는다.
+- 행렬: 리뷰어 행렬에 이름 쌍 4개(시그마 `ασ`/`ΑΣ`, 전각, 악센트, `日本`/`audit`)와 `ΑΣ` 테이블을 더하고 기대 규칙을 바꿨다(SQL Server
+  대소문자 규칙 늘 모름, `NonAscii` 범주, 별칭 DELETE를 정보가 아니라 판정 대상으로). 12,690칸을 새 바이너리로 두 번씩 돌려 오류 0,
+  비결정 0, 위반 0이고, 정보 범주는 DB2 파싱 실패 270칸뿐이다(리뷰어 원래 행렬에서도 같은 비율 150칸, 기존). `8fb92cc` 바이너리는 같은 행렬과 같은 기대 규칙에서
+  거짓 `complete` 3,672칸·추측한 컬럼 효과 2,776칸·진단 누락 6,191칸·지워진 쓰기 140칸(SQL Server `_CI`의 대소문자만 다른
+  대상)이었다. 거짓 `complete`는 시그마·전각·악센트가 각 857칸, `Äudit`/`äudit` 122칸, SQL Server `_CS`·`_BIN2`의 대소문자만
+  다른 대상 122칸이고, 나머지 857칸은 새 보수 판정이 더한 `日本`/`audit`이다. 도구는
+  리뷰어 도구의 사본이다(세션 scratchpad, 저장소 밖). 간선 판정 함수를 고친 뒤에는 저장된 간선으로 다시 셌다.
+- 범위 메모: `ασ`가 아닌 전혀 다른 ASCII 밖 이름(`WITH 日本 AS (…) UPDATE audit`)도 접는·모르는 규칙에서는 `may name`·`partial`이다 —
+  collation 표 없이 다르다고 증명할 수 없어서다(의도한 보수 판정, MySQL 0·PostgreSQL·SQLite는 영향 없음).
+
 ### 라운드 3 검증 (리뷰 반영 뒤 최종 바이너리)
 
 - Rust 1.96.0: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, 워크스페이스
-  테스트 723개 통과(이전 707개 + parser 13 + source 3; 3차 리뷰 반영 뒤 재실행). Go: `gofmt -l`, `go vet`, `go test ./...`.
+  테스트 725개 통과(이전 707개 + parser 15 + source 3; 4차 리뷰 반영 뒤 재실행). Go: `gofmt -l`, `go vet`, `go test ./...`
+  (Go 코드는 3차 이후 바뀌지 않았다).
+- 4차 리뷰 반영 뒤 다시 돌린 것: CI 측정 불변식·시작 실패 경로 Python 테스트 11개와 `test-dml-producers.py`,
+  `test-capture-migration.py`, `verify-contracts.py`(jsonschema 4.23.0·sqlglot 30.18.0), `verify-competitive.py`,
+  `verify-cancellation.py`, SQLite 골든 diff 0(Python sqlite3 3.53.1로 `basic.sql` 생성, 이 환경에 `sqlite3` CLI가 없다),
+  `verify-document-versions.py`, `verify-sqlite-nullability.py`(네이티브·Go·JDBC). PostgreSQL 실DB 검증은 3차 바이너리로 돌린
+  아래 결과이고 4차에서는 다시 돌리지 않았다(PostgreSQL·SQLite는 `Table` 규칙이고 다중 테이블 DELETE 문법이 없어
+  4차 변경이 출력을 바꾸지 않는다).
 - CI 측정 불변식 단계의 Python 테스트 11개와 `test-dml-producers.py`, `test-capture-migration.py`, `verify-contracts.py`
   (jsonschema 4.23.0·sqlglot 30.18.0), `verify-competitive.py`, `verify-cancellation.py`, SQLite 골든 diff 0과
   `verify-document-versions.py`, `verify-sqlite-nullability.py`(네이티브·Go·JDBC).
@@ -333,8 +405,10 @@ PR #59는 GLM 리뷰 없이 머지됐다.
      않는다, main부터). UPDATE는 WHERE 컬럼을 읽기로 남기므로 비대칭이다. 넣으려면 DELETE의 대상·USING·조인·WHERE를 Binder로
      해석하고, DELETE가 든 SQL Server·Oracle fixture 골든(`Fixtures/mssql`·`Fixtures/oracle`, Docker에서만 생성)을 실DB로
      다시 확인해야 한다.
-   - SQL Server CTE 이름의 대소문자 비교가 데이터베이스 collation을 따르는지 실서버로 확인한다(지금은 문서 근거로 그렇게
-     본다). CTE 읽기는 대소문자 규칙을 따르지 않는다 — `_CI`에서 `WITH Recent AS (…) … FROM recent`가 같은 이름의 실제 테이블
+   - SQL Server에서 CTE 이름을 어느 collation이 비교하는지(데이터베이스·인스턴스·포함 DB 카탈로그) 문서가 없어 대소문자만 다른
+     대상은 판정하지 않는다(4차). 실서버에서 데이터베이스·인스턴스 collation을 엇갈리게(CI/CS) 두고 `WITH Audit … UPDATE audit`가
+     CTE를 통해 쓰는지 확인하면, 그리고 프로브가 인스턴스 collation(`SERVERPROPERTY('Collation')`)도 수집하면 판정을 넓힐 수 있다.
+     CTE 읽기는 대소문자 규칙을 따르지 않는다 — `_CI`에서 `WITH Recent AS (…) … FROM recent`가 같은 이름의 실제 테이블
      `recent`를 읽는 간선을 낸다(`body_relations::collect_reads`와 Binder `factor`가 정확 비교, main부터; 3차 리뷰가 짚고 main
      바이너리로 확인). 대소문자 접기 방언 항목과 함께 고친다.
    - (main부터, 3차 리뷰가 짚고 main 바이너리로 확인) T-SQL `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`를 세미콜론 없이 쓰면
@@ -345,6 +419,12 @@ PR #59는 GLM 리뷰 없이 머지됐다.
      남기고 컬럼 효과 없이 `complete`다(라운드 3 CLI로 확인). 고치려면 CTE 몸체의 DML을 `DmlAnalyzer`가 분석하고
      RETURNING 출력을 바깥 질의의 원천으로 이어야 한다. 쿼리 파일만 DML 경로로 보내면 같은 거짓 complete가 되므로
      둘을 함께 고친다.
+   - (main부터, 4차 작업 중 확인) PostgreSQL 미인용 식별자 접기(`scope.rs` `name()`·`name_for_dialect`)가 `to_lowercase`라 ASCII 밖
+     글자도 접는다. PostgreSQL은 다중 바이트 인코딩(UTF8)에서 ASCII만 접는다(REL_16_STABLE `src/backend/parser/scansup.c`
+     `downcase_identifier`: 높은 비트 글자는 `enc_is_single_byte`일 때만 `tolower`). main 바이너리에서 PostgreSQL 프로시저
+     `UPDATE ΑΣ SET name = 'x'`가 테이블 `ΑΣ`를 두고 `s.ας`가 없는 관계라는 한계를 낸다. 같은 이름의 `ας` 테이블이 있으면 거짓 간선이 된다.
+   - 다중 테이블 DELETE의 MySQL `DELETE FROM c USING audit c …` 형식은 대상(`FROM` 목록)의 별칭을 `USING` 관계로 풀지 않는다(main부터).
+     PostgreSQL의 `DELETE FROM t USING …`과 같은 AST라 방언을 보고 갈라야 해 4차 범위에서 뺐다.
    - `--sql-dir` 쿼리 파일의 컬럼 분석 한계 문구는 `view main.query_…: SG_…`처럼 객체 종류를 `view`로 적는다
      (`record_body`/`enrich_view` 경로의 문구). 의미는 맞지만 쿼리 파일을 뷰로 부른다.
 
