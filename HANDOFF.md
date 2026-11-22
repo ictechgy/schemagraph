@@ -19,8 +19,10 @@
   crates.io에는 0.7.1·0.8.0·0.8.1이 없고, Maven Central에는 0.7.1이 없다(2026-11-03 조회).
   GitHub Release v0.1.0–v0.3.0에는 첨부 아카이브가 없다(2026-11-09 조회). 누락 버전은 다시 게시하지 않는다.
 - isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
-- 브랜치 `ccr-37904670-hxdjsx`는 `origin/main` `1365d37`(PR #62 머지)에서 다시 시작한 라운드 4 작업이다. 커밋:
-  `f2164ab`(parser, DELETE·TRUNCATE 대상), `ae54036`(parser, 최상위 END), 그리고 이 HANDOFF·RELEASE-NOTES 커밋. push 전이다.
+- 브랜치 `ccr-37904670-hxdjsx`는 `origin/main` `1365d37`(PR #62 머지)에서 다시 시작한 라운드 4 작업이며
+  [PR #63](https://github.com/ictechgy/schemagraph/pull/63)이다. 커밋: `f2164ab`(parser, DELETE·TRUNCATE 대상), `ae54036`(parser,
+  최상위 END), `67943bb`(HANDOFF·RELEASE-NOTES, push됨), 그리고 PR #63 리뷰 반영 `f6ff67e`(S2)·`2c9b79d`(S1·N1)·`f6caf78`(S3·N2)와
+  이 문서 커밋(아래 "PR #63 리뷰 반영" 절, push 전).
 - 원격에 이 세션과 무관한 브랜치 `fix/postgres-ascii-identifier-fold`(`5ff7a51`, 다른 세션, 2026-11-22, PR 없음)가 있다.
   후속 후보의 PostgreSQL 미인용 식별자 ASCII 접기(`scope.rs` `name()`)를 다룬다. 겹치지 않게 라운드 4는 그 항목과
   `scope.rs`를 건드리지 않았다. 두 브랜치는 `parser/src/lib.rs`·`scope_tests.rs`의 서로 다른 곳을 고친다.
@@ -104,6 +106,68 @@ RELEASE-NOTES `# Unreleased`의 해당 항목이다. 회귀 테스트는 모두 
   시도는 권한 정책으로 멈췄다) — USING·TRY/CATCH 판정은 mysql-server 문법 원문과 Microsoft 문서, sqlparser 소스에 근거한다.
   DML 정확도 워크플로(v0.4.3 기준선; `Fixtures/accuracy/dml-cases.json`에 DELETE·TRUNCATE·END가 없어 영향 없음),
   JDBC `gradle check`, `verify-html.py`, `verify-review-action.py`, `verify-external-imports.py`, `cargo package`, GLM 리뷰.
+
+### PR #63 리뷰 반영 (2026-11-22)
+
+독립 리뷰(`67943bb`)는 blocker 없음, END 이어 읽기의 거짓 간선 없음, should-fix 3개와 nit 3개였다. 리뷰어 바이너리
+(`r4-review-schemagraph/bin/sg-old`가 main 동작임을 세 부분 DELETE로 확인)와 이 세션에서 `67943bb`를 다시 빌드한 바이너리로 주장마다
+재현한 뒤 고쳤다. 커밋: `f6ff67e`(parser S2), `2c9b79d`(parser S1·N1), `f6caf78`(parser S3·N2), 그리고 이 문서 커밋. 중간 커밋 두 개도
+따로 parser 테스트(240·243개)·clippy·fmt를 통과했다.
+
+- S2(새로 잃은 참 간선): `parse_sql_prefix`가 끝에 남은 `END` 하나를 `COMMIT` 문장으로 붙였다. SQLite 뷰 `SELECT id FROM audit end`
+  (SQLite 3.53.1이 만들고 읽는다 — `end`는 별칭)는 main에서 `reads audit`·`audit.id`·`complete`였는데 `67943bb`에서 간선 없이
+  `SG_VIEW_STATEMENT: a view definition must contain exactly one query`, MySQL `--sql-dir` 같은 문장은 `is_select`가 거짓이 되어
+  `object-dependencies`(컬럼 읽기 없음)였다(CLI로 재현). 수정: 다시 읽은 목록이 `END` 한 문장(`Statement::Commit { end: true, .. }`)이고
+  끝(EOF)이면 버린다(`is_lone_end`) — main과 같은 동작이다. 수정 후 둘 다 main과 같다.
+- S1(RELEASE-NOTES 주장과 어긋남, main부터): 추출기가 무시하는 문장(`PRINT`·`RAISERROR`·`THROW`·`WAITFOR`·`GOTO`·`BREAK`·`FETCH`·`CLOSE`·
+  `DEALLOCATE` 등)이 세미콜론 없는 조각에서 뒤를 통째로 삼켜, `BEGIN TRY UPDATE audit … END TRY BEGIN CATCH PRINT ERROR_MESSAGE() INSERT INTO
+  log … END CATCH`가 main·`67943bb` 모두 `writes audit`만 남기고 `complete`였다(세미콜론 판은 `writes log`도). `RAISERROR … WITH NOWAIT`,
+  `WAITFOR DELAY`, `GOTO`, `THROW … END CATCH UPDATE orders`도 같았다. 같은 계열로 `EXEC proc <인자>`도 인자 뒤 문장을 삼켰다(이 세션에서
+  확인). 수정: `next_statement_start`가 인용·주석·괄호·`CASE … END` 밖의 다음 문장 머리(`SELECT`·`INSERT`·`UPDATE`·`DELETE`·`MERGE`·
+  `TRUNCATE`·`EXEC`·`EXECUTE`·`CALL`·`BEGIN`·`END`·`IF`·`WHILE`·`DECLARE`)를 찾고, 그 앞에서 무시하는 문장의 절과 `EXEC` 인자를 끝낸 뒤
+  계속 꺼낸다. `WITH`(`RAISERROR … WITH NOWAIT`)·`SET`(MySQL `SIGNAL … SET MESSAGE_TEXT`)은 끊지 않고, `@`·`.`·`:`·ASCII 밖 글자 바로 뒤
+  단어는 이름의 일부다. 건너뛴 절에 `=`가 있으면(`GET DIAGNOSTICS @s = ROW_COUNT`) 변수 값을 모두 버린다 — 그 대입을 추적하지 않으므로
+  뒤 `EXEC(@s)`를 옛 값으로 접으면 거짓 쓰기다. 수정 후 다섯 재현과 `EXEC` 사례가 세미콜론 판과 같다. 세미콜론으로 끝나는 방언은 절이
+  이미 `;`에서 끝나 바뀌지 않는다(PL/pgSQL `RAISE … (SELECT …)`·`GET DIAGNOSTICS`, MySQL `SIGNAL … SET`, PL/SQL `NULL` 대조 사례가 셋 다 같음).
+  남은 틈: T-SQL `OPEN cur` 뒤에 세미콜론 없이 오는 문장은 여전히 소리 없이 빠진다(`OPEN c FOR SELECT …`의 질의를 끊지 않으려면 FOR 절을
+  따로 봐야 해 손대지 않았다). `BREAK END UPDATE …`는 END 갈래가 꼬리 단어로 `UPDATE`를 먹어 미추출로 센다(소리 없지 않음).
+  RELEASE-NOTES의 "조용히 버리던 몸체는 모두 complete이거나 partial" 문장은 이 틈을 적도록 고쳤다.
+- S3(별칭 대소문자 규칙): 대소문자만 다른 별칭으로 DELETE 대상을 늘 풀어, MySQL `lower_case_table_names=0`의 `DELETE FROM C USING audit c …`가
+  `writes s.audit`·`complete`였다(실제로는 `ER_UNKNOWN_TABLE`). 대상 목록 형식은 라운드 3부터 같았고, SQL Server CS collation도 같았다.
+  근거(GitHub 원문, mysql-server 8.0): `parse_tree_nodes.cc` `multi_delete_table_match`가 대상과 FROM/USING 항목을 `table_alias_charset`으로
+  비교하고(별칭이 있는 항목은 별칭으로만), `mysqld.cc`에서 그 charset은 lctn 0이면 `my_charset_bin`, 아니면 `my_charset_utf8mb3_tolower_ci`다.
+  그 함수 주석이 USING 형식의 FROM 목록도 같은 별칭 참조라고 적는다. 수정: `CollectRules.alias_case`(문서의 `cte_target::name_case`,
+  MySQL만 lctn으로 증명)를 몸체 파서까지 넘긴다. 정확한 철자는 늘 풀고, 대소문자만 다르면 Insensitive(lctn 1·2)는 풀고, Sensitive(lctn 0)는
+  풀지 않으며(이름이 남아 `references s.C, which is missing …`, 0.9.0과 같음), Unknown(lctn 없음, MariaDB, SQL Server 모든 collation)은 쓰기를
+  남기고 `SG_DML_TARGET_SHAPE: DML target 'C' names the alias 'c' only if letter case is ignored, …`와 부분 분석이다. SQL Server를 `_CI`로도
+  증명하지 않은 것은 라운드 3 4차의 CTE 이름 판정과 같은 이유(별칭을 어느 collation이 비교하는지 문서 없음)다 — 리뷰는 `_CI`를 증명으로
+  보자고 했지만 쓰기를 지우지 않는 보수 판정이라 그대로 두었다. 좁힘: lctn 0의 대상 목록 형식에서 라운드 3이 내던 거짓 `writes`가 사라진다.
+- N1: 상한에 걸리면 "1 body statement(s) not extracted"만 남아 손실 크기를 알 수 없었다(2천 쌍에서 약 3,980문장). 상한에 걸린 조각마다
+  남은 바이트 수를 실은 `SG_BODY_PARTIAL`(`statement extraction stopped after 16 re-extractions … its remaining N bytes, which may hold many
+  statements, were not analyzed`)을 더한다.
+- N2: USING 형식의 FROM 목록 철자를 문장 전체 읽기에서 빼서, `DELETE FROM c USING audit c WHERE c.id IN (SELECT id FROM c)`(실제 테이블 `c`)의
+  `reads s.c`가 사라졌다. `read_exclusions`에서 그 갈래를 빼고 `body_relations`가 그 FROM 목록 이름 노드의 주소만 건너뛴다
+  (`using_alias_references`). `UPDATE c … FROM audit c`의 대상 철자 제외는 main부터 문장 전체라 그대로다(후속 후보).
+- N3(성능 선형): 바꾸지 않았다.
+- 테스트(새 7개): `a_lone_trailing_end_is_dropped_for_views_and_query_files`, `ignored_tsql_statements_end_at_the_next_statement_head`
+  (여덟 사례: 다섯 재현·`EXEC` 인자·`PRINT @update`·`PRINT CASE … END`), `a_skipped_clause_with_an_assignment_forgets_variable_values`,
+  `reextraction_cap_reports_the_size_left_unanalyzed`, `delete_alias_case_follows_the_documented_alias_rule`(두 형식 × lctn 0·1·2·없음,
+  MariaDB, SQL Server CS·CI·없음), `mysql_using_alias_exclusion_does_not_hide_a_real_table_read`, 그리고 parse_limits 끝 END 단위 테스트를
+  바꿨다(세 입력이 한 문장). 새 6개가 `67943bb`의 parser 소스에서 실패하고, 변이 10종(끝 END 버리기 끔, 무시 문장 절 끊기 끔, `=` 변수 버리기 끔,
+  CASE 깊이 무시, EXEC 인자 끊기 끔, `@` 뒤 단어 허용, Sensitive를 풀기, Unknown 진단 끔, 상한 진단 끔, 주소 대신 이름 비교)을 각각 잡는다.
+- 대항 입력 21개(`adv2.py`, main·`67943bb`·수정본)와 라운드 4의 38개(`67943bb`·수정본): 38개 가운데 바뀐 것은 S3의 lctn 0 사례 하나다. 새 21개에서
+  main에만 있던 간선은 lctn 0 대상 목록 형식의 거짓 `writes audit`뿐이고, 더해진 간선은 모두 세미콜론 판과 같다. 세미콜론으로 끝나는 방언
+  사례(PL/pgSQL·MySQL·PL/SQL)와 `RAISERROR … WITH NOWAIT;`는 셋이 같다. `EXEC get_sql @s OUTPUT EXEC(@s)`는 `OUTPUT` 인자를 지워 동적
+  SQL을 접지 않는다(세미콜론 판과 같은 미추출). 코퍼스: SQL Server fixture는 세미콜론 판이 같고, 세미콜론을 지운 판은 `dynamic_touch`의
+  `EXEC(N'UPDATE customers …')` 간선 3개가 더해진다(세미콜론 판에 있는 간선).
+- 검증(최종 트리): `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, 워크스페이스 테스트
+  739개 통과(733 + parser 6). Python CI 테스트 11개와 `test-dml-producers.py`·`test-capture-migration.py`·`verify-contracts.py`·
+  `verify-competitive.py`·`verify-cancellation.py`·`verify-document-versions.py`(SQLite·PG)·`verify-dynamic-sql.py`(PG). SQLite 골든·PG 골든
+  diff 0. 실제 PostgreSQL 16.15: `verify-accuracy.py --sqlglot --suite all --strict`(실패 0, 엔진 결과는 main과 같음),
+  `verify-bridge-facts.py --require-isthmus`(isthmus-cli 0.14.0), `verify-openlineage.py`, `verify-collection-scope.py`·`verify-schema-lint.py`·
+  `verify-unused.py`·`verify-catalog-dependencies.py`(네이티브) 모두 `ok`. Go `gofmt -l`·`go vet`·`go test` 통과. `--cache-dir` cold/warm는
+  `lower_case_table_names`를 0↔1로 바꿔도, 새 몸체 모양에서도 같다. 성능: TRY·CATCH 2천 쌍 몸체 0.84초(디버그, 부하 낮을 때).
+  돌리지 못한 것은 라운드 4와 같다(MySQL·MariaDB·SQL Server 실서버, Docker fixture, DML 정확도, JDBC, GLM 리뷰).
 
 ### 라운드 3 (2026-11-22)
 
@@ -500,6 +564,11 @@ PR #59는 GLM 리뷰 없이 머지됐다.
      텍스트를 버린다. `IF 1 = 1 BEGIN UPDATE audit … END ELSE BEGIN UPDATE log … END UPDATE orders …`(SQL Server)는 `IF` 머리와 끝의
      `UPDATE orders`를 잃는다. 라운드 4 뒤로는 그 안의 `END ELSE`를 읽지 못해 `partial`로 표시되지만 `log`·`orders` 간선은 없다.
      고치려면 routine에서는 바깥 `BEGIN … END`가 몸체 전체를 감쌀 때만 벗겨야 하고, trigger 머리(`CREATE TRIGGER … AS`)와 갈라야 한다.
+   - (PR #63 리뷰 반영 중 확인) 세미콜론 없는 T-SQL에서 `OPEN cur` 뒤 문장은 여전히 소리 없이 빠진다(`strip_open`이 조각 끝까지 본다;
+     PL/pgSQL `OPEN c FOR SELECT …`의 질의를 끊지 않게 FOR 절을 따로 봐야 한다). END 갈래는 `END` 뒤 한 단어를 꼬리로 먹어
+     `BREAK END UPDATE log …`의 `UPDATE`를 잃는다(미추출로 셈) — 꼬리가 문장 머리면 먹지 않게 할 수 있다. `UPDATE C … FROM audit c`의 승격
+     (`promoted_update_factor`·`scope.rs` `promoted_update_target`)은 아직 문서의 별칭 대소문자 규칙을 보지 않고 늘 대소문자를 무시하며,
+     대상 철자를 문장 전체 읽기에서 뺀다(main부터; DELETE는 PR #63 리뷰에서 고침). MariaDB의 별칭·CTE 이름 규칙은 확인하지 않았다.
    - (sqlparser 0.58 한계, 라운드 4에서 확인) T-SQL 문장 사이 `;`는 `END` 앞에서만 생략할 수 있다. `UPDATE a … UPDATE b …`는
      미추출로 세고, 세미콜론 없는 `DECLARE @n int BEGIN TRY …`는 추출기가 DECLARE 조각에 나머지를 삼켜 몸체가 unsupported다(라운드 4
      전후 같음). `DELETE TOP (n) FROM …`과 FROM 없는 `DELETE app.dbo.audit WHERE …`도 파싱하지 못해 미추출이다.
