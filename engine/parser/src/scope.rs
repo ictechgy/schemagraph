@@ -741,8 +741,13 @@ fn object_shape(object: &ObjectDoc) -> String {
 ///
 /// 앞에 WITH가 붙은 INSERT·UPDATE·DELETE도 sqlparser에서는 `Statement::Query`다. 그 문장을
 /// 읽기 해석기로 보내면 쓰기 대상이 사라지므로 DML 경로에 남긴다.
+///
+/// 문장 뒤에 `;` 없이 `END`가 오고 그 뒤를 읽지 못하는 몸체(`select id from audit end where end.id = 1` —
+/// SQLite·MySQL은 `end`를 별칭으로 받는다)도 그 앞이 한 SELECT면 읽기 해석기로 보낸다. 해석기는 읽은
+/// 앞부분의 간선을 남기고 부분 분석으로 표시한다(`enrich_view`).
 pub(crate) fn is_select(dialect: &dyn Dialect, body: &str) -> bool {
-    super::parse_limits::parse_sql(dialect, body).is_ok_and(|s| {
+    super::parse_limits::parse_sql_prefix(dialect, body).is_ok_and(|prefix| {
+        let s = prefix.statements;
         s.len() == 1
             && matches!(&s[0], Statement::Query(query) if super::query_dml_statement(query).is_none())
             && !super::is_column_dml_statement(&s[0])
@@ -3506,7 +3511,7 @@ pub(crate) fn enrich_view(
         )];
     };
     let hash = body_hash(body);
-    let parsed = super::parse_limits::parse_sql(dialect, body);
+    let parsed = super::parse_limits::parse_sql_prefix(dialect, body);
     let mut binder = Binder {
         catalog,
         graph,
@@ -3523,6 +3528,22 @@ pub(crate) fn enrich_view(
         local_relations: BTreeMap::new(),
     };
     let mut outputs = Vec::new();
+    // 문장 뒤에 `;` 없이 온 `END`부터 읽지 못한 정의(`… from audit end where end.id = 1`)는 앞부분의
+    // 간선을 남기되 뒤 절을 분석하지 않았다고 표시한다. 이전에는 그 뒤를 소리 없이 버리고 `complete`일
+    // 수 있었고, `END`부터 다시 읽게 된 뒤로는 파싱 실패로 간선을 모두 잃었다.
+    let parsed = parsed.map(|prefix| {
+        if let Some(unparsed) = &prefix.unparsed {
+            binder.note(
+                "SG_BODY_PARTIAL",
+                format!(
+                    "SQL text from a bare END onward was not parsed; the clauses after it were not analyzed ({})",
+                    unparsed.error
+                ),
+                None,
+            );
+        }
+        prefix.statements
+    });
     match parsed {
         Ok(statements) if statements.len() == 1 => {
             for statement in &statements {

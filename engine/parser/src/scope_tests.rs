@@ -2073,6 +2073,45 @@ fn case_sensitive_alias_mismatch_writes_no_catalog_table() {
     );
 }
 
+/// 뷰·쿼리 파일에서 `end` 별칭 뒤에 절이 이어지면(SQLite 3.53.1은 세 뷰를 모두 만든다) sqlparser는 그
+/// `END`에서 멈춘다. 그 앞 SELECT의 간선은 남기고 뒤 절을 분석하지 않았다고 부분 분석으로 표시한다.
+/// main은 뒤를 소리 없이 버렸고(`complete`일 수 있었다), bc223db는 파싱 실패로 간선을 모두 잃었다.
+#[test]
+fn an_end_alias_followed_by_clauses_keeps_the_select_edges() {
+    for body in [
+        "select id from orders end order by id",
+        "select id from orders end where end.id = 1",
+        "select end.id from orders end join customers o on o.id = end.id",
+    ] {
+        let view = scan_with_dialect(body, &["id"], "sqlite");
+        let detail = format!("{body}: {:?} {:?}", view.edges(), view.analysis());
+        assert!(edge(&view, "s.v", "s.orders", EdgeKind::Reads), "{detail}");
+        let analysis = &view.analysis()[&VertexId::from_raw("s.v")];
+        assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "SG_BODY_PARTIAL"
+                    && diagnostic
+                        .message
+                        .starts_with("SQL text from a bare END onward was not parsed")),
+            "{detail}"
+        );
+    }
+    let query = scan_routine_kind(
+        "select id from audit end where end.id = 1",
+        "mysql",
+        "sql",
+        "query",
+    );
+    let detail = format!("{:?} {:?}", query.edges(), query.analysis());
+    assert!(
+        edge(&query, "s.mutate", "s.audit.id", EdgeKind::Reads),
+        "{detail}"
+    );
+}
+
 /// T-SQL에서 끊은 자리의 읽기·쓰기는 세미콜론 판과 같다 — `EXECUTE proc` 인자 뒤 문장, `PRINT`의 하위 질의,
 /// 그리고 `WITH cte AS (…)`로 여는 문장. 이전에는 `PRINT 'x' WITH cte AS (…) INSERT …`가 `WITH`를 `PRINT`의
 /// 절로 버려 실제 테이블 `cte`를 읽는 거짓 간선을 냈다.
