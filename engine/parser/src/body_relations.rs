@@ -9,9 +9,9 @@ use sqlparser::ast::{
 };
 
 use super::{
-    copy_to_table, is_sqlserver_transition_relation, qualified_write_targets, read_exclusions,
-    relation_name_key, relation_name_parts, using_alias_references, write_targets_shallow,
-    CollectRules, ParsedTrigger,
+    copy_to_table, is_rejected_delete, is_sqlserver_transition_relation, qualified_write_targets,
+    read_exclusions, relation_name_key, relation_name_parts, using_alias_references,
+    write_targets_shallow, CollectRules, ParsedTrigger,
 };
 
 /// 컬럼 해석과 같은 PostgreSQL 인용 규칙을 본문의 관계·호출 이름에도 적용한다.
@@ -76,6 +76,8 @@ pub(super) fn collect_reads(
         exclusions: Vec<Vec<(Option<String>, String)>>,
         /// 문장마다 읽기로 세지 않을 이름 노드의 주소(MySQL USING 형식의 FROM 목록).
         alias_references: Vec<Vec<*const ObjectName>>,
+        /// 문장마다, MySQL이 거절해 실행되지 않는 DELETE 안인가(`is_rejected_delete`).
+        rejected: Vec<bool>,
         qualified_writes: Vec<Vec<ObjectName>>,
     }
     impl Relations<'_> {
@@ -98,6 +100,9 @@ pub(super) fn collect_reads(
             ));
             self.alias_references
                 .push(using_alias_references(statement, self.rules));
+            let inside_rejected = self.rejected.last().copied().unwrap_or(false);
+            self.rejected
+                .push(inside_rejected || is_rejected_delete(statement, self.rules));
             self.qualified_writes
                 .push(qualified_write_targets(statement, self.rules));
             // COPY TO의 원본 테이블은 visitor가 관계로 방문하지 않는 자리라
@@ -110,6 +115,7 @@ pub(super) fn collect_reads(
         fn post_visit_statement(&mut self, _: &Statement) -> ControlFlow<()> {
             self.exclusions.pop();
             self.alias_references.pop();
+            self.rejected.pop();
             self.qualified_writes.pop();
             ControlFlow::Continue(())
         }
@@ -143,6 +149,9 @@ pub(super) fn collect_reads(
             ControlFlow::Continue(())
         }
         fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<()> {
+            if self.rejected.last().copied().unwrap_or(false) {
+                return ControlFlow::Continue(());
+            }
             if self
                 .alias_references
                 .last()
@@ -198,6 +207,7 @@ pub(super) fn collect_reads(
             definitions: BTreeMap::new(),
             exclusions: Vec::new(),
             alias_references: Vec::new(),
+            rejected: Vec::new(),
             qualified_writes: Vec::new(),
         },
     );

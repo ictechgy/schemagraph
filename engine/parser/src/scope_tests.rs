@@ -2225,6 +2225,41 @@ fn set_statements_end_at_the_next_statement_head() {
     }
 }
 
+/// MySQL이 거절하는 DELETE(대상 하나가 lctn 0에서 별칭과 대소문자만 다름)는 문장 전체가 실행되지 않는다 —
+/// 다른 대상(`o`)에도 쓰지 않고 그 문장의 읽기도 없다. 이전에는 거절된 대상만 빼고 `writes orders`와
+/// `reads audit`를 남겼다.
+#[test]
+fn a_rejected_delete_records_no_writes_or_reads() {
+    for body in [
+        "DELETE C, o FROM audit c JOIN orders o ON o.id = c.id",
+        "DELETE FROM C, o USING audit c JOIN orders o ON o.id = c.id",
+        "DELETE C FROM audit c WHERE c.id IN (SELECT id FROM C)",
+        // 절차형 추출로 가는 몸체도 거절 진단과 부분 분석을 남긴다(간선이 없어도 파싱 실패가 아니다).
+        "BEGIN DECLARE x INT DEFAULT 1; DELETE C FROM audit c WHERE c.id = x; END",
+    ] {
+        let graph = scan_routine_with_objects(
+            body,
+            "mysql",
+            "sql",
+            "procedure",
+            Some(naming_context(None, Some(0))),
+            vec![object("c", &["id"]), object("C", &["id"])],
+        );
+        let detail = format!("{body}: {:?} {:?}", graph.edges(), graph.analysis());
+        for target in ["s.audit", "s.orders", "s.C", "s.c"] {
+            assert!(!touches(&graph, "s.mutate", target), "{detail}");
+        }
+        let analysis = &graph.analysis()[&VertexId::from_raw("s.mutate")];
+        assert_eq!(analysis.state, AnalysisState::Partial, "{detail}");
+        assert!(
+            analysis.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("rejects the whole statement (ER_UNKNOWN_TABLE)")),
+            "{detail}"
+        );
+    }
+}
+
 /// MySQL USING 형식의 FROM 목록 별칭은 그 자리만 읽기에서 뺀다. 하위 질의가 같은 이름의 실제 테이블
 /// `c`를 읽는 것은 읽기다.
 #[test]

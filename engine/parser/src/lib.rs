@@ -422,7 +422,12 @@ pub fn enrich_with_cache(
                                     format_shadowed,
                                     alias_case,
                                 );
-                                if parsed.has_edges() || unextracted > 0 {
+                                // 간선이 없어도 부분 분석으로 표시한 진단(MySQL이 거절하는 DELETE 등)은
+                                // 파싱 실패가 아니라 분석 결과다.
+                                if parsed.has_edges() || parsed.partial || unextracted > 0 {
+                                    if !parsed.has_edges() && parsed.partial {
+                                        state = schemagraph_core::AnalysisState::Partial;
+                                    }
                                     if parsed.has_edges() {
                                         let partial = apply_routine(
                                             g,
@@ -4304,10 +4309,28 @@ fn write_targets_shallow(stmt: &Statement, rules: CollectRules) -> Vec<(Option<S
 /// 이름은 부분으로 나누지 않고 돌려준다. 데이터베이스까지 한정한 대상(`DELETE FROM app.dbo.audit`,
 /// `DELETE c FROM app.dbo.audit c …`)도 대상으로 남아 `qualified_write_targets`가 쓰기로 모은다.
 fn delete_target_names(delete: &sqlparser::ast::Delete, rules: CollectRules) -> Vec<&ObjectName> {
-    delete_target_resolutions(delete, rules)
+    let resolutions = delete_target_resolutions(delete, rules);
+    // 대상 하나라도 MySQL이 거절하면(`ER_UNKNOWN_TABLE`) 문장 전체가 실행되지 않는다 — 다른 대상에도
+    // 쓰지 않는다.
+    if resolutions
+        .iter()
+        .any(|(_, resolution)| resolution.relation.is_none())
+    {
+        return Vec::new();
+    }
+    resolutions
         .into_iter()
         .filter_map(|(_, resolution)| resolution.relation)
         .collect()
+}
+
+/// MySQL이 거절해 실행되지 않는 DELETE인가 — 대상 하나라도 대소문자를 구분하는 규칙에서 별칭과
+/// 대소문자만 다르다(`resolve_delete_target`). 그 문장의 읽기도 일어나지 않는다(`body_relations`).
+fn is_rejected_delete(stmt: &Statement, rules: CollectRules) -> bool {
+    matches!(stmt, Statement::Delete(delete)
+        if delete_target_resolutions(delete, rules)
+            .iter()
+            .any(|(_, resolution)| resolution.relation.is_none()))
 }
 
 /// DELETE 대상 하나를 별칭으로 푼 결과다.
@@ -4456,7 +4479,7 @@ fn alias_case_messages(stmt: &Statement, rules: CollectRules) -> Vec<String> {
                     "DML target '{target}' names the alias '{alias}' only if letter case is ignored, and the document does not prove the alias case rule; the write edge to the aliased relation is kept"
                 ),
                 None => format!(
-                    "DML target '{target}' matches the alias '{alias}' only by letter case; MySQL compares them byte for byte when lower_case_table_names is 0 and rejects the statement (ER_UNKNOWN_TABLE), so no write edge is recorded"
+                    "DML target '{target}' matches the alias '{alias}' only by letter case; MySQL compares them byte for byte when lower_case_table_names is 0 and rejects the whole statement (ER_UNKNOWN_TABLE), so none of its writes or reads are recorded"
                 ),
             });
         }
