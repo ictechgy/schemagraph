@@ -1405,6 +1405,163 @@ fn delete_through_a_from_alias_writes_the_aliased_table() {
     );
 }
 
+/// 수집한 데이터베이스까지 한정한 DELETE·TRUNCATE 대상(`app.s.audit`)은 쓰기다. 세 부분 쓰기 대상은
+/// `qualified_write_targets`가 따로 모으는데 DELETE·TRUNCATE가 빠져 있어, 대상이 FROM 관계로 방문되어
+/// `reads s.audit`(거짓)이 되고 쓰기 간선은 없었다. 별칭이 세 부분 관계를 가리키는 다중 테이블
+/// DELETE·UPDATE(`DELETE c FROM app.s.audit c …`)는 별칭 철자로 되돌아가 없는 관계 `s.c` 한계와 부분
+/// 분석을 냈다. SQL Server 문서의 DELETE `<object>`와 TRUNCATE TABLE 문법은 `database_name.schema_name.`
+/// 한정을 허용한다.
+#[test]
+fn database_qualified_delete_and_truncate_targets_are_writes() {
+    let context = CollectionContext {
+        database: Some("app".into()),
+        ..naming_context(None, None)
+    };
+    for body in [
+        "DELETE FROM app.s.audit WHERE id = 1",
+        "TRUNCATE TABLE app.s.audit",
+        "DELETE c FROM app.s.audit c JOIN s.orders o ON c.id = o.id",
+        "UPDATE c SET name = 'x' FROM app.s.audit c JOIN s.orders o ON c.id = o.id",
+        "WITH x AS (SELECT id FROM s.orders) DELETE FROM app.s.audit WHERE id IN (SELECT id FROM x)",
+        // 별칭 `c`·`C`는 대소문자를 구분하는 collation에서만 함께 쓸 수 있고, 그때 `c`는 audit다.
+        // 이전에는 세 부분 관계를 후보에서 빼 `C`(orders)를 대상으로 골랐다.
+        "DELETE c FROM app.s.audit c JOIN s.orders C ON c.id = C.id",
+    ] {
+        let graph = scan_routine_in_context(
+            body,
+            "sqlserver",
+            "sql",
+            "procedure",
+            Some(context.clone()),
+        );
+        let detail = format!("{body}: {:?} {:?}", graph.edges(), graph.limitations());
+        assert!(
+            edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert!(
+            !edge(&graph, "s.mutate", "s.audit", EdgeKind::Reads),
+            "{detail}"
+        );
+        assert!(
+            !edge(&graph, "s.mutate", "s.orders", EdgeKind::Writes),
+            "{detail}"
+        );
+        assert!(!touches(&graph, "s.mutate", "s.c"), "{detail}");
+        assert!(graph.limitations().is_empty(), "{detail}");
+        assert_eq!(
+            graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+            AnalysisState::Complete,
+            "{detail}"
+        );
+    }
+    // 다른 데이터베이스의 대상은 이전처럼 간선 없이 SG_CROSS_DATABASE다.
+    let other = scan_routine_in_context(
+        "DELETE FROM other.s.audit WHERE id = 1",
+        "sqlserver",
+        "sql",
+        "procedure",
+        Some(context),
+    );
+    let detail = format!("{:?} {:?}", other.edges(), other.limitations());
+    assert!(!touches(&other, "s.mutate", "s.audit"), "{detail}");
+    assert!(has_diagnostic(&other, "SG_CROSS_DATABASE"), "{detail}");
+}
+
+/// MySQL·MariaDB의 `DELETE FROM c USING audit c …`에서 FROM 목록은 USING 관계를 가리키는 참조다
+/// (mysql-server 8.0 `sql_yacc.yy`: `FROM table_alias_ref_list USING table_reference_list`). 이전에는
+/// FROM의 `c`를 삭제 대상 테이블로 읽어 `s.c`가 없다는 거짓 한계와 `reads s.audit`만 남겼다.
+/// PostgreSQL의 FROM은 삭제할 테이블 자체라 같은 모양을 풀지 않는다 — `DELETE FROM c USING audit "C"`는
+/// PostgreSQL에서 테이블 `c`를 지운다(PostgreSQL 16에서 확인).
+#[test]
+fn mysql_delete_using_resolves_the_from_list_through_using_aliases() {
+    for dialect in ["mysql", "mariadb"] {
+        for (body, writes, reads) in [
+            (
+                "DELETE FROM c USING audit c JOIN orders o ON c.id = o.id",
+                &["s.audit"][..],
+                &["s.orders"][..],
+            ),
+            (
+                "DELETE FROM c, o USING audit AS c JOIN orders AS o ON c.id = o.id",
+                &["s.audit", "s.orders"][..],
+                &[][..],
+            ),
+            (
+                "DELETE FROM audit USING audit JOIN orders o ON audit.id = o.id",
+                &["s.audit"][..],
+                &["s.orders"][..],
+            ),
+            (
+                "WITH c AS (SELECT id FROM customers) DELETE FROM c USING audit c JOIN orders o ON c.id = o.id",
+                &["s.audit"][..],
+                &["s.orders", "s.customers"][..],
+            ),
+        ] {
+            let graph = scan_routine_in_context(
+                body,
+                dialect,
+                "sql",
+                "procedure",
+                Some(naming_context(None, Some(0))),
+            );
+            let detail = format!(
+                "{dialect} {body}: {:?} {:?}",
+                graph.edges(),
+                graph.limitations()
+            );
+            for target in writes {
+                assert!(
+                    edge(&graph, "s.mutate", target, EdgeKind::Writes),
+                    "{detail}"
+                );
+            }
+            for source in reads {
+                assert!(edge(&graph, "s.mutate", source, EdgeKind::Reads), "{detail}");
+            }
+            assert!(!touches(&graph, "s.mutate", "s.c"), "{detail}");
+            assert!(graph.limitations().is_empty(), "{detail}");
+            assert_eq!(
+                graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+                AnalysisState::Complete,
+                "{detail}"
+            );
+        }
+    }
+    // USING 별칭이 그 문장의 WITH 이름인 관계를 가리키면 MySQL은 그 WITH 질의를 대상으로 본다.
+    let through_cte = scan_routine_in_context(
+        "WITH audit AS (SELECT id FROM customers) DELETE FROM x USING audit x JOIN orders o ON x.id = o.id",
+        "mysql",
+        "sql",
+        "procedure",
+        Some(naming_context(None, Some(0))),
+    );
+    let detail = format!("{:?}", through_cte.edges());
+    assert!(!touches(&through_cte, "s.mutate", "s.audit"), "{detail}");
+    assert!(
+        has_diagnostic(&through_cte, "SG_DML_TARGET_SHAPE"),
+        "{detail}"
+    );
+    // PostgreSQL은 FROM의 테이블을 지운다.
+    let postgres = scan_routine_with_objects(
+        "DELETE FROM c USING audit \"C\" WHERE \"C\".id = c.id",
+        "postgres",
+        "sql",
+        "procedure",
+        None,
+        vec![object("c", &["id"])],
+    );
+    let detail = format!("{:?} {:?}", postgres.edges(), postgres.limitations());
+    assert!(
+        edge(&postgres, "s.mutate", "s.c", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(
+        !edge(&postgres, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{detail}"
+    );
+}
+
 /// 앞에 WITH가 붙은 DELETE도 CTE 몸체가 읽는 컬럼을 남긴다. 읽기 경로로 보내던 때에는 그
 /// 컬럼 읽기가 남았는데, DML 경로로 옮기면서 DELETE를 컬럼 분석기로 보내지 않아 사라졌다.
 #[test]

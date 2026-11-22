@@ -91,10 +91,11 @@ pub(super) fn collect_reads(
         fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
             self.exclusions.push(read_exclusions(
                 statement,
-                &write_targets_shallow(statement),
+                &write_targets_shallow(statement, self.rules),
+                self.rules,
             ));
             self.qualified_writes
-                .push(qualified_write_targets(statement));
+                .push(qualified_write_targets(statement, self.rules));
             // COPY TO의 원본 테이블은 visitor가 관계로 방문하지 않는 자리라
             // 같은 관계 판정을 직접 적용한다.
             if let Some(source) = copy_to_table(statement) {

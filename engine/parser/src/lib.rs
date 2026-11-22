@@ -999,6 +999,7 @@ fn parse_trigger_body(
                 sqlserver_trigger,
                 sqlite_trigger,
                 sqlite: dialect.is::<SQLiteDialect>(),
+                mysql: dialect.is::<MySqlDialect>(),
             };
             for mut stmt in stmts {
                 if dialect.is::<PostgreSqlDialect>() {
@@ -2012,6 +2013,7 @@ fn parse_procedural_body(
     }
     let rules = CollectRules {
         sqlite: dialect.is::<SQLiteDialect>(),
+        mysql: dialect.is::<MySqlDialect>(),
         ..CollectRules::default()
     };
     for stmt in &stmts {
@@ -3490,6 +3492,10 @@ struct CollectRules {
     /// SQLite 몸체(trigger·DML 쿼리 파일) — CTE 이름을 SQLite처럼 ASCII 대소문자만 접어
     /// 비교한다. 컬럼 단위 Binder(`scope::name`)와 같은 규칙이다.
     sqlite: bool,
+    /// MySQL·MariaDB 몸체 — 다중 테이블 DELETE의 `DELETE FROM c USING audit c …`에서 FROM 목록은
+    /// 삭제할 관계가 아니라 USING 관계(의 별칭)를 가리키는 참조다. PostgreSQL의
+    /// `DELETE FROM t USING …`도 같은 AST지만 FROM의 `t`가 삭제 대상 테이블 자체라 방언으로 가른다.
+    mysql: bool,
 }
 
 /// 앞에 WITH가 붙은 DML에서 그 WITH의 CTE와 이름이 같은 한정자 없는 쓰기 대상이다.
@@ -3508,7 +3514,10 @@ struct CteWrite {
 /// 절차형 블록(`IF 1 = 1 WITH c AS (…) UPDATE c …`) 안의 문장도 부모 문장이 안쪽 대상을 모으므로
 /// 여기서 함께 가른다. visitor는 부모를 자식보다 먼저 방문하므로, WITH로 감싼 문장을 만나면 안쪽
 /// DML의 주소와 CTE 이름을 기억해 두었다가 그 DML을 방문할 때 쓴다.
-fn split_write_targets(stmt: &Statement) -> (Vec<(Option<String>, String)>, Vec<CteWrite>) {
+fn split_write_targets(
+    stmt: &Statement,
+    rules: CollectRules,
+) -> (Vec<(Option<String>, String)>, Vec<CteWrite>) {
     let mut writes = Vec::new();
     let mut cte_writes = Vec::new();
     let mut wrapped: Vec<(*const Statement, Vec<String>)> = Vec::new();
@@ -3520,7 +3529,7 @@ fn split_write_targets(stmt: &Statement) -> (Vec<(Option<String>, String)>, Vec<
             .iter()
             .find(|(dml, _)| std::ptr::eq(*dml, statement))
             .map(|(_, names)| names.as_slice());
-        for target in write_targets_shallow(statement) {
+        for target in write_targets_shallow(statement, rules) {
             match names.and_then(|names| cte_write(&target, names)) {
                 Some(write) => cte_writes.push(write),
                 None => writes.push(target),
@@ -3650,13 +3659,13 @@ fn collect_trigger_facts(stmt: &Statement, parsed: &mut ParsedTrigger, rules: Co
     }
     // 쓰기 대상은 절차형 블록까지 재귀로 본다 — 블록 안의 UPDATE 대상이
     // 부모 문장의 visit_relations에서 reads로 오인되지 않게 미리 다 알아야 한다.
-    let (write_targets, cte_writes) = split_write_targets(stmt);
+    let (write_targets, cte_writes) = split_write_targets(stmt, rules);
     for write in cte_writes {
         if !parsed.cte_writes.contains(&write) {
             parsed.cte_writes.push(write);
         }
     }
-    let qualified_writes = qualified_write_targets(stmt);
+    let qualified_writes = qualified_write_targets(stmt, rules);
     for target in &qualified_writes {
         if !parsed.qualified_writes.contains(target) {
             parsed.qualified_writes.push(target.clone());
@@ -3909,7 +3918,10 @@ fn nested_statements(stmt: &Statement) -> Vec<&Statement> {
 }
 
 /// 한 문장의 표면 쓰기 대상 — 중첩 블록은 write_targets가 본다.
-fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
+///
+/// 두 부분 이하의 이름만 돌려준다. 데이터베이스까지 한정한 세 부분 대상은
+/// `qualified_write_targets`가 따로 모은다.
+fn write_targets_shallow(stmt: &Statement, rules: CollectRules) -> Vec<(Option<String>, String)> {
     match stmt {
         Statement::Truncate { table_names, .. } => table_names
             .iter()
@@ -3923,10 +3935,13 @@ fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
                     | UpdateTableFromKind::AfterSet(tables) => tables.as_slice(),
                 })
                 .unwrap_or(&[]);
-            promoted_update_target(&table.relation, tables)
-                .or_else(|| table_factor_name(&table.relation))
-                .into_iter()
-                .collect()
+            // 별칭이 가리키는 FROM 관계가 세 부분 이름이면 여기서는 대상이 없다 — 별칭 철자로
+            // 되돌아가면 없는 관계 `s.c`를 쓰는 거짓 간선·한계가 된다.
+            table_factor_name(
+                promoted_update_factor(&table.relation, tables).unwrap_or(&table.relation),
+            )
+            .into_iter()
+            .collect()
         }
         Statement::Merge { table, .. } => table_factor_name(table).into_iter().collect(),
         Statement::Insert(insert) => match &insert.table {
@@ -3944,12 +3959,15 @@ fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
             .and_then(|into| relation_name_parts(&into.name))
             .into_iter()
             .collect(),
-        Statement::Delete(delete) => delete_write_targets(delete),
+        Statement::Delete(delete) => delete_target_names(delete, rules)
+            .into_iter()
+            .filter_map(relation_name_parts)
+            .collect(),
         _ => vec![],
     }
 }
 
-/// DELETE의 쓰기 대상이다.
+/// DELETE가 행을 지우는 관계의 이름이다.
 ///
 /// `DELETE FROM t`는 FROM 절이 대상이다. FROM 앞에 대상 목록이 있는 다중 테이블 DELETE
 /// (`DELETE c FROM audit c JOIN orders o …`, MySQL·SQL Server)에서 목록의 이름은 FROM 절 관계를
@@ -3957,34 +3975,49 @@ fn write_targets_shallow(stmt: &Statement) -> Vec<(Option<String>, String)> {
 /// table_source clause representing the table or view from which the rows are to be deleted"이고,
 /// mysql-server 8.0 `Query_block::add_table_to_list`는 그 목록(`TL_OPTION_ALIAS`)을 CTE로 찾지
 /// 않는다("those are only references into the FROM list, and any CTEs referenced by the aliases will
-/// be resolved when we later resolve the FROM list"). 그래서 `UPDATE` 승격(`promoted_update_target`)
+/// be resolved when we later resolve the FROM list"). 그래서 `UPDATE` 승격(`promoted_update_factor`)
 /// 처럼 FROM 절의 별칭이 가리키는 관계로 먼저 바꾸고, 그 관계 이름으로 CTE 이름 판정을 한다.
-fn delete_write_targets(delete: &sqlparser::ast::Delete) -> Vec<(Option<String>, String)> {
+///
+/// MySQL·MariaDB의 `DELETE FROM c USING audit c …`도 같은 다중 테이블 DELETE다(mysql-server 8.0
+/// `sql_yacc.yy`의 `FROM table_alias_ref_list USING table_reference_list`). FROM 목록은 USING
+/// 관계를 가리키므로 같은 규칙으로 USING의 별칭을 푼다. PostgreSQL의 FROM은 삭제할 테이블 자체이고
+/// USING에 같은 이름의 별칭을 두면 "table name … specified more than once" 오류라 풀지 않는다.
+///
+/// 이름은 부분으로 나누지 않고 돌려준다. 데이터베이스까지 한정한 대상(`DELETE FROM app.dbo.audit`,
+/// `DELETE c FROM app.dbo.audit c …`)도 대상으로 남아 `qualified_write_targets`가 쓰기로 모은다.
+fn delete_target_names(delete: &sqlparser::ast::Delete, rules: CollectRules) -> Vec<&ObjectName> {
     let from: &[TableWithJoins] = match &delete.from {
         sqlparser::ast::FromTable::WithFromKeyword(tables)
         | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
     };
-    if delete.tables.is_empty() {
-        return from
+    if !delete.tables.is_empty() {
+        return delete
+            .tables
             .iter()
-            .filter_map(|twj| table_factor_name(&twj.relation))
+            .map(|target| alias_target(target, from).unwrap_or(target))
             .collect();
     }
-    let sources: Vec<&TableFactor> = from
-        .iter()
-        .flat_map(|twj| {
-            std::iter::once(&twj.relation).chain(twj.joins.iter().map(|join| &join.relation))
-        })
-        .collect();
-    delete
-        .tables
-        .iter()
-        .filter_map(|target| {
-            single_ident(target)
-                .and_then(|alias| aliased_relation(alias, sources.iter().copied()))
-                .or_else(|| relation_name_parts(target))
+    let using = delete.using.as_deref().filter(|_| rules.mysql);
+    from.iter()
+        .filter_map(|twj| match &twj.relation {
+            TableFactor::Table { name, alias, .. } => Some(
+                using
+                    .filter(|_| alias.is_none())
+                    .and_then(|using| alias_target(name, using))
+                    .unwrap_or(name),
+            ),
+            _ => None,
         })
         .collect()
+}
+
+/// 한 부분짜리 대상 이름이 `tables`(조인한 관계 포함)에서 별칭으로 선언된 물리 관계를 가리키면
+/// 그 관계의 이름이다.
+fn alias_target<'a>(target: &ObjectName, tables: &'a [TableWithJoins]) -> Option<&'a ObjectName> {
+    let factors = tables.iter().flat_map(|twj| {
+        std::iter::once(&twj.relation).chain(twj.joins.iter().map(|join| &join.relation))
+    });
+    aliased_relation(single_ident(target)?, factors)
 }
 
 /// 한 부분짜리 이름의 식별자 철자다.
@@ -3995,62 +4028,80 @@ fn single_ident(name: &ObjectName) -> Option<&str> {
     Some(part.as_ident()?.value.as_str())
 }
 
-/// `alias`(ASCII 대소문자 무시)로 선언된 물리 관계가 `factors` 가운데 하나뿐이면 그 관계 이름이다.
+/// `alias`로 선언된 물리 관계가 `factors` 가운데 하나뿐이면 그 관계 이름이다.
+///
+/// 철자가 정확히 같은 별칭을 먼저 찾고, 없을 때만 ASCII 대소문자를 무시한다. 별칭의 대소문자를
+/// 구분하는 설정(SQL Server CS collation, MySQL `lower_case_table_names=0`)에서는 `c`와 `C`가 다른
+/// 별칭이고, 무시하는 설정에서는 둘을 함께 선언할 수 없다(오류). 그래서 정확한 철자가 하나면 그
+/// 관계가 어느 설정에서나 맞다. 이름을 부분으로 나누지 않는다 — 별칭이 세 부분 이름의 관계를
+/// 가리켜도 후보에서 빠지지 않아야 별칭 철자를 관계 이름으로 오인하지 않는다.
 fn aliased_relation<'a>(
     alias: &str,
     factors: impl Iterator<Item = &'a TableFactor>,
-) -> Option<(Option<String>, String)> {
-    let matches: Vec<_> = factors
+) -> Option<&'a ObjectName> {
+    let declared: Vec<(&str, &ObjectName)> = factors
         .filter_map(|factor| match factor {
             TableFactor::Table {
+                name,
                 alias: Some(declared),
                 args: None,
                 ..
-            } if declared.name.value.eq_ignore_ascii_case(alias) => table_factor_name(factor),
+            } if declared.name.value.eq_ignore_ascii_case(alias) => {
+                Some((declared.name.value.as_str(), name))
+            }
             _ => None,
         })
         .collect();
-    match matches.as_slice() {
-        [target] => Some(target.clone()),
+    let exact: Vec<&ObjectName> = declared
+        .iter()
+        .filter(|(spelling, _)| *spelling == alias)
+        .map(|(_, name)| *name)
+        .collect();
+    let candidates = if exact.is_empty() {
+        declared.iter().map(|(_, name)| *name).collect()
+    } else {
+        exact
+    };
+    match candidates.as_slice() {
+        [target] => Some(*target),
         _ => None,
     }
 }
 
+/// 한 문장에서 읽기로 세지 않을 관계 이름이다 — 쓰기 대상과, 대상을 별칭으로 적은 자리의 철자.
+///
+/// `UPDATE c … FROM audit c`의 `c`와 MySQL `DELETE FROM c USING audit c …`의 FROM 목록 `c`는
+/// visitor가 관계로 방문하지만 실제로는 별칭 참조라, 읽기로 세면 없는 관계 `s.c`가 된다.
 fn read_exclusions(
     stmt: &Statement,
     write_targets: &[(Option<String>, String)],
+    rules: CollectRules,
 ) -> Vec<(Option<String>, String)> {
     let mut exclusions = write_targets.to_vec();
-    if let Statement::Update { table, .. } = stmt {
-        if let Some(target) = table_factor_name(&table.relation) {
-            if !exclusions.contains(&target) {
-                exclusions.push(target);
+    let aliased: Vec<&TableFactor> = match stmt {
+        Statement::Update { table, .. } => vec![&table.relation],
+        Statement::Delete(delete) if rules.mysql && delete.using.is_some() => match &delete.from {
+            sqlparser::ast::FromTable::WithFromKeyword(tables)
+            | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
+                tables.iter().map(|twj| &twj.relation).collect()
             }
+        },
+        _ => Vec::new(),
+    };
+    for target in aliased.into_iter().filter_map(table_factor_name) {
+        if !exclusions.contains(&target) {
+            exclusions.push(target);
         }
     }
     exclusions
 }
 
-fn promoted_update_target(
-    target: &TableFactor,
-    from: &[TableWithJoins],
-) -> Option<(Option<String>, String)> {
-    let TableFactor::Table {
-        name,
-        alias: None,
-        args: None,
-        ..
-    } = target
-    else {
-        return None;
-    };
-    aliased_relation(
-        single_ident(name)?,
-        from.iter().map(|table| &table.relation),
-    )
-}
-
-fn qualified_write_targets(stmt: &Statement) -> Vec<ObjectName> {
+/// 데이터베이스까지 한정한 세 부분 쓰기 대상이다(`app.dbo.audit`).
+///
+/// 관계 정점은 두 부분까지라, 수집한 데이터베이스를 가리키는지는 적용 단계
+/// (`local_qualified_relation`)가 판정한다. 여기서 빠진 문장의 대상은 visitor가 관계로 방문해
+/// 세 부분 읽기(`qualified_reads`)가 되므로, 쓰는 문장은 모두 여기 있어야 한다.
+fn qualified_write_targets(stmt: &Statement, rules: CollectRules) -> Vec<ObjectName> {
     let mut names = Vec::new();
     match stmt {
         Statement::Update { table, from, .. } => {
@@ -4082,13 +4133,19 @@ fn qualified_write_targets(stmt: &Statement) -> Vec<ObjectName> {
         Statement::Query(query) => {
             // 앞에 WITH가 붙은 DML의 대상은 감싼 문장 안에 있다.
             if let Some(dml) = query_dml_statement(query) {
-                return qualified_write_targets(dml);
+                return qualified_write_targets(dml, rules);
             }
             if let Some(into) = select_into(stmt) {
                 names.push(into.name.clone());
             }
         }
         Statement::Copy { .. } => names.extend(copy_from_table(stmt).cloned()),
+        Statement::Delete(delete) => {
+            names.extend(delete_target_names(delete, rules).into_iter().cloned())
+        }
+        Statement::Truncate { table_names, .. } => {
+            names.extend(table_names.iter().map(|target| target.name.clone()))
+        }
         _ => {}
     }
     names
