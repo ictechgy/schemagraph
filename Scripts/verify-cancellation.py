@@ -13,8 +13,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 ACK = b"Cancellation requested; press Ctrl+C again to exit immediately.\n"
@@ -683,6 +684,48 @@ def check_mcp(engine: Path, work: Path) -> None:
             process.stderr.close()
 
 
+CHECKS: tuple[Callable[[Path, Path], None], ...] = (
+    check_cli_queries,
+    check_inherited_sigint_ignore,
+    check_review,
+    check_second_interrupt,
+    check_closed_stderr,
+    check_blocked_stderr,
+    check_mcp,
+)
+
+
+class CheckFailure(Exception):
+    """실패한 검사 이름과 원래 오류를 함께 실어 main이 어느 검사인지 알리게 한다."""
+
+    def __init__(self, check: str, error: BaseException) -> None:
+        super().__init__(check, error)
+        self.check = check
+        self.error = error
+
+
+def raised_at(error: BaseException) -> str:
+    """오류가 난 가장 안쪽 위치를 돌려준다. `fail` 자신은 원인이 아니라 건너뛴다.
+
+    한 검사 안에서도 FIFO·stdin·stderr 쓰기가 여러 곳이라 `[Errno 32] Broken pipe`만으로는
+    어느 쓰기가 끊겼는지 알 수 없다.
+    """
+    frames = [frame for frame in traceback.extract_tb(error.__traceback__) if frame.name != "fail"]
+    if not frames:
+        return "unknown location"
+    frame = frames[-1]
+    return f"{frame.name} line {frame.lineno}"
+
+
+def run_checks(engine: Path, work: Path, checks: tuple[Callable[[Path, Path], None], ...]) -> None:
+    """검사를 차례로 돌리고, 실패하면 그 검사 이름을 붙여 다시 올린다."""
+    for check in checks:
+        try:
+            check(engine, work)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise CheckFailure(check.__name__, error) from error
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run process-level cancellation regression checks.")
     parser.add_argument("--engine", required=True, type=Path, help="path to an executable schemagraph binary")
@@ -696,16 +739,17 @@ def main() -> int:
         return 2
     try:
         with tempfile.TemporaryDirectory(prefix="schemagraph-cancellation-") as directory:
-            work = Path(directory)
-            check_cli_queries(engine, work)
-            check_inherited_sigint_ignore(engine, work)
-            check_review(engine, work)
-            check_second_interrupt(engine, work)
-            check_closed_stderr(engine, work)
-            check_blocked_stderr(engine, work)
-            check_mcp(engine, work)
-    except (OSError, RuntimeError, ValueError) as error:
-        print(f"cancellation process regression failed: {error}", file=sys.stderr)
+            run_checks(engine, Path(directory), CHECKS)
+    except CheckFailure as failure:
+        print(
+            f"cancellation process regression failed in {failure.check} "
+            f"({raised_at(failure.error)}): {failure.error}",
+            file=sys.stderr,
+        )
+        return 1
+    except OSError as error:
+        # 검사 밖(임시 디렉터리 생성·정리)의 실패다.
+        print(f"cancellation process regression failed outside the checks: {error}", file=sys.stderr)
         return 1
     print("cancellation process regression: ok")
     return 0
