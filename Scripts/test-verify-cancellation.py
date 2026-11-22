@@ -7,8 +7,11 @@ macOS 릴리스 job에서 `[Errno 32] Broken pipe`만 남고 검사 이름이 �
 import contextlib
 import importlib.util
 import io
+import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +33,25 @@ def failing_assertion_check(engine, work):
 
 def passing_check(engine, work):
     """앞선 검사가 통과해도 뒤 검사의 실패가 그 검사 이름으로 보고되는지 본다."""
+
+
+def library_error_check(engine, work):
+    """표준 라이브러리 안에서 난 오류는 그 라이브러리가 아니라 이 호출 줄을 가리켜야 한다."""
+    json.loads('{')
+
+
+class FailingCleanup:
+    """임시 디렉터리 정리가 OSError로 실패하는 상황을 흉내 낸다."""
+
+    def __init__(self, prefix):
+        self.directory = tempfile.mkdtemp(prefix=prefix)
+
+    def __enter__(self):
+        return self.directory
+
+    def __exit__(self, *exc_info):
+        os.rmdir(self.directory)
+        raise OSError(39, 'Directory not empty')
 
 
 class FailureNames(unittest.TestCase):
@@ -56,6 +78,22 @@ class FailureNames(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('failed in failing_assertion_check (failing_assertion_check line ', stderr)
         self.assertIn('engine exited 3, expected 0: boom', stderr)
+
+    def test_library_errors_point_at_the_calling_line_of_this_script(self):
+        code, stderr = self.run_main((library_error_check,))
+        self.assertEqual(code, 1)
+        self.assertIn('failed in library_error_check (library_error_check line ', stderr)
+        self.assertNotIn('decode', stderr.split('):', 1)[0])
+
+    def test_cleanup_failure_keeps_the_failed_check(self):
+        with patch.object(CANCELLATION.tempfile, 'TemporaryDirectory', FailingCleanup):
+            code, stderr = self.run_main((broken_pipe_check,))
+            self.assertEqual(code, 1)
+            self.assertIn('failed in broken_pipe_check (', stderr)
+            self.assertIn('; temporary directory cleanup also failed: [Errno 39] Directory not empty', stderr)
+            code, stderr = self.run_main((passing_check,))
+            self.assertEqual(code, 1)
+            self.assertIn('failed outside the checks: [Errno 39] Directory not empty', stderr)
 
     def test_all_checks_passing_reports_ok(self):
         stdout = io.StringIO()
