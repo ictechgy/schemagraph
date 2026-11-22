@@ -953,6 +953,80 @@ mod tests {
         }
     }
 
+    /// PostgreSQL 지문도 Binder와 같은 `name` 규칙(따옴표 없는 이름의 ASCII 접기)으로 관계
+    /// 후보를 담는다. `ΑΣ`를 읽는 뷰에게는 `ΑΣ`의 모양 변화가 지문을 바꾸고, 함께 생긴 `ας`는
+    /// 다른 테이블이라 지문을 바꾸지 않는다. 어느 단계에서도 warm 실행은 cold 실행과 같다.
+    #[test]
+    fn postgres_non_ascii_names_keep_warm_results_equal_to_cold() {
+        let body = "SELECT id FROM ΑΣ";
+        let column = |name: &str, ordinal: usize| serde_json::json!({"name":name,"data_type":"integer","nullable":true,"ordinal":ordinal,"pk_position":0});
+        let object = |name: &str, kind: &str, columns: &[&str]| {
+            let mut value = serde_json::json!({
+                "name":name,"kind":kind,"constraints":[],"indexes":[],"triggers":[],
+                "columns":columns.iter().enumerate().map(|(i, c)| column(c, i + 1)).collect::<Vec<_>>()
+            });
+            if kind == "view" {
+                value["body"] = serde_json::json!(body);
+            }
+            value
+        };
+        let document = |objects: Vec<serde_json::Value>| -> CatalogDocument {
+            serde_json::from_value(serde_json::json!({
+                "version":1,"dialect":"postgres","reader":"test","limitations":[],
+                "context":{"source_id":"t","catalog_complete":true},
+                "schemas":[{"name":"s","routines":[],"objects":objects}]
+            }))
+            .unwrap()
+        };
+        let view = object("v", "view", &["id"]);
+        let documents = [
+            document(vec![object("ΑΣ", "table", &["id"]), view.clone()]),
+            document(vec![object("ΑΣ", "table", &["id", "extra"]), view.clone()]),
+            document(vec![
+                object("ΑΣ", "table", &["id", "extra"]),
+                object("ας", "table", &["id"]),
+                view,
+            ]),
+        ];
+        let owner = VertexId::object("s", "v");
+        let contexts: Vec<CacheContext> = documents
+            .iter()
+            .map(|doc| {
+                let graph = schemagraph_source::graph::document_to_graph(doc);
+                crate::scope::cache_context(doc, &graph, &owner, body)
+            })
+            .collect();
+        assert!(contexts.iter().all(|context| context.trusted));
+        assert_ne!(contexts[0].fingerprint, contexts[1].fingerprint);
+        assert_eq!(contexts[1].fingerprint, contexts[2].fingerprint);
+
+        let mut cache = ScopedMemoryCache::default();
+        for (step, doc) in documents.iter().enumerate() {
+            let mut cold = schemagraph_source::graph::document_to_graph(doc);
+            let cold_result = crate::enrich_from_document(&mut cold, doc);
+            let mut warm = schemagraph_source::graph::document_to_graph(doc);
+            let warm_result = crate::enrich_with_cache(&mut warm, doc, Some(&mut cache));
+            assert_eq!(warm_result, cold_result, "step {step}");
+            assert_eq!(warm.edges(), cold.edges(), "step {step}");
+            assert_eq!(warm.analysis(), cold.analysis(), "step {step}");
+            assert_eq!(warm.origins(), cold.origins(), "step {step}");
+            assert!(
+                cold.edges().iter().any(|edge| edge.from == owner
+                    && edge.to.as_str() == "s.ΑΣ"
+                    && edge.kind == EdgeKind::Reads),
+                "step {step}: {:?}",
+                cold.edges()
+            );
+            assert!(
+                !cold.edges().iter().any(|edge| {
+                    edge.from.as_str().starts_with("s.v") && edge.to.as_str().starts_with("s.ας")
+                }),
+                "step {step}: {:?}",
+                cold.edges()
+            );
+        }
+    }
+
     #[test]
     fn wrapped_routine_body_uses_conservative_cache_context() {
         let doc: CatalogDocument = serde_json::from_value(serde_json::json!({

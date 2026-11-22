@@ -42,7 +42,7 @@ fn function(name: &str, signature: Option<&str>, body: &str) -> Value {
 }
 
 fn analyze(dialect: &str, objects: Vec<Value>, routines: Vec<Value>) -> Graph {
-    let document = document_from_value(json!({
+    analyze_document(json!({
         "version": 1,
         "dialect": dialect,
         "reader": "identifier-semantics-test",
@@ -53,7 +53,33 @@ fn analyze(dialect: &str, objects: Vec<Value>, routines: Vec<Value>) -> Graph {
         }],
         "limitations": []
     }))
-    .expect("test catalog must decode");
+}
+
+/// `analyze`와 같은 카탈로그에 수집 database를 싣는다. 3부분 이름(`db.schema.table`)은
+/// 그 database와 같을 때만 로컬 관계로 해석된다.
+fn analyze_in_database(
+    dialect: &str,
+    database: &str,
+    objects: Vec<Value>,
+    routines: Vec<Value>,
+) -> Graph {
+    analyze_document(json!({
+        "version": 1,
+        "dialect": dialect,
+        "reader": "identifier-semantics-test",
+        "context": {"source_id": "t", "database": database, "catalog_complete": true},
+        "schemas": [{
+            "name": "s",
+            "objects": objects,
+            "routines": routines
+        }],
+        "limitations": []
+    }))
+}
+
+/// 문서 JSON을 그래프로 만들고 몸체를 분석해 note를 그래프 한계로 싣는다.
+fn analyze_document(document: Value) -> Graph {
+    let document = document_from_value(document).expect("test catalog must decode");
     let mut graph = document_to_graph(&document);
     let (_, notes) = enrich_from_document(&mut graph, &document);
     for note in notes {
@@ -285,6 +311,229 @@ fn feedback_postgres_body_folds_only_unquoted_relation_names() {
     assert!(has_edge(&graph, "s.archive", "s.orders", EdgeKind::Reads));
     assert!(has_edge(&graph, "s.archive", "s.audit", EdgeKind::Writes));
     assert!(!has_edge(&graph, "s.quoted", "s.orders", EdgeKind::Reads));
+}
+
+/// 한 routine이 남긴 진단 문구들이다. 코드만 보는 `diagnostics`로는 어느 이름이 풀리지
+/// 않았는지 가를 수 없어 문구 전체를 본다.
+fn diagnostic_messages(graph: &Graph, id: &str) -> Vec<String> {
+    graph.analysis()[&vertex(id)]
+        .diagnostics
+        .iter()
+        .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+        .collect()
+}
+
+/// UTF8 PostgreSQL은 따옴표 없는 식별자에서 ASCII `A`–`Z`만 접는다(`scansup.c`
+/// `downcase_identifier`). PostgreSQL 16.15에서 `CREATE TABLE ΑΣ`는 `ΑΣ`로 저장되고,
+/// `UPDATE ΑΣ`는 같은 스키마의 `ας`를 두고 `ΑΣ`를 바꿨다. Unicode 소문자로 접으면
+/// `ΑΣ`가 어말 시그마 규칙으로 `ας`가 되어, `ας`가 없으면 누락, 있으면 거짓 쓰기였다.
+#[test]
+fn postgres_unquoted_greek_names_fold_only_ascii_letters() {
+    let body = "UPDATE ΑΣ SET name = 'x'";
+    let alone = analyze(
+        "postgres",
+        vec![table("ΑΣ", &["id", "name"])],
+        vec![function("r", None, body)],
+    );
+    let detail = format!("{:?} {:?}", alone.edges(), alone.limitations());
+    assert!(
+        has_edge(&alone, "s.r", "s.ΑΣ", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(
+        has_edge(&alone, "s.r", "s.ΑΣ.name", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(alone.limitations().is_empty(), "{detail}");
+    assert_eq!(state(&alone, "s.r"), AnalysisState::Complete, "{detail}");
+
+    let both = analyze(
+        "postgres",
+        vec![table("ΑΣ", &["id", "name"]), table("ας", &["id", "name"])],
+        vec![function("r", None, body)],
+    );
+    let detail = format!("{:?}", both.edges());
+    assert!(has_edge(&both, "s.r", "s.ΑΣ", EdgeKind::Writes), "{detail}");
+    assert!(
+        has_edge(&both, "s.r", "s.ΑΣ.name", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(!has_dependency_to(&both, "s.r", "s.ας"), "{detail}");
+    assert!(!has_dependency_to(&both, "s.r", "s.ας.name"), "{detail}");
+}
+
+/// 악센트 글자도 같다. PostgreSQL 16.15에서 `CREATE TABLE Été (id int, Nom text)`는 테이블
+/// `Été`·컬럼 `nom`으로 저장된다(ASCII `N`만 접힘). `UPDATE Été SET Nom = …`는 그 테이블에
+/// 쓰고, `UPDATE ÉTÉ …`는 `relation "ÉtÉ" does not exist`로 거절된다.
+#[test]
+fn postgres_unquoted_accented_names_keep_non_ascii_letters() {
+    let graph = analyze(
+        "postgres",
+        vec![
+            table("Été", &["id", "nom"]),
+            view("v", &["value"], "SELECT Nom FROM Été"),
+        ],
+        vec![
+            function("touch", None, "UPDATE Été SET Nom = 'x'"),
+            function("shout", None, "UPDATE ÉTÉ SET nom = 'x'"),
+        ],
+    );
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(
+        has_edge(&graph, "s.touch", "s.Été", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(
+        has_edge(&graph, "s.touch", "s.Été.nom", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert_eq!(
+        state(&graph, "s.touch"),
+        AnalysisState::Complete,
+        "{detail}"
+    );
+    assert!(
+        has_edge(&graph, "s.v.value", "s.Été.nom", EdgeKind::DerivesFrom),
+        "{detail}"
+    );
+    assert_eq!(state(&graph, "s.v"), AnalysisState::Complete, "{detail}");
+    assert!(!has_dependency_to(&graph, "s.shout", "s.Été"), "{detail}");
+    assert!(
+        graph
+            .limitations()
+            .iter()
+            .any(|note| note == "s.shout references s.ÉtÉ, which is missing from the catalog"),
+        "{detail}"
+    );
+}
+
+/// 컬럼 이름도 같은 규칙이다. PostgreSQL 16.15에서 `ΌΝΟΜΑ` 컬럼은 그대로 저장되고 `όνομα`는
+/// `column "όνομα" does not exist`다. `Prénom`으로 만든 컬럼은 `prénom`이고, `PRÉNOM`은
+/// `prÉnom`이라 `column "prÉnom" does not exist`, `PRéNOM`은 그 컬럼이다.
+#[test]
+fn postgres_unquoted_non_ascii_column_names_fold_only_ascii_letters() {
+    let graph = analyze(
+        "postgres",
+        vec![
+            table("people", &["id", "ΌΝΟΜΑ", "prénom"]),
+            view("v_greek", &["n"], "SELECT ΌΝΟΜΑ AS n FROM people"),
+            view("v_upper", &["p"], "SELECT PRÉNOM AS p FROM people"),
+            view("v_ascii", &["p"], "SELECT PRéNOM AS p FROM people"),
+        ],
+        vec![function("rename", None, "UPDATE people SET ΌΝΟΜΑ = 'x'")],
+    );
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(
+        has_edge(
+            &graph,
+            "s.v_greek.n",
+            "s.people.ΌΝΟΜΑ",
+            EdgeKind::DerivesFrom
+        ),
+        "{detail}"
+    );
+    assert_eq!(
+        state(&graph, "s.v_greek"),
+        AnalysisState::Complete,
+        "{detail}"
+    );
+    assert!(
+        has_edge(&graph, "s.rename", "s.people.ΌΝΟΜΑ", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert_eq!(
+        state(&graph, "s.rename"),
+        AnalysisState::Complete,
+        "{detail}"
+    );
+    assert!(
+        has_edge(
+            &graph,
+            "s.v_ascii.p",
+            "s.people.prénom",
+            EdgeKind::DerivesFrom
+        ),
+        "{detail}"
+    );
+    assert!(
+        !has_dependency_to(&graph, "s.v_upper", "s.people.prénom"),
+        "{detail}"
+    );
+    assert!(
+        !has_edge(
+            &graph,
+            "s.v_upper.p",
+            "s.people.prénom",
+            EdgeKind::DerivesFrom
+        ),
+        "{detail}"
+    );
+    let upper = diagnostic_messages(&graph, "s.v_upper");
+    assert!(
+        upper
+            .iter()
+            .any(|message| message.starts_with("SG_COLUMN_UNRESOLVED")
+                && message.contains("'prÉnom'")),
+        "{upper:?}"
+    );
+}
+
+/// routine 호출 이름도 같은 규칙이다. PostgreSQL 16.15에서 `CREATE FUNCTION Écho(int)`는
+/// `Écho`로 저장되고, `ÉCHO(1)`은 그 함수를 부르며(`É`는 그대로, `CHO`만 접힘) `écho(1)`은
+/// `function écho(integer) does not exist`다.
+#[test]
+fn postgres_unquoted_routine_calls_fold_only_ascii_letters() {
+    let graph = analyze(
+        "postgres",
+        vec![
+            table("people", &["id"]),
+            view("v_upper", &["e"], "SELECT ÉCHO(id) AS e FROM people"),
+            view("v_lower", &["e"], "SELECT écho(id) AS e FROM people"),
+        ],
+        vec![
+            function("Écho", None, "SELECT 1"),
+            function("caller", None, "SELECT ÉCHO(1)"),
+        ],
+    );
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(
+        has_edge(&graph, "s.v_upper", "s.Écho", EdgeKind::Calls),
+        "{detail}"
+    );
+    assert!(
+        has_edge(&graph, "s.caller", "s.Écho", EdgeKind::Calls),
+        "{detail}"
+    );
+    assert!(
+        !has_edge(&graph, "s.v_lower", "s.Écho", EdgeKind::Calls),
+        "{detail}"
+    );
+}
+
+/// 수집 database로 한정한 3부분 이름도 같은 규칙이다. 객체 단위 해석
+/// (`local_qualified_relation`)은 이미 접힌 이름을 한 번 더 정규화하므로, 그 규칙만 Unicode로
+/// 남으면 컬럼 단위는 `ΑΣ`에 쓰는데 객체 단위는 `ας`를 가리킨다. PostgreSQL 16.15에서
+/// 현재 database로 한정한 `UPDATE postgres.s.ΑΣ`는 `ΑΣ`만 바꿨다.
+#[test]
+fn postgres_three_part_names_fold_only_ascii_letters() {
+    let graph = analyze_in_database(
+        "postgres",
+        "app",
+        vec![table("ΑΣ", &["id", "name"]), table("ας", &["id", "name"])],
+        vec![function("r", None, "UPDATE APP.s.ΑΣ SET name = 'x'")],
+    );
+    let detail = format!("{:?} {:?}", graph.edges(), graph.limitations());
+    assert!(
+        has_edge(&graph, "s.r", "s.ΑΣ", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(
+        has_edge(&graph, "s.r", "s.ΑΣ.name", EdgeKind::Writes),
+        "{detail}"
+    );
+    assert!(!has_dependency_to(&graph, "s.r", "s.ας"), "{detail}");
+    assert!(!has_dependency_to(&graph, "s.r", "s.ας.name"), "{detail}");
+    assert!(graph.limitations().is_empty(), "{detail}");
 }
 
 #[test]

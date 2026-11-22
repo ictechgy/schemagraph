@@ -810,7 +810,9 @@ fn column_key(dialect: &str, value: &str) -> String {
 ///
 /// SQLite는 인용 여부와 무관하게 ASCII 대소문자만 무시한다 — 카탈로그 키(`catalog_key`)와
 /// 객체 단위 해석(`vertex_hit`의 ASCII 접기)이 같은 규칙이어야 한 몸체의 객체 간선과 컬럼
-/// 간선이 같은 대상을 가리킨다.
+/// 간선이 같은 대상을 가리킨다. PostgreSQL의 따옴표 없는 이름은
+/// `fold_unquoted_postgres_identifier`로 접는다. 객체 단위 경로(`normalize_postgres`)도 이
+/// 함수를 거치므로 두 단위가 같은 대상을 가리킨다.
 pub(super) fn name(dialect: &str, ident: &Ident) -> String {
     if dialect == "sqlite" {
         return ident.value.to_ascii_lowercase();
@@ -819,10 +821,23 @@ pub(super) fn name(dialect: &str, ident: &Ident) -> String {
         return ident.value.clone();
     }
     match dialect {
-        "postgres" | "postgresql" => ident.value.to_lowercase(),
+        "postgres" | "postgresql" => fold_unquoted_postgres_identifier(&ident.value),
         "oracle" | "db2" => ident.value.to_uppercase(),
         _ => ident.value.clone(),
     }
+}
+
+/// PostgreSQL이 따옴표 없는 식별자를 접는 규칙이다 — ASCII `A`–`Z`만 소문자로 바꾼다.
+///
+/// PostgreSQL은 따옴표 없는 식별자를 `downcase_identifier`(`src/backend/parser/scansup.c`,
+/// REL_16_STABLE과 master가 같다)로 접는다. ASCII 대문자는 늘 접고, 상위 비트 바이트는
+/// 데이터베이스 인코딩이 단일 바이트일 때만(`pg_database_encoding_max_length() == 1`)
+/// `tolower()`에 넘긴다. UTF8 같은 다중 바이트 인코딩에서는 ASCII 밖 글자를 그대로 둔다.
+/// `str::to_lowercase`로 접으면 `ΑΣ`가 그리스어 어말 시그마 규칙으로 `ας`가 되고 `Été`가
+/// `été`가 되어, PostgreSQL이 실제로 고르는 `ΑΣ`·`Été` 대신 없는 이름이나 함께 있는 다른
+/// 테이블(`ας`)을 가리킨다. 문서는 인코딩을 싣지 않으므로 다중 바이트 규칙을 쓴다.
+pub(super) fn fold_unquoted_postgres_identifier(value: &str) -> String {
+    value.to_ascii_lowercase()
 }
 
 /// SQL 식별자의 컬럼 위치를 해석한다. 인용 여부에 따른 PostgreSQL·Oracle의
@@ -2148,7 +2163,8 @@ pub(crate) fn apply_dml_column_effects(
                 .insert(procedural_symbol_key(name), relation.clone());
             let normalized = match dialect {
                 "oracle" | "db2" => name.to_uppercase(),
-                "postgres" | "postgresql" => name.to_lowercase(),
+                // 몸체의 `new`·`old` 참조가 거치는 `name`과 같은 규칙이어야 같은 키가 된다.
+                "postgres" | "postgresql" => fold_unquoted_postgres_identifier(name),
                 // SQLite 식별자는 ASCII 대소문자만 접는다(`catalog_key`와 같은 규칙).
                 "sqlite" => name.to_ascii_lowercase(),
                 _ => (*name).to_owned(),
@@ -3245,13 +3261,19 @@ impl DmlAnalyzer<'_, '_> {
     }
 }
 
+/// SQLite를 접지 않는다는 점만 `name`과 다른 정규화다(3부분 이름의 각 부분, INSERT 별칭).
+///
+/// PostgreSQL 갈래는 `name`과 같은 `fold_unquoted_postgres_identifier`여야 한다. 객체 단위의
+/// 3부분 이름 해석(`local_qualified_relation`)은 `normalize_postgres`가 `name`으로 이미 접은
+/// 이름에 이 함수를 한 번 더 적용하므로, 규칙이 다르면 두 번째 접기가 결과를 바꿔(`ΑΣ`→`ας`)
+/// 컬럼 단위와 다른 객체를 가리킨다.
 fn name_for_dialect(dialect: &str, ident: &Ident) -> String {
     if ident.quote_style.is_some() {
         ident.value.clone()
     } else if matches!(dialect, "oracle" | "db2") {
         ident.value.to_uppercase()
     } else if matches!(dialect, "postgres" | "postgresql") {
-        ident.value.to_lowercase()
+        fold_unquoted_postgres_identifier(&ident.value)
     } else {
         ident.value.clone()
     }

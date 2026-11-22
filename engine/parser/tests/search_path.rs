@@ -236,6 +236,44 @@ fn search_path_names_follow_postgres_quoting_and_skip_special_entries() {
     );
 }
 
+/// 따옴표 없는 경로 항목도 몸체 식별자와 같은 ASCII 접기를 따른다. PostgreSQL은 경로 값을
+/// `SplitIdentifierString`으로 읽고 따옴표 없는 이름을 `downcase_truncate_identifier`로 접는다.
+/// PostgreSQL 16.15(UTF8)에서 `CREATE SCHEMA ÉCOLE`은 `École`을 만들고, `SET search_path TO
+/// ÉCOLE`인 함수의 proconfig는 `search_path="École"`이며 그 스키마의 테이블을 읽었다.
+#[test]
+fn unquoted_search_path_entries_fold_only_ascii_letters() {
+    let ddl = "CREATE FUNCTION public.count_items() RETURNS bigint LANGUAGE sql \
+               SET search_path TO ÉCOLE \
+               AS $$SELECT count(*) FROM items$$";
+    let document = document_from_value(json!({
+        "version": 1, "dialect": "postgres", "reader": "search-path-test", "limitations": [],
+        "schemas": [
+            {"name": "École", "objects": [table("items", &["id"])], "routines": []},
+            {"name": "école", "objects": [table("items", &["id"])], "routines": []},
+            {"name": "public", "objects": [],
+             "routines": [routine("count_items", "sql", ddl)]}
+        ]
+    }))
+    .expect("test catalog must decode");
+    let mut graph = document_to_graph(&document);
+    let (_, notes) = enrich_from_document(&mut graph, &document);
+    assert!(
+        has_edge(&graph, "public.count_items", "École.items", EdgeKind::Reads),
+        "{:?} {notes:?}",
+        graph.edges()
+    );
+    assert!(
+        !has_edge(&graph, "public.count_items", "école.items", EdgeKind::Reads),
+        "{:?}",
+        graph.edges()
+    );
+    assert_eq!(state(&graph, "public.count_items"), AnalysisState::Complete);
+    assert_eq!(
+        notes_for(&graph, "public.count_items"),
+        Vec::<String>::new()
+    );
+}
+
 #[test]
 fn role_dependent_search_path_entry_is_reported_when_a_name_passes_it() {
     let sql = definition(

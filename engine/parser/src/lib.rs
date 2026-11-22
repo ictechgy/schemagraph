@@ -1576,7 +1576,8 @@ fn as_dollar_body_end(rest: &str) -> Option<usize> {
 }
 
 /// `'a', "B", c` 꼴 값 목록을 읽는다. 문자열·큰따옴표 이름은 그대로, 따옴표 없는 이름은
-/// PostgreSQL처럼 소문자로 접는다. 목록은 쉼표가 끊기는 곳(다음 절)에서 끝난다.
+/// PostgreSQL처럼 ASCII 글자만 소문자로 접는다(`scope::fold_unquoted_postgres_identifier`).
+/// 목록은 쉼표가 끊기는 곳(다음 절)에서 끝난다.
 fn parse_search_path_value(value: &str, collected: &impl Fn(&str) -> bool) -> Option<SearchPath> {
     let mut entries = Vec::new();
     let mut rest = value.trim_start();
@@ -1638,7 +1639,12 @@ fn search_path_entry(rest: &str) -> Option<(String, &str)> {
     let end = rest
         .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
         .unwrap_or(rest.len());
-    (end > 0).then(|| (rest[..end].to_lowercase(), &rest[end..]))
+    // PostgreSQL은 경로 값의 따옴표 없는 이름을 몸체 식별자와 같은 `downcase_identifier`로
+    // 접는다(`SplitIdentifierString` → `downcase_truncate_identifier`).
+    (end > 0).then(|| {
+        let name = scope::fold_unquoted_postgres_identifier(&rest[..end]);
+        (name, &rest[end..])
+    })
 }
 
 /// '...' 리터럴의 내용 — '' 이스케이프는 따옴표 하나로 되돌린다.
