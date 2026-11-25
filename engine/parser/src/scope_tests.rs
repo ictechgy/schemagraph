@@ -2310,6 +2310,50 @@ fn tsql_exec_after_a_query_is_the_next_statement() {
     assert_eq!(facts.1, AnalysisState::Partial, "{facts:?}");
 }
 
+/// T-SQL 스칼라 함수와 다중 문장 테이블 반환 함수의 머리는 `AS`를 생략할 수 있다(`CREATE FUNCTION f(@a int)
+/// RETURNS int BEGIN …`). 그 머리를 블록 밖 문장으로 보아 완전한 함수를 `partial`로 표시하지 않는다. 머리 뒤에
+/// 실제 문장이 있으면 이전처럼 표시한다.
+#[test]
+fn tsql_function_headers_without_as_are_not_text_outside_the_block() {
+    const OUTSIDE: &str =
+        "T-SQL body text before the first BEGIN or after the last END was not analyzed";
+    let outcome = |body: &str| {
+        let graph = scan_routine_kind(body, "sqlserver", "sql", "function");
+        let analysis = graph.analysis()[&VertexId::from_raw("s.mutate")].clone();
+        let flagged = analysis
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.starts_with(OUTSIDE))
+            .count();
+        let reads_orders = edge(&graph, "s.mutate", "s.orders", EdgeKind::Reads);
+        (analysis.state, flagged, reads_orders)
+    };
+    for body in [
+        "CREATE FUNCTION s.mutate(@a int) RETURNS int\nBEGIN\n  RETURN (SELECT COUNT(*) FROM orders WHERE id = @a);\nEND",
+        "CREATE FUNCTION s.mutate(@a AS int) RETURNS int WITH SCHEMABINDING\nBEGIN\n  RETURN (SELECT COUNT(*) FROM s.orders WHERE id = @a);\nEND",
+        "create or alter function s.mutate(@a int) returns int -- r\nbegin\n  return (select count(*) from orders where id = @a);\nend",
+    ] {
+        let (state, flagged, reads_orders) = outcome(body);
+        assert_eq!(
+            (state, flagged, reads_orders),
+            (AnalysisState::Complete, 0, true),
+            "{body}"
+        );
+    }
+    // 다중 문장 테이블 반환 함수 — 남는 `partial`은 테이블 변수 `@r`(main부터)이고, 블록 밖 진단은 없다.
+    let (_, flagged, _) = outcome(
+        "CREATE FUNCTION s.mutate() RETURNS @r TABLE (id int)\nBEGIN\n  INSERT INTO @r (id) SELECT id FROM orders\n  RETURN\nEND",
+    );
+    assert_eq!(flagged, 0);
+    for body in [
+        "CREATE FUNCTION s.mutate() RETURNS int\nUPDATE audit SET name = 'x';\nBEGIN\n  RETURN 1;\nEND",
+        "CREATE FUNCTION s.mutate(@a int) RETURNS int\nBEGIN\n  RETURN (SELECT COUNT(*) FROM orders);\nEND\nUPDATE audit SET name = 'x'",
+    ] {
+        let (state, flagged, _) = outcome(body);
+        assert_eq!((state, flagged), (AnalysisState::Partial, 1), "{body}");
+    }
+}
+
 /// MySQL·MariaDB·SQL Server·SQLite의 routine 몸체는 `AS` 뒤 문자열로 감싸이지 않는다. 그 방언들이 받는 문자열
 /// 별칭(`AS 'total'`)을 PostgreSQL `AS '…'` 몸체처럼 꺼내, routine 전체가 별칭 한 단어로 바뀌고 간선 없이
 /// `body parse failed`였다. PostgreSQL의 문자열 몸체는 이전처럼 꺼낸다.

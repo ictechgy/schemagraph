@@ -1839,7 +1839,8 @@ fn note_text_outside_block(parsed: &mut ParsedTrigger) {
 /// 않으려면 첫 `BEGIN` 앞에는 공백·주석이나 정의문 머리(`CREATE PROCEDURE … AS`, 마지막 `AS` 키워드까지)만
 /// 오고, 마지막 `END` 뒤에는 공백·주석·`;`만 와야 한다. 머리의 끝을 마지막 `AS`로 보는 것은 `AS` 바로 뒤에
 /// `BEGIN`이 오는 자리가 정의문 머리뿐이기 때문이다 — 문장 안의 `AS`(`SELECT id AS x`, `CAST(@v AS int)`)
-/// 뒤에는 `BEGIN`이 올 수 없어, 그 `AS`가 마지막이면 뒤에 문장 텍스트가 남는다. `END TRY`·`END CATCH`로
+/// 뒤에는 `BEGIN`이 올 수 없어, 그 `AS`가 마지막이면 뒤에 문장 텍스트가 남는다. 함수 머리는 `AS`를 생략할 수
+/// 있어(`CREATE FUNCTION f(@a int) RETURNS int BEGIN …`) 따로 본다(`tsql_function_header`). `END TRY`·`END CATCH`로
 /// 끝나는 몸체는 꼬리 단어가 남아 참이지만, 벗긴 안쪽에 `BEGIN CATCH`가 남아 문장 파서가 실패하므로 표시되지
 /// 않는다(그 몸체는 이전처럼 절차형 추출기가 통째로 읽는다). 첫 `BEGIN`과 마지막 `END`가 서로 짝인지는 보지
 /// 않는다(`BEGIN … END UPDATE … BEGIN … END`는 이전처럼 안쪽의 최상위 `END`에서 부분 분석이다).
@@ -1853,14 +1854,39 @@ fn tsql_text_outside_block(body: &str) -> bool {
         return false;
     };
     let before = &body[..begin];
-    let header_end = find_all_keywords(before, "AS")
-        .last()
-        .map_or(0, |at| at + "AS".len());
+    let header_end = if tsql_function_header(before) {
+        before.len()
+    } else {
+        find_all_keywords(before, "AS")
+            .last()
+            .map_or(0, |at| at + "AS".len())
+    };
     let mut after = skip_ws_comments(body.get(end + "END".len()..).unwrap_or(""));
     while let Some(rest) = after.strip_prefix(';') {
         after = skip_ws_comments(rest);
     }
     !skip_ws_comments(&before[header_end..]).is_empty() || !after.is_empty()
+}
+
+/// 첫 `BEGIN` 앞 텍스트가 T-SQL 함수 정의 머리(`CREATE [OR ALTER] FUNCTION … RETURNS <형> [WITH <옵션>] [AS]`)
+/// 뿐인가.
+///
+/// T-SQL 스칼라 함수와 다중 문장 테이블 반환 함수의 머리는 `AS`를 생략할 수 있고, 몸체는 `BEGIN … END` 하나라
+/// 그 앞에 문장이 올 수 없다. 그래서 `RETURNS` 뒤(반환 형과 옵션)에 문장 머리(`next_statement_start`)가 없으면 첫
+/// `BEGIN` 앞 전체를 머리로 본다. `WITH EXECUTE AS`처럼 머리 안에 `EXECUTE`가 오면 거짓이지만, 그 몸체는
+/// `EXECUTE` 단어 때문에 절차형 추출기로 가서 블록 밖 표시 경로에 닿지 않는다.
+fn tsql_function_header(before: &str) -> bool {
+    let mut text = skip_ws_comments(before);
+    for word in ["CREATE", "OR", "ALTER", "FUNCTION"] {
+        if starts_with_keyword(text, word) {
+            text = skip_ws_comments(&text[word.len()..]);
+        } else if matches!(word, "CREATE" | "FUNCTION") {
+            return false;
+        }
+    }
+    find_all_keywords(text, "RETURNS")
+        .first()
+        .is_some_and(|&returns| next_statement_start(&text[returns + "RETURNS".len()..]).is_none())
 }
 
 /// 인용·주석 바깥의 키워드만 찾는다 — 문자열에 든 SQL은 실행 문맥에서만 푼다.
