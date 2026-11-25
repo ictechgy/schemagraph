@@ -1935,6 +1935,23 @@ fn tsql_open_ends_at_the_cursor_name() {
             "DECLARE [my c] CURSOR FOR SELECT id FROM audit; OPEN [my c]; UPDATE orders SET amount = 0;",
             Some("Writes s.orders"),
         ),
+        // 커서 이름 뒤의 문장 머리가 아닌 문장(`RETURN (SELECT …)`)도 제 갈래로 읽는다 — 다음 문장 머리까지를
+        // `OPEN` 절로 삼키면 그 읽기를 잃는다. `master`·`symmetric`도 뒤에 `KEY`가 없으면 커서 이름이다.
+        (
+            "DECLARE c CURSOR FOR SELECT id FROM audit; OPEN c RETURN (SELECT COUNT(*) FROM orders)",
+            "DECLARE c CURSOR FOR SELECT id FROM audit; OPEN c; RETURN (SELECT COUNT(*) FROM orders);",
+            Some("Reads s.orders"),
+        ),
+        (
+            "DECLARE master CURSOR FOR SELECT id FROM audit; OPEN master RETURN (SELECT COUNT(*) FROM orders)",
+            "DECLARE master CURSOR FOR SELECT id FROM audit; OPEN master; RETURN (SELECT COUNT(*) FROM orders);",
+            Some("Reads s.orders"),
+        ),
+        (
+            "DECLARE c CURSOR FOR SELECT id FROM audit; IF 1 = 1 BEGIN OPEN c RETURN (SELECT COUNT(*) FROM orders) END",
+            "DECLARE c CURSOR FOR SELECT id FROM audit; IF 1 = 1 BEGIN OPEN c; RETURN (SELECT COUNT(*) FROM orders); END;",
+            Some("Reads s.orders"),
+        ),
         (
             "DECLARE @n int; OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE cert UPDATE orders SET amount = 0",
             "DECLARE @n int; OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE cert; UPDATE orders SET amount = 0;",
@@ -2072,6 +2089,225 @@ fn tsql_routine_text_outside_the_block_is_not_claimed_complete() {
         let (graph, _, flagged) = outcome(mixed, dialect, "procedure");
         assert!(!flagged, "{dialect}: {:?}", graph.analysis());
     }
+}
+
+/// 세미콜론 없는 T-SQL에서 변수 선언(`DECLARE @m int = 1`, `DECLARE @t TABLE (…)`)은 다음 문장 머리에서 끝난다.
+/// 이전에는 선언이 조각 끝까지 이어져 뒤 문장(`UPDATE orders …`)이 기본값으로 읽힌 채 소리 없이 빠졌고, 블록의
+/// `END` 뒤에서는 그 몸체가 `complete`였다. 세미콜론을 넣은 같은 몸체와 같은 간선·상태여야 한다.
+#[test]
+fn tsql_declare_ends_at_the_next_statement_head() {
+    let block = |inner: &str| {
+        format!("CREATE PROCEDURE s.mutate AS\nBEGIN\n  BEGIN\n    UPDATE audit SET name = 'x'\n  END\n{inner}\nEND")
+    };
+    let block_semi = |inner: &str| {
+        format!("CREATE PROCEDURE s.mutate AS\nBEGIN\n  BEGIN\n    UPDATE audit SET name = 'x';\n  END;\n{inner}\nEND")
+    };
+    for (without, with, expected) in [
+        (
+            block("  DECLARE @t TABLE (id int)\n  INSERT INTO customers (id) SELECT id FROM orders"),
+            block_semi("  DECLARE @t TABLE (id int);\n  INSERT INTO customers (id) SELECT id FROM orders;"),
+            "Writes s.customers",
+        ),
+        (
+            block("  DECLARE @m int = 1\n  UPDATE orders SET amount = @m"),
+            block_semi("  DECLARE @m int = 1;\n  UPDATE orders SET amount = @m;"),
+            "Writes s.orders",
+        ),
+        (
+            block("  DECLARE @m int = 1\n  DELETE FROM orders WHERE id = @m"),
+            block_semi("  DECLARE @m int = 1;\n  DELETE FROM orders WHERE id = @m;"),
+            "Writes s.orders",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH UPDATE customers SET name = 'y' END CATCH DECLARE @m int = 1 UPDATE orders SET amount = @m".to_owned(),
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH UPDATE customers SET name = 'y'; END CATCH; DECLARE @m int = 1; UPDATE orders SET amount = @m;".to_owned(),
+            "Writes s.orders",
+        ),
+        (
+            "DECLARE @m int = 1 UPDATE orders SET amount = @m".to_owned(),
+            "DECLARE @m int = 1; UPDATE orders SET amount = @m;".to_owned(),
+            "Writes s.orders",
+        ),
+        (
+            "DECLARE @a int = 1, @b int = 2 UPDATE orders SET amount = @a".to_owned(),
+            "DECLARE @a int = 1, @b int = 2; UPDATE orders SET amount = @a;".to_owned(),
+            "Writes s.orders",
+        ),
+        // 괄호 속 하위 질의의 `SELECT`는 다음 문장이 아니다.
+        (
+            "DECLARE @n int = (SELECT COUNT(*) FROM customers) UPDATE orders SET amount = @n".to_owned(),
+            "DECLARE @n int = (SELECT COUNT(*) FROM customers); UPDATE orders SET amount = @n;".to_owned(),
+            "Reads s.customers",
+        ),
+        // 커서 선언의 질의 뒤에 붙은 `EXEC`는 다음 문장이다(이전에는 질의의 별칭으로 읽혀 빠졌다).
+        (
+            "DECLARE c CURSOR FOR SELECT name FROM customers EXEC other".to_owned(),
+            "DECLARE c CURSOR FOR SELECT name FROM customers; EXEC other;".to_owned(),
+            "Reads s.customers",
+        ),
+    ] {
+        let facts = routine_edges_and_state(&without, "sqlserver");
+        assert!(
+            facts.0.iter().any(|edge| edge == expected),
+            "{without}: {facts:?}"
+        );
+        assert_eq!(facts, routine_edges_and_state(&with, "sqlserver"), "{without}");
+    }
+}
+
+/// 추출기가 따로 읽는 T-SQL 문장(`FETCH`·`PRINT`·`RAISERROR`·`CLOSE`·`OPEN` 등)도 앞 문장의 절을 끊는다. 이전에는
+/// `PRINT 'x' FETCH NEXT FROM c INTO @s`의 `FETCH`가 `PRINT` 절에 묻혀 `@s`의 옛 값(`UPDATE audit …`)을 버리지 못해,
+/// 뒤 `EXEC(@s)`가 거짓 `writes audit`가 됐다(`FETCH … INTO @x FETCH … INTO @s`는 main부터). `OPEN master`·
+/// `OPEN symmetric`은 뒤에 `KEY`가 없으면 커서 이름이고, `OPEN global FETCH …`의 `global`도 이름이다. `END` 뒤의
+/// 그런 문장(`END PRINT 'done' UPDATE orders …`)은 꼬리로 먹지 않는다. 세미콜론을 넣은 같은 몸체와 같아야 한다.
+#[test]
+fn tsql_skipped_statements_are_cut_points() {
+    let stale = "DECLARE @s nvarchar(100) = N'UPDATE audit SET name = 1'; ";
+    let cursor = "DECLARE c CURSOR FOR SELECT name FROM customers; ";
+    for (without, with) in [
+        (
+            "OPEN c PRINT 'start' FETCH NEXT FROM c INTO @s EXEC(@s)",
+            "OPEN c; PRINT 'start'; FETCH NEXT FROM c INTO @s; EXEC(@s);",
+        ),
+        (
+            "DECLARE @x nvarchar(10); OPEN c FETCH NEXT FROM c INTO @x FETCH NEXT FROM c INTO @s EXEC(@s)",
+            "DECLARE @x nvarchar(10); OPEN c; FETCH NEXT FROM c INTO @x; FETCH NEXT FROM c INTO @s; EXEC(@s);",
+        ),
+        (
+            "DECLARE @x nvarchar(10); FETCH NEXT FROM c INTO @x FETCH NEXT FROM c INTO @s EXEC(@s)",
+            "DECLARE @x nvarchar(10); FETCH NEXT FROM c INTO @x; FETCH NEXT FROM c INTO @s; EXEC(@s);",
+        ),
+        (
+            "OPEN c CLOSE c OPEN c FETCH NEXT FROM c INTO @s EXEC(@s)",
+            "OPEN c; CLOSE c; OPEN c; FETCH NEXT FROM c INTO @s; EXEC(@s);",
+        ),
+        (
+            "OPEN c RAISERROR('x', 10, 1) WITH NOWAIT FETCH NEXT FROM c INTO @s EXEC(@s)",
+            "OPEN c; RAISERROR('x', 10, 1) WITH NOWAIT; FETCH NEXT FROM c INTO @s; EXEC(@s);",
+        ),
+        (
+            "OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE cert FETCH NEXT FROM c INTO @s EXEC(@s)",
+            "OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE cert; FETCH NEXT FROM c INTO @s; EXEC(@s);",
+        ),
+        (
+            "DECLARE master CURSOR FOR SELECT name FROM customers; OPEN master FETCH NEXT FROM master INTO @s EXEC(@s)",
+            "DECLARE master CURSOR FOR SELECT name FROM customers; OPEN master; FETCH NEXT FROM master INTO @s; EXEC(@s);",
+        ),
+        (
+            "DECLARE symmetric CURSOR FOR SELECT name FROM customers; OPEN symmetric FETCH NEXT FROM symmetric INTO @s EXEC(@s)",
+            "DECLARE symmetric CURSOR FOR SELECT name FROM customers; OPEN symmetric; FETCH NEXT FROM symmetric INTO @s; EXEC(@s);",
+        ),
+    ] {
+        let (without, with) = (
+            format!("{stale}{cursor}{without}"),
+            format!("{stale}{cursor}{with}"),
+        );
+        let facts = routine_edges_and_state(&without, "sqlserver");
+        assert!(
+            !facts.0.iter().any(|edge| edge == "Writes s.audit"),
+            "{without}: {facts:?}"
+        );
+        assert_eq!(facts.1, AnalysisState::Partial, "{without}: {facts:?}");
+        assert_eq!(facts, routine_edges_and_state(&with, "sqlserver"), "{without}");
+    }
+    // 이름이 `global`인 커서 — 뒤가 `FETCH`면 GLOBAL은 범위 한정자가 아니라 이름이다.
+    let without = format!("{stale}DECLARE global CURSOR FOR SELECT name FROM customers; OPEN global FETCH NEXT FROM global INTO @s EXEC(@s) UPDATE orders SET amount = 0");
+    let with = format!("{stale}DECLARE global CURSOR FOR SELECT name FROM customers; OPEN global; FETCH NEXT FROM global INTO @s; EXEC(@s); UPDATE orders SET amount = 0;");
+    let facts = routine_edges_and_state(&without, "sqlserver");
+    assert!(
+        facts.0.iter().any(|edge| edge == "Writes s.orders"),
+        "{without}: {facts:?}"
+    );
+    assert!(
+        !facts.0.iter().any(|edge| edge == "Writes s.audit"),
+        "{without}: {facts:?}"
+    );
+    assert_eq!(
+        facts,
+        routine_edges_and_state(&with, "sqlserver"),
+        "{without}"
+    );
+    // `END` 뒤의 이 문장들은 꼬리가 아니라 다음 문장이다 — 꼬리로 먹으면 남은 절과 뒤 `UPDATE`를 잃는다.
+    for statement in [
+        "PRINT 'done'",
+        "RAISERROR('x', 16, 1)",
+        "THROW 50000, 'x', 1",
+        "WAITFOR DELAY '00:00:01'",
+        "GOTO done",
+        "FETCH NEXT FROM c",
+        "CLOSE c",
+        "DEALLOCATE c",
+        "OPEN c",
+    ] {
+        let without = format!(
+            "DECLARE @n int; IF @n = 1 BEGIN UPDATE audit SET name = 'x' END {statement} UPDATE orders SET amount = 0"
+        );
+        let with = format!(
+            "DECLARE @n int; IF @n = 1 BEGIN UPDATE audit SET name = 'x'; END; {statement}; UPDATE orders SET amount = 0;"
+        );
+        let facts = routine_edges_and_state(&without, "sqlserver");
+        assert!(
+            facts.0.iter().any(|edge| edge == "Writes s.orders"),
+            "{without}: {facts:?}"
+        );
+        assert_eq!(
+            facts,
+            routine_edges_and_state(&with, "sqlserver"),
+            "{without}"
+        );
+    }
+    // `SELECT … OFFSET … FETCH NEXT …`의 `FETCH`는 문장 안이라 끊지 않는다.
+    let paged = "DECLARE @n int; PRINT 'x' SELECT id FROM orders ORDER BY id OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY";
+    let paged_semi = "DECLARE @n int; PRINT 'x'; SELECT id FROM orders ORDER BY id OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY;";
+    let facts = routine_edges_and_state(paged, "sqlserver");
+    assert_eq!(facts.1, AnalysisState::Complete, "{facts:?}");
+    assert_eq!(facts, routine_edges_and_state(paged_semi, "sqlserver"));
+}
+
+/// T-SQL `SELECT`·`UPDATE`·`DELETE`·`MERGE` 바로 뒤에 세미콜론 없이 붙은 `EXEC`는 다음 문장이다. sqlparser가
+/// `FROM customers EXEC(@s)`를 컬럼 목록이 붙은 별칭으로 읽어, 동적 SQL이 소리 없이 빠진 채 `complete`였다.
+/// 다른 문장 경계가 먼저 오면(`… END FETCH … INTO @s EXEC(@s)`, `… IF 1 = 1 SET @s = … EXEC(@s)`) 이전처럼 끊지
+/// 않는다 — 끊으면 그 사이 문장을 이 상태가 보지 못해 `EXEC(@s)`를 옛 값으로 접는다.
+#[test]
+fn tsql_exec_after_a_query_is_the_next_statement() {
+    let stale = "DECLARE @s nvarchar(100) = N'UPDATE audit SET name = 1'; ";
+    for (without, with) in [
+        (
+            format!("{stale}SELECT @s = name FROM customers EXEC(@s)"),
+            format!("{stale}SELECT @s = name FROM customers; EXEC(@s);"),
+        ),
+        (
+            "DECLARE @n int; SELECT @n = COUNT(*) FROM customers EXEC other @n".to_owned(),
+            "DECLARE @n int; SELECT @n = COUNT(*) FROM customers; EXEC other @n;".to_owned(),
+        ),
+        (
+            format!("{stale}BEGIN UPDATE orders SET amount = 0 END FETCH NEXT FROM c INTO @s EXEC(@s)"),
+            format!("{stale}BEGIN UPDATE orders SET amount = 0; END; FETCH NEXT FROM c INTO @s; EXEC(@s);"),
+        ),
+    ] {
+        let facts = routine_edges_and_state(&without, "sqlserver");
+        assert!(
+            facts.0.iter().any(|edge| edge == "Reads s.customers" || edge == "Writes s.orders"),
+            "{without}: {facts:?}"
+        );
+        assert!(
+            !facts.0.iter().any(|edge| edge == "Writes s.audit"),
+            "{without}: {facts:?}"
+        );
+        assert_eq!(facts.1, AnalysisState::Partial, "{without}: {facts:?}");
+        assert_eq!(facts, routine_edges_and_state(&with, "sqlserver"), "{without}");
+    }
+    // `EXEC` 앞에 다른 문장 경계(`IF`)가 먼저 오면 끊지 않는다. 끊으면 이 상태가 그 사이 `IF … SET @s = …`를 보지
+    // 못해 `EXEC(@s)`를 옛 값(`UPDATE audit …`)으로 접는다 — 끊지 않은 문장은 파싱되지 않아 미추출로 센다.
+    let facts = routine_edges_and_state(
+        &format!("{stale}SELECT id FROM orders WHERE 1 = 0 IF 1 = 1 SET @s = N'UPDATE customers SET name = 1' EXEC(@s)"),
+        "sqlserver",
+    );
+    assert!(
+        !facts.0.iter().any(|edge| edge == "Writes s.audit"),
+        "{facts:?}"
+    );
+    assert_eq!(facts.1, AnalysisState::Partial, "{facts:?}");
 }
 
 /// MySQL·MariaDB·SQL Server·SQLite의 routine 몸체는 `AS` 뒤 문자열로 감싸이지 않는다. 그 방언들이 받는 문자열
