@@ -1079,7 +1079,7 @@ fn parse_routine_body(
     body: &str,
     alias_case: cte_target::NameCase,
 ) -> Result<ParsedTrigger, String> {
-    let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
+    let inner = quoted_routine_body(dialect, body).unwrap_or(std::borrow::Cow::Borrowed(body));
     let transformed =
         inner.as_ref().len() != body.len() || !std::ptr::eq(inner.as_ref().as_ptr(), body.as_ptr());
     let mut parsed = parse_trigger_body(dialect, &inner, false, false, alias_case)?;
@@ -1382,6 +1382,25 @@ fn strip_outer_parentheses(text: &str) -> Option<&str> {
         index += 1;
     }
     (depth == 0).then(|| trimmed[1..end - 1].trim())
+}
+
+/// routine 몸체가 `AS` 뒤 문자열로 감싸였으면 그 안쪽을 꺼낸다(`extract_as_body`).
+///
+/// MySQL·MariaDB·SQL Server·SQLite의 routine 몸체는 문자열로 감싸이지 않는다 — MySQL `ROUTINE_DEFINITION`은
+/// 몸체 문장 자체이고, T-SQL `CREATE PROCEDURE … AS`는 `AS` 뒤가 바로 문장이며, SQLite에는 저장 routine이
+/// 없어 routine은 `--sql-dir`·가져온 쿼리 파일의 SQL 원문뿐이다. 이 방언들은 문자열 별칭(`SELECT COUNT(*) AS
+/// 'total' FROM orders`)을 받는데, 그 별칭이 몸체로 오인되어 routine 전체가 `total` 한 단어로 바뀌고
+/// `body parse failed`로 간선을 모두 잃었다. 그래서 이 방언들에서는 꺼내지 않는다. 다른 방언(PostgreSQL
+/// `AS $$…$$`, H2 `CREATE ALIAS … AS $$…$$` 등)은 이전과 같다.
+fn quoted_routine_body<'a>(
+    dialect: &dyn Dialect,
+    body: &'a str,
+) -> Option<std::borrow::Cow<'a, str>> {
+    if dialect.is::<MySqlDialect>() || dialect.is::<MsSqlDialect>() || dialect.is::<SQLiteDialect>()
+    {
+        return None;
+    }
+    extract_as_body(body)
 }
 
 /// `AS $$...$$`·`AS $tag$...$tag$`·`AS '...'` 안의 몸체를 꺼낸다 —
@@ -2075,7 +2094,7 @@ fn parse_procedural_body(
     format_shadowed: bool,
     alias_case: cte_target::NameCase,
 ) -> (ParsedTrigger, usize) {
-    let extracted = extract_as_body(body);
+    let extracted = quoted_routine_body(dialect, body);
     let starts_in_declare = extracted
         .as_ref()
         .is_some_and(|inner| !starts_with_keyword(skip_ws_comments(inner), "BEGIN"));

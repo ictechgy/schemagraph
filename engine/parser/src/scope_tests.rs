@@ -2074,6 +2074,57 @@ fn tsql_routine_text_outside_the_block_is_not_claimed_complete() {
     }
 }
 
+/// MySQL·MariaDB·SQL Server·SQLite의 routine 몸체는 `AS` 뒤 문자열로 감싸이지 않는다. 그 방언들이 받는 문자열
+/// 별칭(`AS 'total'`)을 PostgreSQL `AS '…'` 몸체처럼 꺼내, routine 전체가 별칭 한 단어로 바뀌고 간선 없이
+/// `body parse failed`였다. PostgreSQL의 문자열 몸체는 이전처럼 꺼낸다.
+#[test]
+fn string_column_aliases_do_not_replace_the_routine_body() {
+    for (dialect, body) in [
+        (
+            "mysql",
+            "BEGIN UPDATE audit SET name = 'x'; SELECT COUNT(*) AS 'total' FROM orders; END",
+        ),
+        (
+            "mariadb",
+            "BEGIN UPDATE audit SET name = 'x'; SELECT COUNT(*) AS 'total' FROM orders; END",
+        ),
+        (
+            "sqlserver",
+            "CREATE PROCEDURE s.mutate AS\nBEGIN\n  UPDATE audit SET name = 'x';\n  SELECT id AS 'ident' FROM orders;\nEND",
+        ),
+        // 절차형 추출기로 가는 몸체(`DECLARE`)도 같다.
+        (
+            "sqlserver",
+            "CREATE PROCEDURE s.mutate AS\nBEGIN\n  DECLARE @n int;\n  UPDATE audit SET name = 'x';\n  SELECT id AS 'ident' FROM orders;\nEND",
+        ),
+        (
+            "sqlite",
+            "UPDATE audit SET name = (SELECT COUNT(*) AS 'n' FROM orders)",
+        ),
+    ] {
+        let graph = scan_routine_kind(body, dialect, "sql", "procedure");
+        let detail = format!("{dialect}: {:?} {:?}", graph.edges(), graph.limitations());
+        assert!(edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes), "{detail}");
+        assert!(edge(&graph, "s.mutate", "s.orders", EdgeKind::Reads), "{detail}");
+        assert_eq!(
+            graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+            AnalysisState::Complete,
+            "{detail}"
+        );
+    }
+    let graph = scan_routine_kind(
+        "CREATE FUNCTION s.mutate() RETURNS int LANGUAGE sql AS 'SELECT count(*) FROM orders'",
+        "postgres",
+        "sql",
+        "function",
+    );
+    assert!(
+        edge(&graph, "s.mutate", "s.orders", EdgeKind::Reads),
+        "{:?}",
+        graph.edges()
+    );
+}
+
 /// 건너뛴 절에 대입이 있으면(`GET DIAGNOSTICS @s = ROW_COUNT`) 그 변수의 옛 값으로 뒤 동적 SQL을 접지
 /// 않는다. 접으면 실행되지 않는 `UPDATE audit`가 거짓 쓰기가 된다.
 #[test]
