@@ -1083,6 +1083,9 @@ fn parse_routine_body(
     let transformed =
         inner.as_ref().len() != body.len() || !std::ptr::eq(inner.as_ref().as_ptr(), body.as_ptr());
     let mut parsed = parse_trigger_body(dialect, &inner, false, false, alias_case)?;
+    if dialect.is::<MsSqlDialect>() && tsql_text_outside_block(&inner) {
+        note_text_outside_block(&mut parsed);
+    }
     parsed
         .scalar_symbols
         .extend(routine_parameter_symbols(body));
@@ -1790,6 +1793,55 @@ fn extract_trigger_inner(body: &str) -> Option<&str> {
         inner = inner["ATOMIC".len()..].trim_start();
     }
     (!inner.is_empty()).then_some(inner)
+}
+
+/// 첫 `BEGIN`과 마지막 `END` 사이만 읽은 T-SQL routine 몸체를 부분 분석으로 표시한다.
+///
+/// routine 몸체는 trigger처럼 그 둘 사이를 벗겨 읽는다(`extract_trigger_inner`). 다른 방언의 routine
+/// 몸체는 문장 하나(MySQL 복합문, PostgreSQL `BEGIN ATOMIC`)라 벗겨도 잃는 것이 없지만, T-SQL routine
+/// 몸체는 문장 목록이고 `BEGIN … END`는 그 안의 블록 문장 하나일 뿐이다. 블록 앞뒤에 문장이 있으면
+/// (`CREATE PROCEDURE p AS UPDATE audit …; IF @@ROWCOUNT = 0 BEGIN … END UPDATE orders …`) 그 문장이
+/// 소리 없이 빠진 채 `complete`였다. 몸체 전체를 읽으면 sqlparser 0.58이 괄호 없는 T-SQL 매개변수 머리와
+/// 세미콜론 없이 이어진 문장을 읽지 못하고, 절차형 추출기는 머리 뒤 텍스트를 선언으로 삼켜 블록 안의
+/// 간선까지 잃는 몸체가 있다. 그래서 읽은 간선은 이전과 같게 두고, 블록 밖을 분석하지 않았다고 알린다.
+fn note_text_outside_block(parsed: &mut ParsedTrigger) {
+    parsed.partial = true;
+    parsed.diagnostics.push(schemagraph_core::Diagnostic {
+        code: "SG_BODY_PARTIAL".into(),
+        message: "T-SQL body text before the first BEGIN or after the last END was not analyzed; only the statements inside that BEGIN/END block were read".into(),
+        location: None,
+        candidates: Vec::new(),
+    });
+}
+
+/// routine 몸체에서 벗긴 블록(첫 `BEGIN`부터 마지막 `END`까지) 밖에, 정의문 머리 말고도 텍스트가 남는가.
+///
+/// 블록을 벗기지 않는 몸체(`BEGIN`이나 `END`가 없거나 그 사이가 비었다)는 통째로 읽으므로 거짓이다. 남지
+/// 않으려면 첫 `BEGIN` 앞에는 공백·주석이나 정의문 머리(`CREATE PROCEDURE … AS`, 마지막 `AS` 키워드까지)만
+/// 오고, 마지막 `END` 뒤에는 공백·주석·`;`만 와야 한다. 머리의 끝을 마지막 `AS`로 보는 것은 `AS` 바로 뒤에
+/// `BEGIN`이 오는 자리가 정의문 머리뿐이기 때문이다 — 문장 안의 `AS`(`SELECT id AS x`, `CAST(@v AS int)`)
+/// 뒤에는 `BEGIN`이 올 수 없어, 그 `AS`가 마지막이면 뒤에 문장 텍스트가 남는다. `END TRY`·`END CATCH`로
+/// 끝나는 몸체는 꼬리 단어가 남아 참이지만, 벗긴 안쪽에 `BEGIN CATCH`가 남아 문장 파서가 실패하므로 표시되지
+/// 않는다(그 몸체는 이전처럼 절차형 추출기가 통째로 읽는다). 첫 `BEGIN`과 마지막 `END`가 서로 짝인지는 보지
+/// 않는다(`BEGIN … END UPDATE … BEGIN … END`는 이전처럼 안쪽의 최상위 `END`에서 부분 분석이다).
+fn tsql_text_outside_block(body: &str) -> bool {
+    if extract_trigger_inner(body).is_none() {
+        return false;
+    }
+    let begins = find_all_keywords(body, "BEGIN");
+    let ends = find_all_keywords(body, "END");
+    let (Some(&begin), Some(&end)) = (begins.first(), ends.last()) else {
+        return false;
+    };
+    let before = &body[..begin];
+    let header_end = find_all_keywords(before, "AS")
+        .last()
+        .map_or(0, |at| at + "AS".len());
+    let mut after = skip_ws_comments(body.get(end + "END".len()..).unwrap_or(""));
+    while let Some(rest) = after.strip_prefix(';') {
+        after = skip_ws_comments(rest);
+    }
+    !skip_ws_comments(&before[header_end..]).is_empty() || !after.is_empty()
 }
 
 /// 인용·주석 바깥의 키워드만 찾는다 — 문자열에 든 SQL은 실행 문맥에서만 푼다.

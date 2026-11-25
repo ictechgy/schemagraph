@@ -2003,6 +2003,77 @@ fn tsql_open_ends_at_the_cursor_name() {
     );
 }
 
+/// T-SQL routine 몸체는 문장 목록이라 `BEGIN … END`는 그 안의 블록 하나일 뿐이다. 첫 `BEGIN`과 마지막 `END` 사이만
+/// 벗겨 읽던 몸체는 그 밖의 문장(아래 `UPDATE audit`·`UPDATE orders` 등)을 소리 없이 버리고 `complete`였다. 읽은
+/// 간선은 그대로 두고 블록 밖을 분석하지 않았다고 부분 분석으로 알린다. 블록이 정의문 머리 뒤 몸체 전체를 감싸면
+/// (주석, 문자열 속 `END`, `TRY`·`CATCH` 꼬리 포함) 이전처럼 `complete`이고, 다른 방언은 같은 몸체에서도 이 진단을
+/// 내지 않는다.
+#[test]
+fn tsql_routine_text_outside_the_block_is_not_claimed_complete() {
+    const OUTSIDE: &str =
+        "T-SQL body text before the first BEGIN or after the last END was not analyzed";
+    let outcome = |body: &str, dialect: &str, kind: &str| {
+        let graph = scan_routine_kind(body, dialect, "sql", kind);
+        let analysis = graph.analysis()[&VertexId::from_raw("s.mutate")].clone();
+        let flagged = analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "SG_BODY_PARTIAL" && diagnostic.message.starts_with(OUTSIDE)
+        });
+        (graph, analysis.state, flagged)
+    };
+    let mixed = "UPDATE orders SET amount = 1; BEGIN UPDATE audit SET name = 'x'; END; UPDATE customers SET name = 'y';";
+    for (body, kept) in [
+        (
+            "CREATE PROCEDURE s.mutate @id int AS\nUPDATE audit SET name = 'x' WHERE id = @id;\nIF @@ROWCOUNT = 0\nBEGIN\n  UPDATE customers SET name = 'y';\nEND\nUPDATE orders SET amount = 1;",
+            "s.customers",
+        ),
+        (mixed, "s.audit"),
+        (
+            "CREATE PROCEDURE s.mutate AS\nBEGIN\n  UPDATE audit SET name = 'x'\nEND\nUPDATE orders SET amount = 1",
+            "s.audit",
+        ),
+        (
+            "CREATE PROCEDURE s.mutate @id int AS\nUPDATE orders SET amount = 1;\nBEGIN\n  UPDATE audit SET name = 'x';\nEND",
+            "s.audit",
+        ),
+    ] {
+        let (graph, state, flagged) = outcome(body, "sqlserver", "procedure");
+        assert!(
+            edge(&graph, "s.mutate", kept, EdgeKind::Writes),
+            "{body}: {:?}",
+            graph.edges()
+        );
+        assert_eq!(state, AnalysisState::Partial, "{body}");
+        assert!(flagged, "{body}: {:?}", graph.analysis());
+    }
+    for (body, kind) in [
+        (
+            "CREATE PROCEDURE s.mutate @id int = 1 AS /* c */\nBEGIN\n  UPDATE audit SET name = 'END x';\nEND; -- tail",
+            "procedure",
+        ),
+        (
+            "CREATE PROCEDURE s.mutate AS\nBEGIN TRY\n  UPDATE audit SET name = 'x';\nEND TRY\nBEGIN CATCH\n  UPDATE orders SET amount = 0;\nEND CATCH",
+            "procedure",
+        ),
+        (
+            "CREATE FUNCTION s.mutate() RETURNS INT AS\nBEGIN\n  RETURN (SELECT count(*) FROM orders);\nEND",
+            "function",
+        ),
+        // 마지막 `END CATCH`의 꼬리 — 블록을 벗긴 몸체를 문장 파서가 끝까지 읽는다.
+        (
+            "CREATE PROCEDURE s.mutate AS\nBEGIN\n  UPDATE audit SET name = 'x';\nEND;\nBEGIN TRY\n  UPDATE orders SET amount = 0;\nEND TRY\nBEGIN CATCH\n  UPDATE customers SET name = 'y';\nEND CATCH",
+            "procedure",
+        ),
+    ] {
+        let (graph, state, flagged) = outcome(body, "sqlserver", kind);
+        assert!(!flagged, "{body}: {:?}", graph.analysis());
+        assert_eq!(state, AnalysisState::Complete, "{body}: {:?}", graph.analysis());
+    }
+    for dialect in ["mysql", "postgres", "oracle"] {
+        let (graph, _, flagged) = outcome(mixed, dialect, "procedure");
+        assert!(!flagged, "{dialect}: {:?}", graph.analysis());
+    }
+}
+
 /// 건너뛴 절에 대입이 있으면(`GET DIAGNOSTICS @s = ROW_COUNT`) 그 변수의 옛 값으로 뒤 동적 SQL을 접지
 /// 않는다. 접으면 실행되지 않는 `UPDATE audit`가 거짓 쓰기가 된다.
 #[test]
