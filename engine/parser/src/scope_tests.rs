@@ -1787,6 +1787,222 @@ fn ignored_tsql_statements_end_at_the_next_statement_head() {
     }
 }
 
+/// routine `s.mutate`의 간선(정렬한 `종류 대상`)과 분석 상태.
+fn routine_edges_and_state(body: &str, dialect: &str) -> (Vec<String>, AnalysisState) {
+    let graph = scan_routine_kind(body, dialect, "sql", "procedure");
+    let mut edges: Vec<String> = graph
+        .edges()
+        .iter()
+        .filter(|edge| edge.from.as_str() == "s.mutate")
+        .map(|edge| format!("{:?} {}", edge.kind, edge.to))
+        .collect();
+    edges.sort();
+    (
+        edges,
+        graph.analysis()[&VertexId::from_raw("s.mutate")].state,
+    )
+}
+
+/// 세미콜론 없는 T-SQL 조각에서 `END` 뒤의 다음 문장 머리(`UPDATE`·`SET`·`IF`·`DECLARE`·`EXEC`·CTE를 여는
+/// `WITH`)는 그 `END`의 꼬리가 아니다. 이전에는 꼬리 한 단어로 먹어 그 문장을 미추출로 셌고(`EXEC(@s)`는 간선
+/// 없이), 세미콜론을 넣은 같은 몸체와 결과가 달랐다. `ELSE`·`TRY`/`CATCH`처럼 꼬리로 먹던 단어는 그대로다.
+#[test]
+fn tsql_end_does_not_swallow_the_next_statement_head() {
+    let declare = "DECLARE @n int; ";
+    let folded = "DECLARE @s nvarchar(100) = N'UPDATE audit SET name = 1'; ";
+    for (without, with, expected) in [
+        (
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x' END UPDATE orders SET amount = 0",
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x'; END; UPDATE orders SET amount = 0;",
+            "Writes s.orders",
+        ),
+        (
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x' END SET @n = (SELECT count(*) FROM orders)",
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x'; END; SET @n = (SELECT count(*) FROM orders);",
+            "Reads s.orders",
+        ),
+        (
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x' END IF @n = 2 BEGIN UPDATE orders SET amount = 0 END",
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x'; END; IF @n = 2 BEGIN UPDATE orders SET amount = 0; END;",
+            "Writes s.orders",
+        ),
+        (
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x' END DECLARE @m int = (SELECT count(*) FROM orders)",
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x'; END; DECLARE @m int = (SELECT count(*) FROM orders);",
+            "Reads s.orders",
+        ),
+        (
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x' END WITH big AS (SELECT id FROM orders) SELECT id FROM big",
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x'; END; WITH big AS (SELECT id FROM orders) SELECT id FROM big;",
+            "Reads s.orders",
+        ),
+        (
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x' END ELSE BEGIN UPDATE customers SET name = 'y' END",
+            "IF @n = 1 BEGIN UPDATE audit SET name = 'x'; END ELSE BEGIN UPDATE customers SET name = 'y'; END;",
+            "Writes s.customers",
+        ),
+        (
+            "BEGIN TRY UPDATE audit SET name = 'x' END TRY BEGIN CATCH UPDATE orders SET amount = 0 END CATCH",
+            "BEGIN TRY UPDATE audit SET name = 'x'; END TRY BEGIN CATCH UPDATE orders SET amount = 0; END CATCH;",
+            "Writes s.orders",
+        ),
+    ] {
+        let (without, with) = (format!("{declare}{without}"), format!("{declare}{with}"));
+        let facts = routine_edges_and_state(&without, "sqlserver");
+        assert!(facts.0.iter().any(|edge| edge == expected), "{without}: {facts:?}");
+        assert_eq!(facts, routine_edges_and_state(&with, "sqlserver"), "{without}");
+    }
+    // 블록 뒤의 `EXEC(@s)`는 블록 안에서 바꾼 값으로 접힌다(세미콜론 판과 같다).
+    let without = format!("{folded}BEGIN SET @s = N'UPDATE orders SET amount = 1' END EXEC(@s)");
+    let with = format!("{folded}BEGIN SET @s = N'UPDATE orders SET amount = 1'; END; EXEC(@s);");
+    let facts = routine_edges_and_state(&without, "sqlserver");
+    assert!(
+        facts.0.iter().any(|edge| edge == "Writes s.orders"),
+        "{facts:?}"
+    );
+    assert!(
+        !facts.0.iter().any(|edge| edge == "Writes s.audit"),
+        "{facts:?}"
+    );
+    assert_eq!(facts, routine_edges_and_state(&with, "sqlserver"));
+    // 이어진 블록의 `BEGIN`은 이전처럼 꼬리로 먹는다 — 따로 보내면 제어 흐름으로 보아 접던 값을 버린다.
+    let blocks =
+        format!("{folded}BEGIN SET @s = N'UPDATE orders SET amount = 1' END BEGIN EXEC(@s) END");
+    let facts = routine_edges_and_state(&blocks, "sqlserver");
+    assert!(
+        facts.0.iter().any(|edge| edge == "Writes s.orders"),
+        "{facts:?}"
+    );
+    // 문장마다 `;`가 있는 방언의 `END IF`·`END LOOP`는 이전처럼 꼬리다(절차형 추출기로 가는 몸체).
+    for (dialect, language, body) in [
+        (
+            "postgres",
+            "plpgsql",
+            "BEGIN IF true THEN UPDATE audit SET name = 'x'; END IF; UPDATE orders SET amount = 0; END",
+        ),
+        (
+            "postgres",
+            "plpgsql",
+            "BEGIN LOOP UPDATE audit SET name = 'x'; EXIT; END LOOP; UPDATE orders SET amount = 0; END",
+        ),
+        (
+            "mysql",
+            "sql",
+            "BEGIN SET @v = 1; IF @v = 1 THEN UPDATE audit SET name = 'x'; END IF; UPDATE orders SET amount = 0; END",
+        ),
+    ] {
+        let graph = scan_routine_kind(body, dialect, language, "procedure");
+        let detail = format!("{dialect}: {:?} {:?}", graph.edges(), graph.limitations());
+        assert!(edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes), "{detail}");
+        assert!(edge(&graph, "s.mutate", "s.orders", EdgeKind::Writes), "{detail}");
+        assert!(
+            !graph.limitations().iter().any(|note| note.contains("not extracted")),
+            "{detail}"
+        );
+    }
+}
+
+/// T-SQL `OPEN 커서`는 커서 이름 하나로 끝난다(FOR 절이 없다). 이전에는 PL/pgSQL `OPEN c FOR <질의>`처럼 조각
+/// 끝까지를 커서 질의로 읽어, 세미콜론 없이 이어진 `FETCH … UPDATE orders …`가 소리 없이 빠진 채 `complete`였다.
+/// `FETCH … INTO @s`가 제 갈래를 거쳐 `@s`의 옛 값을 버리므로 뒤 `EXEC(@s)`를 옛 값으로 접지 않는다.
+/// 키를 여는 `OPEN SYMMETRIC KEY …`는 다음 문장 머리에서 끝난다. PL/pgSQL·PL/SQL의 `OPEN … FOR`는 이전과 같다.
+#[test]
+fn tsql_open_ends_at_the_cursor_name() {
+    for (without, with, expected) in [
+        (
+            "DECLARE @id int; DECLARE c CURSOR FOR SELECT id FROM audit; OPEN c FETCH NEXT FROM c INTO @id UPDATE orders SET amount = 0 WHERE id = @id",
+            "DECLARE @id int; DECLARE c CURSOR FOR SELECT id FROM audit; OPEN c; FETCH NEXT FROM c INTO @id; UPDATE orders SET amount = 0 WHERE id = @id;",
+            Some("Writes s.orders"),
+        ),
+        (
+            "DECLARE c CURSOR GLOBAL FOR SELECT id FROM audit; OPEN GLOBAL c UPDATE orders SET amount = 0",
+            "DECLARE c CURSOR GLOBAL FOR SELECT id FROM audit; OPEN GLOBAL c; UPDATE orders SET amount = 0;",
+            Some("Writes s.orders"),
+        ),
+        // 이름이 `global`인 커서 — 뒤가 문장 머리면 GLOBAL은 범위 한정자가 아니라 이름이다.
+        (
+            "DECLARE global CURSOR FOR SELECT id FROM audit; OPEN global UPDATE orders SET amount = 0",
+            "DECLARE global CURSOR FOR SELECT id FROM audit; OPEN global; UPDATE orders SET amount = 0;",
+            Some("Writes s.orders"),
+        ),
+        (
+            "DECLARE @c CURSOR; SET @c = CURSOR FOR SELECT id FROM audit; OPEN @c UPDATE orders SET amount = 0",
+            "DECLARE @c CURSOR; SET @c = CURSOR FOR SELECT id FROM audit; OPEN @c; UPDATE orders SET amount = 0;",
+            Some("Writes s.orders"),
+        ),
+        (
+            "DECLARE [my c] CURSOR FOR SELECT id FROM audit; OPEN [my c] UPDATE orders SET amount = 0",
+            "DECLARE [my c] CURSOR FOR SELECT id FROM audit; OPEN [my c]; UPDATE orders SET amount = 0;",
+            Some("Writes s.orders"),
+        ),
+        (
+            "DECLARE @n int; OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE cert UPDATE orders SET amount = 0",
+            "DECLARE @n int; OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE cert; UPDATE orders SET amount = 0;",
+            Some("Writes s.orders"),
+        ),
+        (
+            "DECLARE @s nvarchar(100) = N'UPDATE audit SET name = 1'; DECLARE c CURSOR FOR SELECT name FROM customers; OPEN c FETCH NEXT FROM c INTO @s EXEC(@s)",
+            "DECLARE @s nvarchar(100) = N'UPDATE audit SET name = 1'; DECLARE c CURSOR FOR SELECT name FROM customers; OPEN c; FETCH NEXT FROM c INTO @s; EXEC(@s);",
+            None,
+        ),
+    ] {
+        let facts = routine_edges_and_state(without, "sqlserver");
+        match expected {
+            Some(expected) => {
+                assert!(facts.0.iter().any(|edge| edge == expected), "{without}: {facts:?}")
+            }
+            // `@s`의 값은 커서 행이라 모른다 — 동적 SQL은 미추출로 남는다.
+            None => assert_eq!(facts.1, AnalysisState::Partial, "{without}: {facts:?}"),
+        }
+        assert!(!facts.0.iter().any(|edge| edge == "Writes s.audit"), "{without}: {facts:?}");
+        assert_eq!(facts, routine_edges_and_state(with, "sqlserver"), "{without}");
+    }
+    for (dialect, language, body) in [
+        (
+            "postgres",
+            "plpgsql",
+            "DECLARE c refcursor; BEGIN OPEN c FOR SELECT id FROM orders; UPDATE audit SET name = 'x'; END",
+        ),
+        (
+            "oracle",
+            "plsql",
+            "IS c SYS_REFCURSOR; BEGIN OPEN c FOR SELECT id FROM orders; UPDATE audit SET name = 'x'; END;",
+        ),
+    ] {
+        let graph = scan_routine_kind(body, dialect, language, "procedure");
+        assert!(
+            edge(&graph, "s.mutate", "s.orders", EdgeKind::Reads),
+            "{dialect}: {:?}",
+            graph.edges()
+        );
+        assert!(
+            edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+            "{dialect}: {:?}",
+            graph.edges()
+        );
+    }
+    // PL/SQL 매개변수 커서 `OPEN c(1)`의 인자는 다음 문장이 아니다.
+    let graph = scan_routine_kind(
+        "IS CURSOR c(p NUMBER) IS SELECT id FROM orders WHERE id = p; BEGIN OPEN c(1); UPDATE audit SET name = 'x'; CLOSE c; END;",
+        "oracle",
+        "plsql",
+        "procedure",
+    );
+    assert!(
+        edge(&graph, "s.mutate", "s.audit", EdgeKind::Writes),
+        "{:?}",
+        graph.edges()
+    );
+    assert!(
+        !graph
+            .limitations()
+            .iter()
+            .any(|note| note.contains("not extracted")),
+        "{:?}",
+        graph.limitations()
+    );
+}
+
 /// 건너뛴 절에 대입이 있으면(`GET DIAGNOSTICS @s = ROW_COUNT`) 그 변수의 옛 값으로 뒤 동적 SQL을 접지
 /// 않는다. 접으면 실행되지 않는 `UPDATE audit`가 거짓 쓰기가 된다.
 #[test]

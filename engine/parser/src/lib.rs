@@ -2277,9 +2277,10 @@ fn extract_procedural_statements(
                 }
                 "END" => {
                     rest = &rest[wlen..];
-                    // END IF/LOOP/CASE 또는 END <label> — 꼬리 한 단어를 소비.
+                    // END IF/LOOP/CASE 또는 END <label> — 꼬리 한 단어를 소비한다. T-SQL에서는
+                    // 다음 문장의 머리를 꼬리로 먹지 않는다(`end_consumes_tail`).
                     let (_tail_word, tail_len) = head_word(rest.trim_start());
-                    if tail_len > 0 {
+                    if tail_len > 0 && end_consumes_tail(rest.trim_start(), state) {
                         rest = &rest.trim_start()[tail_len..];
                     }
                 }
@@ -2333,8 +2334,13 @@ fn extract_procedural_statements(
                     break;
                 }
                 "OPEN" => {
-                    strip_open(rest, wlen, &mut stmts, &mut unextracted, state);
-                    break;
+                    // T-SQL `OPEN 커서`에는 FOR 절이 없어, 세미콜론 없는 조각에서는 커서 이름 뒤에
+                    // 다음 문장이 붙는다(`OPEN c FETCH … UPDATE log …`). 그 앞에서 끝내고 계속 꺼낸다.
+                    let Some(end) = tsql_open_end(&rest[wlen..], state).map(|at| wlen + at) else {
+                        strip_open(rest, wlen, &mut stmts, &mut unextracted, state);
+                        break;
+                    };
+                    rest = &rest[end..];
                 }
                 "EXECUTE" => {
                     // T-SQL에서는 `EXEC`처럼 인자 뒤에 다음 문장이 붙을 수 있다.
@@ -2490,6 +2496,80 @@ fn assign_tsql_variable(name: &str, lhs: &str, rhs: &str, state: &mut Extraction
     }
 }
 
+/// 절차형 추출기가 `END` 바로 뒤 단어(`tail`의 첫 단어)를 그 `END`의 꼬리로 소비하는가.
+///
+/// PL/pgSQL·PL/SQL·MySQL의 `END IF`·`END LOOP`·`END CASE`·`END <레이블>`은 꼬리 한 단어가 붙고, 그 방언들은
+/// 문장마다 `;`가 있어 `END` 뒤 다른 문장은 같은 조각에 오지 않는다. T-SQL은 문장 사이 `;`를 생략할 수 있어
+/// `… END UPDATE orders …`의 `UPDATE`를 꼬리로 먹으면 그 문장을 잃었다(미추출로 셈). 그래서 T-SQL에서는
+/// 다른 T-SQL 끊기 자리와 같은 다음 문장 머리(`starts_with_tsql_statement_head`: DML·`EXEC`·`SET`·`IF`·`WHILE`·
+/// `DECLARE`·CTE를 여는 `WITH`)를 먹지 않는다. 블록 단어(`BEGIN`·`END`)와 그 밖의 단어(`TRY`·`CATCH`·`ELSE`·`COMMIT`
+/// 등)는 이전처럼 먹는다 — `BEGIN`을 따로 보내면 `observe_begin`이 이어진 블록을 제어 흐름으로 보아 접히던
+/// 동적 SQL이 미추출이 되고, `COMMIT` 같은 머리는 따로 보내면 조각 끝까지를 한 문장으로 읽어 뒤 문장을 잃는다.
+fn end_consumes_tail(tail: &str, state: &ExtractionState) -> bool {
+    if state.dialect != constant_sql::TextDialect::MsSql || !starts_with_tsql_statement_head(tail) {
+        return true;
+    }
+    let (word, _) = head_word(tail);
+    word.eq_ignore_ascii_case("BEGIN") || word.eq_ignore_ascii_case("END")
+}
+
+/// T-SQL `OPEN { [GLOBAL] 커서 | @커서_변수 }` 문장이 끝난 뒤 다음 텍스트가 시작하는 위치(`OPEN` 뒤 텍스트
+/// 기준)다.
+///
+/// T-SQL `OPEN`은 커서 이름 하나만 받는다. 이름 뒤를 다음 문장 머리로 찾지 않고 이름에서 끝내는 것은,
+/// 그 사이의 `FETCH … INTO @v`가 `FETCH` 갈래를 거쳐야 `@v`의 추적 값을 버리기 때문이다(건너뛰면 뒤
+/// `EXEC(@v)`를 옛 값으로 접는다). `OPEN SYMMETRIC KEY …`·`OPEN MASTER KEY …`는 커서가 아니라 키를 여는
+/// 문장이라 무시하는 문장처럼 다음 문장 머리에서 끝낸다(`tsql_statement_end`). T-SQL이 아니거나, 이름 뒤에
+/// 아무것도 없거나, 이름 뒤가 FOR 절이면(`OPEN c FOR SELECT …`, PL/pgSQL·PL/SQL 꼴) `None`이다 — 그때는
+/// 이전처럼 `strip_open`이 읽는다.
+fn tsql_open_end(after_open: &str, state: &ExtractionState) -> Option<usize> {
+    if state.dialect != constant_sql::TextDialect::MsSql {
+        return None;
+    }
+    let head = skip_ws_comments(after_open);
+    if ["SYMMETRIC", "MASTER"]
+        .iter()
+        .any(|word| starts_with_keyword(head, word))
+    {
+        return tsql_statement_end(after_open, state);
+    }
+    let mut end = skip_tsql_name(after_open)?;
+    if starts_with_keyword(head, "GLOBAL") {
+        // `OPEN GLOBAL c`의 GLOBAL은 범위 한정자다. 뒤에 이름이 없거나 뒤가 FOR 절·다음 문장 머리면
+        // GLOBAL이 커서 이름이다(`OPEN global UPDATE …`).
+        let next = skip_ws_comments(&after_open[end..]);
+        let named = !starts_with_keyword(next, "FOR") && !starts_with_tsql_statement_head(next);
+        if let Some(name_end) = skip_tsql_name(&after_open[end..]).filter(|_| named) {
+            end += name_end;
+        }
+    }
+    let tail = skip_ws_comments(&after_open[end..]);
+    (!tail.is_empty() && !starts_with_keyword(tail, "FOR")).then(|| after_open.len() - tail.len())
+}
+
+/// 앞 공백·주석 뒤의 T-SQL 이름 하나(`이름`·`@변수`·`[인용]`·`"인용"`)가 끝나는 위치. 이름이 없으면 `None`이다.
+///
+/// 인용 없는 이름에는 ASCII 밖 글자도 든다 — T-SQL 식별자는 유니코드 글자를 받는다.
+fn skip_tsql_name(text: &str) -> Option<usize> {
+    let start = text.len() - skip_ws_comments(text).len();
+    let bytes = text.as_bytes();
+    let end = match bytes.get(start) {
+        Some(b'[' | b'"') => skip_quoted_ident(text, start),
+        Some(_) => {
+            let mut end = start + usize::from(bytes[start] == b'@');
+            while bytes
+                .get(end)
+                .is_some_and(|&byte| is_ident_char(byte) || byte >= 0x80)
+            {
+                end += 1;
+            }
+            end
+        }
+        None => start,
+    };
+    (end > start && &text[start..end] != "@").then_some(end)
+}
+
 /// T-SQL 몸체에서 무시하는 절차형 문장(`PRINT`·`RAISERROR`·`THROW`·`WAITFOR`·`GOTO`·`BREAK` 등)의 절이나
 /// `EXEC` 인자 뒤에서 다음 문장이 시작하는 위치다. T-SQL이 아니거나 다음 문장이 없으면 `None`이다.
 ///
@@ -2511,10 +2591,6 @@ fn tsql_statement_end(text: &str, state: &ExtractionState) -> Option<usize> {
 /// `SET` 단어가 없다 — `WITH SETERROR`는 한 단어다). `@`·`.`·`:`나 ASCII 밖 글자 바로 뒤의 단어는
 /// 변수·한정 이름의 일부다.
 fn next_statement_start(text: &str) -> Option<usize> {
-    const HEADS: [&str; 14] = [
-        "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "EXEC", "EXECUTE", "CALL",
-        "SET", "BEGIN", "IF", "WHILE", "DECLARE",
-    ];
     let quotes = QuoteScanner::new(text);
     let bytes = text.as_bytes();
     let (mut i, mut parens, mut cases) = (0usize, 0usize, 0usize);
@@ -2542,13 +2618,33 @@ fn next_statement_start(text: &str) -> Option<usize> {
                 "END" if cases > 0 => cases -= 1,
                 "END" => return Some(i),
                 "WITH" if cases == 0 && opens_cte(&text[i + len..]) => return Some(i),
-                head if cases == 0 && HEADS.contains(&head) => return Some(i),
+                head if cases == 0 && TSQL_STATEMENT_HEADS.contains(&head) => return Some(i),
                 _ => {}
             }
         }
         i += len;
     }
     None
+}
+
+/// T-SQL 문장 절을 끊는 다음 문장 머리(`next_statement_start`). 최상위 `END`와 CTE를 여는 `WITH`도 끊는다.
+const TSQL_STATEMENT_HEADS: [&str; 14] = [
+    "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "EXEC", "EXECUTE", "CALL", "SET",
+    "BEGIN", "IF", "WHILE", "DECLARE",
+];
+
+/// `text`의 첫 단어가 `next_statement_start`가 끊는 문장 머리인가(`next_statement_start(text) == Some(0)`).
+///
+/// 첫 단어만 본다 — 머리가 아니어도 뒤를 끝까지 훑지 않으므로, 세미콜론 없는 긴 조각에서 `END`마다 불러도
+/// 조각 길이에 비례하는 일을 하지 않는다.
+fn starts_with_tsql_statement_head(text: &str) -> bool {
+    let (word, len) = head_word(text);
+    let upper = word.to_ascii_uppercase();
+    match upper.as_str() {
+        "END" => true,
+        "WITH" => opens_cte(&text[len..]),
+        head => TSQL_STATEMENT_HEADS.contains(&head),
+    }
 }
 
 /// `WITH` 뒤가 CTE 정의(`이름 [(컬럼…)] AS (`)로 이어지는가.
@@ -2659,6 +2755,20 @@ fn split_top_level(s: &str) -> Vec<&str> {
 /// 인용·주석·괄호 안이 아닌 최상위에서 needle의 첫 위치를 찾는다.
 /// word_boundary가 true면 식별자 문자와 붙은 위치는 건너뛴다.
 fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
+    find_first_top_level(s, &[needle], word_boundary).map(|(position, _)| position)
+}
+
+/// `find_top_level`과 같되 needle 여럿 가운데 가장 먼저 나오는 것의 위치와 그 needle을 돌려준다(같은 자리면
+/// 앞 needle).
+///
+/// needle마다 `find_top_level`을 부르면 없는 needle이 매번 텍스트 끝까지 훑는다. 세미콜론 없는 T-SQL 조각은
+/// 끝까지 한 조각이라, `IF … BEGIN`마다 T-SQL에 없는 `THEN`을 조각 끝까지 찾으면 일이 조각 길이 × `IF` 수로
+/// 커진다. 한 번 훑어 첫 일치에서 멈추면 그 `IF`의 조건 길이만큼만 읽는다.
+fn find_first_top_level<'n>(
+    s: &str,
+    needles: &[&'n str],
+    word_boundary: bool,
+) -> Option<(usize, &'n str)> {
     let quotes = QuoteScanner::new(s);
     let b = s.as_bytes();
     let n = b.len();
@@ -2679,12 +2789,14 @@ fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
                 i + 1
             }
             _ => {
-                if depth == 0
-                    && i + needle.len() <= n
-                    && b[i..i + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
-                    && (!word_boundary || self::word_boundary(s, i, needle.len()))
-                {
-                    return Some(i);
+                let hit = needles.iter().find(|needle| {
+                    depth == 0
+                        && i + needle.len() <= n
+                        && b[i..i + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
+                        && (!word_boundary || self::word_boundary(s, i, needle.len()))
+                });
+                if let Some(needle) = hit {
+                    return Some((i, needle));
                 }
                 i + 1
             }
@@ -2996,10 +3108,7 @@ fn strip_condition<'a>(
     unextracted: &mut usize,
 ) -> &'a str {
     let tail = &rest[kwlen..];
-    let hit = terms
-        .iter()
-        .filter_map(|t| find_top_level(tail, t, true).map(|p| (p, t.len())))
-        .min_by_key(|(p, _)| *p);
+    let hit = find_first_top_level(tail, terms, true).map(|(p, term)| (p, term.len()));
     match hit {
         Some((p, tlen)) => {
             let cond = tail[..p].trim();
