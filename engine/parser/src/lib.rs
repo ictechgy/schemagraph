@@ -7,7 +7,7 @@
 //! 뷰는 스키마·스코프별로 컬럼을 해석하고, 절차형 몸체는 지원하는 SQL 문장을
 //! 추출한다. 값의 계보와 조건절의 읽기 의존성을 구분하고 미해석은 진단한다.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
@@ -1079,10 +1079,13 @@ fn parse_routine_body(
     body: &str,
     alias_case: cte_target::NameCase,
 ) -> Result<ParsedTrigger, String> {
-    let inner = extract_as_body(body).unwrap_or(std::borrow::Cow::Borrowed(body));
+    let inner = quoted_routine_body(dialect, body).unwrap_or(std::borrow::Cow::Borrowed(body));
     let transformed =
         inner.as_ref().len() != body.len() || !std::ptr::eq(inner.as_ref().as_ptr(), body.as_ptr());
     let mut parsed = parse_trigger_body(dialect, &inner, false, false, alias_case)?;
+    if dialect.is::<MsSqlDialect>() && tsql_text_outside_block(&inner) {
+        note_text_outside_block(&mut parsed);
+    }
     parsed
         .scalar_symbols
         .extend(routine_parameter_symbols(body));
@@ -1379,6 +1382,25 @@ fn strip_outer_parentheses(text: &str) -> Option<&str> {
         index += 1;
     }
     (depth == 0).then(|| trimmed[1..end - 1].trim())
+}
+
+/// routine 몸체가 `AS` 뒤 문자열로 감싸였으면 그 안쪽을 꺼낸다(`extract_as_body`).
+///
+/// MySQL·MariaDB·SQL Server·SQLite의 routine 몸체는 문자열로 감싸이지 않는다 — MySQL `ROUTINE_DEFINITION`은
+/// 몸체 문장 자체이고, T-SQL `CREATE PROCEDURE … AS`는 `AS` 뒤가 바로 문장이며, SQLite에는 저장 routine이
+/// 없어 routine은 `--sql-dir`·가져온 쿼리 파일의 SQL 원문뿐이다. 이 방언들은 문자열 별칭(`SELECT COUNT(*) AS
+/// 'total' FROM orders`)을 받는데, 그 별칭이 몸체로 오인되어 routine 전체가 `total` 한 단어로 바뀌고
+/// `body parse failed`로 간선을 모두 잃었다. 그래서 이 방언들에서는 꺼내지 않는다. 다른 방언(PostgreSQL
+/// `AS $$…$$`, H2 `CREATE ALIAS … AS $$…$$` 등)은 이전과 같다.
+fn quoted_routine_body<'a>(
+    dialect: &dyn Dialect,
+    body: &'a str,
+) -> Option<std::borrow::Cow<'a, str>> {
+    if dialect.is::<MySqlDialect>() || dialect.is::<MsSqlDialect>() || dialect.is::<SQLiteDialect>()
+    {
+        return None;
+    }
+    extract_as_body(body)
 }
 
 /// `AS $$...$$`·`AS $tag$...$tag$`·`AS '...'` 안의 몸체를 꺼낸다 —
@@ -1792,6 +1814,81 @@ fn extract_trigger_inner(body: &str) -> Option<&str> {
     (!inner.is_empty()).then_some(inner)
 }
 
+/// 첫 `BEGIN`과 마지막 `END` 사이만 읽은 T-SQL routine 몸체를 부분 분석으로 표시한다.
+///
+/// routine 몸체는 trigger처럼 그 둘 사이를 벗겨 읽는다(`extract_trigger_inner`). 다른 방언의 routine
+/// 몸체는 문장 하나(MySQL 복합문, PostgreSQL `BEGIN ATOMIC`)라 벗겨도 잃는 것이 없지만, T-SQL routine
+/// 몸체는 문장 목록이고 `BEGIN … END`는 그 안의 블록 문장 하나일 뿐이다. 블록 앞뒤에 문장이 있으면
+/// (`CREATE PROCEDURE p AS UPDATE audit …; IF @@ROWCOUNT = 0 BEGIN … END UPDATE orders …`) 그 문장이
+/// 소리 없이 빠진 채 `complete`였다. 몸체 전체를 읽으면 sqlparser 0.58이 괄호 없는 T-SQL 매개변수 머리와
+/// 세미콜론 없이 이어진 문장을 읽지 못하고, 절차형 추출기는 머리 뒤 텍스트를 선언으로 삼켜 블록 안의
+/// 간선까지 잃는 몸체가 있다. 그래서 읽은 간선은 이전과 같게 두고, 블록 밖을 분석하지 않았다고 알린다.
+fn note_text_outside_block(parsed: &mut ParsedTrigger) {
+    parsed.partial = true;
+    parsed.diagnostics.push(schemagraph_core::Diagnostic {
+        code: "SG_BODY_PARTIAL".into(),
+        message: "T-SQL body text before the first BEGIN or after the last END was not analyzed; only the statements inside that BEGIN/END block were read".into(),
+        location: None,
+        candidates: Vec::new(),
+    });
+}
+
+/// routine 몸체에서 벗긴 블록(첫 `BEGIN`부터 마지막 `END`까지) 밖에, 정의문 머리 말고도 텍스트가 남는가.
+///
+/// 블록을 벗기지 않는 몸체(`BEGIN`이나 `END`가 없거나 그 사이가 비었다)는 통째로 읽으므로 거짓이다. 남지
+/// 않으려면 첫 `BEGIN` 앞에는 공백·주석이나 정의문 머리(`CREATE PROCEDURE … AS`, 마지막 `AS` 키워드까지)만
+/// 오고, 마지막 `END` 뒤에는 공백·주석·`;`만 와야 한다. 머리의 끝을 마지막 `AS`로 보는 것은 `AS` 바로 뒤에
+/// `BEGIN`이 오는 자리가 정의문 머리뿐이기 때문이다 — 문장 안의 `AS`(`SELECT id AS x`, `CAST(@v AS int)`)
+/// 뒤에는 `BEGIN`이 올 수 없어, 그 `AS`가 마지막이면 뒤에 문장 텍스트가 남는다. 함수 머리는 `AS`를 생략할 수
+/// 있어(`CREATE FUNCTION f(@a int) RETURNS int BEGIN …`) 따로 본다(`tsql_function_header`). `END TRY`·`END CATCH`로
+/// 끝나는 몸체는 꼬리 단어가 남아 참이지만, 벗긴 안쪽에 `BEGIN CATCH`가 남아 문장 파서가 실패하므로 표시되지
+/// 않는다(그 몸체는 이전처럼 절차형 추출기가 통째로 읽는다). 첫 `BEGIN`과 마지막 `END`가 서로 짝인지는 보지
+/// 않는다(`BEGIN … END UPDATE … BEGIN … END`는 이전처럼 안쪽의 최상위 `END`에서 부분 분석이다).
+fn tsql_text_outside_block(body: &str) -> bool {
+    if extract_trigger_inner(body).is_none() {
+        return false;
+    }
+    let begins = find_all_keywords(body, "BEGIN");
+    let ends = find_all_keywords(body, "END");
+    let (Some(&begin), Some(&end)) = (begins.first(), ends.last()) else {
+        return false;
+    };
+    let before = &body[..begin];
+    let header_end = if tsql_function_header(before) {
+        before.len()
+    } else {
+        find_all_keywords(before, "AS")
+            .last()
+            .map_or(0, |at| at + "AS".len())
+    };
+    let mut after = skip_ws_comments(body.get(end + "END".len()..).unwrap_or(""));
+    while let Some(rest) = after.strip_prefix(';') {
+        after = skip_ws_comments(rest);
+    }
+    !skip_ws_comments(&before[header_end..]).is_empty() || !after.is_empty()
+}
+
+/// 첫 `BEGIN` 앞 텍스트가 T-SQL 함수 정의 머리(`CREATE [OR ALTER] FUNCTION … RETURNS <형> [WITH <옵션>] [AS]`)
+/// 뿐인가.
+///
+/// T-SQL 스칼라 함수와 다중 문장 테이블 반환 함수의 머리는 `AS`를 생략할 수 있고, 몸체는 `BEGIN … END` 하나라
+/// 그 앞에 문장이 올 수 없다. 그래서 `RETURNS` 뒤(반환 형과 옵션)에 문장 머리(`next_statement_start`)가 없으면 첫
+/// `BEGIN` 앞 전체를 머리로 본다. `WITH EXECUTE AS`처럼 머리 안에 `EXECUTE`가 오면 거짓이지만, 그 몸체는
+/// `EXECUTE` 단어 때문에 절차형 추출기로 가서 블록 밖 표시 경로에 닿지 않는다.
+fn tsql_function_header(before: &str) -> bool {
+    let mut text = skip_ws_comments(before);
+    for word in ["CREATE", "OR", "ALTER", "FUNCTION"] {
+        if starts_with_keyword(text, word) {
+            text = skip_ws_comments(&text[word.len()..]);
+        } else if matches!(word, "CREATE" | "FUNCTION") {
+            return false;
+        }
+    }
+    find_all_keywords(text, "RETURNS")
+        .first()
+        .is_some_and(|&returns| next_statement_start(&text[returns + "RETURNS".len()..]).is_none())
+}
+
 /// 인용·주석 바깥의 키워드만 찾는다 — 문자열에 든 SQL은 실행 문맥에서만 푼다.
 fn find_all_keywords(s: &str, kw: &str) -> Vec<usize> {
     let quotes = QuoteScanner::new(s);
@@ -2023,7 +2120,7 @@ fn parse_procedural_body(
     format_shadowed: bool,
     alias_case: cte_target::NameCase,
 ) -> (ParsedTrigger, usize) {
-    let extracted = extract_as_body(body);
+    let extracted = quoted_routine_body(dialect, body);
     let starts_in_declare = extracted
         .as_ref()
         .is_some_and(|inner| !starts_with_keyword(skip_ws_comments(inner), "BEGIN"));
@@ -2274,12 +2371,23 @@ fn extract_procedural_statements(
                 "DECLARE" | "DEFINE" | "IS" | "AS" => {
                     in_declare = true;
                     rest = &rest[wlen..];
+                    // T-SQL `DECLARE`는 문장 하나다. 세미콜론 없는 조각에서는 뒤 문장이 기본값으로 읽히지
+                    // 않게 다음 문장 머리에서 끝내고 계속 꺼낸다(`tsql_declaration_end`).
+                    if let Some(end) = word
+                        .eq_ignore_ascii_case("DECLARE")
+                        .then(|| tsql_declaration_end(rest, state))
+                        .flatten()
+                    {
+                        extract_decl_default(&rest[..end], &mut stmts, state);
+                        rest = &rest[end..];
+                    }
                 }
                 "END" => {
                     rest = &rest[wlen..];
-                    // END IF/LOOP/CASE 또는 END <label> — 꼬리 한 단어를 소비.
+                    // END IF/LOOP/CASE 또는 END <label> — 꼬리 한 단어를 소비한다. T-SQL에서는
+                    // 다음 문장의 머리를 꼬리로 먹지 않는다(`end_consumes_tail`).
                     let (_tail_word, tail_len) = head_word(rest.trim_start());
-                    if tail_len > 0 {
+                    if tail_len > 0 && end_consumes_tail(rest.trim_start(), state) {
                         rest = &rest.trim_start()[tail_len..];
                     }
                 }
@@ -2333,8 +2441,13 @@ fn extract_procedural_statements(
                     break;
                 }
                 "OPEN" => {
-                    strip_open(rest, wlen, &mut stmts, &mut unextracted, state);
-                    break;
+                    // T-SQL `OPEN 커서`에는 FOR 절이 없어, 세미콜론 없는 조각에서는 커서 이름 뒤에
+                    // 다음 문장이 붙는다(`OPEN c FETCH … UPDATE log …`). 그 앞에서 끝내고 계속 꺼낸다.
+                    let Some(end) = tsql_open_end(&rest[wlen..], state).map(|at| wlen + at) else {
+                        strip_open(rest, wlen, &mut stmts, &mut unextracted, state);
+                        break;
+                    };
+                    rest = &rest[end..];
                 }
                 "EXECUTE" => {
                     // T-SQL에서는 `EXEC`처럼 인자 뒤에 다음 문장이 붙을 수 있다.
@@ -2403,6 +2516,13 @@ fn extract_procedural_statements(
                         rest = strip_routine_header(rest, wlen, &mut unextracted);
                         in_declare = true;
                     } else {
+                        // `CREATE TABLE #t (…)` 뒤에 세미콜론 없이 붙은 문장도 이 텍스트에 묻힌다 — 문장 머리
+                        // 갈래와 같이 평가를 끈다(`tsql_swallows_statement`).
+                        if state.dialect == constant_sql::TextDialect::MsSql
+                            && tsql_swallows_statement(rest, word)
+                        {
+                            state.invalidate_control_flow();
+                        }
                         stmts.push(rest.trim().to_owned());
                         break;
                     }
@@ -2413,7 +2533,10 @@ fn extract_procedural_statements(
                     // 세미콜론 없는 T-SQL 조각에서는 이 문장 뒤에 다음 문장이 붙어 있다
                     // (`PRINT ERROR_MESSAGE() INSERT INTO log …`). 이 문장의 절은 다음 문장 머리
                     // 앞에서 끝내고, 그 뒤를 계속 꺼낸다.
-                    let clause_end = tsql_statement_end(&rest[wlen..], state).map(|at| wlen + at);
+                    // 커서·레이블 이름(`FETCH NEXT FROM throw INTO @s`)은 다음 문장 머리가 아니다.
+                    let operand = wlen + tsql_named_operand_end(word, &rest[wlen..], state);
+                    let clause_end =
+                        tsql_statement_end(&rest[operand..], state).map(|at| operand + at);
                     let clause = &rest[wlen..clause_end.unwrap_or(rest.len())];
                     if word.eq_ignore_ascii_case("FETCH") {
                         if let Some(into) = find_top_level(clause, "INTO", true) {
@@ -2439,35 +2562,71 @@ fn extract_procedural_statements(
                     // 오인되지 않게 실제 SQL 문장을 우선 본다.
                     if is_statement_head(word) {
                         in_declare = false;
-                        record_variable_writes(rest, word, state);
+                        // T-SQL 문장 뒤에 세미콜론 없이 붙은 `EXEC`는 다음 문장이다(`tsql_exec_after_statement`).
+                        let end = tsql_exec_after_statement(rest, word, state);
+                        let statement = &rest[..end.unwrap_or(rest.len())];
+                        record_variable_writes(statement, word, state);
+                        if end.is_some() {
+                            // 끊은 문장 텍스트에는 머리 문장 말고도 `SET @s = …`·`SELECT @s = …` 같은 문장이 묻혀
+                            // 있을 수 있다. 그 대입을 따라가지 않으므로 뒤 `EXEC(@s)`를 옛 값으로 접지 않게 버린다
+                            // (머리 문장 자신의 대입도 함께 버려 그 접기를 잃는다).
+                            invalidate_assigned_names(statement, state);
+                        } else if state.dialect == constant_sql::TextDialect::MsSql
+                            && tsql_swallows_statement(statement, word)
+                        {
+                            // 끊지 않은 문장 텍스트에 다른 문장이 묻혀 있다(`tsql_swallows_statement`). 그 대입·분기를
+                            // 따라가지 않으므로 뒤 조각의 `EXEC(@s)`를 옛 값으로 접지 않게 평가를 끈다.
+                            state.invalidate_control_flow();
+                        }
                         // SELECT .. INTO <변수>·RETURNING .. INTO <변수>는
                         // 변수 귀속 절 — 벗기지 않으면 변수가 테이블로 오인된다.
                         let stmt = match word.to_ascii_uppercase().as_str() {
-                            "SELECT" | "WITH" => strip_select_into(rest),
+                            "SELECT" | "WITH" => strip_select_into(statement),
                             "INSERT" | "UPDATE" | "DELETE" => {
-                                match find_top_level(rest, "RETURNING", true) {
-                                    Some(r) => strip_returning_into(rest, r),
-                                    None => rest.trim().to_owned(),
+                                match find_top_level(statement, "RETURNING", true) {
+                                    Some(r) => strip_returning_into(statement, r),
+                                    None => statement.trim().to_owned(),
                                 }
                             }
-                            _ => rest.trim().to_owned(),
+                            _ => statement.trim().to_owned(),
                         };
                         if !stmt.is_empty() {
                             stmts.push(stmt);
                         }
-                    } else if in_declare {
-                        extract_decl_default(rest, &mut stmts, state);
-                    } else if let Some(p) = find_top_level(rest, ":=", false) {
-                        // 대입문 — 우변의 서브쿼리·함수 호출만 SELECT로 살린다.
-                        let rhs = rest[p + 2..].trim();
-                        if let Some(name) = variable_name(&rest[..p]) {
-                            state.assign(name, rhs);
+                        if let Some(end) = end {
+                            rest = &rest[end..];
+                            continue;
                         }
-                        if rhs.contains('(') && !is_constant_text(rhs, state) {
-                            stmts.push(format!("SELECT {rhs}"));
+                    } else {
+                        let tsql = state.dialect == constant_sql::TextDialect::MsSql;
+                        // 추출기가 모르는 T-SQL 문장(`SAVE TRANSACTION`·`DBCC`·`BULK INSERT`·`RECEIVE` 등)은 조각
+                        // 끝까지를 한 덩어리로 읽는다. 그 뒤에 묻힌 문장은 따라가지 않으므로 평가를 끈다
+                        // (`tsql_swallows_statement`). `DECLARE @a int` 뒤 남은 선언 텍스트에는 다음 문장 머리가 없다
+                        // (`tsql_declaration_end`가 거기서 끊는다).
+                        if tsql && tsql_swallows_statement(rest, word) {
+                            state.invalidate_control_flow();
                         }
-                    } else if !bare_call(rest, &mut stmts, state) {
-                        unextracted += 1;
+                        if in_declare {
+                            extract_decl_default(rest, &mut stmts, state);
+                        } else if let Some(p) = find_top_level(rest, ":=", false) {
+                            // 대입문 — 우변의 서브쿼리·함수 호출만 SELECT로 살린다.
+                            let rhs = rest[p + 2..].trim();
+                            if let Some(name) = variable_name(&rest[..p]) {
+                                state.assign(name, rhs);
+                            }
+                            if rhs.contains('(') && !is_constant_text(rhs, state) {
+                                stmts.push(format!("SELECT {rhs}"));
+                            }
+                        } else {
+                            if tsql {
+                                // 버리는 텍스트의 대입(`RECEIVE TOP (1) @s = message_body FROM q`)도 따라가지
+                                // 않으므로 그 이름의 값을 버린다.
+                                invalidate_assigned_names(rest, state);
+                            }
+                            if !bare_call(rest, &mut stmts, state) {
+                                unextracted += 1;
+                            }
+                        }
                     }
                     break;
                 }
@@ -2488,6 +2647,336 @@ fn assign_tsql_variable(name: &str, lhs: &str, rhs: &str, state: &mut Extraction
         Some('-' | '*' | '/' | '%' | '&' | '|' | '^') => state.invalidate_variable(name),
         _ => state.assign(name, rhs),
     }
+}
+
+/// T-SQL `DECLARE …`(`DECLARE` 뒤 텍스트 기준)가 끝나고 다음 문장 머리가 시작하는 위치다.
+///
+/// 끊지 않으면 선언이 조각 끝까지 이어져, `DECLARE @m int = 1 UPDATE orders …`의 `UPDATE`가 기본값으로 읽힌 채
+/// 소리 없이 빠졌다(`DECLARE @t TABLE (…)` 뒤도 같다). 커서 선언(`DECLARE c CURSOR FOR SELECT …`)은 `FOR` 뒤
+/// `SELECT`에서 끊겨, 그 질의를 문장 머리 갈래가 읽는다 — 끊지 않을 때 `extract_decl_default`가 `FOR` 뒤를 질의로
+/// 꺼내던 것과 같고, 질의 뒤에 붙은 `EXEC(@s)`는 `tsql_exec_after_statement`로 다음 문장이 된다. 커서 이름이 끊기
+/// 머리 단어여도(`DECLARE throw CURSOR FOR SELECT …`) 그 단어의 갈래가 `FOR` 뒤 `SELECT`에서 끊겨 결과가 같다.
+/// T-SQL이 아니거나 뒤에 다음 문장이 없으면 `None`이다.
+fn tsql_declaration_end(after_declare: &str, state: &ExtractionState) -> Option<usize> {
+    tsql_statement_end(after_declare, state)
+}
+
+/// T-SQL `SELECT`·`UPDATE`·`DELETE`·`MERGE` 문장(`statement`, 머리 단어 `head`부터) 바로 뒤에 세미콜론 없이 붙은
+/// `EXEC`·`EXECUTE`의 위치다.
+///
+/// 문장 머리 갈래는 조각 끝까지를 한 문장으로 넘긴다. sqlparser는 `SELECT @s = name FROM customers EXEC(@s)`의
+/// `EXEC(@s)`를 컬럼 목록이 붙은 테이블 별칭으로 읽어, 동적 SQL이 소리 없이 빠진 채 `complete`였다. `EXEC`·`EXECUTE`는
+/// T-SQL 예약어라 이 네 문장의 최상위(인용·괄호·`CASE … END` 밖)에는 다음 문장으로만 온다. 그 앞에 다른 문장
+/// 경계(`END`, `FETCH`·`PRINT`·`IF` 같은 문장 머리 — 이 네 문장 안에 오는 `SELECT`·`INSERT`·`UPDATE`·`DELETE`·`SET`
+/// 은 빼고)가 먼저 나오면 끊지 않는다: 그 사이 문장(`END FETCH … INTO @s`)은 최상위 `END` 뒤 다시 꺼내기가 따로
+/// 읽어 이 추출 상태의 `@s`를 버리지 못하므로, 끊으면 뒤 `EXEC(@s)`를 옛 값으로 접는다. `SELECT … OFFSET … FETCH
+/// NEXT …`의 `FETCH`도 그래서 끊지 않는 쪽이다. 이 네 문장 안에 올 수 있는 `SELECT`·`INSERT`·`UPDATE`·`DELETE`·
+/// `SET`은 경계로 보지 않으므로, 끊은 문장 텍스트에 다른 문장(`DELETE FROM log SET @s = … EXEC(@s)`의 `SET @s = …`)이
+/// 묻혀 있을 수 있다 — 호출자는 끊은 뒤 그 텍스트의 `=` 대입을 모두 버린다(`invalidate_assigned_names`; T-SQL에서
+/// 스칼라 변수에 값을 넣는 다른 문장 `FETCH … INTO`·`EXEC … OUTPUT`은 경계라 이 텍스트에 오지 않는다). `INSERT … EXEC
+/// proc`은 한 문장이고, `WITH`로 시작하는 문장은 뒤 DML이 `INSERT`일 수 있어 끊지 않는다. T-SQL이 아니면 `None`이다.
+fn tsql_exec_after_statement(
+    statement: &str,
+    head: &str,
+    state: &ExtractionState,
+) -> Option<usize> {
+    const INSIDE_DML: [&str; 5] = ["SELECT", "INSERT", "UPDATE", "DELETE", "SET"];
+    let cuts = ["SELECT", "UPDATE", "DELETE", "MERGE"];
+    if state.dialect != constant_sql::TextDialect::MsSql
+        || !cuts.iter().any(|cut| head.eq_ignore_ascii_case(cut))
+    {
+        return None;
+    }
+    let body = &statement[head.len()..];
+    let boundary = find_top_level_word(body, |upper, after| match upper {
+        "END" => true,
+        "WITH" => opens_cte(after),
+        word => TSQL_STATEMENT_HEADS.contains(&word) && !INSIDE_DML.contains(&word),
+    })?;
+    let (word, _) = head_word(&body[boundary..]);
+    (word.eq_ignore_ascii_case("EXEC") || word.eq_ignore_ascii_case("EXECUTE"))
+        .then_some(head.len() + boundary)
+}
+
+/// 세미콜론 없는 T-SQL에서 끊지 않고 한 문장으로 보낸 텍스트(`statement`, 머리 단어 `head`부터)가 머리 문장 자신의
+/// 절 뒤에 다른 문장을 품는가.
+///
+/// 문장 머리 갈래는 끊을 자리(`tsql_exec_after_statement`)가 없으면 조각 끝까지를 한 문장으로 보낸다. 그 안에 묻힌
+/// `SET @s = …`·`SELECT @s = …`·`FETCH … INTO @s`·`IF`·`END` 같은 문장은 변수 추적이 보지 못한다. 그런데 다음
+/// `;` 뒤 조각의 `EXEC(@s)`를 옛 값으로 접으면 실행되지 않는 문장이 쓰기 간선이 됐다
+/// (`UPDATE log SET msg = 'x' SET @s = N'…' PRINT 'x'; EXEC(@s);`). 묻힌 문장이 있으면 호출자가 평가를 끈다.
+///
+/// 묻힌 문장의 머리는 다음 문장 머리(`TSQL_STATEMENT_HEADS`)와 CTE를 여는 `WITH`, 그리고 변수에 값을 넣는
+/// `RECEIVE`(뒤가 `TOP`·`*`·`@`일 때 — 예약어가 아니라 컬럼 이름이면 그렇게 이어지지 않는다)다. `THROW`와 `CALL`은
+/// 빼는데, T-SQL 예약어가 아니라 컬럼 이름으로 올 수 있고 `THROW` 문장은 앞 문장이 `;`로 끝나야 해서 묻힐 수 없으며
+/// `CALL`은 T-SQL 문장이 아니기 때문이다. 최상위 `END` 뒤는 `parse_sql_prefix`가 평가를 끈 새 상태로 다시 꺼내 이 추출
+/// 상태가 보지 못하지만, 그 뒤에서 변수에 값을 넣거나 흐름을 바꾸는 문장은 위 머리로 시작하므로 `END` 자체는 묻힌
+/// 문장으로 보지 않는다(마지막 `END`마다 평가를 끄지 않는다). 머리 문장 문법 안의 문장 머리 단어는 묻힌 문장이
+/// 아니다: 집합 연산 바로 뒤 `SELECT`(`UNION [ALL] SELECT`), `OFFSET … ROWS` 바로 뒤 `FETCH {FIRST|NEXT} <수>`,
+/// 커서 질의의 `FOR UPDATE`, `INSERT`의 원본 `SELECT`·`EXEC`(원본이 하나도 나오기 전, `VALUES` 앞에서만),
+/// `UPDATE`의 첫 `SET`, `ALTER`의 `SET`(뒤가 `@` 변수가 아닐 때), `BULK INSERT`, `GRANT`·`REVOKE`·`DENY`의 권한
+/// 목록(첫 `ON`·`TO`·`FROM` 앞), `ALTER`의 `ON DELETE`·`ON UPDATE`와 그 바로 뒤 `SET`,
+/// `CREATE … AS SELECT`, `DROP`·`ALTER`의 `IF EXISTS <이름>`. `WITH` 문장은 CTE 목록 뒤 첫 문장 머리(T-SQL에서는
+/// DML·`MERGE`)를 머리로 본다. `MERGE`는 `;`로 끝나야 하는 문장이라(T-SQL 오류 10713) 그 뒤에 묻힌 문장이 없다 — 보지 않는다.
+fn tsql_swallows_statement(statement: &str, head: &str) -> bool {
+    let mut head = head.to_ascii_uppercase();
+    let mut body = &statement[head.len()..];
+    let is_head = |upper: &str, after: &str| match upper {
+        "WITH" => opens_cte(after),
+        "THROW" | "CALL" => false,
+        "RECEIVE" => {
+            let next = skip_ws_comments(after);
+            starts_with_keyword(next, "TOP") || next.starts_with(['*', '@'])
+        }
+        word => TSQL_STATEMENT_HEADS.contains(&word),
+    };
+    if head == "WITH" {
+        let Some(at) = find_top_level_word(body, is_head) else {
+            return false;
+        };
+        let (word, len) = head_word(&body[at..]);
+        head = word.to_ascii_uppercase();
+        body = &body[at + len..];
+    }
+    if head == "MERGE" {
+        return false;
+    }
+    // 머리 문법이 바로 다음 단어로 허용한 문장 머리의 자리(그 단어부터 끝까지의 길이 — 자리마다 다르다).
+    let adjacent = Cell::new(None::<usize>);
+    // `UPDATE`의 `SET`, `INSERT`의 원본, `BULK`의 `INSERT`, `GRANT` 등의 `ON`·`TO`·`FROM`이 이미 나왔는가.
+    let clause_seen = Cell::new(false);
+    let swallowed = find_top_level_word(body, |upper, after| {
+        let next = skip_ws_comments(after);
+        let here = Some(after.len() + upper.len());
+        let allowed_here = adjacent.get() == here;
+        let allow_next = |words: &[&str], next: &str| {
+            if words.iter().any(|word| starts_with_keyword(next, word)) {
+                adjacent.set(Some(next.len()));
+            }
+        };
+        match (head.as_str(), upper) {
+            (_, "UNION" | "EXCEPT" | "INTERSECT") => {
+                let next = if starts_with_keyword(next, "ALL") {
+                    skip_ws_comments(&next["ALL".len()..])
+                } else {
+                    next
+                };
+                allow_next(&["SELECT"], next);
+            }
+            (_, "ROWS" | "ROW") if starts_with_keyword(next, "FETCH") => {
+                // `OFFSET … ROWS FETCH {FIRST|NEXT} <수> ROWS ONLY`의 수는 숫자·변수·괄호 식이다. 커서를
+                // 읽는 `FETCH NEXT FROM c`는 묻힌 문장이다
+                // (`UPDATE STATISTICS t WITH SAMPLE 10 ROWS FETCH NEXT FROM c …`).
+                let direction = skip_ws_comments(&next["FETCH".len()..]);
+                let count = ["FIRST", "NEXT"]
+                    .iter()
+                    .find(|word| starts_with_keyword(direction, word))
+                    .map(|word| skip_ws_comments(&direction[word.len()..]));
+                if count.is_some_and(|count| {
+                    count.starts_with(|c: char| c.is_ascii_digit() || c == '@' || c == '(')
+                }) {
+                    adjacent.set(Some(next.len()));
+                }
+            }
+            (_, "FOR") => allow_next(&["UPDATE"], next),
+            ("ALTER", "ON") => allow_next(&["DELETE", "UPDATE"], next),
+            ("ALTER", "DELETE" | "UPDATE") => allow_next(&["SET"], next),
+            ("CREATE", "AS") => allow_next(&["SELECT"], next),
+            ("INSERT", "VALUES") | ("GRANT" | "REVOKE" | "DENY", "ON" | "TO" | "FROM") => {
+                clause_seen.set(true)
+            }
+            _ => {}
+        }
+        if !is_head(upper, after) || allowed_here {
+            return false;
+        }
+        let in_clause = match (head.as_str(), upper) {
+            ("INSERT", "SELECT" | "EXEC" | "EXECUTE") | ("UPDATE", "SET") | ("BULK", "INSERT") => {
+                !clause_seen.replace(true)
+            }
+            // `ALTER TABLE t SET (…)`·`ALTER DATABASE d SET 옵션` — 변수 대입 `SET @v = …`는 묻힌 문장이다
+            // (`@`로 시작하지 않는 `SET` 문장은 옵션이라 변수에 값을 넣지 않는다).
+            ("ALTER", "SET") => !next.starts_with('@'),
+            ("GRANT" | "REVOKE" | "DENY", _) => !clause_seen.get(),
+            ("DROP" | "ALTER", "IF") => {
+                starts_with_keyword(next, "EXISTS")
+                    && !skip_ws_comments(&next["EXISTS".len()..]).starts_with('(')
+            }
+            _ => false,
+        };
+        !in_clause
+    });
+    swallowed.is_some()
+}
+
+/// 절차형 추출기가 `END` 바로 뒤 단어(`tail`의 첫 단어)를 그 `END`의 꼬리로 소비하는가.
+///
+/// PL/pgSQL·PL/SQL·MySQL의 `END IF`·`END LOOP`·`END CASE`·`END <레이블>`은 꼬리 한 단어가 붙고, 그 방언들은
+/// 문장마다 `;`가 있어 `END` 뒤 다른 문장은 같은 조각에 오지 않는다. T-SQL은 문장 사이 `;`를 생략할 수 있어
+/// `… END UPDATE orders …`의 `UPDATE`를 꼬리로 먹으면 그 문장을 잃었다(미추출로 셈). 그래서 T-SQL에서는
+/// 다른 T-SQL 끊기 자리와 같은 다음 문장 머리(`starts_with_tsql_statement_head`: DML·`EXEC`·`SET`·`IF`·`WHILE`·
+/// `DECLARE`·`FETCH`·`PRINT` 등 `TSQL_STATEMENT_HEADS`와 CTE를 여는 `WITH`)를 먹지 않는다. 블록 단어(`BEGIN`·`END`)와
+/// 그 밖의 단어(`TRY`·`CATCH`·`ELSE`·`COMMIT` 등)는 이전처럼 먹는다 — `BEGIN`을 따로 보내면 `observe_begin`이 이어진
+/// 블록을 제어 흐름으로 보아 접히던 동적 SQL이 미추출이 되고, `COMMIT` 같은 머리는 따로 보내면 조각 끝까지를 한
+/// 문장으로 읽어 뒤 문장을 잃는다.
+fn end_consumes_tail(tail: &str, state: &ExtractionState) -> bool {
+    if state.dialect != constant_sql::TextDialect::MsSql || !starts_with_tsql_statement_head(tail) {
+        return true;
+    }
+    let (word, _) = head_word(tail);
+    word.eq_ignore_ascii_case("BEGIN") || word.eq_ignore_ascii_case("END")
+}
+
+/// T-SQL `OPEN { [GLOBAL] 커서 | @커서_변수 }` 문장이 끝난 뒤 다음 텍스트가 시작하는 위치(`OPEN` 뒤 텍스트
+/// 기준)다.
+///
+/// T-SQL `OPEN`은 커서 참조 하나만 받는다(`skip_tsql_cursor_reference`). 이름 뒤를 다음 문장 머리로 찾지 않고
+/// 이름에서 끝내는 것은, 그 사이 문장 머리가 아닌 문장(`RETURN (SELECT …)`)도 제 갈래로 읽기 위해서다.
+/// `OPEN SYMMETRIC KEY …`·`OPEN MASTER KEY …`는 커서가 아니라 키를 여는
+/// 문장이라 무시하는 문장처럼 다음 문장 머리에서 끝낸다(`tsql_statement_end`). 뒤에 `KEY`가 없으면
+/// `master`·`symmetric`도 커서 이름이다(`OPEN master FETCH …`). T-SQL이 아니거나, 이름 뒤에
+/// 아무것도 없거나, 이름 뒤가 FOR 절이면(`OPEN c FOR SELECT …`, PL/pgSQL·PL/SQL 꼴) `None`이다 — 그때는
+/// 이전처럼 `strip_open`이 읽는다.
+fn tsql_open_end(after_open: &str, state: &ExtractionState) -> Option<usize> {
+    if state.dialect != constant_sql::TextDialect::MsSql {
+        return None;
+    }
+    let head = skip_ws_comments(after_open);
+    let opens_key = ["SYMMETRIC", "MASTER"].iter().any(|word| {
+        starts_with_keyword(head, word)
+            && starts_with_keyword(skip_ws_comments(&head[word.len()..]), "KEY")
+    });
+    if opens_key {
+        return tsql_statement_end(after_open, state);
+    }
+    let end = skip_tsql_cursor_reference(after_open)?;
+    let tail = skip_ws_comments(&after_open[end..]);
+    (!tail.is_empty() && !starts_with_keyword(tail, "FOR")).then(|| after_open.len() - tail.len())
+}
+
+/// 앞 공백·주석 뒤의 T-SQL 커서 참조 `{ [GLOBAL] 커서 | @커서_변수 }`가 끝나는 위치. 이름이 없으면 `None`이다.
+///
+/// `GLOBAL`은 뒤에 이름이 오면 범위 한정자다. 다만 그 이름이 문장 머리 단어면 둘을 가른다 — 그 단어 뒤가 끝이거나
+/// `INTO`이거나 또 다른 문장 머리면 그 단어가 커서 이름이고(`OPEN GLOBAL print UPDATE …`), 아니면 그 단어는 다음
+/// 문장이고 `global`이 커서 이름이다(`OPEN global PRINT 'x'`, `OPEN global FETCH NEXT FROM global …`). 뒤가 `FOR`·
+/// `INTO`면 `global`이 이름이다.
+fn skip_tsql_cursor_reference(text: &str) -> Option<usize> {
+    let end = skip_tsql_name(text)?;
+    if !starts_with_keyword(skip_ws_comments(text), "GLOBAL") {
+        return Some(end);
+    }
+    let rest = &text[end..];
+    let next = skip_ws_comments(rest);
+    let Some(name_end) = skip_tsql_name(rest) else {
+        return Some(end);
+    };
+    if starts_with_keyword(next, "FOR") || starts_with_keyword(next, "INTO") {
+        return Some(end);
+    }
+    if starts_with_tsql_statement_head(next) {
+        let after = skip_ws_comments(&rest[name_end..]);
+        let ends_reference = after.is_empty()
+            || starts_with_keyword(after, "INTO")
+            || starts_with_tsql_statement_head(after);
+        if !ends_reference {
+            return Some(end);
+        }
+    }
+    Some(end + name_end)
+}
+
+/// T-SQL 무시하는 문장 가운데 커서를 피연산자로 받는 문장에서 커서 참조가 끝나는 위치(`word` 뒤 텍스트 기준)다.
+///
+/// `FETCH [NEXT|PRIOR|FIRST|LAST|ABSOLUTE n|RELATIVE n] [FROM] 커서`·`CLOSE 커서`·`DEALLOCATE 커서`의 커서 참조는
+/// 다음 문장 머리가 아니다 — `THROW`는 T-SQL 예약어가 아니어서 커서 이름이 될 수 있고, 그 이름에서 절을 끊으면
+/// `FETCH NEXT FROM throw INTO @s`의 `INTO @s`를 보지 못해 뒤 `EXEC(@s)`를 옛 값으로 접었다. `CLOSE fetch UPDATE …`
+/// 처럼 이름이 다른 끊기 단어일 때도 그 단어의 갈래가 뒤 문장을 삼키지 않는다. 레이블(`GOTO throw`)은 그 단어의
+/// 갈래가 다음 문장 머리에서 끝나 결과가 같아 건너뛰지 않는다. T-SQL이 아니거나 그 밖의 문장이면 0이다.
+fn tsql_named_operand_end(word: &str, after_word: &str, state: &ExtractionState) -> usize {
+    if state.dialect != constant_sql::TextDialect::MsSql {
+        return 0;
+    }
+    match word.to_ascii_uppercase().as_str() {
+        "FETCH" => tsql_fetch_cursor_end(after_word),
+        "CLOSE" | "DEALLOCATE" => skip_tsql_cursor_reference(after_word).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// `FETCH` 뒤 텍스트에서 방향(`NEXT`·`PRIOR`·`FIRST`·`LAST`·`ABSOLUTE n`·`RELATIVE n`)과 `FROM`을 건너뛴 커서
+/// 참조가 끝나는 위치다. 커서 참조를 찾지 못하면 그 앞까지다.
+fn tsql_fetch_cursor_end(after_fetch: &str) -> usize {
+    let mut at = 0;
+    let offset_of = |text: &str| after_fetch.len() - skip_ws_comments(text).len();
+    let head = skip_ws_comments(after_fetch);
+    if let Some(word) = ["NEXT", "PRIOR", "FIRST", "LAST"]
+        .into_iter()
+        .find(|word| starts_with_keyword(head, word))
+    {
+        at = offset_of(after_fetch) + word.len();
+    } else if let Some(word) = ["ABSOLUTE", "RELATIVE"]
+        .into_iter()
+        .find(|word| starts_with_keyword(head, word))
+    {
+        at = offset_of(after_fetch) + word.len();
+        let amount = skip_ws_comments(&after_fetch[at..]);
+        let sign = usize::from(amount.starts_with(['-', '+']));
+        let amount_at = offset_of(&after_fetch[at..]) + sign;
+        at = amount_at + skip_tsql_name(&after_fetch[amount_at..]).unwrap_or(0);
+    }
+    if starts_with_keyword(skip_ws_comments(&after_fetch[at..]), "FROM") {
+        at = offset_of(&after_fetch[at..]) + "FROM".len();
+    }
+    at + skip_tsql_cursor_reference(&after_fetch[at..]).unwrap_or(0)
+}
+
+/// T-SQL `UPDATE … SET` 목록에서 값을 받는 변수(`@v = col`, `@v = col = expr`)의 추적 값을 버린다.
+///
+/// 이전에는 `UPDATE customers SET @s = name WHERE id = 1; EXEC(@s);`의 `@s`가 선언 때 값(`UPDATE audit …`)을
+/// 유지해, 실행되지 않는 문장이 거짓 `writes audit`가 됐다(세미콜론 판 포함 main부터). `SET` 목록은 최상위
+/// `FROM`·`WHERE`·`OUTPUT`·`OPTION`이나 다음 문장 경계(`END`, T-SQL 끊기 머리) 앞까지다. 끊기 머리 가운데 `THROW`·
+/// `CALL`에서는 멈추지 않는다 — T-SQL 예약어가 아니라 컬럼 이름으로 오고(`SET throw = 1, @s = name`), 거기서 멈추면
+/// 뒤 `@s`를 버리지 못했다. `THROW` 문장은 앞 문장이 `;`로 끝나야 해서 이 목록 뒤에 붙지 않고, `CALL`은 T-SQL 문장이
+/// 아니다. 목록 안의 비교식(`CASE WHEN @x = 1 …`)도 대입처럼 보아 그 변수를
+/// 버릴 수 있다 — 참인 접기를 잃을 뿐 거짓 간선은 만들지 않는다.
+fn invalidate_update_set_variables(stmt: &str, state: &mut ExtractionState) {
+    let Some(set) = find_top_level(stmt, "SET", true) else {
+        return;
+    };
+    let list = &stmt[set + "SET".len()..];
+    // 세미콜론 없는 조각에서 문장 텍스트는 조각 끝까지라, 목록 끝 단어를 하나씩 끝까지 찾으면 `UPDATE`마다
+    // 조각 길이만큼 읽는다. 한 번 훑어 목록을 끝내는 절이나 다음 문장 경계에서 멈춘다.
+    let end = find_top_level_word(list, |upper, after| match upper {
+        "FROM" | "WHERE" | "OUTPUT" | "OPTION" | "END" => true,
+        "WITH" => opens_cte(after),
+        "THROW" | "CALL" => false,
+        word => TSQL_STATEMENT_HEADS.contains(&word),
+    })
+    .unwrap_or(list.len());
+    invalidate_assigned_names(&list[..end], state);
+}
+
+/// 앞 공백·주석 뒤의 T-SQL 이름 하나(`이름`·`@변수`·`[인용]`·`"인용"`)가 끝나는 위치. 이름이 없으면 `None`이다.
+///
+/// 인용 없는 이름에는 ASCII 밖 글자도 든다 — T-SQL 식별자는 유니코드 글자를 받는다.
+fn skip_tsql_name(text: &str) -> Option<usize> {
+    let start = text.len() - skip_ws_comments(text).len();
+    let bytes = text.as_bytes();
+    let end = match bytes.get(start) {
+        Some(b'[' | b'"') => skip_quoted_ident(text, start),
+        Some(_) => {
+            let mut end = start + usize::from(bytes[start] == b'@');
+            while bytes
+                .get(end)
+                .is_some_and(|&byte| is_ident_char(byte) || byte >= 0x80)
+            {
+                end += 1;
+            }
+            end
+        }
+        None => start,
+    };
+    (end > start && &text[start..end] != "@").then_some(end)
 }
 
 /// T-SQL 몸체에서 무시하는 절차형 문장(`PRINT`·`RAISERROR`·`THROW`·`WAITFOR`·`GOTO`·`BREAK` 등)의 절이나
@@ -2511,10 +3000,17 @@ fn tsql_statement_end(text: &str, state: &ExtractionState) -> Option<usize> {
 /// `SET` 단어가 없다 — `WITH SETERROR`는 한 단어다). `@`·`.`·`:`나 ASCII 밖 글자 바로 뒤의 단어는
 /// 변수·한정 이름의 일부다.
 fn next_statement_start(text: &str) -> Option<usize> {
-    const HEADS: [&str; 14] = [
-        "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "EXEC", "EXECUTE", "CALL",
-        "SET", "BEGIN", "IF", "WHILE", "DECLARE",
-    ];
+    find_top_level_word(text, |upper, after| match upper {
+        "END" => true,
+        "WITH" => opens_cte(after),
+        head => TSQL_STATEMENT_HEADS.contains(&head),
+    })
+}
+
+/// 인용·주석·괄호와 `CASE … END` 밖의 최상위 단어 가운데 `is_cut(대문자 단어, 그 뒤 텍스트)`가 참인 첫 단어의
+/// 위치다. `@`·`.`·`:`나 ASCII 밖 글자 바로 뒤의 단어는 이름의 일부라 보지 않는다. `CASE` 안의 `END`는
+/// `CASE`를 닫을 뿐 `is_cut`에 묻지 않는다.
+fn find_top_level_word(text: &str, is_cut: impl Fn(&str, &str) -> bool) -> Option<usize> {
     let quotes = QuoteScanner::new(text);
     let bytes = text.as_bytes();
     let (mut i, mut parens, mut cases) = (0usize, 0usize, 0usize);
@@ -2540,15 +3036,61 @@ fn next_statement_start(text: &str) -> Option<usize> {
             match upper.as_str() {
                 "CASE" => cases += 1,
                 "END" if cases > 0 => cases -= 1,
-                "END" => return Some(i),
-                "WITH" if cases == 0 && opens_cte(&text[i + len..]) => return Some(i),
-                head if cases == 0 && HEADS.contains(&head) => return Some(i),
+                word if cases == 0 && is_cut(word, &text[i + len..]) => return Some(i),
                 _ => {}
             }
         }
         i += len;
     }
     None
+}
+
+/// T-SQL 문장 절을 끊는 다음 문장 머리(`next_statement_start`). 최상위 `END`와 CTE를 여는 `WITH`도 끊는다.
+///
+/// 간선을 낼 수 있는 문장과 블록·제어 머리에 더해, 추출기가 따로 읽는 T-SQL 문장(`FETCH`·`PRINT`·`RAISERROR`·
+/// `THROW`·`CLOSE`·`DEALLOCATE`·`OPEN`·`WAITFOR`·`GOTO`)에서도 끊는다. 그러지 않으면 세미콜론 없이 이어진
+/// `PRINT 'x' FETCH NEXT FROM c INTO @s EXEC(@s)`의 `FETCH`가 `PRINT` 절에 묻혀 `@s`의 옛 값을 버리지 못한다.
+/// `THROW` 말고는 T-SQL 예약어라 다른 문장 절의 최상위에 이름으로 오지 않는다. 커서·레이블 이름 자리는
+/// `tsql_named_operand_end`·`skip_tsql_cursor_reference`·`tsql_declaration_end`가 건너뛴다. `SELECT … OFFSET … FETCH NEXT …`의
+/// `FETCH`는 `SELECT` 문장 안이라 이 끊기의 대상이 아니다(문장 머리 갈래는 조각 끝까지를 한 문장으로 읽는다).
+const TSQL_STATEMENT_HEADS: [&str; 23] = [
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "TRUNCATE",
+    "EXEC",
+    "EXECUTE",
+    "CALL",
+    "SET",
+    "BEGIN",
+    "IF",
+    "WHILE",
+    "DECLARE",
+    "FETCH",
+    "PRINT",
+    "RAISERROR",
+    "THROW",
+    "CLOSE",
+    "DEALLOCATE",
+    "OPEN",
+    "WAITFOR",
+    "GOTO",
+];
+
+/// `text`의 첫 단어가 `next_statement_start`가 끊는 문장 머리인가(`next_statement_start(text) == Some(0)`).
+///
+/// 첫 단어만 본다 — 머리가 아니어도 뒤를 끝까지 훑지 않으므로, 세미콜론 없는 긴 조각에서 `END`마다 불러도
+/// 조각 길이에 비례하는 일을 하지 않는다.
+fn starts_with_tsql_statement_head(text: &str) -> bool {
+    let (word, len) = head_word(text);
+    let upper = word.to_ascii_uppercase();
+    match upper.as_str() {
+        "END" => true,
+        "WITH" => opens_cte(&text[len..]),
+        head => TSQL_STATEMENT_HEADS.contains(&head),
+    }
 }
 
 /// `WITH` 뒤가 CTE 정의(`이름 [(컬럼…)] AS (`)로 이어지는가.
@@ -2659,6 +3201,20 @@ fn split_top_level(s: &str) -> Vec<&str> {
 /// 인용·주석·괄호 안이 아닌 최상위에서 needle의 첫 위치를 찾는다.
 /// word_boundary가 true면 식별자 문자와 붙은 위치는 건너뛴다.
 fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
+    find_first_top_level(s, &[needle], word_boundary).map(|(position, _)| position)
+}
+
+/// `find_top_level`과 같되 needle 여럿 가운데 가장 먼저 나오는 것의 위치와 그 needle을 돌려준다(같은 자리면
+/// 앞 needle).
+///
+/// needle마다 `find_top_level`을 부르면 없는 needle이 매번 텍스트 끝까지 훑는다. 세미콜론 없는 T-SQL 조각은
+/// 끝까지 한 조각이라, `IF … BEGIN`마다 T-SQL에 없는 `THEN`을 조각 끝까지 찾으면 일이 조각 길이 × `IF` 수로
+/// 커진다. 한 번 훑어 첫 일치에서 멈추면 그 `IF`의 조건 길이만큼만 읽는다.
+fn find_first_top_level<'n>(
+    s: &str,
+    needles: &[&'n str],
+    word_boundary: bool,
+) -> Option<(usize, &'n str)> {
     let quotes = QuoteScanner::new(s);
     let b = s.as_bytes();
     let n = b.len();
@@ -2679,12 +3235,14 @@ fn find_top_level(s: &str, needle: &str, word_boundary: bool) -> Option<usize> {
                 i + 1
             }
             _ => {
-                if depth == 0
-                    && i + needle.len() <= n
-                    && b[i..i + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
-                    && (!word_boundary || self::word_boundary(s, i, needle.len()))
-                {
-                    return Some(i);
+                let hit = needles.iter().find(|needle| {
+                    depth == 0
+                        && i + needle.len() <= n
+                        && b[i..i + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
+                        && (!word_boundary || self::word_boundary(s, i, needle.len()))
+                });
+                if let Some(needle) = hit {
+                    return Some((i, needle));
                 }
                 i + 1
             }
@@ -2996,10 +3554,7 @@ fn strip_condition<'a>(
     unextracted: &mut usize,
 ) -> &'a str {
     let tail = &rest[kwlen..];
-    let hit = terms
-        .iter()
-        .filter_map(|t| find_top_level(tail, t, true).map(|p| (p, t.len())))
-        .min_by_key(|(p, _)| *p);
+    let hit = find_first_top_level(tail, terms, true).map(|(p, term)| (p, term.len()));
     match hit {
         Some((p, tlen)) => {
             let cond = tail[..p].trim();
@@ -3407,6 +3962,10 @@ fn record_variable_writes(stmt: &str, head: &str, state: &mut ExtractionState) {
         }
         record_select_assignments(stmt, head, state);
         return;
+    }
+    if upper == "UPDATE" && state.dialect == constant_sql::TextDialect::MsSql {
+        // T-SQL `UPDATE t SET @v = col`·`SET @v = col = expr`은 변수에도 값을 넣는다.
+        invalidate_update_set_variables(stmt, state);
     }
     if matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE") {
         let Some(returning) = find_top_level(stmt, "RETURNING", true) else {
