@@ -22,12 +22,67 @@
 - isthmus `compatibility.json`은 아직 schemagraph 0.7.0을 고정한다. 갱신은 isthmus 저장소의 일이다.
 - 브랜치 `ccr-37904670-hxdjsx`는 `origin/main` `96d5c4f`(PR #63 머지)에서 다시 시작한 라운드 5 작업이며
   [PR #64](https://github.com/ictechgy/schemagraph/pull/64)다. 커밋: `3cf7882`(parser, T-SQL END 꼬리·OPEN), `17ce099`(parser, T-SQL
-  routine 블록 밖), `cbccc61`(parser, 문자열 별칭), `bb29526`(문서, push됨), PR #64 리뷰 반영 `e3dd771`(B1·B2·S2·N1)·`5e55e28`(S1·N2)과
-  그 문서 커밋(아래 "PR #64 리뷰 반영" 절, push 전). 라운드 4의 커밋 목록은 PR #63에 있다.
+  routine 블록 밖), `cbccc61`(parser, 문자열 별칭), `bb29526`(문서, push됨), PR #64 리뷰 반영 `e3dd771`(B1·B2·S2·N1)·`5e55e28`(S1·N2)·
+  `ecefcd7`(문서, push됨), 재검토 반영 `fbea4cd`(blocker·S-a)·`a69fcba`(S-b)와 그 문서 커밋(아래 "PR #64 재검토 반영" 절, push 전).
+  라운드 4의 커밋 목록은 PR #63에 있다.
 - 원격에 이 세션과 무관한 브랜치 `fix/postgres-ascii-identifier-fold`(`5ff7a51`, 다른 세션, 2026-11-22, PR 없음)가 있다.
   후속 후보의 PostgreSQL 미인용 식별자 ASCII 접기(`scope.rs` `name()`)를 다룬다. 겹치지 않게 라운드 4·5는 그 항목과
   `scope.rs`를 건드리지 않았다. 그 브랜치(병합 기준 `1365d37`)는 `parser/src/lib.rs`의 `as_dollar_body_end`·`search_path_entry`
   근처만 고쳐 라운드 5의 `lib.rs` 변경과 겹치는 덩어리가 없다. 함께 머지하면 RELEASE-NOTES·HANDOFF 충돌을 확인한다.
+
+### PR #64 재검토 반영 (2026-11-25)
+
+`bb29526..ecefcd7` 재검토는 1차 지적 여섯이 모두 고쳐졌고 방언 격리·fixture·성능·결정성을 확인했다. 새 지적은 blocker 1, should-fix 2,
+nit 1이다. main·`bb29526`·`ecefcd7`·수정본을 따로 빌드해 재현했다(세션 scratchpad `r5-schemagraph/rv2.py`, 56쌍).
+
+- Blocker(`e3dd771`부터, 새 거짓 간선, 수정 `fbea4cd`): 쿼리 뒤 `EXEC` 끊기(`tsql_exec_after_statement`)가 문장 안에 올 수 있는 `SELECT`·`INSERT`·`UPDATE`·
+  `DELETE`·`SET`을 경계로 보지 않아, 끊은 문장 텍스트에 진짜 대입 문장이 묻혔다. `DELETE FROM log SET @s = N'UPDATE items …' EXEC(@s)`가
+  `@s`의 옛 값으로 거짓 `writes audit`(main·`bb29526`은 간선 없이 미추출 1, 세미콜론 판은 `writes items`·`writes log`). `UPDATE … SELECT @s = …`·
+  `DELETE … SET @s = (SELECT …)`·`UPDATE … UPDATE … SET @s = …`·`SELECT @x = 1 INSERT … SELECT … SELECT @s = …`도 같았다. 수정: 끊은 뒤
+  그 문장 텍스트 전체에 `invalidate_assigned_names`를 돌려 `=` 왼쪽 변수를 모두 버린다(리뷰가 권한 보수 쪽). 스칼라 변수에 값을 넣는 다른
+  T-SQL 문장(`FETCH … INTO`·`EXEC … OUTPUT`)은 경계라 그 텍스트에 오지 않아 `INTO` 목록은 보지 않는다(넣었다가, 어떤 입력에서도 결과를
+  바꾸지 못해 뺐다). 대가: 머리 문장 자신의 상수 대입(`SELECT @s = N'UPDATE items …' EXEC(@s)`)도 버려, `ecefcd7`의 참 `writes items`가
+  미추출로 바뀐다(세미콜론 판은 접는다; main은 `EXEC`를 소리 없이 잃었다).
+- S-a(`e3dd771`부터, 세미콜론 판에도 거짓 간선, 수정 `fbea4cd`): `THROW`는 T-SQL 예약어가 아닌데 끊기 머리에 넣어, `DECLARE throw CURSOR …; OPEN throw;
+  FETCH NEXT FROM throw INTO @s; EXEC(@s);`의 `FETCH` 절이 `throw`에서 끊겨 `INTO @s`를 못 보고 거짓 `writes audit`였다. 수정: `FETCH`(방향·
+  `FROM` 다음)·`CLOSE`·`DEALLOCATE`의 커서 참조를 건너뛴 뒤 다음 문장 머리를 찾는다(`tsql_named_operand_end`·`tsql_fetch_cursor_end`).
+  `OPEN`과 함께 쓰는 `skip_tsql_cursor_reference`는 `GLOBAL` 뒤 이름이 끊기 단어일 때 그 뒤를 본다 — 끝·`INTO`·다른 문장 머리면 그 단어가
+  커서 이름(`OPEN GLOBAL print`, `FETCH NEXT FROM GLOBAL print INTO @s`), 아니면 다음 문장이고 `global`이 이름(`OPEN global PRINT 'x'`).
+  다른 끊기 단어(`print`·`close`·`open`·`fetch`·`goto`·`waitfor`·`raiserror`·`deallocate`, 예약어라 SQL Server는 받지 않지만)도 커서 이름으로
+  넣어 세미콜론 판·없는 판 모두 거짓 간선이 없고 서로 같다. `DECLARE throw CURSOR`의 선언 이름과 `GOTO throw`의 레이블은 건너뛰지 않는다 — 그
+  단어의 갈래가 다음 문장 머리에서 끝나 결과가 같다(변이로 확인하고 뺐다).
+- S-b(main부터, 세미콜론 판 포함, 수정 `a69fcba`): `record_variable_writes`가 T-SQL `UPDATE t SET @v = col`을 몰라 `UPDATE customers SET @s = name WHERE id = 1;
+  EXEC(@s);`가 선언 때 값으로 거짓 `writes audit`였다(`ecefcd7` 세미콜론 없는 판은 끊기 때문에 미추출도 사라졌다). 수정: T-SQL `UPDATE`의 `SET`
+  목록(최상위 `FROM`·`WHERE`·`OUTPUT`·`OPTION` 앞)의 `=` 왼쪽 변수를 버린다(`invalidate_update_set_variables`). **좁힘**: main에 있던 그 거짓
+  쓰기(리뷰 꼴 네 사례의 세미콜론 판)가 사라진다.
+- Nit: RELEASE-NOTES "사라지는 간선은 옛 값 접기뿐"을 고쳤다 — `DECLARE [fetch] CURSOR FOR SELECT … OPEN [fetch] … SELECT @s = … EXEC(@s)`의
+  main `reads customers`(오파싱으로 얻은 참 읽기)는 이제 문서화한 "커서 질의 뒤 문장" 한계로 미추출로 센다.
+- 테스트(새 3개, 바꾼 0개): `tsql_exec_cut_forgets_values_assigned_in_the_cut_statement`(다섯 꼴, 세미콜론 판에 없는 간선 없음),
+  `tsql_cursor_and_label_names_are_not_statement_heads`(아홉 이름 × FETCH·CLOSE/DEALLOCATE, 전역 `print`, `GOTO throw`),
+  `tsql_update_set_variable_is_a_variable_write`, 그리고 `tsql_exec_after_a_query_is_the_next_statement`에 `UPDATE … FETCH … INTO @s
+  EXEC(@s)` 사례(끊기 경계 — `=`가 없는 대입은 끊은 뒤 버리기에도 잡히지 않는다). 새 셋은 `ecefcd7` parser 소스에서 실패한다. 변이 40종
+  (라운드 5·1차 리뷰의 34종 + 새 6종: 끊은 뒤 대입 버리기 끔, 커서 피연산자 건너뛰기 끔, `FETCH` 방향 건너뛰기 끔, 옛 `GLOBAL` 규칙, `UPDATE SET`
+  변수 무시, `CLOSE` 피연산자 건너뛰기 끔)을 최종 코드에서 모두 잡는다. 대입 버리기가 들어가자 "경계 무시하고 끊기" 변이가 살아남아 위
+  `FETCH` 사례를 더했다. 중간 커밋 `fbea4cd`도 parser 테스트 262·clippy·fmt를 따로 통과했다.
+- 대조(main·`bb29526`·`ecefcd7`·수정본): 재검토 꼴 112개(56쌍), 1차 리뷰 꼴 140개, 라운드 5의 165개와 문자열 별칭 26개, 남은 틈 16개
+  (459개). 엄격 대조 — 수정본의 세미콜론 없는 판에만 있고 그 세미콜론 판에 없는 간선은 2개이고 둘 다 main에도 같다: 이어진 블록 접기
+  (`end_begin_fold`, 참 간선; 세미콜론 판이 보수적)와 문서화한 소리 없는 `INSERT … SELECT … EXEC(@s)` 틈에서 sqlparser 별칭 읽기가 더하는
+  `reads log.id`. `ecefcd7` 대비 더해진 간선은 `OPEN open CLOSE open DEALLOCATE open UPDATE orders`의 `writes orders`(세미콜론 판에 있음)
+  하나, 사라진 간선은 `ecefcd7`의 거짓 `writes audit` 전부와 위 대가인 `SELECT @s = N'…' EXEC(@s)`의 `writes items`(미추출로 셈)다. main
+  대비 사라진 간선은 옛 값 접기 11개(1차 리뷰의 `FETCH` 7개 + `UPDATE … SET @v` 세미콜론 판 4개)와 nit의 `reads customers`다. 세미콜론 판과
+  간선·상태가 같은 쌍: 재검토 꼴 56쌍에서 main 1·`bb29526` 31·`ecefcd7` 42·수정본 44, 1차 리뷰 꼴 62쌍에서 58(`ecefcd7`과 같음), 라운드 5의
+  65쌍에서 59(같음). 1차 리뷰 꼴·라운드 5·문자열 별칭 사례는 `ecefcd7`과 결과가 모두 같다.
+- 방언 격리: T-SQL 몸체 465개를 PostgreSQL·Oracle·H2·Db2·generic으로 돌리면 main과 모두 같고, MySQL·MariaDB·SQLite는 `AS '…'` 몸체 8개만
+  다르다. SQL Server fixture 근사 카탈로그는 세미콜론 판·지운 판 모두 `ecefcd7`과 graph.json이 같고 `verify-dynamic-sql.py … sqlserver`를
+  통과한다.
+- 시간(디버그, 두 크기, main → 수정본): TRY·CATCH 1천·2천 쌍 0.61·1.02초 → 0.58·1.17초(`UPDATE … SET` 목록 끝을 단어마다 조각 끝까지 찾던
+  첫 판은 0.89·1.79초였다 — 한 번 훑어 목록 끝 절이나 문장 경계에서 멈추게 고쳤다), `FETCH NEXT FROM throw INTO` 2천 개 0.06 → 0.06초,
+  `DELETE … SET @s = … EXEC(@s)` 2천 개 0.08 → 0.10초, `UPDATE … SET @s = name;` 2천 개 0.20 → 0.20초. 나머지 모양도 main과 같은 크기다.
+- 검증: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`
+  757개 통과(754 + 3). 실제 PostgreSQL 16.15: PG 골든 diff 0(main·수정본), `verify-dynamic-sql.py`·`verify-document-versions.py` 통과,
+  `verify-accuracy.py --sqlglot --suite all --strict` 실패 0(엔진 결과 main과 같음). SQLite 골든 diff 0과 `verify-document-versions.py`(SQLite).
+  `--cache-dir` cold/warm 새 모양 13개 같음. Python CI 테스트 11개·`test-dml-producers.py`·`test-capture-migration.py`·`verify-contracts.py`·
+  `verify-competitive.py`·`verify-cancellation.py` 통과. 돌리지 못한 것은 라운드 5와 같다.
 
 ### PR #64 리뷰 반영 (2026-11-25)
 
@@ -813,7 +868,9 @@ PR #59는 GLM 리뷰 없이 머지됐다.
    - (PR #63 리뷰 반영 중 확인) 세미콜론 없는 T-SQL의 `OPEN cur` 뒤 문장, `END` 뒤 문장 머리, `DECLARE` 뒤 문장, 쿼리 뒤 `EXEC`는 라운드 5와
      PR #64 리뷰에서 고쳤다. 남은 것(세어짐): 추출기 갈래가 없는 단어가 `END` 뒤에 오면(`END RETURN 0 UPDATE …`) 꼬리로 먹어 뒤 문장을 미추출로
      세고, 커서 선언의 질의나 DML 뒤에 세미콜론 없이 붙은 문장은 sqlparser 0.58이 읽지 못해 미추출로 센다(T-SQL 커서 루프 `UPDATE … FETCH …`가
-     대표적). 남은 것(소리 없음, main부터): `INSERT …`·`WITH …`로 시작하는 문장 바로 뒤의 `EXEC(@s)`는 별칭으로 읽혀 빠진다. `UPDATE C … FROM audit c`의 승격
+     대표적). 남은 것(소리 없음, main부터): `INSERT …`·`WITH …`로 시작하는 문장 바로 뒤의 `EXEC(@s)`는 별칭으로 읽혀 빠진다. 보수 판정(세어짐):
+     쿼리 뒤 `EXEC`를 끊으면 끊은 텍스트의 `=` 대입을 모두 버려, 머리 문장 자신의 상수 대입(`SELECT @s = N'UPDATE …' EXEC(@s)`)도 접지
+     않는다 — 머리 문장의 대입 목록과 묻힌 문장을 가르면 되찾을 수 있다. `UPDATE C … FROM audit c`의 승격
      (`promoted_update_factor`·`scope.rs` `promoted_update_target`)은 아직 문서의 별칭 대소문자 규칙을 보지 않고 늘 대소문자를 무시하며,
      대상 철자를 문장 전체 읽기에서 뺀다(main부터; DELETE는 PR #63 리뷰에서 고침). MariaDB의 별칭·CTE 이름 규칙은 확인하지 않았다.
    - (sqlparser 0.58 한계, 라운드 4에서 확인) T-SQL 문장 사이 `;`는 `END` 앞에서만 생략할 수 있다. `UPDATE a … UPDATE b …`는
