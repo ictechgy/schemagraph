@@ -2480,6 +2480,201 @@ fn tsql_update_set_variable_is_a_variable_write() {
     }
 }
 
+/// 세미콜론 없는 T-SQL에서 끊지 않은 문장 텍스트에 묻힌 문장(`SET @s = …`·`SELECT @s = …`·`FETCH … INTO @s`·`END`
+/// 뒤 문장)은 변수 추적이 보지 못한다. 이전에는 그 뒤 `;` 다음 조각의 `EXEC(@s)`를 선언 때 값으로 접어 실행되지
+/// 않는 문장이 거짓 `writes audit`가 됐다(main부터). 묻힌 문장이 있으면 평가를 끄므로 세미콜론 판에 없는 간선은
+/// 하나도 없고, 세미콜론 판이 새 값으로 접은 간선은 미추출로 센다.
+#[test]
+fn tsql_swallowed_statement_before_a_semicolon_turns_folding_off() {
+    let prefix = "DECLARE @s nvarchar(100) = N'UPDATE audit SET name = 1'; DECLARE @n int; \
+                  DECLARE c CURSOR FOR SELECT name FROM customers; OPEN c; ";
+    let new = "N'UPDATE orders SET amount = 1'";
+    for (without, with) in [
+        (
+            format!("UPDATE customers SET name = 'x' SET @s = {new} PRINT 'x'; EXEC(@s);"),
+            format!("UPDATE customers SET name = 'x'; SET @s = {new}; PRINT 'x'; EXEC(@s);"),
+        ),
+        (
+            format!("DELETE FROM customers SET @s = {new} IF @n = 1 PRINT 'x'; EXEC(@s);"),
+            format!("DELETE FROM customers; SET @s = {new}; IF @n = 1 PRINT 'x'; EXEC(@s);"),
+        ),
+        (
+            "DELETE FROM customers SELECT @s = name FROM customers PRINT 'x'; EXEC(@s);".into(),
+            "DELETE FROM customers; SELECT @s = name FROM customers; PRINT 'x'; EXEC(@s);".into(),
+        ),
+        (
+            format!("UPDATE customers SET name = 'x' SET @s = {new}; EXEC(@s);"),
+            format!("UPDATE customers SET name = 'x'; SET @s = {new}; EXEC(@s);"),
+        ),
+        (
+            format!("INSERT INTO orders (id) VALUES (1) SET @s = {new}; EXEC(@s);"),
+            format!("INSERT INTO orders (id) VALUES (1); SET @s = {new}; EXEC(@s);"),
+        ),
+        (
+            "INSERT INTO orders (id) VALUES (1) SELECT @s = name FROM customers; EXEC(@s);".into(),
+            "INSERT INTO orders (id) VALUES (1); SELECT @s = name FROM customers; EXEC(@s);".into(),
+        ),
+        (
+            "INSERT INTO orders (id) SELECT id FROM customers SELECT @s = name FROM customers; EXEC(@s);"
+                .into(),
+            "INSERT INTO orders (id) SELECT id FROM customers; SELECT @s = name FROM customers; EXEC(@s);"
+                .into(),
+        ),
+        (
+            "SELECT name FROM customers UNION SELECT name FROM audit SELECT @s = name FROM customers; EXEC(@s);"
+                .into(),
+            "SELECT name FROM customers UNION SELECT name FROM audit; SELECT @s = name FROM customers; EXEC(@s);"
+                .into(),
+        ),
+        (
+            "SELECT name FROM customers ORDER BY name OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY FETCH NEXT FROM c INTO @s; EXEC(@s);"
+                .into(),
+            "SELECT name FROM customers ORDER BY name OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY; FETCH NEXT FROM c INTO @s; EXEC(@s);"
+                .into(),
+        ),
+        (
+            format!("WITH k AS (SELECT id FROM customers) DELETE FROM orders WHERE id IN (SELECT id FROM k) SET @s = {new}; EXEC(@s);"),
+            format!("WITH k AS (SELECT id FROM customers) DELETE FROM orders WHERE id IN (SELECT id FROM k); SET @s = {new}; EXEC(@s);"),
+        ),
+        (
+            format!("BEGIN DELETE FROM customers WHERE id = 1 END SET @s = {new} PRINT 'x'; EXEC(@s);"),
+            format!("BEGIN DELETE FROM customers WHERE id = 1; END; SET @s = {new}; PRINT 'x'; EXEC(@s);"),
+        ),
+        (
+            format!("CREATE TABLE #t (id int) SET @s = {new}; EXEC(@s);"),
+            format!("CREATE TABLE #t (id int); SET @s = {new}; EXEC(@s);"),
+        ),
+        (
+            format!("DROP TABLE IF EXISTS #t SET @s = {new}; EXEC(@s);"),
+            format!("DROP TABLE IF EXISTS #t; SET @s = {new}; EXEC(@s);"),
+        ),
+        (
+            "DROP TABLE IF EXISTS #t IF EXISTS (SELECT 1 FROM customers) RETURN; EXEC(@s);".into(),
+            "DROP TABLE IF EXISTS #t; IF EXISTS (SELECT 1 FROM customers) RETURN; EXEC(@s);".into(),
+        ),
+        (
+            format!("ALTER TABLE orders ADD note int SET @s = {new}; EXEC(@s);"),
+            format!("ALTER TABLE orders ADD note int; SET @s = {new}; EXEC(@s);"),
+        ),
+        (
+            format!("ALTER TABLE orders SET (LOCK_ESCALATION = AUTO) SET @s = {new}; EXEC(@s);"),
+            format!("ALTER TABLE orders SET (LOCK_ESCALATION = AUTO); SET @s = {new}; EXEC(@s);"),
+        ),
+        (
+            format!("GRANT SELECT ON orders TO public SET @s = {new}; EXEC(@s);"),
+            format!("GRANT SELECT ON orders TO public; SET @s = {new}; EXEC(@s);"),
+        ),
+        (
+            "UPDATE STATISTICS customers WITH SAMPLE 10 ROWS FETCH NEXT FROM c INTO @s; EXEC(@s);"
+                .into(),
+            "UPDATE STATISTICS customers WITH SAMPLE 10 ROWS; FETCH NEXT FROM c INTO @s; EXEC(@s);"
+                .into(),
+        ),
+        (
+            format!("SAVE TRANSACTION sp SET @s = {new}; EXEC(@s);"),
+            format!("SAVE TRANSACTION sp; SET @s = {new}; EXEC(@s);"),
+        ),
+        (
+            "SAVE TRANSACTION sp FETCH NEXT FROM c INTO @s; EXEC(@s);".into(),
+            "SAVE TRANSACTION sp; FETCH NEXT FROM c INTO @s; EXEC(@s);".into(),
+        ),
+        (
+            format!("BULK INSERT orders FROM 'f' SET @s = {new}; EXEC(@s);"),
+            format!("BULK INSERT orders FROM 'f'; SET @s = {new}; EXEC(@s);"),
+        ),
+        (
+            "DELETE FROM customers RECEIVE TOP (1) @s = message_body FROM q; EXEC(@s);".into(),
+            "DELETE FROM customers; RECEIVE TOP (1) @s = message_body FROM q; EXEC(@s);".into(),
+        ),
+    ] {
+        let (without, with) = (format!("{prefix}{without}"), format!("{prefix}{with}"));
+        let facts = routine_edges_and_state(&without, "sqlserver");
+        let semicolons = routine_edges_and_state(&with, "sqlserver");
+        assert!(
+            !facts.0.iter().any(|edge| edge == "Writes s.audit"),
+            "{without}: {facts:?}"
+        );
+        assert!(
+            facts.0.iter().all(|edge| semicolons.0.contains(edge)),
+            "{without}: {facts:?} vs {semicolons:?}"
+        );
+        assert_eq!(facts.1, AnalysisState::Partial, "{without}: {facts:?}");
+    }
+    // 추출기가 모르는 문장의 대입도 따라가지 않는다 — 세미콜론으로 끝난 `RECEIVE … @s = …;`도 `@s`를 버린다.
+    let body = format!("{prefix}RECEIVE TOP (1) @s = message_body FROM q; EXEC(@s);");
+    let facts = routine_edges_and_state(&body, "sqlserver");
+    assert!(
+        !facts.0.iter().any(|edge| edge == "Writes s.audit"),
+        "{body}: {facts:?}"
+    );
+}
+
+/// 머리 문장 문법 안의 문장 머리 단어(`UNION ALL SELECT`, `OFFSET … ROWS FETCH`, `INSERT … SELECT`·`EXEC`,
+/// `UPDATE … SET`, CTE 뒤 DML, `MERGE … THEN UPDATE SET … INSERT`, `DROP … IF EXISTS`, `GRANT SELECT, INSERT`,
+/// `ALTER … SET (…)`·`ON DELETE SET NULL`, `CREATE … AS SELECT`, 커서 질의의 `FOR UPDATE`, `BULK INSERT`)와 컬럼
+/// 이름 `throw`·`call`·`receive`는 묻힌 문장이 아니다.
+/// 평가가 켜진 채라 뒤 `SET @s = …; EXEC(@s);`가 접힌다.
+#[test]
+fn tsql_clause_words_of_the_head_statement_keep_folding() {
+    let prefix = "DECLARE @s nvarchar(100); ";
+    for statement in [
+        "SELECT name FROM customers UNION ALL SELECT name FROM orders",
+        "SELECT name FROM customers WITH (NOLOCK) EXCEPT SELECT name FROM audit",
+        "SELECT name FROM customers INTERSECT SELECT name FROM audit",
+        "SELECT name FROM customers ORDER BY name OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+        "SELECT name FROM customers ORDER BY name OFFSET 0 ROW FETCH FIRST (1) ROW ONLY",
+        "SELECT name FROM customers ORDER BY name OFFSET @n ROWS FETCH NEXT @n ROWS ONLY",
+        "INSERT INTO orders (id) SELECT id FROM customers UNION SELECT id FROM audit",
+        "INSERT INTO orders (id) SELECT id FROM customers ORDER BY id OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+        "INSERT INTO orders (id) VALUES (1)",
+        "INSERT INTO orders EXEC p",
+        "UPDATE orders SET amount = 1 WHERE id = 1",
+        "UPDATE customers SET throw = 1 WHERE id = 1",
+        "UPDATE customers SET call = 1 WHERE id = 1",
+        "WITH k AS (SELECT id FROM customers) UPDATE orders SET amount = 1 WHERE id IN (SELECT id FROM k)",
+        "MERGE orders AS t USING customers AS k ON t.id = k.id WHEN MATCHED THEN UPDATE SET amount = 1 \
+         WHEN NOT MATCHED THEN INSERT (id) VALUES (k.id)",
+        "DROP TABLE IF EXISTS #t",
+        "GRANT SELECT, INSERT ON orders TO public",
+        "REVOKE UPDATE ON orders FROM public",
+        "DENY DELETE ON orders TO public",
+        "ALTER TABLE orders SET (LOCK_ESCALATION = AUTO)",
+        "ALTER TABLE orders ADD CONSTRAINT fk FOREIGN KEY (customer_id) REFERENCES customers (id) \
+         ON DELETE SET NULL ON UPDATE SET NULL",
+        "ALTER TABLE orders DROP COLUMN IF EXISTS amount",
+        "CREATE TABLE #t WITH (DISTRIBUTION = ROUND_ROBIN) AS SELECT id FROM customers",
+        "DECLARE k CURSOR FOR SELECT name FROM customers FOR UPDATE OF name",
+        "UPDATE customers SET receive = 1 WHERE id = 1",
+        "BULK INSERT orders FROM 'f'",
+        "SAVE TRANSACTION sp",
+    ] {
+        let body =
+            format!("{prefix}{statement}; SET @s = N'UPDATE audit SET name = 1'; EXEC(@s);");
+        let facts = routine_edges_and_state(&body, "sqlserver");
+        assert!(
+            facts.0.iter().any(|edge| edge == "Writes s.audit"),
+            "{body}: {facts:?}"
+        );
+    }
+}
+
+/// `UPDATE … SET` 목록은 `throw`·`call` 컬럼에서 끝나지 않는다. 이전에는 거기서 멈춰 뒤 `@s = name`을 보지 못해,
+/// 세미콜론으로 끝난 몸체에서도 `EXEC(@s)`가 선언 때 값의 거짓 `writes audit`가 됐다.
+#[test]
+fn tsql_update_set_list_does_not_stop_at_throw_or_call_columns() {
+    let stale = "DECLARE @s nvarchar(100) = N'UPDATE audit SET name = 1'; ";
+    for column in ["throw", "call"] {
+        let body =
+            format!("{stale}UPDATE customers SET {column} = 1, @s = name WHERE id = 1; EXEC(@s);");
+        let facts = routine_edges_and_state(&body, "sqlserver");
+        assert!(
+            !facts.0.iter().any(|edge| edge == "Writes s.audit"),
+            "{body}: {facts:?}"
+        );
+        assert_eq!(facts.1, AnalysisState::Partial, "{body}: {facts:?}");
+    }
+}
+
 /// T-SQL 스칼라 함수와 다중 문장 테이블 반환 함수의 머리는 `AS`를 생략할 수 있다(`CREATE FUNCTION f(@a int)
 /// RETURNS int BEGIN …`). 그 머리를 블록 밖 문장으로 보아 완전한 함수를 `partial`로 표시하지 않는다. 머리 뒤에
 /// 실제 문장이 있으면 이전처럼 표시한다.
