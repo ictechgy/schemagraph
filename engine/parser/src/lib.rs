@@ -2526,7 +2526,10 @@ fn extract_procedural_statements(
                     // 세미콜론 없는 T-SQL 조각에서는 이 문장 뒤에 다음 문장이 붙어 있다
                     // (`PRINT ERROR_MESSAGE() INSERT INTO log …`). 이 문장의 절은 다음 문장 머리
                     // 앞에서 끝내고, 그 뒤를 계속 꺼낸다.
-                    let clause_end = tsql_statement_end(&rest[wlen..], state).map(|at| wlen + at);
+                    // 커서·레이블 이름(`FETCH NEXT FROM throw INTO @s`)은 다음 문장 머리가 아니다.
+                    let operand = wlen + tsql_named_operand_end(word, &rest[wlen..], state);
+                    let clause_end =
+                        tsql_statement_end(&rest[operand..], state).map(|at| operand + at);
                     let clause = &rest[wlen..clause_end.unwrap_or(rest.len())];
                     if word.eq_ignore_ascii_case("FETCH") {
                         if let Some(into) = find_top_level(clause, "INTO", true) {
@@ -2556,6 +2559,12 @@ fn extract_procedural_statements(
                         let end = tsql_exec_after_statement(rest, word, state);
                         let statement = &rest[..end.unwrap_or(rest.len())];
                         record_variable_writes(statement, word, state);
+                        if end.is_some() {
+                            // 끊은 문장 텍스트에는 머리 문장 말고도 `SET @s = …`·`SELECT @s = …` 같은 문장이 묻혀
+                            // 있을 수 있다. 그 대입을 따라가지 않으므로 뒤 `EXEC(@s)`를 옛 값으로 접지 않게 버린다
+                            // (머리 문장 자신의 대입도 함께 버려 그 접기를 잃는다).
+                            invalidate_assigned_names(statement, state);
+                        }
                         // SELECT .. INTO <변수>·RETURNING .. INTO <변수>는
                         // 변수 귀속 절 — 벗기지 않으면 변수가 테이블로 오인된다.
                         let stmt = match word.to_ascii_uppercase().as_str() {
@@ -2615,8 +2624,9 @@ fn assign_tsql_variable(name: &str, lhs: &str, rhs: &str, state: &mut Extraction
 /// 끊지 않으면 선언이 조각 끝까지 이어져, `DECLARE @m int = 1 UPDATE orders …`의 `UPDATE`가 기본값으로 읽힌 채
 /// 소리 없이 빠졌다(`DECLARE @t TABLE (…)` 뒤도 같다). 커서 선언(`DECLARE c CURSOR FOR SELECT …`)은 `FOR` 뒤
 /// `SELECT`에서 끊겨, 그 질의를 문장 머리 갈래가 읽는다 — 끊지 않을 때 `extract_decl_default`가 `FOR` 뒤를 질의로
-/// 꺼내던 것과 같고, 질의 뒤에 붙은 `EXEC(@s)`는 `tsql_exec_after_statement`로 다음 문장이 된다. T-SQL이 아니거나
-/// 뒤에 다음 문장이 없으면 `None`이다.
+/// 꺼내던 것과 같고, 질의 뒤에 붙은 `EXEC(@s)`는 `tsql_exec_after_statement`로 다음 문장이 된다. 커서 이름이 끊기
+/// 머리 단어여도(`DECLARE throw CURSOR FOR SELECT …`) 그 단어의 갈래가 `FOR` 뒤 `SELECT`에서 끊겨 결과가 같다.
+/// T-SQL이 아니거나 뒤에 다음 문장이 없으면 `None`이다.
 fn tsql_declaration_end(after_declare: &str, state: &ExtractionState) -> Option<usize> {
     tsql_statement_end(after_declare, state)
 }
@@ -2630,8 +2640,11 @@ fn tsql_declaration_end(after_declare: &str, state: &ExtractionState) -> Option<
 /// 경계(`END`, `FETCH`·`PRINT`·`IF` 같은 문장 머리 — 이 네 문장 안에 오는 `SELECT`·`INSERT`·`UPDATE`·`DELETE`·`SET`
 /// 은 빼고)가 먼저 나오면 끊지 않는다: 그 사이 문장(`END FETCH … INTO @s`)은 최상위 `END` 뒤 다시 꺼내기가 따로
 /// 읽어 이 추출 상태의 `@s`를 버리지 못하므로, 끊으면 뒤 `EXEC(@s)`를 옛 값으로 접는다. `SELECT … OFFSET … FETCH
-/// NEXT …`의 `FETCH`도 그래서 끊지 않는 쪽이다. `INSERT … EXEC proc`은 한 문장이고, `WITH`로 시작하는 문장은 뒤
-/// DML이 `INSERT`일 수 있어 끊지 않는다. T-SQL이 아니면 `None`이다.
+/// NEXT …`의 `FETCH`도 그래서 끊지 않는 쪽이다. 이 네 문장 안에 올 수 있는 `SELECT`·`INSERT`·`UPDATE`·`DELETE`·
+/// `SET`은 경계로 보지 않으므로, 끊은 문장 텍스트에 다른 문장(`DELETE FROM log SET @s = … EXEC(@s)`의 `SET @s = …`)이
+/// 묻혀 있을 수 있다 — 호출자는 끊은 뒤 그 텍스트의 `=` 대입을 모두 버린다(`invalidate_assigned_names`; T-SQL에서
+/// 스칼라 변수에 값을 넣는 다른 문장 `FETCH … INTO`·`EXEC … OUTPUT`은 경계라 이 텍스트에 오지 않는다). `INSERT … EXEC
+/// proc`은 한 문장이고, `WITH`로 시작하는 문장은 뒤 DML이 `INSERT`일 수 있어 끊지 않는다. T-SQL이 아니면 `None`이다.
 fn tsql_exec_after_statement(
     statement: &str,
     head: &str,
@@ -2676,9 +2689,9 @@ fn end_consumes_tail(tail: &str, state: &ExtractionState) -> bool {
 /// T-SQL `OPEN { [GLOBAL] 커서 | @커서_변수 }` 문장이 끝난 뒤 다음 텍스트가 시작하는 위치(`OPEN` 뒤 텍스트
 /// 기준)다.
 ///
-/// T-SQL `OPEN`은 커서 이름 하나만 받는다. 이름 뒤를 다음 문장 머리로 찾지 않고 이름에서 끝내는 것은,
-/// 그 사이의 `FETCH … INTO @v`가 `FETCH` 갈래를 거쳐야 `@v`의 추적 값을 버리기 때문이다(건너뛰면 뒤
-/// `EXEC(@v)`를 옛 값으로 접는다). `OPEN SYMMETRIC KEY …`·`OPEN MASTER KEY …`는 커서가 아니라 키를 여는
+/// T-SQL `OPEN`은 커서 참조 하나만 받는다(`skip_tsql_cursor_reference`). 이름 뒤를 다음 문장 머리로 찾지 않고
+/// 이름에서 끝내는 것은, 그 사이 문장 머리가 아닌 문장(`RETURN (SELECT …)`)도 제 갈래로 읽기 위해서다.
+/// `OPEN SYMMETRIC KEY …`·`OPEN MASTER KEY …`는 커서가 아니라 키를 여는
 /// 문장이라 무시하는 문장처럼 다음 문장 머리에서 끝낸다(`tsql_statement_end`). 뒤에 `KEY`가 없으면
 /// `master`·`symmetric`도 커서 이름이다(`OPEN master FETCH …`). T-SQL이 아니거나, 이름 뒤에
 /// 아무것도 없거나, 이름 뒤가 FOR 절이면(`OPEN c FOR SELECT …`, PL/pgSQL·PL/SQL 꼴) `None`이다 — 그때는
@@ -2695,18 +2708,85 @@ fn tsql_open_end(after_open: &str, state: &ExtractionState) -> Option<usize> {
     if opens_key {
         return tsql_statement_end(after_open, state);
     }
-    let mut end = skip_tsql_name(after_open)?;
-    if starts_with_keyword(head, "GLOBAL") {
-        // `OPEN GLOBAL c`의 GLOBAL은 범위 한정자다. 뒤에 이름이 없거나 뒤가 FOR 절·다음 문장 머리면
-        // GLOBAL이 커서 이름이다(`OPEN global UPDATE …`).
-        let next = skip_ws_comments(&after_open[end..]);
-        let named = !starts_with_keyword(next, "FOR") && !starts_with_tsql_statement_head(next);
-        if let Some(name_end) = skip_tsql_name(&after_open[end..]).filter(|_| named) {
-            end += name_end;
-        }
-    }
+    let end = skip_tsql_cursor_reference(after_open)?;
     let tail = skip_ws_comments(&after_open[end..]);
     (!tail.is_empty() && !starts_with_keyword(tail, "FOR")).then(|| after_open.len() - tail.len())
+}
+
+/// 앞 공백·주석 뒤의 T-SQL 커서 참조 `{ [GLOBAL] 커서 | @커서_변수 }`가 끝나는 위치. 이름이 없으면 `None`이다.
+///
+/// `GLOBAL`은 뒤에 이름이 오면 범위 한정자다. 다만 그 이름이 문장 머리 단어면 둘을 가른다 — 그 단어 뒤가 끝이거나
+/// `INTO`이거나 또 다른 문장 머리면 그 단어가 커서 이름이고(`OPEN GLOBAL print UPDATE …`), 아니면 그 단어는 다음
+/// 문장이고 `global`이 커서 이름이다(`OPEN global PRINT 'x'`, `OPEN global FETCH NEXT FROM global …`). 뒤가 `FOR`·
+/// `INTO`면 `global`이 이름이다.
+fn skip_tsql_cursor_reference(text: &str) -> Option<usize> {
+    let end = skip_tsql_name(text)?;
+    if !starts_with_keyword(skip_ws_comments(text), "GLOBAL") {
+        return Some(end);
+    }
+    let rest = &text[end..];
+    let next = skip_ws_comments(rest);
+    let Some(name_end) = skip_tsql_name(rest) else {
+        return Some(end);
+    };
+    if starts_with_keyword(next, "FOR") || starts_with_keyword(next, "INTO") {
+        return Some(end);
+    }
+    if starts_with_tsql_statement_head(next) {
+        let after = skip_ws_comments(&rest[name_end..]);
+        let ends_reference = after.is_empty()
+            || starts_with_keyword(after, "INTO")
+            || starts_with_tsql_statement_head(after);
+        if !ends_reference {
+            return Some(end);
+        }
+    }
+    Some(end + name_end)
+}
+
+/// T-SQL 무시하는 문장 가운데 커서를 피연산자로 받는 문장에서 커서 참조가 끝나는 위치(`word` 뒤 텍스트 기준)다.
+///
+/// `FETCH [NEXT|PRIOR|FIRST|LAST|ABSOLUTE n|RELATIVE n] [FROM] 커서`·`CLOSE 커서`·`DEALLOCATE 커서`의 커서 참조는
+/// 다음 문장 머리가 아니다 — `THROW`는 T-SQL 예약어가 아니어서 커서 이름이 될 수 있고, 그 이름에서 절을 끊으면
+/// `FETCH NEXT FROM throw INTO @s`의 `INTO @s`를 보지 못해 뒤 `EXEC(@s)`를 옛 값으로 접었다. `CLOSE fetch UPDATE …`
+/// 처럼 이름이 다른 끊기 단어일 때도 그 단어의 갈래가 뒤 문장을 삼키지 않는다. 레이블(`GOTO throw`)은 그 단어의
+/// 갈래가 다음 문장 머리에서 끝나 결과가 같아 건너뛰지 않는다. T-SQL이 아니거나 그 밖의 문장이면 0이다.
+fn tsql_named_operand_end(word: &str, after_word: &str, state: &ExtractionState) -> usize {
+    if state.dialect != constant_sql::TextDialect::MsSql {
+        return 0;
+    }
+    match word.to_ascii_uppercase().as_str() {
+        "FETCH" => tsql_fetch_cursor_end(after_word),
+        "CLOSE" | "DEALLOCATE" => skip_tsql_cursor_reference(after_word).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// `FETCH` 뒤 텍스트에서 방향(`NEXT`·`PRIOR`·`FIRST`·`LAST`·`ABSOLUTE n`·`RELATIVE n`)과 `FROM`을 건너뛴 커서
+/// 참조가 끝나는 위치다. 커서 참조를 찾지 못하면 그 앞까지다.
+fn tsql_fetch_cursor_end(after_fetch: &str) -> usize {
+    let mut at = 0;
+    let offset_of = |text: &str| after_fetch.len() - skip_ws_comments(text).len();
+    let head = skip_ws_comments(after_fetch);
+    if let Some(word) = ["NEXT", "PRIOR", "FIRST", "LAST"]
+        .into_iter()
+        .find(|word| starts_with_keyword(head, word))
+    {
+        at = offset_of(after_fetch) + word.len();
+    } else if let Some(word) = ["ABSOLUTE", "RELATIVE"]
+        .into_iter()
+        .find(|word| starts_with_keyword(head, word))
+    {
+        at = offset_of(after_fetch) + word.len();
+        let amount = skip_ws_comments(&after_fetch[at..]);
+        let sign = usize::from(amount.starts_with(['-', '+']));
+        let amount_at = offset_of(&after_fetch[at..]) + sign;
+        at = amount_at + skip_tsql_name(&after_fetch[amount_at..]).unwrap_or(0);
+    }
+    if starts_with_keyword(skip_ws_comments(&after_fetch[at..]), "FROM") {
+        at = offset_of(&after_fetch[at..]) + "FROM".len();
+    }
+    at + skip_tsql_cursor_reference(&after_fetch[at..]).unwrap_or(0)
 }
 
 /// 앞 공백·주석 뒤의 T-SQL 이름 하나(`이름`·`@변수`·`[인용]`·`"인용"`)가 끝나는 위치. 이름이 없으면 `None`이다.
@@ -2803,7 +2883,8 @@ fn find_top_level_word(text: &str, is_cut: impl Fn(&str, &str) -> bool) -> Optio
 /// 간선을 낼 수 있는 문장과 블록·제어 머리에 더해, 추출기가 따로 읽는 T-SQL 문장(`FETCH`·`PRINT`·`RAISERROR`·
 /// `THROW`·`CLOSE`·`DEALLOCATE`·`OPEN`·`WAITFOR`·`GOTO`)에서도 끊는다. 그러지 않으면 세미콜론 없이 이어진
 /// `PRINT 'x' FETCH NEXT FROM c INTO @s EXEC(@s)`의 `FETCH`가 `PRINT` 절에 묻혀 `@s`의 옛 값을 버리지 못한다.
-/// 이 단어들은 T-SQL 예약어라 다른 문장 절의 최상위에 이름으로 오지 않는다. `SELECT … OFFSET … FETCH NEXT …`의
+/// `THROW` 말고는 T-SQL 예약어라 다른 문장 절의 최상위에 이름으로 오지 않는다. 커서·레이블 이름 자리는
+/// `tsql_named_operand_end`·`skip_tsql_cursor_reference`·`tsql_declaration_end`가 건너뛴다. `SELECT … OFFSET … FETCH NEXT …`의
 /// `FETCH`는 `SELECT` 문장 안이라 이 끊기의 대상이 아니다(문장 머리 갈래는 조각 끝까지를 한 문장으로 읽는다).
 const TSQL_STATEMENT_HEADS: [&str; 23] = [
     "SELECT",
