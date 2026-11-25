@@ -2447,6 +2447,39 @@ fn tsql_cursor_and_label_names_are_not_statement_heads() {
     );
 }
 
+/// T-SQL `UPDATE t SET @v = col`은 변수에 값을 넣는다. 이전에는 그 대입을 보지 않아 세미콜론으로 끝난
+/// `UPDATE customers SET @s = name WHERE id = 1; EXEC(@s);`에서도 `@s`의 선언 때 값으로 거짓 `writes audit`를
+/// 냈다(main부터).
+#[test]
+fn tsql_update_set_variable_is_a_variable_write() {
+    let stale = "DECLARE @s nvarchar(100) = N'UPDATE audit SET name = 1'; ";
+    for (without, with) in [
+        (
+            "UPDATE customers SET @s = name WHERE id = 1 EXEC(@s)",
+            "UPDATE customers SET @s = name WHERE id = 1; EXEC(@s);",
+        ),
+        (
+            "UPDATE customers SET @s = name = 'x' WHERE id = 1 EXEC(@s)",
+            "UPDATE customers SET @s = name = 'x' WHERE id = 1; EXEC(@s);",
+        ),
+    ] {
+        let (without, with) = (format!("{stale}{without}"), format!("{stale}{with}"));
+        for body in [&with, &without] {
+            let facts = routine_edges_and_state(body, "sqlserver");
+            assert!(
+                !facts.0.iter().any(|edge| edge == "Writes s.audit"),
+                "{body}: {facts:?}"
+            );
+            assert_eq!(facts.1, AnalysisState::Partial, "{body}: {facts:?}");
+        }
+        assert_eq!(
+            routine_edges_and_state(&without, "sqlserver"),
+            routine_edges_and_state(&with, "sqlserver"),
+            "{without}"
+        );
+    }
+}
+
 /// T-SQL 스칼라 함수와 다중 문장 테이블 반환 함수의 머리는 `AS`를 생략할 수 있다(`CREATE FUNCTION f(@a int)
 /// RETURNS int BEGIN …`). 그 머리를 블록 밖 문장으로 보아 완전한 함수를 `partial`로 표시하지 않는다. 머리 뒤에
 /// 실제 문장이 있으면 이전처럼 표시한다.

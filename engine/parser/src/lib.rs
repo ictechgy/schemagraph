@@ -2789,6 +2789,28 @@ fn tsql_fetch_cursor_end(after_fetch: &str) -> usize {
     at + skip_tsql_cursor_reference(&after_fetch[at..]).unwrap_or(0)
 }
 
+/// T-SQL `UPDATE … SET` 목록에서 값을 받는 변수(`@v = col`, `@v = col = expr`)의 추적 값을 버린다.
+///
+/// 이전에는 `UPDATE customers SET @s = name WHERE id = 1; EXEC(@s);`의 `@s`가 선언 때 값(`UPDATE audit …`)을
+/// 유지해, 실행되지 않는 문장이 거짓 `writes audit`가 됐다(세미콜론 판 포함 main부터). `SET` 목록은 최상위
+/// `FROM`·`WHERE`·`OUTPUT`·`OPTION`이나 다음 문장 경계(`END`, T-SQL 끊기 머리) 앞까지다. 목록 안의 비교식(`CASE WHEN @x = 1 …`)도 대입처럼 보아 그 변수를
+/// 버릴 수 있다 — 참인 접기를 잃을 뿐 거짓 간선은 만들지 않는다.
+fn invalidate_update_set_variables(stmt: &str, state: &mut ExtractionState) {
+    let Some(set) = find_top_level(stmt, "SET", true) else {
+        return;
+    };
+    let list = &stmt[set + "SET".len()..];
+    // 세미콜론 없는 조각에서 문장 텍스트는 조각 끝까지라, 목록 끝 단어를 하나씩 끝까지 찾으면 `UPDATE`마다
+    // 조각 길이만큼 읽는다. 한 번 훑어 목록을 끝내는 절이나 다음 문장 경계에서 멈춘다.
+    let end = find_top_level_word(list, |upper, after| match upper {
+        "FROM" | "WHERE" | "OUTPUT" | "OPTION" | "END" => true,
+        "WITH" => opens_cte(after),
+        word => TSQL_STATEMENT_HEADS.contains(&word),
+    })
+    .unwrap_or(list.len());
+    invalidate_assigned_names(&list[..end], state);
+}
+
 /// 앞 공백·주석 뒤의 T-SQL 이름 하나(`이름`·`@변수`·`[인용]`·`"인용"`)가 끝나는 위치. 이름이 없으면 `None`이다.
 ///
 /// 인용 없는 이름에는 ASCII 밖 글자도 든다 — T-SQL 식별자는 유니코드 글자를 받는다.
@@ -3795,6 +3817,10 @@ fn record_variable_writes(stmt: &str, head: &str, state: &mut ExtractionState) {
         }
         record_select_assignments(stmt, head, state);
         return;
+    }
+    if upper == "UPDATE" && state.dialect == constant_sql::TextDialect::MsSql {
+        // T-SQL `UPDATE t SET @v = col`·`SET @v = col = expr`은 변수에도 값을 넣는다.
+        invalidate_update_set_variables(stmt, state);
     }
     if matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE") {
         let Some(returning) = find_top_level(stmt, "RETURNING", true) else {
